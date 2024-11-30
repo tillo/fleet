@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eclipse-mosquitto
+  namespace: mqtt
+spec:
+  selector:
+    matchLabels:
+      app: eclipse-mosquitto
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: eclipse-mosquitto
+    spec:
+      containers:
+      - name: eclipse-mosquitto
+        image: eclipse-mosquitto
+        ports:
+        - containerPort: 1883
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        volumeMounts:
+        - name: mosquitto-data
+          mountPath: /mosquitto/data
+        - name: mosquitto-config
+          mountPath: /mosquitto/config
+      volumes:
+      - name: mosquitto-data
+        persistentVolumeClaim:
+          claimName: mosquitto-data
+      - name: mosquitto-config
+        configMap:
+          name: mosquitto-config
