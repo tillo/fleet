@@ -1,0 +1,42 @@
+config:
+  provider: keycloak-oidc
+  cookieName: mdapi-tv
+  existingSecret: oauth2-proxy-tv-credentials 
+  configFile: |-
+    provider="keycloak-oidc"
+    provider_display_name="MDAPI"
+    redirect_url="https://auth.mdapi.ch/tv/oauth2/callback"
+    oidc_issuer_url="https://idp.mdapi.org/realms/tilloch"
+    cookie_domains=["mdapi.ch"]
+    whitelist_domains=[".mdapi.ch"]
+    email_domains=["*"]
+    allowed_roles=["mdapi-tv"]
+sessionStorage:
+  type: redis
+  redis:
+    existingSecret: oauth2-proxy-tv-credentials
+    passwordKey: redis-password
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    existingSecret: oauth2-proxy-tv-credentials
+    existingSecretPasswordKey: redis-password
+ingress:
+  enabled: true
+  path: /tv
+  hosts:
+    - auth.mdapi.ch
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    flame.pawelmalak/type: app
+    flame.pawelmalak/name: Whoami (tv)
+    flame.pawelmalak/url: https://auth.mdapi.ch/tv/oauth2/userinfo
+    flame.pawelmalak/category: Identity
+    flame.pawelmalak/icon: account-question
+    flame.pawelmalak/order: '240'
+  tls:
+    - secretName: auth-cert
+      hosts:
+        - auth.mdapi.ch
+    
