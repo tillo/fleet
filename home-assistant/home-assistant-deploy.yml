@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: home-assitant
+  namespace: home-assistant
+spec:
+  selector:
+    matchLabels:
+      app: home-assistant
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: home-assistant
+    spec:
+      containers:
+      - name: home-assistant
+        image: ghcr.io/home-assistant/home-assistant
+        ports:
+        - containerPort: 8123
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+        - name: home-assistant-config
+          mountPath: /config/configuration.json
+          subPath: configuration.json
+      volumes:
+      - name: home-assistant-data
+        persistentVolumeClaim:
+          claimName: home-assistant-data
+      - name: home-assistant-config
+        configMap:
+          name: home-assistant-config
