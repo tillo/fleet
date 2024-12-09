@@ -23,6 +23,24 @@ data:
         - 192.168.0.0/16
       ip_ban_enabled: true
       login_attempts_threshold: 5
+    device_tracker:
+      - platform: bluetooth_le_tracker
+        interval_seconds: 60
+        consider_home: 180
+        track_new_devices: true
+        track_battery: true
+        new_device_defaults:
+          track_new_devices: true
+      - platform: swisscom
+        host: 192.168.1.1
+    shelly:
+    bluetooth:
+    google_assistant:
+      project_id: control-homeass-from-goo-84760
+      service_account: !include SERVICE_ACCOUNT.JSON
+      report_state: true
+      expose_by_default: true
+      secure_devices_pin: '6544'
     command_line:
       - sensor:
           name: Home Assistant DB size
@@ -31,3 +49,17 @@ data:
           command: "bash -c 'du -shm /config/home-assistant_v2.db | cut -f1'"
           unit_of_measurement: MB
           value_template: "{{ value if is_number(value) }}"
+    homeassistant:
+      packages:
+        energy: !include packages/energy.yaml
+      customize:
+        sensor.solar_imported_power_kwh:
+          device_class: energy
+        sensor.solar_exported_power_kwh:
+          device_class: energy
+        sensor.solar_panel_production_kwh:
+          device_class: energy
+        sensor.solar_panel_to_house_kwh:
+          device_class: energy
+        sensor.solar_house_consumption_kwh:
+          device_class: energy
