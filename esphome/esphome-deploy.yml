@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esphome
+  namespace: esphome
+spec:
+  selector:
+    matchLabels:
+      app: esphome
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: esphome
+    spec:
+      containers:
+      - name: esphome
+        image: docker.io/esphome/esphome
+        ports:
+        - containerPort: 6052
+        dnsConfig:
+          nameservers:
+            - 192.168.1.1
+        dnsPolicy: None
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: ESPHOME_DASHBOARD_USE_PING
+          value: 'true'
+        envFrom:
+          - secretRef:
+              name: esphome-env-secret
+        volumeMounts:
+        - name: esphome-config
+          mountPath: /config
+        - name: esphome-secrets
+          mountPath: /config/secrets.yaml
+          subPath: secrets.yaml
+      volumes:
+      - name: esphome-config
+        persistentVolumeClaim:
+          claimName: esphome-config
+      - name: esphome-secrets
+        secret:
+          secretName: esphome-secrets
