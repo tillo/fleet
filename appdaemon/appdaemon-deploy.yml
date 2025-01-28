@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: appdaemon
+  namespace: appdaemon
+spec:
+  selector:
+    matchLabels:
+      app: appdaemon
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: appdaemon
+    spec:
+      containers:
+      - name: appdaemon
+        image: acockburn/appdaemon
+        ports:
+        - containerPort: 80
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: DASH_URL
+          value: https://appdaemon.mdapi.ch
+        - name: HA_URL
+          value: https://home.mdapi.ch
+        - name: LATITUDE
+          value: "46.6387"
+        - name: LONGITUDE
+          value: "6.6290"
+        - name: ELEVATION
+          value: "621"
+        envFrom:
+          - secretRef:
+              name: appdaemon-env-secret
+        volumeMounts:
+        - name: appdaemon-conf
+          mountPath: /conf
+      volumes:
+      - name: appdaemon-conf
+        persistentVolumeClaim:
+          claimName: appdaemon-conf
