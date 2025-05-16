@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pms-docker
+  namespace: tv
+spec:
+  selector:
+    matchLabels:
+      app: pms-docker
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: pms-docker
+    spec:
+      containers:
+      - name: pms-docker
+        image: plexinc/pms-docker
+        ports:
+        - containerPort: 32400
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        volumeMounts:
+        - name: pms-docker-config
+          mountPath: /config
+        - name: pms-docker-transcode
+          mountPath: /transcode
+        - name: tv
+          mountPath: /data
+      volumes:
+      - name: pms-docker-config
+        persistentVolumeClaim:
+          claimName: pms-docker-config
+      - name: pms-docker-transcode
+        persistentVolumeClaim:
+          claimName: pms-docker-transcode
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv
