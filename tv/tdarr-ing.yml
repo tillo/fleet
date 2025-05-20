@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tdarr
+  namespace: tv
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    flame.pawelmalak/type: app
+    flame.pawelmalak/name: Transcoding
+    flame.pawelmalak/url: https://tdarr.mdapi.ch
+    flame.pawelmalak/category: TV
+    flame.pawelmalak/icon: barcode
+    flame.pawelmalak/order: '400'
+    nginx.ingress.kubernetes.io/auth-response-headers: Authorization
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/tv/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: https://auth.mdapi.ch/tv/oauth2/auth
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tdarr.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: tdarr
+                port:
+                  number: 8265
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - tdarr.mdapi.ch
+      secretName: tdarr-cert

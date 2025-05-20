@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tdarr
+  namespace: tv
+spec:
+  selector:
+    matchLabels:
+      app: tdarr
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: tdarr
+    spec:
+      containers:
+      - name: tdarr
+        image: ghcr.io/haveagitgat/tdarr
+        ports:
+        - containerPort: 8265
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: serverIP
+          value: '0.0.0.0'
+        - name: serverPort
+          value: '8266'
+        - name: webUIPort
+          value: '8265'
+        - name: internalNode
+          value: 'true'
+        - name: nodeName
+          value: mdapi
+        volumeMounts:
+        - name: tdarr-server
+          mountPath: /app/server
+        - name: tdarr-configs
+          mountPath: /app/configs
+        - name: tdarr-temp
+          mountPath: /temp
+        - name: tv
+          mountPath: /media
+      volumes:
+      - name: tdarr-server
+        persistentVolumeClaim:
+          claimName: tdarr-server
+      - name: tdarr-configs
+        persistentVolumeClaim:
+          claimName: tdarr-configs
+      - name: tdarr-temp
+        persistentVolumeClaim:
+          claimName: tdarr-temp
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv
