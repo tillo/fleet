@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: radarr
+  namespace: tv
+spec:
+  selector:
+    matchLabels:
+      app: radarr
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: radarr
+    spec:
+      containers:
+      - name: radarr
+        image: lscr.io/linuxserver/radarr
+        ports:
+        - containerPort: 7878
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        volumeMounts:
+        - name: radarr-config
+          mountPath: /config
+        - name: tv
+          mountPath: /downloads/complete
+          subPath: Torrents/Finish
+        - name: tv
+          mountPath: /downloads/incomplete
+          subPath: Torrents/Temp
+        - name: tv
+          mountPath: /tv
+      volumes:
+      - name: radarr-config
+        persistentVolumeClaim:
+          claimName: radarr-config
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv
