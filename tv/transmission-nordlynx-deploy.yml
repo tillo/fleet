@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transmission-nordlynx
+  namespace: tv
+spec:
+  selector:
+    matchLabels:
+      app: transmission-nordlynx
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: transmission-nordlynx
+    spec:
+      initContainers:
+      - name: disable-ipv6
+        command:
+        - /bin/sysctl
+        args:
+        - -w
+        - net.ipv6.conf.all.disable_ipv6=1
+        image: docker.io/busybox
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+      containers:
+      - name: transmission
+        image: lscr.io/linuxserver/transmission
+        ports:
+        - containerPort: 9091
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        volumeMounts:
+        - name: transmission-config
+          mountPath: /config
+        - name: tv
+          mountPath: /downloads/complete
+          subPath: Torrents/Finish
+        - name: tv
+          mountPath: /downloads/incomplete
+          subPath: Torrents/Temp
+        - name: tv
+          mountPath: /watch
+          subPath: Torrents/Start
+      - name: nordlynx
+        image: ghcr.io/bubuntux/nordlynx
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: NET_LOCAL
+          value: '10.0.0.0/8'
+        envFrom:
+          - secretRef:
+              name: nordlynx-env-secret
+        securityContext:
+          capabilities:
+            add:
+              - NET_ADMIN
+      volumes:
+      - name: transmission-config
+        persistentVolumeClaim:
+          claimName: transmission-config
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv
