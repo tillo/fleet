@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: certspotter
+  namespace: certspotter
+spec:
+  selector:
+    matchLabels:
+      app: certspotter
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: certspotter
+    spec:
+      containers:
+      - name: certspotter
+        image: registry.mdapi.ch/mdapi/compose/certspotter
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: CS_DELAY
+          value: '3600'
+        - name: CS_DOMAINS
+          value: .tillo.ch .mdapi.org .mdapi.ch .dellambrogio.ch .dellambrogio.com .dellambrogio.org .maurodellambrogio.com .icebow.org .coders.ch .lithia.eu .r3h.ch .kyos.ch
+        - name: CS_DEBUG
+          value: '0'
+        envFrom:
+          - secretRef:
+              name: certspotter-env-secret
+        volumeMounts:
+        - name: certspotter-config
+          mountPath: /certspotter/.certspotter
+      volumes:
+      - name: certspotter-config
+        persistentVolumeClaim:
+          claimName: certspotter-config
