@@ -1,3 +1,3 @@
 # fleet
 
-Rancher Fleet repository for MDAPI kubernetes clusters.
+Rancher Fleet repository for MDAPI kubernetes clusters. (DEV)
