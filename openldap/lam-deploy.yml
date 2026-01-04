@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lam
+  namespace: openldap
+spec:
+  selector:
+    matchLabels:
+      app: lam
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: lam
+    spec:
+      containers:
+      - name: lam
+        image: ghcr.io/ldapaccountmanager/lam
+        ports:
+        - containerPort: 80
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: LDAP_DOMAIN
+          value: mdapi.ch
+        - name: LDAP_BASE_DN
+          value: dc=mdapi,dc=ch
+        - name: LDAP_SERVER
+          value: ldap://openldap.openldap.svc.cluster.local:389
+        - name: LDAP_USER
+          value: cn=admin,dc=mdapi,dc=ch
+        - name: LDAP_ORGANISATION
+          value: MDAPI
+        envFrom:
+          - secretRef:
+              name: lam-env-secret
+        volumeMounts:
+        - name: lam-data
+          mountPath: /var/lib/ldap-account-manager
+      volumes:
+      - name: lam-data
+        persistentVolumeClaim:
+          claimName: lam-data
