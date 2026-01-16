@@ -13,6 +13,13 @@ spec:
       labels:
         app: trapeye-nodeport
     spec:
+      initContainers:
+      - name: uuidgen
+        image: andyneff/uuidgen
+        command: ['sh', '-c', "echo \"TRAPEYE_UUID=\'$(uuidgen)\'\" > /ephemeral/random.env"]
+        volumeMounts:
+        - name: ephemeral
+          mountPath: /ephemeral
       containers:
       - name: trapeye
         image: ghcr.io/anantis-security/trapeye:1.1.12
@@ -40,9 +47,19 @@ spec:
         env:
         - name: TZ
           value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            fileKeyRef:
+              path: random.env
+              volumeName: ephemeral
+              key: TRAPEYE_UUID
+              optional: false
         envFrom:
         - secretRef:
             name: trapeye-env-secret
+      volumes:
+      - name: ephemeral
+        emptyDir: {}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -59,6 +76,13 @@ spec:
       labels:
         app: trapeye-clusterip
     spec:
+      initContainers:
+      - name: uuidgen
+        image: andyneff/uuidgen
+        command: ['sh', '-c', "echo \"TRAPEYE_UUID=\'$(uuidgen)\'\" > /ephemeral/random.env"]
+        volumeMounts:
+        - name: ephemeral
+          mountPath: /ephemeral
       containers:
       - name: trapeye
         image: ghcr.io/anantis-security/trapeye:1.1.12
@@ -86,9 +110,19 @@ spec:
         env:
         - name: TZ
           value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            fileKeyRef:
+              path: random.env
+              volumeName: ephemeral
+              key: TRAPEYE_UUID
+              optional: false
         envFrom:
         - secretRef:
             name: trapeye-env-secret
+      volumes:
+      - name: ephemeral
+        emptyDir: {}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -105,6 +139,13 @@ spec:
       labels:
         app: trapeye-loadbalancer
     spec:
+      initContainers:
+      - name: uuidgen
+        image: andyneff/uuidgen
+        command: ['sh', '-c', "echo \"TRAPEYE_UUID=\'$(uuidgen)\'\" > /ephemeral/random.env"]
+        volumeMounts:
+        - name: ephemeral
+          mountPath: /ephemeral
       containers:
       - name: trapeye
         image: ghcr.io/anantis-security/trapeye:1.1.12
@@ -132,6 +173,16 @@ spec:
         env:
         - name: TZ
           value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            fileKeyRef:
+              path: random.env
+              volumeName: ephemeral
+              key: TRAPEYE_UUID
+              optional: false
         envFrom:
         - secretRef:
             name: trapeye-env-secret
+      volumes:
+      - name: ephemeral
+        emptyDir: {}
