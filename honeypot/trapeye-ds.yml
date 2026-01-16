@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: trapeye-daemonset
+  namespace: honeypot
+spec:
+  selector:
+    matchLabels:
+      app: trapeye-daemonset
+  template:
+    metadata:
+      labels:
+        app: trapeye-daemonset
+    spec:
+      containers:
+      - name: trapeye
+        image: ghcr.io/anantis-security/trapeye:1.1.12
+        ports:
+        - name: ftp
+          containerPort: 21
+          hostPort: 21
+        - name: ssh
+          containerPort: 22
+          hostPort: 2222
+        - name: smtp
+          containerPort: 25
+          hostPort: 25
+        - name: smtps
+          containerPort: 465
+          hostPort: 25465
+        - name: http
+          containerPort: 80
+          hostPort: 8080
+        - name: https
+          containerPort: 443
+          hostPort: 8443
+        - name: ldap
+          containerPort: 389
+          hostPort: 3268
+        - name: ldaps
+          containerPort: 636
+          hostPort: 3269
+        - name: rdp
+          containerPort: 3389
+          hostPort: 3389
+        - name: postgresql
+          containerPort: 5432
+          hostPort: 5432
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        envFrom:
+        - secretRef:
+            name: trapeye-env-secret
