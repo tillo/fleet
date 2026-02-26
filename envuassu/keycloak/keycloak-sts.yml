@@ -19,6 +19,23 @@ spec:
       labels:
         app: keycloak
     spec:
+      volumes:
+        - name: providers-volume
+          emptyDir: { }
+      initContainers:
+        - name: download-plugins
+          image: curlimages/curl
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /plugins
+              curl -L -o /plugins/keycloak-webhook-provider-core.jar https://github.com/vymalo/keycloak-webhook/releases/download/v0.10.0-rc.1/keycloak-webhook-provider-core-0.10.0-rc.1-all.jar
+              curl -L -o /plugins/keycloak-webhook-provider-http.jar https://github.com/vymalo/keycloak-webhook/releases/download/v0.10.0-rc.1/keycloak-webhook-provider-http-0.10.0-rc.1-all.jar
+              cp /plugins/*.jar /providers/
+          volumeMounts:
+            - name: providers-volume
+              mountPath: /providers
       containers:
         - name: keycloak
           image: quay.io/keycloak/keycloak
@@ -51,6 +68,12 @@ spec:
               value: 'postgres'
             - name: 'KC_DB_USERNAME'
               value: 'keycloak'
+            - name: WEBHOOK_HTTP_BASE_PATH
+              value: "https://windmill.mdapi.ch/api/w/envuassu/capture_u/http/flow/u.tillo.C5jrwiEgYVv3/enregistrement_login_ajoute_utilisateur_suivi_webhook"
+            - name: WEBHOOK_HTTP_AUTH_USERNAME
+              value: "enregistrement_login_ajoute_utilisateur_suivi"
+            - name: WEBHOOK_EVENTS_TAKEN
+              value: "REGISTER"
           envFrom:
             - secretRef:
                 name: keycloak-env-secret
@@ -79,10 +102,6 @@ spec:
               port: 9000
             periodSeconds: 10
             failureThreshold: 3              
-          resources:
-            limits:
-              cpu: 2000m
-              memory: 2000Mi
-            requests:
-              cpu: 500m
-              memory: 1700Mi
+          volumeMounts:
+            - name: providers-volume
+              mountPath: /opt/keycloak/providers
