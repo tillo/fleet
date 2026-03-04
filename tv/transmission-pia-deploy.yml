@@ -1,17 +1,17 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: transmission-nordlynx
+  name: transmission-pia
   namespace: tv
 spec:
   selector:
     matchLabels:
-      app: transmission-nordlynx
+      app: transmission-pia
   replicas: 1
   template:
     metadata:
       labels:
-        app: transmission-nordlynx
+        app: transmission-pia
     spec:
       initContainers:
       - name: disable-ipv6
@@ -26,7 +26,7 @@ spec:
           privileged: true
       containers:
       - name: transmission
-        image: lscr.io/linuxserver/transmission:4.0.5
+        image: lscr.io/linuxserver/transmission
         ports:
         - containerPort: 9091
         env:
@@ -48,16 +48,40 @@ spec:
         - name: tv
           mountPath: /watch
           subPath: Torrents/Start
-      - name: nordlynx
-        image: ghcr.io/bubuntux/nordlynx
+      - name: pia
+        image: thrnz/docker-wireguard-pia
         env:
         - name: TZ
           value: Europe/Zurich
-        - name: NET_LOCAL
-          value: '10.0.0.0/8'
+        - name: LOC
+          value: swiss
+        - name: LOCAL_NETWORK
+          value: '10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/22'
+        - name: VPNDNS
+          value: '45.90.28.16, 45.90.30.16'
+        - name: KEEPALIVE
+          value: '25'
+        - name: PORT_FORWARDING
+          value: '1'
+        - name: PORT_PERSIST
+          value: '1'
+        - name: PORT_FATAL
+          value: '1'
+        - name: EXIT_ON_FATAL
+          value: '1'
+        - name: ACTIVE_HEALTHCHECKS
+          value: '1'
+        - name: HEALTHCHECK_PING_TARGET
+          value: '31.3.128.49, test-ipv6.alpinedc.ch'
+        - name: RECONNECT
+          value: '1'
+        - name: POST_UP
+          value: 'sleep 10; apk add --no-cache transmission-remote && transmission-remote -p $(cat /pia-shared/port.dat)'
+        - name: POST_RECONNECT
+          value: 'sleep 10; apk add --no-cache transmission-remote && transmission-remote -p $(cat /pia-shared/port.dat)'
         envFrom:
           - secretRef:
-              name: nordlynx-env-secret
+              name: pia-env-secret
         securityContext:
           capabilities:
             add:
