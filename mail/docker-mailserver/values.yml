@@ -1,7 +1,7 @@
 certificate: mail-cert
 deployment:
   env:
-    ACCOUNT_PROVISIONER: FILE
+    ACCOUNT_PROVISIONER: LDAP
     LOG_LEVEL: info
     SUPERVISOR_LOGLEVEL: info
     ENABLE_CLAMAV: 1
@@ -19,6 +19,19 @@ deployment:
     PFLOGSUMM_RECIPIENT: tillo@tillo.ch
     LOGWATCH_INTERVAL: weekly
     LOGWATCH_RECIPIENT: tillo@tillo.ch
+    LDAP_SEARCH_BASE: dc=mdapi,dc=ch
+    LDAP_QUERY_FILTER_USER: "(&(objectClass=room)(cn=%s)(dn=*,ou=People,dc=mdapi,dc=ch))"
+    LDAP_QUERY_FILTER_GROUP: "(&(objectClass=room)(cn=%s)(dn=*,ou=group,dc=mdapi,dc=ch))"
+    LDAP_QUERY_FILTER_ALIAS: "(&(objectClass=room)(cn=%s)(dn=*,ou=alias,dc=mdapi,dc=ch))"
+    LDAP_QUERY_FILTER_DOMAIN: "(&(objectClass=room)(cn=%s)(dn=*,ou=domain,dc=mdapi,dc=ch))"
+    DOVECOT_USER_FILTER: "(&(objectClass=room)(cn=%u)(dn=*,ou=People,dc=mdapi,dc=ch))"
+    DOVECOT_PASS_FILTER: "(&(objectClass=posixAccount)(mail=%u)(dn=*,ou=People,dc=mdapi,dc=ch))"
+    DOVECOT_USER_ATTRS: "uidNumber=uid,=gid=5000,description=home=/var/mail/%$"
+    DOVECOT_PASS_ATTRS: "userPassword=password"
+    ENABLE_SASLAUTHD: 1
+    SASLAUTHD_MECHANISMS: rimap
+    SASLAUTHD_MECH_OPTIONS: "127.0.0.1"
+  secretEnvironments: docker-mailserver-env-secret
 persistent_volume_claims:
   mail-config:
     size: 1G
@@ -34,6 +47,44 @@ persistent_volume_claims:
     storageClass: harvester-longhorn-2replicas
 service:
   type: LoadBalancer
+rspamd:
+  ingress:
+    enabled: true
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+    host: rspamd.mdapi.ch
+    tls:
+      enabled: true
+      secret: rspamd-cert
+dovecot:
+  fullTextSearch:
+    enabled: true
+extraDeploy:
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata:
+    name: docker-mailserver-env-secret
+  spec:
+    refreshInterval: 1m0s
+
+    secretStoreRef:
+      kind: ClusterSecretStore
+      name: cm-akeyless
+
+    target:
+      name: docker-mailserver-env-secret
+      creationPolicy: Owner
+
+    data:
+      - remoteRef:
+          key: /mdapi/mail/docker-mailserver-env-secret/LDAP_SERVER_HOST
+        secretKey: LDAP_SERVER_HOST
+      - remoteRef:
+          key: /mdapi/mail/docker-mailserver-env-secret/LDAP_BIND_DN
+        secretKey: LDAP_BIND_DN
+      - remoteRef:
+          key: /mdapi/mail/docker-mailserver-env-secret/LDAP_BIND_PW
+        secretKey: LDAP_BIND_PW
 keel:
   policy: minor
   trigger: poll
