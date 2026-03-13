@@ -63,6 +63,46 @@ rspamd:
 dovecot:
   fullTextSearch:
     enabled: true
+configMaps:
+  user-patches.sh:
+    create: true
+    path: user-patches.sh
+    data: |
+      #!/bin/bash
+
+      {{- if .Values.proxyProtocol.enabled }}
+      # NOTE: Keep in sync with upstream advice:
+      # https://github.com/docker-mailserver/docker-mailserver/blob/v15.0.0/docs/content/examples/tutorials/mailserver-behind-proxy.md?plain=1#L238-L268
+
+      # Duplicate the config for the submission(s) service ports (587 / 465) with adjustments for the PROXY ports (10587 / 10465) and `syslog_name` setting:
+      postconf -Mf submission/inet | sed -e s/^submission/10587/ -e 's/submission/submission-proxyprotocol/' >> /etc/postfix/master.cf
+      postconf -Mf submissions/inet | sed -e s/^submissions/10465/ -e 's/submissions/submissions-proxyprotocol/' >> /etc/postfix/master.cf
+      # Enable PROXY Protocol support for these new service variants:
+      postconf -P 10587/inet/smtpd_upstream_proxy_protocol=haproxy
+      postconf -P 10465/inet/smtpd_upstream_proxy_protocol=haproxy
+
+      # Create a variant for port 25 too (NOTE: Port 10025 is already assigned in DMS to Amavis):
+      postconf -Mf smtp/inet | sed -e s/^smtp/12525/ >> /etc/postfix/master.cf
+      # Enable PROXY Protocol support:
+      # - Uses a different setting as port 25 is handled via the postscreen service
+      # - Optionally configure a `syslog_name` to distinguish in logs:
+      postconf -P \
+        12525/inet/postscreen_upstream_proxy_protocol=haproxy \
+        12525/inet/syslog_name=postfix/smtpd-proxyprotocol
+
+      # Add the `proxy:` prefix to share this cache between each running postscreen service via `proxymap`:
+      postconf 'postscreen_cache_map = proxy:btree:$data_directory/postscreen_cache'
+      {{- end }}
+
+      perl -p -i -e 's/^result_attribute = mail$/result_attribute = cn/g' /etc/postfix/ldap-domains.cf
+
+      perl -p -i -e 's/^result_attribute = mail$/result_attribute = description/g' /etc/postfix/ldap-aliases.cf
+      perl -p -i -e 's/^result_attribute = mail$/result_attribute = description/g' /etc/postfix/ldap-groups.cf
+
+      cp /etc/postfix/ldap-users.cf /etc/postfix/ldap-usersmap.cf
+      perl -p -i -e 's/^result_attribute = mail$/result_attribute = description/g' /etc/postfix/ldap-users.cf
+      perl -p -i -e 's/^result_attribute = mail$/result_attribute = cn/g' /etc/postfix/ldap-usersmap.cf
+      postconf 'virtual_alias_maps = ldap:/etc/postfix/ldap-aliases.cf, ldap:/etc/postfix/ldap-groups.cf, ldap:/etc/postfix/ldap-usersmap.cf'
 extraDeploy:
 - apiVersion: external-secrets.io/v1
   kind: ExternalSecret
