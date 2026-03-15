@@ -64,6 +64,76 @@ dovecot:
   fullTextSearch:
     enabled: true
 configMaps:
+  dovecot.cf:
+    create: true
+    path: dovecot.cf
+    data: |
+      {{- if .Values.proxyProtocol.enabled }}
+        haproxy_trusted_networks = {{ .Values.proxyProtocol.trustedNetworks }}
+
+        {{- if and (.Values.deployment.env.ENABLE_IMAP) (not .Values.deployment.env.SMTP_ONLY) }}
+        service imap-login {
+            inet_listener imap {
+                port = 143
+            }
+
+            inet_listener imaps {
+                port = 993
+                ssl = yes
+            }
+
+            inet_listener imap_proxyprotocol {
+                haproxy = yes
+                port = 10143
+                ssl = no
+            }
+
+            inet_listener imaps_proxyprotocol {
+                haproxy = yes
+                port = 10993
+                ssl = yes
+            }
+        }
+        {{- end -}}
+
+        {{- if and (.Values.deployment.env.ENABLE_POP3) (not .Values.deployment.env.SMTP_ONLY) }}
+        service pop3-login {
+            inet_listener pop3 {
+                port = 110
+            }
+
+            inet_listener pop3s {
+                port = 995
+                ssl = yes
+            }
+
+            inet_listener pop3_proxyprotocol {
+                haproxy = yes
+                port = 10110
+                ssl = no
+            }
+
+            inet_listener pop3s_proxyprotocol {
+                haproxy = yes
+                port = 10995
+                ssl = yes
+            }
+        }
+        {{- end -}}
+
+        {{- if and (.Values.deployment.env.ENABLE_MANAGESIEVE) (not .Values.deployment.env.SMTP_ONLY) }}
+        service managesieve-login {
+            inet_listener sieve {
+                port = 4190
+            }
+
+            inet_listener sieve_proxyprotocol {
+                haproxy = yes
+                port = 14190
+            }
+        }
+        {{- end -}}
+      {{- end -}}
   user-patches.sh:
     create: true
     path: user-patches.sh
