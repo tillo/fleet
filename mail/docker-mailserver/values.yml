@@ -68,8 +68,17 @@ configMaps:
     create: true
     path: dovecot.cf
     data: |
+      iterate_attrs = cn=user
+      iterate_filter = (&(objectClass=room)(ou:dn:=People))
       service indexer-worker {
             vsz_limit = 16GB
+      }
+      service decode2text {
+            executable = script /usr/lib/dovecot/decode2text.sh
+            user = docker
+            unix_listener decode2text {
+                  mode = 0666
+            }
       }
       {{- if .Values.proxyProtocol.enabled }}
         haproxy_trusted_networks = {{ .Values.proxyProtocol.trustedNetworks }}
@@ -142,6 +151,11 @@ configMaps:
     path: user-patches.sh
     data: |
       #!/bin/bash
+
+      curl -o /usr/lib/dovecot/decode2text.sh https://github.com/bdraco/dovecot/raw/refs/heads/master/src/plugins/fts/decode2text.sh
+      chmod +x /usr/lib/dovecot/decode2text.sh
+      apt -y update
+      apt -y install --no-install-recommends poppler-utils catdoc antiword unzip
 
       {{- if .Values.proxyProtocol.enabled }}
       # NOTE: Keep in sync with upstream advice:
