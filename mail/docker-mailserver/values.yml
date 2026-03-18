@@ -154,6 +154,20 @@ configMaps:
     data: |
       #!/bin/bash
 
+      cat <<EOF >/etc/rspamd/local.d/multimap.conf
+      sender_from_regexp {
+        type = "from";
+        filter = "email:addr";
+        map = "file:///tmp/docker-mailserver/from_re.map";
+        symbol = "SENDER_FROM_REGEXP";
+        regexp = true;
+      }
+      EOF
+
+      cat <<EOF >/tmp/docker-mailserver/from_re.map
+      \w+@\w+\.tillo\.ch SENDER_FROM_REGEXP:-10:edgestuff
+      EOF
+
       # Removed by docker-mailserver Dockerfile
       curl -o /usr/lib/dovecot/decode2text.sh https://raw.githubusercontent.com/bdraco/dovecot/refs/heads/master/src/plugins/fts/decode2text.sh
       chmod +x /usr/lib/dovecot/decode2text.sh
