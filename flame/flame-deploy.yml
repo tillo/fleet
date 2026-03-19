@@ -16,19 +16,9 @@ spec:
       serviceAccountName: flame
       containers:
       - name: flame
-        image: ghcr.io/fdarveau/flame
+        image: registry.mdapi.ch/mdapi/flame
         ports:
         - containerPort: 5005
-        command: ['/bin/sh']
-        args:
-        - '+x'
-        - '-c'
-        - >-
-          apk add --no-cache patch
-          && patch -l -N -t -p3 -i /mnt/patches/dot-name-bug.patch /app/controllers/apps/docker/useKubernetes.js
-          && patch -l -N -t -p3 -i /mnt/patches/category-bug.patch /app/controllers/apps/docker/useKubernetes.js
-          && node server.js
-          || sleep infinity
         env:
         - name: TZ
           value: Europe/Zurich
@@ -36,15 +26,12 @@ spec:
         - secretRef:
             name: flame-env-secret
         volumeMounts:
-        - name: flame-patches
-          mountPath: /mnt/patches
         - name: flame-config
           mountPath: /app/utils/init/initialConfig.json
           subPath: initialConfig.json
       volumes:
-      - name: flame-patches
-        configMap:
-          name: flame-patches
       - name: flame-config
         configMap:
           name: flame-config
+      imagePullSecrets:
+      - name: mdapi-registry
