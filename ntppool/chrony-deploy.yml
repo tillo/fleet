@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chrony
+  namespace: chrony
+annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: chrony
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: chrony
+    spec:
+      containers:
+      - name: chrony
+        image: registry.mdapi.ch/mdapi/chrony
+        ports:
+        - name: ntp-udp
+          containerPort: 123
+          protocol: UDP
+        - name: ntp-tcp
+          containerPort: 123
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: NTP_SERVERS
+          value: "81.94.123.16 81.94.123.17 194.242.34.149 193.5.68.2 192.33.96.101 192.33.96.102"
+      imagePullSecrets:
+      - name: mdapi-registry
