@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opennic-tier2
+  namespace: opennic
+annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: opennic-tier2
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: opennic-tier2
+    spec:
+      containers:
+      - name: opennic-tier2
+        image: registry.mdapi.ch/mdapi/opennic-tier2
+        securityContext:
+          privileged: true
+        ports:
+        - name: nameserver-udp
+          containerPort: 53
+          protocol: UDP
+        - name: nameserver-tcp
+          containerPort: 53
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+      imagePullSecrets:
+      - name: mdapi-registry
