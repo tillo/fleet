@@ -38,21 +38,8 @@ postgresql:
       effective_cache_size = 256MB
       work_mem = 8MB
 
-elasticsearch:
-  master:
-    # Single-node cluster: set number_of_replicas=0 on all indices via postStart hook
-    # This keeps the cluster green instead of yellow (no replica shards to assign)
-    lifecycleHooks:
-      postStart:
-        exec:
-          command:
-            - /bin/bash
-            - -c
-            - |
-              until curl -sf http://localhost:9200/_cluster/health; do sleep 3; done
-              curl -sf -X PUT "http://localhost:9200/_index_template/no-replicas" \
-                -H 'Content-Type: application/json' \
-                -d '{"index_patterns":["*"],"priority":1,"template":{"settings":{"number_of_replicas":0}}}'
-              curl -sf -X PUT "http://localhost:9200/*/_settings" \
-                -H 'Content-Type: application/json' \
-                -d '{"index":{"number_of_replicas":0}}'
+# Note: Elasticsearch runs in single-node mode and will show YELLOW status due to unassigned
+# replica shards. This is expected and harmless. To turn it GREEN, run once after ES is up:
+#   kubectl exec -n envuassu zammad-elasticsearch-master-0 -- curl -s -X PUT \
+#     "http://localhost:9200/*/_settings" -H 'Content-Type: application/json' \
+#     -d '{"index":{"number_of_replicas":0}}'
