@@ -344,6 +344,15 @@ data:
           device_class: energy
         sensor.qua_ilo_present_power:
           device_class: energy
+    shell_command:
+      onu_reboot: >-
+        TOKEN=$(curl -sk -X POST https://192.168.11.1/ubus
+        -H 'Content-Type: application/json'
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"00000000000000000000000000000000\",\"session\",\"login\",{\"username\":\"root\",\"password\":\"$ONU_PASSWORD\"}]}"
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['result'][1]['ubus_rpc_session'])")
+        && curl -sk -X POST https://192.168.11.1/ubus
+        -H 'Content-Type: application/json'
+        -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"call\",\"params\":[\"$TOKEN\",\"system\",\"reboot\",{}]}"
     config_editor:
     opnsense:
       url: https://pfsense.mdapi.ch/api
