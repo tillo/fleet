@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: threadfin
+  namespace: tv
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    flame.pawelmalak/type: app
+    flame.pawelmalak/name: Tuning
+    flame.pawelmalak/url: https://threadfin.mdapi.ch
+    flame.pawelmalak/category: TV
+    flame.pawelmalak/icon: knob
+    flame.pawelmalak/order: '500'
+    nginx.ingress.kubernetes.io/auth-response-headers: Authorization
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/tv/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: https://auth.mdapi.ch/tv/oauth2/auth
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: threadfin.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: threadfin
+                port:
+                  number: 34400
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - threadfin.mdapi.ch
+      secretName: threadfin-cert
