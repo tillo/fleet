@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: threadfin-bis
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: threadfin-bis
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: threadfin-bis
+    spec:
+      containers:
+      - name: threadfin
+        image: registry.mdapi.ch/mdapi/threadfin:latest
+        ports:
+        - containerPort: 34400
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1001'
+        - name: PGID
+          value: '1001'
+        volumeMounts:
+        - name: threadfin-bis-config
+          mountPath: /home/threadfin/conf
+      volumes:
+      - name: threadfin-bis-config
+        persistentVolumeClaim:
+          claimName: threadfin-bis-config
+      imagePullSecrets:
+      - name: mdapi-registry
