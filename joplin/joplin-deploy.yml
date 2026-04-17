@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: joplin
+  namespace: joplin
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: joplin
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: joplin
+    spec:
+      containers:
+      - name: joplin
+        image: joplin/server:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 22300
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: APP_PORT
+          value: "22300"
+        - name: APP_BASE_URL
+          value: https://notes.mdapi.ch
+        - name: DB_CLIENT
+          value: pg
+        - name: POSTGRES_DATABASE
+          value: joplin
+        - name: POSTGRES_USER
+          value: joplin
+        - name: POSTGRES_PORT
+          value: "5432"
+        - name: POSTGRES_HOST
+          value: joplin-postgres-postgresql.joplin.svc.cluster.local
+        - name: MAILER_ENABLED
+          value: "1"
+        - name: MAILER_HOST
+          value: leg.tillo.ch
+        - name: MAILER_PORT
+          value: "25"
+        - name: MAILER_SECURITY
+          value: none
+        - name: MAILER_NOREPLY_NAME
+          value: Joplin
+        - name: MAILER_NOREPLY_EMAIL
+          value: joplin@notes.mdapi.ch
+        envFrom:
+        - secretRef:
+            name: joplin-env-secret

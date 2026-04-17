@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: joplin-mcp
+  namespace: joplin
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: joplin-mcp
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: joplin-mcp
+    spec:
+      containers:
+      - name: joplin-mcp
+        image: registry.mdapi.ch/mdapi/joplin-mcp:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: JOPLIN_SERVER_URL
+          value: http://joplin.joplin.svc.cluster.local:22300
+        envFrom:
+        - secretRef:
+            name: joplin-mcp-env-secret
+      imagePullSecrets:
+      - name: mdapi-registry
