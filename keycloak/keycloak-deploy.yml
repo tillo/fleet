@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: keycloak
+          image: registry.mdapi.ch/mdapi/keycloak-postgres:latest
+          imagePullPolicy: Always
+          args: ["start", "--optimized"]
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: KC_HOSTNAME
+              value: https://idp.mdapi.ch
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://postgres.keycloak.svc.cluster.local/keycloak
+            - name: KC_DB_USERNAME
+              value: keycloak
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+          envFrom:
+            - secretRef:
+                name: keycloak-env-secret
+          ports:
+            - name: http
+              containerPort: 8080
