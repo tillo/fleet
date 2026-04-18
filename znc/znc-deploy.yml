@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: znc
+  namespace: znc
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: znc
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: znc
+    spec:
+      initContainers:
+        - name: cert-init
+          image: alpine:3
+          command:
+            - /bin/sh
+            - -c
+            - |
+              cat /tls/tls.key /tls/tls.crt > /znc-data/znc.pem
+              chmod 600 /znc-data/znc.pem
+              if [ -f /znc-data/configs/znc.conf ]; then
+                sed -i \
+                  -e 's/Port = [0-9]*/Port = 443/' \
+                  -e '/^\tBindHost/d' \
+                  -e 's|SSLCertFile = .*|SSLCertFile = /znc-data/znc.pem|' \
+                  -e 's|SSLKeyFile = .*|SSLKeyFile = /znc-data/znc.pem|' \
+                  -e 's|SSLDHParamFile = .*|SSLDHParamFile = /znc-data/znc.pem|' \
+                  /znc-data/configs/znc.conf
+              fi
+          volumeMounts:
+            - name: znc-data
+              mountPath: /znc-data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      containers:
+        - name: znc
+          image: registry.mdapi.ch/mdapi/znc:latest
+          ports:
+            - containerPort: 443
+          volumeMounts:
+            - name: znc-data
+              mountPath: /znc-data
+      volumes:
+        - name: znc-data
+          persistentVolumeClaim:
+            claimName: znc-data
+        - name: tls
+          secret:
+            secretName: znc-cert
