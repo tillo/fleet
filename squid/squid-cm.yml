@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: squid-conf
+  namespace: squid
+data:
+  squid.conf: |
+    auth_param basic program /usr/lib/squid/basic_ldap_auth -b "dc=mdapi,dc=ch" -D "cn=admin,dc=mdapi,dc=ch" -W /etc/squid/ldap/ADMIN_PASS openldap.openldap.svc.cluster.local
+    auth_param basic children 5
+    auth_param basic realm Proxy
+
+    acl ldapauth proxy_auth REQUIRED
+
+    acl SSL_ports port 443
+    acl Safe_ports port 80
+    acl Safe_ports port 443
+    acl Safe_ports port 1025-65535
+    acl CONNECT method CONNECT
+
+    http_access deny !Safe_ports
+    http_access deny CONNECT !SSL_ports
+    http_access allow ldapauth
+    http_access deny all
+
+    https_port 443 tls-cert=/etc/squid/ssl/tls.crt tls-key=/etc/squid/ssl/tls.key
+
+    cache_mem 0 MB
+    cache deny all
+    coredump_dir /var/spool/squid
+    forwarded_for off

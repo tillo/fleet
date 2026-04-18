@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: squid
+  namespace: squid
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: squid
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: squid
+    spec:
+      containers:
+        - name: squid
+          image: ubuntu/squid:6.6-24.04_edge
+          ports:
+            - containerPort: 443
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            - name: squid-conf
+              mountPath: /etc/squid/squid.conf
+              subPath: squid.conf
+            - name: squid-cert
+              mountPath: /etc/squid/ssl
+              readOnly: true
+            - name: squid-ldap
+              mountPath: /etc/squid/ldap
+              readOnly: true
+      volumes:
+        - name: squid-conf
+          configMap:
+            name: squid-conf
+        - name: squid-cert
+          secret:
+            secretName: squid-cert
+        - name: squid-ldap
+          secret:
+            secretName: squid-ldap
