@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coiffuredreams
+  namespace: coiffuredreams
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: coiffuredreams
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: coiffuredreams
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: coiffuredreams
+          image: registry.mdapi.ch/mdapi/coiffuredreams:latest
+          ports:
+            - containerPort: 80
+          envFrom:
+            - secretRef:
+                name: wp-salts
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: DB_PASSWORD
+          volumeMounts:
+            - name: uploads
+              mountPath: /var/www/html/wp-content/uploads
+            - name: msmtp-config
+              mountPath: /etc/msmtprc
+              subPath: msmtprc
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: uploads
+        - name: msmtp-config
+          configMap:
+            name: msmtp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coiffuredreams
+  namespace: coiffuredreams
+spec:
+  selector:
+    app: coiffuredreams
+  ports:
+    - port: 80
+      targetPort: 80
