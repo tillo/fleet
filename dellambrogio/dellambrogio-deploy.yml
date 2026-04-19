@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dellambrogio
+  namespace: dellambrogio
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: dellambrogio
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: dellambrogio
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: dellambrogio
+          image: registry.mdapi.ch/mdapi/dellambrogio:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: RECAPTCHA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: recaptcha-secret
+                  key: RECAPTCHA_SECRET_KEY
+            - name: EMAIL_TO
+              value: tillo@tillo.ch
+          volumeMounts:
+            - name: msmtp-config
+              mountPath: /etc/msmtprc
+              subPath: msmtprc
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: msmtp-config
+          configMap:
+            name: msmtp-config
