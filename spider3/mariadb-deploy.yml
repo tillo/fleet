@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb
+  namespace: spider3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      containers:
+      - env:
+        - name: MARIADB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: MARIADB_ROOT_PASSWORD
+              name: db-secret
+        - name: MARIADB_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              key: DB_NAME
+              name: db-config
+        - name: MARIADB_USER
+          valueFrom:
+            configMapKeyRef:
+              key: DB_USER
+              name: db-config
+        - name: MARIADB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: DB_PASSWORD
+              name: db-secret
+        image: mariadb:10.11
+        name: mariadb
+        ports:
+        - containerPort: 3306
+        resources:
+          limits:
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - mountPath: /var/lib/mysql
+          name: db-data
+      volumes:
+      - name: db-data
+        persistentVolumeClaim:
+          claimName: db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  namespace: spider3
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mariadb

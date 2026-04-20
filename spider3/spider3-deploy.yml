@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    keel.sh/match-tag: 'true'
+    keel.sh/policy: force
+    keel.sh/pollSchedule: '@every 4h'
+    keel.sh/trigger: poll
+  name: spider3
+  namespace: spider3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spider3
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: spider3
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+      - name: spider3
+        image: registry.mdapi.ch/mdapi/spider3:latest
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - mountPath: /var/www/spider3
+          name: spider3-data
+        - mountPath: /etc/msmtprc
+          name: msmtp-config
+          subPath: msmtprc
+      volumes:
+      - name: spider3-data
+        persistentVolumeClaim:
+          claimName: spider3-data
+      - name: msmtp-config
+        configMap:
+          name: msmtp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spider3
+  namespace: spider3
+spec:
+  selector:
+    app: spider3
+  ports:
+  - port: 80
+    targetPort: 80
