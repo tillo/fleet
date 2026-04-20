@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: ivodellambrogio
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ivodellambrogio
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: ivodellambrogio
+          image: registry.mdapi.ch/mdapi/ivodellambrogio:latest
+          ports:
+            - containerPort: 80
+          envFrom:
+            - configMapRef:
+                name: db-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: DB_PASSWORD
+          volumeMounts:
+            - name: uploads
+              mountPath: /var/www/html/uploads
+            - name: msmtp-config
+              mountPath: /etc/msmtprc
+              subPath: msmtprc
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: uploads
+        - name: msmtp-config
+          configMap:
+            name: msmtp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+spec:
+  selector:
+    app: ivodellambrogio
+  ports:
+    - port: 80
+      targetPort: 80
