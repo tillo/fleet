@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nameserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nameserver
+  template:
+    metadata:
+      labels:
+        app: nameserver
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: nameserver
+          image: registry.mdapi.ch/mdapi/nameserver:latest
+          ports:
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: webmin
+              containerPort: 10000
+              protocol: TCP
+          volumeMounts:
+            - name: zones
+              mountPath: /var/lib/bind
+            - name: named-conf
+              mountPath: /etc/bind/named.conf
+              subPath: named.conf
+            - name: tsig-key
+              mountPath: /etc/bind/tsig.key
+              subPath: named-key
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            exec:
+              command:
+                - /usr/bin/dig
+                - "@127.0.0.1"
+                - "-p"
+                - "53"
+                - "tillo.ch"
+                - "SOA"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: zones
+          persistentVolumeClaim:
+            claimName: nameserver-zones
+        - name: named-conf
+          configMap:
+            name: named-conf
+        - name: tsig-key
+          secret:
+            secretName: tsig-secret
+            defaultMode: 0440
