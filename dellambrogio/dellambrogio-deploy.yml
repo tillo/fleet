@@ -12,14 +12,26 @@ spec:
   selector:
     matchLabels:
       app: dellambrogio
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       labels:
         app: dellambrogio
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: dellambrogio
+              topologyKey: kubernetes.io/hostname
       imagePullSecrets:
         - name: mdapi-registry
       containers:

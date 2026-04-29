@@ -8,9 +8,12 @@ metadata:
     keel.sh/trigger: poll
     keel.sh/pollSchedule: "@every 4h"
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: keycloak
@@ -19,6 +22,16 @@ spec:
       labels:
         app: keycloak
     spec:
+      serviceAccountName: keycloak
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: keycloak
+              topologyKey: kubernetes.io/hostname
       imagePullSecrets:
         - name: mdapi-registry
       containers:
@@ -45,12 +58,28 @@ spec:
               value: keycloak
             - name: KC_BOOTSTRAP_ADMIN_USERNAME
               value: admin
+            # Infinispan clustering — required for 2+ replicas.
+            # kubernetes stack uses the k8s API to discover peers by label.
+            - name: KC_CACHE
+              value: ispn
+            - name: KC_CACHE_STACK
+              value: kubernetes
+            - name: KC_CACHE_EMBEDDED_NETWORK_BIND_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           envFrom:
             - secretRef:
                 name: keycloak-env-secret
           ports:
             - name: http
               containerPort: 8080
+            - name: jgroups
+              containerPort: 7800
           resources:
             requests:
               cpu: 100m
