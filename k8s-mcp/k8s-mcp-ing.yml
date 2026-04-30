@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k8s-mcp
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # SSE requires no buffering and long timeouts
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # ModSecurity off — MCP JSON traffic triggers false positives
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: k8s-mcp.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: k8s-mcp
+            port:
+              number: 8080
+  tls:
+  - hosts:
+    - k8s-mcp.mdapi.ch
+    secretName: k8s-mcp-cert

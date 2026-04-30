@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-mcp
+  template:
+    metadata:
+      labels:
+        app: k8s-mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: kube-mcp-server
+        image: ghcr.io/kubernetes/kubernetes-mcp-server:latest
+        args:
+          - --transport
+          - sse
+          - --port
+          - "9090"
+        env:
+        - name: KUBECONFIG
+          value: /etc/kubeconfig/kubeconfig
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        volumeMounts:
+        - name: secrets
+          mountPath: /etc/kubeconfig
+          readOnly: true
+
+      - name: caddy
+        image: caddy:2-alpine
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: k8s-mcp-secrets
+              key: AUTH_TOKEN
+        volumeMounts:
+        - name: caddy-config
+          mountPath: /etc/caddy
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+          limits:
+            memory: 64Mi
+
+      volumes:
+      - name: secrets
+        secret:
+          secretName: k8s-mcp-secrets
+          items:
+          - key: kubeconfig
+            path: kubeconfig
+            mode: 0600
+      - name: caddy-config
+        configMap:
+          name: k8s-mcp-caddy
