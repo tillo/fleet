@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wg-dev
+  namespace: vpn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wg-dev
+  template:
+    metadata:
+      labels:
+        app: wg-dev
+    spec:
+      initContainers:
+        - name: config
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /config/wg_confs
+              cat > /config/wg_confs/wg0.conf << EOF
+              [Interface]
+              Address = 10.200.0.3/32
+              PrivateKey = $(cat /secrets/private-key)
+
+              [Peer]
+              # prod cluster
+              PublicKey = BotWItCe2DNfzpfmf6DAUcm6BaAnseq0Q56FH0/ZK3s=
+              PresharedKey = $(cat /secrets/psk)
+              Endpoint = 31.3.128.50:51820
+              AllowedIPs = 10.200.0.1/32
+              PersistentKeepalive = 25
+              EOF
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: secrets
+              mountPath: /secrets
+      containers:
+        - name: wireguard
+          image: lscr.io/linuxserver/wireguard:latest
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+        - name: proxy
+          image: alpine/socat
+          command:
+            - sh
+            - -c
+            - socat TCP4-LISTEN:443,fork,reuseaddr TCP4:ingress-nginx-controller.ingress.svc.cluster.local:443
+          securityContext:
+            capabilities:
+              add:
+                - NET_BIND_SERVICE
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+      volumes:
+        - name: config
+          emptyDir: {}
+        - name: secrets
+          secret:
+            secretName: wg-dev
