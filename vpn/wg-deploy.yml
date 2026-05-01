@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wg-prod
+  namespace: vpn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wg-prod
+  template:
+    metadata:
+      labels:
+        app: wg-prod
+    spec:
+      hostNetwork: true
+      nodeName: qui
+      initContainers:
+        - name: config
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /config/wg_confs
+              cat > /config/wg_confs/wg0.conf << EOF
+              [Interface]
+              Address = 10.200.0.1/24
+              ListenPort = 51820
+              PrivateKey = $(cat /secrets/private-key)
+              PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT
+              PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
+
+              [Peer]
+              # test cluster
+              PublicKey = FhxMXEfyNYM9DgVNuxYEZR2Z50oOnAznHS4Wi5oVS0c=
+              PresharedKey = $(cat /secrets/psk-test)
+              AllowedIPs = 10.200.0.2/32
+
+              [Peer]
+              # dev cluster
+              PublicKey = IkrA/gWQfvRF0//Gxf/mmHAumNnzPmtRkgpEVKIe5T0=
+              PresharedKey = $(cat /secrets/psk-dev)
+              AllowedIPs = 10.200.0.3/32
+              EOF
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: secrets
+              mountPath: /secrets
+      containers:
+        - name: wireguard
+          image: lscr.io/linuxserver/wireguard:latest
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+      volumes:
+        - name: config
+          emptyDir: {}
+        - name: secrets
+          secret:
+            secretName: wg-prod
