@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: technitium-secondary
+  namespace: technitium
+  annotations:
+    keel.sh/policy: minor
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: technitium-secondary
+  template:
+    metadata:
+      labels:
+        app: technitium-secondary
+        role: dns
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  role: dns
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: technitium
+        image: technitium/dns-server:latest
+        imagePullPolicy: Always
+        ports:
+        - name: dns-tcp
+          containerPort: 53
+          protocol: TCP
+        - name: dns-udp
+          containerPort: 53
+          protocol: UDP
+        - name: http
+          containerPort: 5380
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        envFrom:
+        - secretRef:
+            name: technitium-env-secret
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5380
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5380
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: data
+          mountPath: /etc/dns
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: technitium-secondary-data

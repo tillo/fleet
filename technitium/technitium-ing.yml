@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: technitium
+  namespace: technitium
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    flame.pawelmalak/type: app
+    flame.pawelmalak/name: Technitium DNS
+    flame.pawelmalak/url: https://dns.mdapi.ch
+    flame.pawelmalak/category: Infrastructure
+    flame.pawelmalak/icon: dns
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine DetectionOnly
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: dns.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: technitium-primary
+            port:
+              number: 5380
+  tls:
+  - hosts:
+    - dns.mdapi.ch
+    secretName: technitium-cert
