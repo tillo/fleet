@@ -145,3 +145,27 @@ spec:
     name: threadfin
   updatePolicy:
     updateMode: "Off"
+---
+# nameserver: BIND9 + Webmin. Pinned manually at req 200m/512Mi, lim 1000m/768Mi
+# after CPU throttling at 250m caused liveness probe (dig SOA) to time out.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: nameserver
+  namespace: nameserver
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nameserver
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 1000m
+        memory: 768Mi
