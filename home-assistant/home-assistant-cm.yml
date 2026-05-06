@@ -105,48 +105,6 @@ data:
         max_sub_interval:
           minutes: 20
         method: left
-      - platform: hp_ilo
-        name: qui-ilo
-        host: 192.168.1.170
-        username: Administrator
-        password: !secret qui_ilo_password
-        monitored_variables:
-          - name: Power Status
-            sensor_type: server_power_status
-          - name: Present Power
-            sensor_type: server_health
-            unit_of_measurement: "Wh"
-            value_template: "{{ (ilo_data.power_supply_summary['present_power_reading']).split(' ')[0] }}"
-          - name: Server Health
-            sensor_type: server_health
-      - platform: hp_ilo
-        name: quo-ilo
-        host: 192.168.1.181
-        username: Administrator
-        password: !secret quo_ilo_password
-        monitored_variables:
-          - name: Power Status
-            sensor_type: server_power_status
-          - name: Present Power
-            sensor_type: server_health
-            unit_of_measurement: "Wh"
-            value_template: "{{ (ilo_data.power_supply_summary['present_power_reading']).split(' ')[0] }}"
-          - name: Server Health
-            sensor_type: server_health
-      - platform: hp_ilo
-        name: qua-ilo
-        host: 192.168.1.182
-        username: Administrator
-        password: !secret qua_ilo_password
-        monitored_variables:
-          - name: Power Status
-            sensor_type: server_power_status
-          - name: Present Power
-            sensor_type: server_health
-            unit_of_measurement: "Wh"
-            value_template: "{{ (ilo_data.power_supply_summary['present_power_reading']).split(' ')[0] }}"
-          - name: Server Health
-            sensor_type: server_health
       - platform: rest
         name: airtag_mili1_geo
         value_template: "{{ value_json.results[0].formatted }}"
@@ -175,33 +133,6 @@ data:
             }}
           {% endif %}
 
-      - platform: template
-        sensors:
-          airtag_mili1:
-            friendly_name: "MiLi1"
-            value_template: >
-              {% set home = "Chemin de la Villaire" %} 
-              {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %} 
-              {{ states('input_text.applefindmy').split('MiLi1')[1].split('•')[0].split(',')[0] }}
-              {% elif home in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}Home
-              {% else %}
-              {{ states('sensor.airtag_mili1_geo') }}
-              {% endif %}
-            attribute_templates:
-              latitude: >
-                {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}null
-                {% else %}{{ state_attr('sensor.airtag_mili1_geo','lat') }}
-                {% endif %}
-              longitude: >
-                {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}null
-                {% else %}{{ state_attr('sensor.airtag_mili1_geo','lon') }}
-                {% endif %}
-              status: >
-                {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}unavailable
-                {% else %}available
-                {% endif %}
-              last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
-            icon_template: mdi:numeric-1-circle-outline
       - platform: rest
         name: airtag_mili2_geo
         value_template: "{{ value_json.results[0].formatted }}"
@@ -230,33 +161,6 @@ data:
             }}
           {% endif %}
 
-      - platform: template
-        sensors:
-          airtag_mili2:
-            friendly_name: "MiLi2"
-            value_template: >
-              {% set home = "Chemin de la Villaire" %} 
-              {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %} 
-              {{ states('input_text.applefindmy').split('MiLi2')[1].split('•')[0].split(',')[0] }}
-              {% elif home in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}Home
-              {% else %}
-              {{ states('sensor.airtag_mili2_geo') }}
-              {% endif %}
-            attribute_templates:
-              latitude: >
-                {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}null
-                {% else %}{{ state_attr('sensor.airtag_mili2_geo','lat') }}
-                {% endif %}
-              longitude: >
-                {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}null
-                {% else %}{{ state_attr('sensor.airtag_mili2_geo','lon') }}
-                {% endif %}
-              status: >
-                {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}unavailable
-                {% else %}available
-                {% endif %}
-              last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
-            icon_template: mdi:numeric-2-circle-outline
       - platform: rest
         name: airtag_mili3_geo
         value_template: "{{ value_json.results[0].formatted }}"
@@ -285,33 +189,264 @@ data:
             }}
           {% endif %}
 
-      - platform: template
-        sensors:
-          airtag_mili3:
-            friendly_name: "MiLi3"
-            value_template: >
-              {% set home = "Chemin de la Villaire" %} 
-              {% if ":" in states('input_text.applefindmy').split('MiLi3')[1].split('•')[0] %} 
+    rest:
+      # ===== qui (HP iLO 4 @ 192.168.1.170) =====
+      - resource: https://192.168.1.170/redfish/v1/Chassis/1/Power/
+        username: Administrator
+        password: !secret qui_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 60
+        sensor:
+          - name: qui_ilo_present_power
+            unique_id: qui_ilo_present_power
+            unit_of_measurement: W
+            device_class: power
+            state_class: measurement
+            value_template: "{{ value_json.PowerControl[0].PowerConsumedWatts }}"
+      - resource: https://192.168.1.170/redfish/v1/Chassis/1/Thermal/
+        username: Administrator
+        password: !secret qui_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 300
+        sensor:
+          - name: qui_ilo_intake_temp
+            unique_id: qui_ilo_intake_temp
+            unit_of_measurement: "°C"
+            device_class: temperature
+            state_class: measurement
+            value_template: >-
+              {{ value_json.Temperatures
+                 | selectattr('PhysicalContext', 'eq', 'Intake')
+                 | map(attribute='ReadingCelsius') | first }}
+          - name: qui_ilo_exhaust_temp
+            unique_id: qui_ilo_exhaust_temp
+            unit_of_measurement: "°C"
+            device_class: temperature
+            state_class: measurement
+            value_template: >-
+              {{ value_json.Temperatures
+                 | selectattr('Name', 'in', ['39-Sys Exhaust','40-Sys Exhaust','41-Sys Exhaust'])
+                 | map(attribute='ReadingCelsius') | list | max }}
+      - resource: https://192.168.1.170/redfish/v1/Systems/1/
+        username: Administrator
+        password: !secret qui_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 300
+        sensor:
+          - name: qui_ilo_health
+            unique_id: qui_ilo_health
+            value_template: "{{ value_json.Status.Health }}"
+          - name: qui_ilo_power_state
+            unique_id: qui_ilo_power_state
+            value_template: "{{ value_json.PowerState }}"
+        binary_sensor:
+          - name: qui_ilo_problem
+            unique_id: qui_ilo_problem
+            device_class: problem
+            value_template: "{{ value_json.Status.Health != 'OK' }}"
+      # ===== quo (HP iLO 4 @ 192.168.1.181) =====
+      - resource: https://192.168.1.181/redfish/v1/Chassis/1/Power/
+        username: Administrator
+        password: !secret quo_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 60
+        sensor:
+          - name: quo_ilo_present_power
+            unique_id: quo_ilo_present_power
+            unit_of_measurement: W
+            device_class: power
+            state_class: measurement
+            value_template: "{{ value_json.PowerControl[0].PowerConsumedWatts }}"
+      - resource: https://192.168.1.181/redfish/v1/Chassis/1/Thermal/
+        username: Administrator
+        password: !secret quo_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 300
+        sensor:
+          - name: quo_ilo_intake_temp
+            unique_id: quo_ilo_intake_temp
+            unit_of_measurement: "°C"
+            device_class: temperature
+            state_class: measurement
+            value_template: >-
+              {{ value_json.Temperatures
+                 | selectattr('PhysicalContext', 'eq', 'Intake')
+                 | map(attribute='ReadingCelsius') | first }}
+          - name: quo_ilo_exhaust_temp
+            unique_id: quo_ilo_exhaust_temp
+            unit_of_measurement: "°C"
+            device_class: temperature
+            state_class: measurement
+            value_template: >-
+              {{ value_json.Temperatures
+                 | selectattr('Name', 'in', ['39-Sys Exhaust','40-Sys Exhaust','41-Sys Exhaust'])
+                 | map(attribute='ReadingCelsius') | list | max }}
+      - resource: https://192.168.1.181/redfish/v1/Systems/1/
+        username: Administrator
+        password: !secret quo_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 300
+        sensor:
+          - name: quo_ilo_health
+            unique_id: quo_ilo_health
+            value_template: "{{ value_json.Status.Health }}"
+          - name: quo_ilo_power_state
+            unique_id: quo_ilo_power_state
+            value_template: "{{ value_json.PowerState }}"
+        binary_sensor:
+          - name: quo_ilo_problem
+            unique_id: quo_ilo_problem
+            device_class: problem
+            value_template: "{{ value_json.Status.Health != 'OK' }}"
+      # ===== qua (HP iLO 4 @ 192.168.1.182) =====
+      - resource: https://192.168.1.182/redfish/v1/Chassis/1/Power/
+        username: Administrator
+        password: !secret qua_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 60
+        sensor:
+          - name: qua_ilo_present_power
+            unique_id: qua_ilo_present_power
+            unit_of_measurement: W
+            device_class: power
+            state_class: measurement
+            value_template: "{{ value_json.PowerControl[0].PowerConsumedWatts }}"
+      - resource: https://192.168.1.182/redfish/v1/Chassis/1/Thermal/
+        username: Administrator
+        password: !secret qua_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 300
+        sensor:
+          - name: qua_ilo_intake_temp
+            unique_id: qua_ilo_intake_temp
+            unit_of_measurement: "°C"
+            device_class: temperature
+            state_class: measurement
+            value_template: >-
+              {{ value_json.Temperatures
+                 | selectattr('PhysicalContext', 'eq', 'Intake')
+                 | map(attribute='ReadingCelsius') | first }}
+          - name: qua_ilo_exhaust_temp
+            unique_id: qua_ilo_exhaust_temp
+            unit_of_measurement: "°C"
+            device_class: temperature
+            state_class: measurement
+            value_template: >-
+              {{ value_json.Temperatures
+                 | selectattr('Name', 'in', ['39-Sys Exhaust','40-Sys Exhaust','41-Sys Exhaust'])
+                 | map(attribute='ReadingCelsius') | list | max }}
+      - resource: https://192.168.1.182/redfish/v1/Systems/1/
+        username: Administrator
+        password: !secret qua_ilo_password
+        authentication: basic
+        verify_ssl: false
+        timeout: 15
+        scan_interval: 300
+        sensor:
+          - name: qua_ilo_health
+            unique_id: qua_ilo_health
+            value_template: "{{ value_json.Status.Health }}"
+          - name: qua_ilo_power_state
+            unique_id: qua_ilo_power_state
+            value_template: "{{ value_json.PowerState }}"
+        binary_sensor:
+          - name: qua_ilo_problem
+            unique_id: qua_ilo_problem
+            device_class: problem
+            value_template: "{{ value_json.Status.Health != 'OK' }}"
+    template:
+      - sensor:
+          - name: MiLi1
+            default_entity_id: sensor.airtag_mili1
+            icon: mdi:numeric-1-circle-outline
+            state: >-
+              {% set home = "Chemin de la Villaire" %}
+              {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}
+              {{ states('input_text.applefindmy').split('MiLi1')[1].split('•')[0].split(',')[0] }}
+              {% elif home in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}Home
+              {% else %}
+              {{ states('sensor.airtag_mili1_geo') }}
+              {% endif %}
+            attributes:
+              latitude: >-
+                {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}null
+                {% else %}{{ state_attr('sensor.airtag_mili1_geo','lat') }}
+                {% endif %}
+              longitude: >-
+                {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}null
+                {% else %}{{ state_attr('sensor.airtag_mili1_geo','lon') }}
+                {% endif %}
+              status: >-
+                {% if ":" in states('input_text.applefindmy').split('MiLi1')[1].split('•')[0] %}unavailable
+                {% else %}available
+                {% endif %}
+              last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
+          - name: MiLi2
+            default_entity_id: sensor.airtag_mili2
+            icon: mdi:numeric-2-circle-outline
+            state: >-
+              {% set home = "Chemin de la Villaire" %}
+              {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}
+              {{ states('input_text.applefindmy').split('MiLi2')[1].split('•')[0].split(',')[0] }}
+              {% elif home in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}Home
+              {% else %}
+              {{ states('sensor.airtag_mili2_geo') }}
+              {% endif %}
+            attributes:
+              latitude: >-
+                {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}null
+                {% else %}{{ state_attr('sensor.airtag_mili2_geo','lat') }}
+                {% endif %}
+              longitude: >-
+                {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}null
+                {% else %}{{ state_attr('sensor.airtag_mili2_geo','lon') }}
+                {% endif %}
+              status: >-
+                {% if ":" in states('input_text.applefindmy').split('MiLi2')[1].split('•')[0] %}unavailable
+                {% else %}available
+                {% endif %}
+              last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
+          - name: MiLi3
+            default_entity_id: sensor.airtag_mili3
+            icon: mdi:numeric-3-circle-outline
+            state: >-
+              {% set home = "Chemin de la Villaire" %}
+              {% if ":" in states('input_text.applefindmy').split('MiLi3')[1].split('•')[0] %}
               {{ states('input_text.applefindmy').split('MiLi3')[1].split('•')[0].split(',')[0] }}
               {% elif home in states('input_text.applefindmy').split('MiLi3')[1].split('•')[0] %}Home
               {% else %}
               {{ states('sensor.airtag_mili3_geo') }}
               {% endif %}
-            attribute_templates:
-              latitude: >
+            attributes:
+              latitude: >-
                 {% if ":" in states('input_text.applefindmy').split('MiLi3')[1].split('•')[0] %}null
                 {% else %}{{ state_attr('sensor.airtag_mili3_geo','lat') }}
                 {% endif %}
-              longitude: >
+              longitude: >-
                 {% if ":" in states('input_text.applefindmy').split('MiLi3')[1].split('•')[0] %}null
                 {% else %}{{ state_attr('sensor.airtag_mili3_geo','lon') }}
                 {% endif %}
-              status: >
+              status: >-
                 {% if ":" in states('input_text.applefindmy').split('MiLi3')[1].split('•')[0] %}unavailable
                 {% else %}available
                 {% endif %}
               last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
-            icon_template: mdi:numeric-3-circle-outline
     homeassistant:
       packages:
         energy: !include packages/energy.yaml
@@ -337,12 +472,6 @@ data:
           device_class: energy
         sensor.dishwasher_energy_consumption:
           unit_of_measurement: 'Wh'
-          device_class: energy
-        sensor.qui_ilo_present_power:
-          device_class: energy
-        sensor.quo_ilo_present_power:
-          device_class: energy
-        sensor.qua_ilo_present_power:
           device_class: energy
     shell_command:
       onu_reboot: >-
