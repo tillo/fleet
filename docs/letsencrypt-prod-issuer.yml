@@ -1,0 +1,26 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+  namespace: bootstrap
+spec:
+  acme:
+    email: tillo@tillo.ch
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    server: https://acme-v02.api.letsencrypt.org/directory
+    solvers:
+      - dns01:
+          rfc2136:
+            nameserver: 31.3.128.59:53
+            tsigKeyName: mdapi
+            tsigAlgorithm: HMACSHA256
+            tsigSecretSecretRef:
+              name: tsig-secret
+              key: tsig-secret-key
+        selector:
+          dnsZones:
+            - mdapi.ch
+      - http01:
+          ingress:
+            class: nginx
