@@ -18,6 +18,10 @@ spec:
           containers:
             - name: recover
               image: alpine/k8s:1.34.3
+              envFrom:
+                - secretRef:
+                    name: akri-self-heal-pushover
+                    optional: true
               command: [/bin/sh, -c]
               args:
                 - |
@@ -81,15 +85,13 @@ spec:
                   echo "  delete stuck pod $POD"
                   kubectl -n home-assistant delete pod "$POD" --wait=false
 
-                  # TODO: Pushover notification once /mdapi/akri-self-heal/pushover-{token,user}
-                  # are populated in Akeyless and the ExternalSecret is enabled.
-                  # if [ -f /etc/pushover/token ] && [ -f /etc/pushover/user ]; then
-                  #   curl -s --data-urlencode "token=$(cat /etc/pushover/token)" \
-                  #         --data-urlencode "user=$(cat /etc/pushover/user)" \
-                  #         --data-urlencode "title=akri self-heal" \
-                  #         --data-urlencode "message=Recovered HA USB drift: $POD on $NODE" \
-                  #         https://api.pushover.net/1/messages.json >/dev/null || true
-                  # fi
+                  if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+                    curl -s --data-urlencode "token=$PUSHOVER_TOKEN" \
+                          --data-urlencode "user=$PUSHOVER_USER" \
+                          --data-urlencode "title=akri self-heal: HA USB drift recovered" \
+                          --data-urlencode "message=Pod $POD was stuck on $NODE with stale /dev/bus/usb path. Re-discovered Akri instances and kicked the pod." \
+                          https://api.pushover.net/1/messages.json >/dev/null || true
+                  fi
 
                   echo "recovery complete"
               resources:

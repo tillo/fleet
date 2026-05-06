@@ -26,6 +26,9 @@ spec:
                 - secretRef:
                     name: akri-self-heal-ha-token
                     optional: true
+                - secretRef:
+                    name: akri-self-heal-pushover
+                    optional: true
               command: [/bin/sh, -c]
               args:
                 - |
@@ -65,6 +68,7 @@ spec:
                   kubectl -n akri create cm "$STATE_CM" --from-literal=busdev="$CURRENT" \
                     --dry-run=client -o yaml | kubectl apply -f -
 
+                  ACTION=""
                   if [ -n "${HOMEASSISTANT_API_TOKEN:-}" ]; then
                     echo "reloading ZHA config entry $ZHA_ENTRY_ID via HA API"
                     code=$(curl -sk -o /tmp/r -w "%{http_code}" \
@@ -73,17 +77,26 @@ spec:
                       "$HA_URL/api/services/homeassistant/reload_config_entry" \
                       -d "{\"entry_id\":\"$ZHA_ENTRY_ID\"}")
                     if [ "$code" = "200" ]; then
-                      echo "ZHA reload OK"; exit 0
+                      echo "ZHA reload OK"
+                      ACTION="reloaded ZHA integration"
+                    else
+                      echo "ZHA reload failed (HTTP $code, body: $(cat /tmp/r 2>/dev/null)); falling back to pod restart"
+                      kubectl -n home-assistant delete pod -l app=home-assistant --wait=false
+                      ACTION="restarted HA pod (reload HTTP $code)"
                     fi
-                    echo "ZHA reload failed (HTTP $code, body: $(cat /tmp/r 2>/dev/null)); falling back to pod restart"
                   else
-                    echo "HOMEASSISTANT_API_TOKEN not present (Akeyless not synced yet); falling back to pod restart"
+                    echo "HOMEASSISTANT_API_TOKEN not present; falling back to pod restart"
+                    kubectl -n home-assistant delete pod -l app=home-assistant --wait=false
+                    ACTION="restarted HA pod (no API token)"
                   fi
 
-                  kubectl -n home-assistant delete pod -l app=home-assistant --wait=false
-
-                  # TODO: Pushover notification once /mdapi/akri-self-heal/pushover-{token,user}
-                  # are populated in Akeyless and the ExternalSecret is enabled.
+                  if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
+                    curl -s --data-urlencode "token=$PUSHOVER_TOKEN" \
+                          --data-urlencode "user=$PUSHOVER_USER" \
+                          --data-urlencode "title=akri self-heal: ZBT-1 USB drift" \
+                          --data-urlencode "message=cp210x re-enumerated: was='$LAST' now='$CURRENT'. $ACTION." \
+                          https://api.pushover.net/1/messages.json >/dev/null || true
+                  fi
               volumeMounts:
                 - name: host-sys
                   mountPath: /host-sys
