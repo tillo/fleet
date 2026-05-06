@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: akri-instance-gc
+spec:
+  schedule: "*/30 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: akri-self-heal
+          restartPolicy: Never
+          containers:
+            - name: gc
+              image: alpine/k8s:1.34.3
+              command: [/bin/sh, -c]
+              args:
+                - |
+                  set -eu
+                  threshold=$(( $(date +%s) - 3600 ))
+                  kubectl -n akri get akrii -o json \
+                    | jq -r --argjson t "$threshold" '
+                        .items[]
+                        | select(.spec.nodes | length == 0)
+                        | select((.metadata.creationTimestamp | fromdateiso8601) < $t)
+                        | .metadata.name' \
+                    | while read -r i; do
+                        echo "deleting orphan akri instance $i"
+                        kubectl -n akri delete akrii "$i" --wait=false
+                      done
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  memory: 128Mi
