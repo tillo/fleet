@@ -7,9 +7,9 @@ changes (or you bump apps.yaml settings below). Output is committed to fleet.
 import os
 import yaml
 
-REPO = os.path.expanduser("~/elco-remocon-net-appdaemon")
+REPO = os.environ.get("ELCO_REPO") or os.path.expanduser("~/elco-remocon-net-appdaemon")
 SRC_PATH = f"{REPO}/apps/elco-remocon-net-appdaemon/elco-remocon-net-appdaemon.py"
-OUT = os.path.join(os.path.dirname(__file__), "appdaemon-elco-app-cm.yml")
+OUT = os.environ.get("CM_OUT") or os.path.join(os.path.dirname(__file__), "appdaemon-elco-app-cm.yml")
 
 APPS_YAML = """remocon:
   module: elco-remocon-net-appdaemon
