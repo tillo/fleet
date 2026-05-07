@@ -23,14 +23,27 @@ spec:
                 - |
                   set -eu
                   threshold=$(( $(date +%s) - 3600 ))
+                  # Per akric configuration, keep:
+                  #   - every instance with non-empty deviceUsage (currently allocated)
+                  #   - the most recent instance with empty deviceUsage (spare for the next claim)
+                  # Delete the rest if older than threshold. The previous policy only deleted
+                  # instances with empty .spec.nodes, which left re-enumeration shadows behind
+                  # forever (Akri keeps them advertised on the discovering node even after the
+                  # device has moved bus/dev path).
                   kubectl -n akri get akrii -o json \
                     | jq -r --argjson t "$threshold" '
-                        .items[]
-                        | select(.spec.nodes | length == 0)
-                        | select((.metadata.creationTimestamp | fromdateiso8601) < $t)
-                        | .metadata.name' \
+                        .items
+                        | group_by(.metadata.name | sub("-[0-9a-f]+$"; ""))
+                        | map(
+                            sort_by(.metadata.creationTimestamp) | reverse
+                            | [.[] | select((.spec.deviceUsage // {}) | length == 0)] | .[1:]
+                          )
+                        | flatten
+                        | map(select((.metadata.creationTimestamp | fromdateiso8601) < $t))
+                        | .[].metadata.name' \
                     | while read -r i; do
-                        echo "deleting orphan akri instance $i"
+                        [ -n "$i" ] || continue
+                        echo "deleting shadow akri instance $i"
                         kubectl -n akri delete akrii "$i" --wait=false
                       done
               resources:
