@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: home-assistant-elco-anomaly-pkg
+  namespace: home-assistant
+data:
+  elco_anomaly.yaml: |
+    sensor:
+      - platform: history_stats
+        name: Elco flame on count last hour
+        entity_id: binary_sensor.elco_flame_sensor
+        state: "on"
+        type: count
+        end: "{{ now() }}"
+        duration:
+          hours: 1
+    automation:
+      - id: elco_heating_underperforming
+        alias: "ELCO: heating active 2h+ with target-room gap > 1°C"
+        description: "Boiler running for two hours but not closing in on the desired room temp — possible heat-curve too low, exchanger fouling, or a window left open."
+        mode: single
+        trigger:
+          - platform: state
+            entity_id: binary_sensor.elco_room_heating_is_active
+            to: "on"
+            for:
+              hours: 2
+        condition:
+          - condition: template
+            value_template: >-
+              {{ (states('sensor.elco_desired_room_temperature') | float(0))
+                 - (states('sensor.elco_room_temperature') | float(0)) > 1 }}
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO: heating underperforming"
+              message: >-
+                Heating active 2h+. Room {{ states('sensor.elco_room_temperature') }}°C,
+                target {{ states('sensor.elco_desired_room_temperature') }}°C,
+                outside {{ states('sensor.elco_outside_temperature') }}°C,
+                mode {{ states('sensor.elco_room_operation_mode_heating') }}.
+      - id: elco_flame_excessive_cycling
+        alias: "ELCO: flame cycling > 15 events/hour"
+        description: "Burner ignitions per hour above the short-cycling threshold — oversized burner, DHW leak, or under-tuned hysteresis."
+        mode: single
+        trigger:
+          - platform: numeric_state
+            entity_id: sensor.elco_flame_on_count_last_hour
+            above: 15
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO: flame short-cycling"
+              message: >-
+                Flame events in last hour: {{ states('sensor.elco_flame_on_count_last_hour') }}.
+                Outside {{ states('sensor.elco_outside_temperature') }}°C,
+                DHW storage {{ states('sensor.elco_domestic_hot_water_storage_temperature') }}°C,
+                room {{ states('sensor.elco_room_temperature') }}°C.
+      - id: elco_error_active
+        alias: "ELCO: error sensor went on"
+        description: "Any of the elco *_error binary_sensors went to on — temperature probe / storage / room sensor problem."
+        mode: parallel
+        max: 3
+        trigger:
+          - platform: state
+            entity_id:
+              - binary_sensor.elco_outside_temperature_error
+              - binary_sensor.elco_domestic_hot_water_storage_temperature_error
+              - binary_sensor.elco_room_temperature_error
+            to: "on"
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO: error active"
+              message: >-
+                {{ trigger.entity_id }} just went on. Investigate the affected probe.
+              data:
+                priority: 1
