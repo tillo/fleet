@@ -44,7 +44,7 @@ def main():
         "metadata": {
             "name": "appdaemon-elco-app",
             "annotations": {
-                "mdapi.ch/source": f"{REPO} (run regen-elco-app-cm.py to update)",
+                "mdapi.ch/source": "https://gitlab.mdapi.ch/mdapi/elco-remocon-net-appdaemon",
             },
         },
         "data": {
