@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: overseerr
+  name: seerr
   namespace: tv
   annotations:
     keel.sh/policy: force
@@ -10,18 +10,31 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: overseerr
+      app: seerr
   replicas: 1
   strategy:
     type: Recreate
   template:
     metadata:
       labels:
-        app: overseerr
+        app: seerr
     spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+      - name: chown-config
+        image: alpine:3.20
+        command: [sh, -c, "chown -R 1000:1000 /app/config"]
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - name: seerr-config
+          mountPath: /app/config
       containers:
-      - name: overseerr
-        image: sctx/overseerr:latest
+      - name: seerr
+        image: ghcr.io/seerr-team/seerr:latest
         ports:
         - containerPort: 5055
         resources:
@@ -34,10 +47,12 @@ spec:
         env:
         - name: TZ
           value: Europe/Zurich
+        - name: PORT
+          value: "5055"
         volumeMounts:
-        - name: overseerr-config
+        - name: seerr-config
           mountPath: /app/config
       volumes:
-      - name: overseerr-config
+      - name: seerr-config
         persistentVolumeClaim:
           claimName: overseerr-config
