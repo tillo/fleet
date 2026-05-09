@@ -22,6 +22,25 @@ spec:
     spec:
       imagePullSecrets:
         - name: mdapi-registry
+      initContainers:
+      - name: sftpgo-host-keys
+        image: alpine:3.20
+        command: ["sh", "-c"]
+        args:
+        - |
+          set -e
+          apk add --no-cache openssh-keygen >/dev/null 2>&1
+          mkdir -p /data/.sftpgo
+          [ -f /data/.sftpgo/host_key_ed25519 ] || ssh-keygen -q -t ed25519     -N '' -f /data/.sftpgo/host_key_ed25519
+          [ -f /data/.sftpgo/host_key_rsa     ] || ssh-keygen -q -t rsa -b 3072 -N '' -f /data/.sftpgo/host_key_rsa
+          chown -R 10006:33 /data/.sftpgo
+          chmod 700 /data/.sftpgo
+          chmod 600 /data/.sftpgo/host_key_*
+          chmod 644 /data/.sftpgo/host_key_*.pub
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - { mountPath: /data, name: spider3-data }
       containers:
       - name: spider3
         image: registry.mdapi.ch/mdapi/spider3:latest
