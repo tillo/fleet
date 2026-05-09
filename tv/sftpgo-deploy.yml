@@ -53,9 +53,6 @@ spec:
         - name: SFTPGO_DEFAULT_ADMIN_PASSWORD
           valueFrom:
             secretKeyRef: { name: sftpgo-keycloak, key: SFTPGO_DEFAULT_ADMIN_PASSWORD }
-        - name: SFTPGO_HTTPD__BINDINGS__0__OIDC__CLIENT_SECRET
-          valueFrom:
-            secretKeyRef: { name: sftpgo-keycloak, key: KC_CLIENT_SECRET }
         securityContext:
           runAsUser: 1000
           runAsGroup: 1000
@@ -85,6 +82,9 @@ spec:
         - mountPath: /etc/sftpgo/sftpgo.json
           name: sftpgo-config
           subPath: sftpgo.json
+          readOnly: true
+        - mountPath: /etc/sftpgo/oidc
+          name: sftpgo-oidc-secret
           readOnly: true
       - name: sftpgo-auth
         image: python:3.13-alpine
@@ -118,3 +118,9 @@ spec:
       - name: sftpgo-config
         configMap:
           name: sftpgo-config
+      - name: sftpgo-oidc-secret
+        secret:
+          secretName: sftpgo-keycloak
+          items:
+          - key: KC_CLIENT_SECRET
+            path: client_secret
