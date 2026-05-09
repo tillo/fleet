@@ -5,3 +5,26 @@ namespaceLabels:
   cdenv.mdapi.ch: prod
 helm:
   maxHistory: 25
+# VPA (mode=Auto) writes resources.requests/limits onto running pods.
+# Strip the resources block from both sides before diff so Fleet stops
+# flagging the bundle as Modified. Covers all trapeye workloads.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: DaemonSet
+    name: trapeye-daemonset
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-nodeport
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-clusterip
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}

@@ -5,3 +5,15 @@ namespaceLabels:
   cdenv.mdapi.ch: prod
 helm:
   maxHistory: 25
+# VPA (mode=Auto on autoconfig) writes resources.requests/limits onto
+# running pods. Strip the resources block from both sides before diff so
+# Fleet stops flagging the bundle as Modified. docker-mailserver's VPA is
+# Off, so no patch needed there.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: autoconfig
+    namespace: mail
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
