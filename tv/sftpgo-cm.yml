@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sftpgo-config
+  namespace: tv
+data:
+  sftpgo.json: |
+    {
+      "common": {
+        "idle_timeout": 15,
+        "umask": "0002",
+        "upload_mode": 0,
+        "actions": { "execute_on": [], "execute_sync": [], "hook": "" }
+      },
+      "sftpd": {
+        "bindings": [{ "port": 2022, "address": "" }],
+        "max_auth_tries": 3,
+        "banner": "tv file gateway",
+        "host_keys": [
+          "/data/.sftpgo/host_key_ed25519",
+          "/data/.sftpgo/host_key_rsa"
+        ]
+      },
+      "ftpd": {
+        "bindings": [{
+          "port": 2121,
+          "address": "",
+          "force_passive_ip": "31.3.128.60",
+          "tls_mode": 0
+        }],
+        "passive_port_range": { "start": 22250, "end": 22259 },
+        "banner": "tv file gateway"
+      },
+      "httpd": {
+        "bindings": [{
+          "port": 8080,
+          "address": "",
+          "enable_web_admin": false,
+          "enable_web_client": true,
+          "enable_rest_api": false
+        }],
+        "templates_path": "/usr/share/sftpgo/templates",
+        "static_files_path": "/usr/share/sftpgo/static",
+        "openapi_path": "/usr/share/sftpgo/openapi"
+      },
+      "data_provider": {
+        "driver": "memory",
+        "external_auth_hook": "http://127.0.0.1:8081/auth",
+        "external_auth_scope": 0
+      },
+      "telemetry": { "bind_port": 0 }
+    }
+  auth_server.py: |
+    #!/usr/bin/env python3
+    """SFTPGo external auth -> Keycloak Direct Access Grants -> realm-role check."""
+    import base64, json, os, sys, urllib.parse, urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    KC_ISSUER     = os.environ["KC_ISSUER"]
+    KC_CLIENT_ID  = os.environ["KC_CLIENT_ID"]
+    KC_CLIENT_SEC = os.environ["KC_CLIENT_SECRET"]
+    REQUIRED_ROLE = os.environ["REQUIRED_ROLE"]
+    HOME_DIR      = os.environ.get("HOME_DIR", "/data")
+    UID           = int(os.environ.get("HOME_UID", "0"))
+    GID           = int(os.environ.get("HOME_GID", "0"))
+    BIND_PORT     = int(os.environ.get("BIND_PORT", "8081"))
+
+    def log(msg): print(msg, file=sys.stderr, flush=True)
+
+    def kc_password_grant(user, pwd):
+        data = urllib.parse.urlencode({
+            "grant_type":   "password",
+            "client_id":    KC_CLIENT_ID,
+            "client_secret":KC_CLIENT_SEC,
+            "username":     user,
+            "password":     pwd,
+            "scope":        "openid",
+        }).encode()
+        req = urllib.request.Request(
+            f"{KC_ISSUER}/protocol/openid-connect/token",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                tok = json.loads(r.read())["access_token"]
+        except Exception as e:
+            log(f"kc denied for {user}: {e}")
+            return None
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("realm_access", {}).get("roles", [])
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args): log("auth: " + fmt % args)
+
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length))
+            except Exception:
+                return self._deny("bad json")
+            user = body.get("username", "")
+            pwd  = body.get("password", "")
+            proto = body.get("protocol", "")
+            if not user or not pwd:
+                return self._deny(f"empty creds for proto={proto}")
+            roles = kc_password_grant(user, pwd)
+            if roles is None:
+                return self._deny(f"kc-bind-failed user={user} proto={proto}")
+            if REQUIRED_ROLE not in roles:
+                return self._deny(f"role-missing user={user} need={REQUIRED_ROLE}")
+            return self._allow(user, proto)
+
+        def _allow(self, user, proto):
+            u = {
+                "username":    user,
+                "status":      1,
+                "uid":         UID,
+                "gid":         GID,
+                "home_dir":    HOME_DIR,
+                "permissions": {"/": ["*"]},
+                "filesystem":  {"provider": 0},
+            }
+            log(f"OK user={user} proto={proto}")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(u).encode())
+
+        def _deny(self, why):
+            log(f"DENY {why}")
+            self.send_response(401)
+            self.end_headers()
+
+    if __name__ == "__main__":
+        HTTPServer(("127.0.0.1", BIND_PORT), H).serve_forever()

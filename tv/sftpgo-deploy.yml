@@ -1,64 +1,46 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: sftpgo
+  namespace: tv
   annotations:
     keel.sh/match-tag: 'true'
-    keel.sh/policy: force
-    keel.sh/pollSchedule: "@every 5m"
+    keel.sh/policy: minor
+    keel.sh/pollSchedule: "@every 4h"
     keel.sh/trigger: poll
-  name: spider3
-  namespace: spider3
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: spider3
+      app: sftpgo
   strategy:
     type: Recreate
   template:
     metadata:
       labels:
-        app: spider3
+        app: sftpgo
     spec:
-      imagePullSecrets:
-        - name: mdapi-registry
       containers:
-      - name: spider3
-        image: registry.mdapi.ch/mdapi/spider3:latest
-        ports:
-        - containerPort: 80
-        resources:
-          limits:
-            memory: 384Mi
-          requests:
-            cpu: 50m
-            memory: 256Mi
-        volumeMounts:
-        - mountPath: /var/www/spider3
-          name: spider3-data
-        - mountPath: /etc/msmtprc
-          name: msmtp-config
-          subPath: msmtprc
       - name: sftpgo
         image: drakkan/sftpgo:v2.7-alpine
         args: ["sftpgo", "serve", "--config-file", "/etc/sftpgo/sftpgo.json"]
         securityContext:
-          runAsUser: 10006
-          runAsGroup: 33
+          runAsUser: 1000
+          runAsGroup: 1000
         ports:
         - { containerPort: 2022, name: sftp }
         - { containerPort: 2121, name: ftp }
         - { containerPort: 8080, name: web }
-        - { containerPort: 22150, name: pasv0 }
-        - { containerPort: 22151, name: pasv1 }
-        - { containerPort: 22152, name: pasv2 }
-        - { containerPort: 22153, name: pasv3 }
-        - { containerPort: 22154, name: pasv4 }
-        - { containerPort: 22155, name: pasv5 }
-        - { containerPort: 22156, name: pasv6 }
-        - { containerPort: 22157, name: pasv7 }
-        - { containerPort: 22158, name: pasv8 }
-        - { containerPort: 22159, name: pasv9 }
+        - { containerPort: 22250, name: pasv0 }
+        - { containerPort: 22251, name: pasv1 }
+        - { containerPort: 22252, name: pasv2 }
+        - { containerPort: 22253, name: pasv3 }
+        - { containerPort: 22254, name: pasv4 }
+        - { containerPort: 22255, name: pasv5 }
+        - { containerPort: 22256, name: pasv6 }
+        - { containerPort: 22257, name: pasv7 }
+        - { containerPort: 22258, name: pasv8 }
+        - { containerPort: 22259, name: pasv9 }
         resources:
           limits:
             memory: 256Mi
@@ -67,7 +49,7 @@ spec:
             memory: 64Mi
         volumeMounts:
         - mountPath: /data
-          name: spider3-data
+          name: tv-data
         - mountPath: /etc/sftpgo/sftpgo.json
           name: sftpgo-config
           subPath: sftpgo.json
@@ -81,10 +63,10 @@ spec:
         - name: KC_CLIENT_SECRET
           valueFrom:
             secretKeyRef: { name: sftpgo-keycloak, key: KC_CLIENT_SECRET }
-        - { name: REQUIRED_ROLE, value: "mdapi-spider3" }
+        - { name: REQUIRED_ROLE, value: "mdapi-tv" }
         - { name: HOME_DIR,      value: "/data" }
-        - { name: HOME_UID,      value: "10006" }
-        - { name: HOME_GID,      value: "33" }
+        - { name: HOME_UID,      value: "1000" }
+        - { name: HOME_GID,      value: "1000" }
         resources:
           limits:
             memory: 64Mi
@@ -97,24 +79,9 @@ spec:
           subPath: auth_server.py
           readOnly: true
       volumes:
-      - name: spider3-data
+      - name: tv-data
         persistentVolumeClaim:
-          claimName: spider3-data
-      - name: msmtp-config
-        configMap:
-          name: msmtp-config
+          claimName: tv
       - name: sftpgo-config
         configMap:
           name: sftpgo-config
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: spider3
-  namespace: spider3
-spec:
-  selector:
-    app: spider3
-  ports:
-  - port: 80
-    targetPort: 80
