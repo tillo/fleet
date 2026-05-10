@@ -90,31 +90,6 @@ spec:
         summary: "pushgateway has no jobs pushing"
         description: "Pushgateway is up but no batch jobs are publishing *_last_run_timestamp_seconds. Either nothing's been migrated yet, or every script has stopped running."
 
-  - name: meta-monitoring.alertmanager-config-drift
-    rules:
-    - alert: AlertmanagerConfigMatcherStrategyReverted
-      ## The bundled rancher-monitoring chart owns the Alertmanager CR.
-      ## A chart upgrade can revert spec.alertmanagerConfigMatcherStrategy
-      ## from "None" back to default ("OnNamespace"), which would silently
-      ## prevent every team=mdapi AlertmanagerConfig route from ever
-      ## matching alerts in workload namespaces. Detects the drift.
-      expr: |
-        kube_customresource_alertmanager_spec_matcher_strategy_type{type="None"} == 0
-        or absent(kube_customresource_alertmanager_spec_matcher_strategy_type)
-      for: 30m
-      labels:
-        severity: warning
-        component: General
-        team: mdapi
-      annotations:
-        summary: "Alertmanager AC matcherStrategy reverted from None"
-        description: |
-          The rancher-monitoring Alertmanager spec.alertmanagerConfigMatcherStrategy
-          is no longer "None". Our team=mdapi routes will not match alerts
-          from workload namespaces. Re-apply with:
-            kubectl -n cattle-monitoring-system patch alertmanager rancher-monitoring-alertmanager \
-              --type=merge -p '{"spec":{"alertmanagerConfigMatcherStrategy":{"type":"None"}}}'
-
   - name: meta-monitoring.statuspage-adapter
     rules:
     - alert: StatuspageAdapterUnhealthy
