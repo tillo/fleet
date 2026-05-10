@@ -1,0 +1,82 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-gitlab
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-gitlab.workload
+    rules:
+    - alert: GitLabWebserviceUnavailable
+      expr: |
+        kube_deployment_status_replicas_unavailable{
+          namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+        } > 0
+      for: 5m
+      labels:
+        severity: critical
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "GitLab webservice {{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: "gitlab.mdapi.ch will be unreachable. Check: kubectl -n bootstrap logs deployment/{{ $labels.deployment }}"
+
+    - alert: GitLabGitalyDown
+      expr: |
+        kube_statefulset_status_replicas_ready{
+          namespace="bootstrap", statefulset=~"gitlab-gitaly.*"
+        } < kube_statefulset_status_replicas{
+          namespace="bootstrap", statefulset=~"gitlab-gitaly.*"
+        }
+      for: 5m
+      labels:
+        severity: critical
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "Gitaly statefulset {{ $labels.statefulset }} degraded"
+        description: "Git operations will fail. Check: kubectl -n bootstrap logs sts/{{ $labels.statefulset }}"
+
+    - alert: GitLabSidekiqDown
+      expr: |
+        kube_deployment_status_replicas_unavailable{
+          namespace="bootstrap", deployment=~"gitlab-sidekiq-.*"
+        } > 0
+      for: 10m
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "Sidekiq {{ $labels.deployment }}: {{ $value }} unavailable"
+        description: "Background jobs (CI runners, emails, repository indexing) will queue up."
+
+    - alert: GitLabPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="bootstrap", pod=~"gitlab-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.pod }}/{{ $labels.container }} restarting frequently"
+
+    - alert: GitLabBackupCronJobMissed
+      expr: |
+        time() - kube_cronjob_status_last_successful_time{
+          namespace="bootstrap", cronjob="gitlab-toolbox-backup"
+        } > 36 * 3600
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "GitLab backup CronJob hasn't succeeded in {{ $value | humanizeDuration }}"
+        description: |
+          Schedule is daily at 02:00. >36h means at least one missed run.
+          Check: kubectl -n bootstrap get jobs | grep toolbox-backup

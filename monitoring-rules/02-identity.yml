@@ -1,0 +1,42 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-identity
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-identity.workload
+    rules:
+    - alert: IdentityKeycloakUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          kube_deployment_status_replicas_unavailable{
+            namespace=~"keycloak|envuassu",
+            deployment="keycloak"
+          } > 0
+        )
+      for: 3m
+      labels:
+        severity: critical
+        component: Identity
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/keycloak: {{ $value }} replicas unavailable"
+        description: |
+          Keycloak (SSO) is down or degraded. ALL apps gated by oauth2-proxy/OIDC
+          will start failing logins. Check: kubectl -n {{ $labels.namespace }} logs deployment/keycloak
+
+    - alert: IdentityKeycloakCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace=~"keycloak|envuassu", pod=~"keycloak-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Identity
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} keycloak restarting frequently"

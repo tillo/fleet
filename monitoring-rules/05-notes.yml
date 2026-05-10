@@ -1,0 +1,33 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-notes
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-notes.workload
+    rules:
+    - alert: JoplinUnavailable
+      expr: |
+        kube_deployment_status_replicas_unavailable{namespace="joplin", deployment="joplin"} > 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Notes
+        team: mdapi
+      annotations:
+        summary: "joplin/joplin: {{ $value }} replicas unavailable"
+        description: "Joplin sync server (notes.mdapi.ch) is down — clients can't sync."
+
+    - alert: JoplinPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{namespace="joplin", pod=~"joplin-.*"}[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Notes
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} restarting frequently"

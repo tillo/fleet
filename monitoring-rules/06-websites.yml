@@ -1,0 +1,42 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-websites
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-websites.workload
+    rules:
+    # Personal + customer static sites — each in its own namespace.
+    # Aggregate by namespace so a single alert per affected site.
+    - alert: WebsiteUnavailable
+      expr: |
+        kube_deployment_status_replicas_unavailable{
+          namespace=~"spider3|coiffuredreams|dellambrogio|ivodellambrogio|mdapiorg|textopolis|tillo|flame"
+        } > 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: |
+          Public website deployment is down. Affected host depends on namespace
+          (spider3.ch, coiffuredreams.ch, dellambrogio.*, ivodellambrogio.ch,
+          mdapi.org, textopolis.net, tillo.ch).
+
+    - alert: WebsitePodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace=~"spider3|coiffuredreams|dellambrogio|ivodellambrogio|mdapiorg|textopolis|tillo|flame"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} restarting"

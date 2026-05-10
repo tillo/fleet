@@ -1,0 +1,41 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-dns
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-dns.workload
+    rules:
+    - alert: TechnitiumUnavailable
+      expr: |
+        kube_deployment_status_replicas_unavailable{
+          namespace="technitium", deployment="technitium"
+        } > 0
+      for: 3m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "technitium/technitium: {{ $value }} replicas unavailable"
+        description: |
+          DNS server is down. dns.mdapi.ch will not resolve. Recursive DNS
+          fallback applies for cluster-internal queries via coredns, but
+          public/external resolution from clients pointed at dns.mdapi.ch
+          breaks immediately.
+
+    - alert: TechnitiumPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="technitium", pod=~"technitium-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} restarting frequently"

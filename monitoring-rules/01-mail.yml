@@ -1,0 +1,67 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-mail
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-mail.workload
+    rules:
+    - alert: MailDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          kube_deployment_status_replicas_unavailable{namespace="mail"} > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: |
+          Mail deployment has unavailable replicas for >5m. Statuspage component
+          'Mail' will go to major_outage if not resolved.
+          Check: kubectl -n mail get pods, kubectl -n mail describe deployment {{ $labels.deployment }}
+
+    - alert: MailStatefulSetDegraded
+      expr: |
+        kube_statefulset_status_replicas_ready{namespace="mail"}
+          < kube_statefulset_status_replicas{namespace="mail"}
+      for: 5m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.statefulset }}: not all replicas ready"
+        description: |
+          Mail StatefulSet (roundcube-mariadb, etc.) has fewer ready than desired.
+          Webmail will be degraded.
+
+    - alert: MailPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{namespace="mail"}[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} restarting >0.5/min"
+        description: "Investigate with kubectl -n mail logs --previous {{ $labels.pod }} -c {{ $labels.container }}"
+
+    - alert: MailPodOOMKilled
+      expr: |
+        increase(kube_pod_container_status_last_terminated_reason{
+          namespace="mail", reason="OOMKilled"
+        }[1h]) > 0
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} OOMKilled"
+        description: "Bump memory limits or investigate the leak."
