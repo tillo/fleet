@@ -252,12 +252,12 @@ configMaps:
       perl -p -i -e 's/^result_attribute = mail$/result_attribute = cn/g' /etc/postfix/ldap-usersmap.cf
       postconf 'virtual_alias_maps = ldap:/etc/postfix/ldap-aliases.cf, ldap:/etc/postfix/ldap-groups.cf, ldap:/etc/postfix/ldap-usersmap.cf'
 
-      # Redirect local-system cron output (clamav, amavis, etc.) to POSTMASTER_ADDRESS.
+      # Redirect local-system cron output (clamav, amavis, etc.) to POSTMASTER.
       # Without this, mail to e.g. clamav@mail.mdapi.ch is delivered to a local
-      # mailbox no one reads; combined with $myhostname now in mydestination this
+      # mailbox no one reads; combined with myhostname now in mydestination this
       # cleanly funnels operational mail to the postmaster.
-      # NOTE: bare "$u" syntax (no braces) — Fleet's ${VAR} substitution would
-      # otherwise try to resolve "u" as a Fleet variable and fail to render.
+      # NOTE: bare "dollar-u" syntax (no braces) -- Fleet substitutes brace
+      # form and would fail to resolve a Fleet variable for the loop var.
       for u in clamav amavis nobody amavisd; do
         grep -q "^$u:" /etc/aliases || echo "$u: $POSTMASTER_ADDRESS" >> /etc/aliases
       done
