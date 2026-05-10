@@ -1,0 +1,29 @@
+## Catch-all ClusterFlow shipping every container log to Cribl.
+##
+## Purpose: real-time tail/search via Cribl's Live Capture (Cribl UI →
+## Sources → httpraw → Live Data, or Routes → <route> → Capture). No
+## on-cluster log retention; events stream through and out, no storage.
+##
+## Coexists with the narrower `postfix-loops` flow (which pre-tags
+## events with signal=postfix_failure for the AM webhook route in Cribl).
+## DMS postfix-pattern lines therefore arrive at Cribl twice: once with
+## the tag (route 0 fires AM alert), once without (falls through to
+## existing routes). Volume cost is negligible vs the diagnostic value.
+##
+## Excludes are minimal — kube-system because it's a chatty platform
+## namespace (calico, kube-proxy, csi-node) that drowns the live tail
+## in node-internal noise. Add others here if signal/noise gets bad.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterFlow
+metadata:
+  name: all-logs
+  namespace: cattle-logging-system
+spec:
+  match:
+  - exclude:
+      namespaces:
+      - kube-system
+      - cattle-logging-system   # don't ship fluent-bit/fluentd's own logs
+  globalOutputRefs:
+  - cribl
