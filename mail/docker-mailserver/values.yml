@@ -99,6 +99,10 @@ configMaps:
     path: postfix-main.cf
     data: |
       mynetworks = 127.0.0.0/8 10.52.0.0/22 192.168.1.0/24
+      # Recognize $myhostname (mail.mdapi.ch) as a local destination so that
+      # cron output from system users (e.g. clamav@mail.mdapi.ch) doesn't
+      # try to relay back to ourselves and bounce as "loops back to myself".
+      mydestination = $myhostname, localhost.$mydomain, localhost
   dovecot.cf:
     create: true
     path: dovecot.cf
@@ -247,6 +251,15 @@ configMaps:
       perl -p -i -e 's/^result_attribute = mail$/result_attribute = description/g' /etc/postfix/ldap-users.cf
       perl -p -i -e 's/^result_attribute = mail$/result_attribute = cn/g' /etc/postfix/ldap-usersmap.cf
       postconf 'virtual_alias_maps = ldap:/etc/postfix/ldap-aliases.cf, ldap:/etc/postfix/ldap-groups.cf, ldap:/etc/postfix/ldap-usersmap.cf'
+
+      # Redirect local-system cron output (clamav, amavis, etc.) to POSTMASTER_ADDRESS.
+      # Without this, mail to e.g. clamav@mail.mdapi.ch is delivered to a local
+      # mailbox no one reads; combined with $myhostname now in mydestination this
+      # cleanly funnels operational mail to the postmaster.
+      for u in clamav amavis nobody amavisd; do
+        grep -q "^${u}:" /etc/aliases || echo "${u}: ${POSTMASTER_ADDRESS}" >> /etc/aliases
+      done
+      newaliases
 extraDeploy:
 - apiVersion: external-secrets.io/v1
   kind: ExternalSecret
