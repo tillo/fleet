@@ -22,14 +22,14 @@ spec:
         team: mdapi
         # component label is inherited from the Probe target, no need to set
       annotations:
-        summary: "{{ $labels.component }}: probe {{ $labels.probe | default $labels.instance }} failing"
+        summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} failing"
         description: |
           Blackbox probe `{{ $labels.instance }}` (module: {{ $labels.module }})
           has been returning probe_success=0 for >5m.
           Component {{ $labels.component }} on statuspage will go to major_outage.
           Investigate from a workstation:
             curl -v {{ $labels.instance }}    (for HTTP probes)
-            dig @{{ $labels.instance | reReplaceAll ":53" "" }} mdapi.ch  (for DNS)
+            dig @{{ reReplaceAll ":53" "" $labels.instance }} mdapi.ch  (for DNS)
 
     - alert: SyntheticProbeSlowResponse
       expr: probe_duration_seconds{component!="", team="mdapi"} > 5
@@ -38,7 +38,7 @@ spec:
         severity: warning
         team: mdapi
       annotations:
-        summary: "{{ $labels.component }}: probe {{ $labels.probe | default $labels.instance }} slow ({{ $value }}s)"
+        summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} slow ({{ $value }}s)"
         description: |
           Probe is succeeding but response time >5s for >10m. Performance degradation
           incoming. Statuspage component {{ $labels.component }} → degraded_performance.
