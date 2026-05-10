@@ -1,0 +1,131 @@
+## Watchdog rules for the monitoring/alerting/logging plane itself.
+##
+## If Cribl dies, log-based alerts go silent.
+## If fluentd dies, Cribl receives nothing, log-based alerts go silent.
+## If the statuspage adapter dies, Alertmanager webhooks 5xx and
+##   statuspage components don't update.
+## If the Alertmanager AC matcher strategy gets reverted by a chart
+##   upgrade, no team=mdapi alerts route anywhere.
+##
+## All rides the existing Pushover path so a problem in *one* signal
+## class doesn't silently mask all the others.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: meta-monitoring-stack
+  namespace: monitoring
+spec:
+  groups:
+  - name: meta-monitoring.workload
+    rules:
+    - alert: MonitoringComponentDown
+      expr: |
+        max by (namespace, deployment) (
+          kube_deployment_status_replicas_unavailable{
+            namespace=~"cribl|monitoring|cattle-logging-system",
+            deployment=~"logstream-leader|statuspage-adapter|rancher-logging|blackbox|monitoring-grafana|pushgateway|prometheus-adapter|kube-state-metrics"
+          } > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "monitoring stack: {{ $labels.namespace }}/{{ $labels.deployment }} down ({{ $value }} replicas unavailable)"
+        description: |
+          A component of the monitoring/alerting/logging plane is down.
+          Other alerts in the affected signal class may be silently failing.
+
+    - alert: MonitoringStatefulSetDown
+      expr: |
+        kube_statefulset_status_replicas_ready{
+          namespace=~"cribl|monitoring|cattle-monitoring-system|cattle-logging-system",
+          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager|rancher-logging-root-fluentd"
+        } < kube_statefulset_status_replicas{
+          namespace=~"cribl|monitoring|cattle-monitoring-system|cattle-logging-system",
+          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager|rancher-logging-root-fluentd"
+        }
+      for: 5m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "monitoring stack: {{ $labels.namespace }}/{{ $labels.statefulset }} ready < desired"
+        description: |
+          A monitoring/alerting StatefulSet is not at full strength.
+          Same risk as MonitoringComponentDown — silent gap in alerting.
+
+    - alert: FluentBitDaemonSetDegraded
+      expr: |
+        kube_daemonset_status_number_unavailable{
+          namespace="cattle-logging-system", daemonset=~"rancher-logging-root-fluentbit.*"
+        } > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "fluent-bit DS has {{ $value }} unavailable replicas"
+        description: |
+          One or more nodes are not shipping pod logs to Cribl.
+          Log-based alerts from those nodes' workloads are blind.
+
+    - alert: PushgatewayMissingScripts
+      ## When Pushgateway has been up for a day but nothing is pushing yet,
+      ## the staleness backstop in app-batch-jobs only fires after >24h.
+      ## This is an info-level reminder that no batch jobs are reporting.
+      expr: |
+        absent(
+          {__name__=~".+_last_run_timestamp_seconds", job!=""}
+        ) and on() (time() - kube_pod_start_time{namespace="monitoring", pod=~"pushgateway-.*"}) > 86400
+      labels:
+        severity: info
+        component: General
+        team: mdapi
+      annotations:
+        summary: "pushgateway has no jobs pushing"
+        description: "Pushgateway is up but no batch jobs are publishing *_last_run_timestamp_seconds. Either nothing's been migrated yet, or every script has stopped running."
+
+  - name: meta-monitoring.alertmanager-config-drift
+    rules:
+    - alert: AlertmanagerConfigMatcherStrategyReverted
+      ## The bundled rancher-monitoring chart owns the Alertmanager CR.
+      ## A chart upgrade can revert spec.alertmanagerConfigMatcherStrategy
+      ## from "None" back to default ("OnNamespace"), which would silently
+      ## prevent every team=mdapi AlertmanagerConfig route from ever
+      ## matching alerts in workload namespaces. Detects the drift.
+      expr: |
+        kube_customresource_alertmanager_spec_matcher_strategy_type{type="None"} == 0
+        or absent(kube_customresource_alertmanager_spec_matcher_strategy_type)
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Alertmanager AC matcherStrategy reverted from None"
+        description: |
+          The rancher-monitoring Alertmanager spec.alertmanagerConfigMatcherStrategy
+          is no longer "None". Our team=mdapi routes will not match alerts
+          from workload namespaces. Re-apply with:
+            kubectl -n cattle-monitoring-system patch alertmanager rancher-monitoring-alertmanager \
+              --type=merge -p '{"spec":{"alertmanagerConfigMatcherStrategy":{"type":"None"}}}'
+
+  - name: meta-monitoring.statuspage-adapter
+    rules:
+    - alert: StatuspageAdapterUnhealthy
+      ## Synthetic probe checks /healthz on the adapter Service. If down,
+      ## AM webhooks 5xx → statuspage components stop updating.
+      expr: probe_success{instance="http://statuspage-adapter.monitoring.svc.cluster.local:8080/healthz"} == 0
+      for: 3m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "statuspage adapter /healthz failing"
+        description: "Alertmanager webhooks to the adapter will 5xx; public statuspage components won't reflect actual outages."

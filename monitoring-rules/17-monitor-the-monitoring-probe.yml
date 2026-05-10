@@ -1,0 +1,23 @@
+## Synthetic probe for the statuspage adapter's /healthz so we have a
+## non-kube-state-metrics signal that the adapter is actually serving.
+
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: monitoring-statuspage-adapter
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: monitoring-statuspage-adapter
+  prober:
+    url: blackbox:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - http://statuspage-adapter.monitoring.svc.cluster.local:8080/healthz
+      labels:
+        component: General
+        team: mdapi
+        probe: statuspage_adapter
