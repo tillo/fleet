@@ -1,0 +1,146 @@
+## ConfigMap holding the adapter script + the alertname→component_id mapping.
+## Updating the script or the mapping is a fleet commit + helm upgrade; the
+## Deployment uses a checksum annotation so pods restart on change.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: statuspage-adapter
+  namespace: monitoring
+data:
+  ## Component name (as used in alert labels) -> statuspage component_id.
+  ## Source of truth: memory file reference_statuspage_components.md.
+  components.json: |
+    {
+      "Mail":     "63dvnwpp5t5k",
+      "Identity": "lfkb1wbp5y67",
+      "GitLab":   "2yyn4m9qj6sh",
+      "Files":    "74cp13q9xddn",
+      "Notes":    "tpmgs9xk4nh2",
+      "Websites": "hmpsfntgbtf7",
+      "DNS":      "rcn8wr2jf8fy"
+    }
+
+  adapter.py: |
+    #!/usr/bin/env python3
+    """
+    Alertmanager -> statuspage.io component-state adapter.
+
+    Listens on :8080/webhook for Alertmanager v4 webhook POSTs.
+    For each alert in the payload:
+      - reads label `component` (must match a key in components.json)
+      - reads label `severity` (critical | warning)
+      - if alert.status == "firing":   sets component to major_outage (critical) or degraded_performance (warning)
+      - if alert.status == "resolved": sets component to operational
+
+    Group-aware: per-component, picks the worst current state from the active alerts in the group.
+    """
+    import json, os, sys, time, urllib.parse, urllib.request, urllib.error
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    PAGE_ID    = os.environ["STATUSPAGE_PAGE_ID"]
+    API_KEY    = os.environ["STATUSPAGE_API_KEY"]
+    COMPONENTS = json.loads(open("/etc/adapter/components.json").read())
+    BIND_PORT  = int(os.environ.get("BIND_PORT", "8080"))
+
+    # severity -> statuspage status (firing case). Resolved always -> operational.
+    SEVERITY_STATUS = {
+        "critical": "major_outage",
+        "warning":  "degraded_performance",
+        "info":     "degraded_performance",
+    }
+    STATUS_RANK = {
+        "operational":          0,
+        "under_maintenance":    1,
+        "degraded_performance": 2,
+        "partial_outage":       3,
+        "major_outage":         4,
+    }
+
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    def patch_component(component_id: str, status: str):
+        """Set a single component's status via PATCH."""
+        body = json.dumps({"component": {"status": status}}).encode()
+        req = urllib.request.Request(
+            f"https://api.statuspage.io/v1/pages/{PAGE_ID}/components/{component_id}",
+            data=body,
+            headers={"Authorization": f"OAuth {API_KEY}", "Content-Type": "application/json"},
+            method="PATCH",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            log(f"statuspage PATCH {component_id} -> {status}: HTTP {e.code} {e.read().decode()[:200]}")
+            return e.code
+
+    def derive_status(alerts: list) -> str:
+        """
+        Given the alerts touching one component (firing + resolved mixed),
+        compute the worst-case current status. Resolved alerts contribute nothing.
+        """
+        worst = "operational"
+        for a in alerts:
+            if a.get("status") != "firing":
+                continue
+            sev = a.get("labels", {}).get("severity", "warning")
+            candidate = SEVERITY_STATUS.get(sev, "degraded_performance")
+            if STATUS_RANK[candidate] > STATUS_RANK[worst]:
+                worst = candidate
+        return worst
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            log("adapter: " + fmt % args)
+
+        def do_POST(self):
+            if self.path != "/webhook":
+                self._reply(404, "unknown path")
+                return
+            length = int(self.headers.get("content-length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length))
+            except Exception as e:
+                self._reply(400, f"bad json: {e}")
+                return
+
+            # Group alerts by component label
+            by_component = {}
+            for a in body.get("alerts", []):
+                comp = a.get("labels", {}).get("component")
+                if not comp:
+                    continue
+                by_component.setdefault(comp, []).append(a)
+
+            results = []
+            for comp, alerts in by_component.items():
+                cid = COMPONENTS.get(comp)
+                if not cid:
+                    log(f"WARN: alert with unknown component '{comp}' (alerts: {len(alerts)})")
+                    continue
+                target_status = derive_status(alerts)
+                code = patch_component(cid, target_status)
+                results.append(f"{comp}({cid})={target_status}:{code}")
+                log(f"OK component={comp} status={target_status} http={code}")
+
+            self._reply(200, " ".join(results) or "no-op")
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self._reply(200, "ok")
+            else:
+                self._reply(404, "")
+
+        def _reply(self, code, body=""):
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            if body:
+                self.wfile.write(body.encode())
+
+    if __name__ == "__main__":
+        log(f"adapter starting on :{BIND_PORT}")
+        log(f"loaded {len(COMPONENTS)} components: {sorted(COMPONENTS.keys())}")
+        HTTPServer(("0.0.0.0", BIND_PORT), H).serve_forever()

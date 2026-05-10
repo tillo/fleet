@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statuspage-adapter
+  namespace: monitoring
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 24h"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: statuspage-adapter
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: statuspage-adapter
+    spec:
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+      - name: adapter
+        image: python:3-alpine
+        imagePullPolicy: IfNotPresent
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        command: ["python3", "/etc/adapter/adapter.py"]
+        envFrom:
+        - secretRef:
+            name: statuspage
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 5m
+            memory: 24Mi
+          limits:
+            memory: 64Mi
+        volumeMounts:
+        - mountPath: /etc/adapter
+          name: adapter-files
+          readOnly: true
+      volumes:
+      - name: adapter-files
+        configMap:
+          name: statuspage-adapter
+          defaultMode: 420
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statuspage-adapter
+  namespace: monitoring
+spec:
+  selector:
+    app: statuspage-adapter
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+    protocol: TCP
