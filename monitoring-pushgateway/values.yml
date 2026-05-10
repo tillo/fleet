@@ -1,0 +1,34 @@
+## prometheus-pushgateway values
+##
+## Receives metrics pushed by short-lived jobs (Windmill scripts, GitLab CI
+## tasks, cron jobs) and exposes them for the rancher-monitoring Prometheus
+## to scrape. Lives in `monitoring` ns alongside other supplemental
+## observability bits.
+
+fullnameOverride: pushgateway
+
+resources:
+  requests:
+    cpu: 5m
+    memory: 16Mi
+  limits:
+    memory: 64Mi
+
+## Persist pushed metrics across pod restarts (small PVC).
+## Without this, every pod restart loses all currently-stored values.
+persistentVolume:
+  enabled: true
+  storageClass: longhorn
+  size: 1Gi
+  accessModes:
+    - ReadWriteOnce
+
+## Tell rancher-monitoring's Prometheus to scrape us.
+serviceMonitor:
+  enabled: true
+  ## Default selector ({}) on the Prometheus CRD picks any SM. No release
+  ## label needed.
+
+## NetworkPolicy is optional; skipping for simplicity (cluster-internal only).
+networkPolicy:
+  create: false
