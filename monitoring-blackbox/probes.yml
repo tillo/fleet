@@ -1,0 +1,240 @@
+## 7 Probe CRDs — one per statuspage component.
+##
+## Probes MUST carry the `release: rancher-monitoring` label because the
+## existing Prometheus's `probeSelector` is `matchLabels: {release: rancher-monitoring}`
+## (unlike its other selectors which are `{}`).
+##
+## Each Probe sets `targetLabels: { component, team }` so the resulting
+## probe_success metric carries those labels and our PrometheusRules can
+## key on them.
+
+# ====== Mail ======
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-smtp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-smtp
+  prober:
+    url: blackbox:9115
+  module: smtp_banner
+  targets:
+    staticConfig:
+      static:
+        - mail.mdapi.ch:25
+      labels:
+        component: Mail
+        team: mdapi
+        probe: smtp
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-imaps
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-imaps
+  prober:
+    url: blackbox:9115
+  module: imaps_starttls
+  targets:
+    staticConfig:
+      static:
+        - mail.mdapi.ch:993
+      labels:
+        component: Mail
+        team: mdapi
+        probe: imaps
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-webmail
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-webmail
+  prober:
+    url: blackbox:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://webmail.mdapi.ch
+      labels:
+        component: Mail
+        team: mdapi
+        probe: webmail
+
+# ====== Identity ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: identity-keycloak
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: identity-keycloak
+  prober:
+    url: blackbox:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://idp.mdapi.ch/health/ready
+      labels:
+        component: Identity
+        team: mdapi
+        probe: keycloak
+
+# ====== GitLab ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: gitlab-webservice
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: gitlab-webservice
+  prober:
+    url: blackbox:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://gitlab.mdapi.ch/-/readiness
+      labels:
+        component: GitLab
+        team: mdapi
+        probe: webservice
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: gitlab-registry
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: gitlab-registry
+  prober:
+    url: blackbox:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://registry.mdapi.ch/v2/
+      labels:
+        component: GitLab
+        team: mdapi
+        probe: registry
+
+# ====== Files ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: files
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: files
+  prober:
+    url: blackbox:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://cloud.mdapi.ch/status.php
+        - https://spider3.files.mdapi.ch
+        - https://tv.files.mdapi.ch
+      labels:
+        component: Files
+        team: mdapi
+
+# ====== Notes ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: notes-joplin
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: notes-joplin
+  prober:
+    url: blackbox:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://notes.mdapi.ch/api/ping
+      labels:
+        component: Notes
+        team: mdapi
+        probe: joplin
+
+# ====== Websites ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: websites
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: websites
+  prober:
+    url: blackbox:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://spider3.ch
+        - https://www.spider3.ch
+        - https://coiffuredreams.ch
+        - https://dellambrogio.ch
+        - https://ivodellambrogio.ch
+        - https://mdapi.org
+        - https://textopolis.net
+        - https://tillo.ch
+        - https://mdapi.ch
+      labels:
+        component: Websites
+        team: mdapi
+
+# ====== DNS ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-public
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-public
+  prober:
+    url: blackbox:9115
+  module: dns_mdapi
+  targets:
+    staticConfig:
+      static:
+        - dns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: dns_authoritative

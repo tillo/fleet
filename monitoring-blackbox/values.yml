@@ -1,0 +1,83 @@
+## prometheus-blackbox-exporter values
+##
+## Synthetic-probe sidecar for the existing rancher-monitoring Prometheus.
+## Probes are defined as separate Probe CRDs in probes.yml; this values
+## file only configures the prober modules they reference.
+
+fullnameOverride: blackbox
+
+replicas: 1
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+## ServiceMonitor — let rancher-monitoring's Prometheus scrape blackbox's own
+## metrics (probe_duration etc. for self-health). Default selector ({}) on the
+## Prometheus CRD picks this up without label requirements.
+serviceMonitor:
+  enabled: true
+  defaults:
+    additionalMetricsRelabels: {}
+    labels: {}
+
+## Disable bundled prometheusRule generation; we ship our own in rules.yml
+## with consistent severity/component/team labels.
+prometheusRule:
+  enabled: false
+
+## Modules — only the ones our 7 component probes need.
+config:
+  modules:
+    http_2xx:
+      prober: http
+      timeout: 10s
+      http:
+        valid_status_codes: [200, 301, 302]
+        method: GET
+        follow_redirects: true
+        preferred_ip_protocol: ip4
+
+    http_any_redirect:
+      ## For services that redirect to login (oauth2-proxy / Keycloak) — any
+      ## HTTP response < 500 means the layer is up.
+      prober: http
+      timeout: 10s
+      http:
+        valid_status_codes: [200, 301, 302, 401, 403]
+        method: GET
+        follow_redirects: false
+        preferred_ip_protocol: ip4
+
+    tcp_connect:
+      prober: tcp
+      timeout: 5s
+
+    smtp_banner:
+      prober: tcp
+      timeout: 10s
+      tcp:
+        query_response:
+          - expect: "^220 "
+
+    imaps_starttls:
+      ## IMAPS on port 993 — TLS handshake then capability check
+      prober: tcp
+      timeout: 10s
+      tcp:
+        tls: true
+        query_response:
+          - expect: "^\\* OK"
+
+    dns_mdapi:
+      prober: dns
+      timeout: 5s
+      dns:
+        query_name: "mdapi.ch"
+        query_type: "A"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - ".+"

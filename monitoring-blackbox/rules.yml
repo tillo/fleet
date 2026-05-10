@@ -1,0 +1,57 @@
+## PrometheusRule fed by blackbox probes.
+##
+## probe_success is 1 (probe ok) or 0 (probe failing). We alert when it's
+## been 0 for several minutes — short enough to catch real outages, long
+## enough to ride out single-poll transient failures (15s scrape interval
+## by default).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-blackbox
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-blackbox.synthetic
+    rules:
+    - alert: SyntheticProbeFailing
+      expr: probe_success{component!="", team="mdapi"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        team: mdapi
+        # component label is inherited from the Probe target, no need to set
+      annotations:
+        summary: "{{ $labels.component }}: probe {{ $labels.probe | default $labels.instance }} failing"
+        description: |
+          Blackbox probe `{{ $labels.instance }}` (module: {{ $labels.module }})
+          has been returning probe_success=0 for >5m.
+          Component {{ $labels.component }} on statuspage will go to major_outage.
+          Investigate from a workstation:
+            curl -v {{ $labels.instance }}    (for HTTP probes)
+            dig @{{ $labels.instance | reReplaceAll ":53" "" }} mdapi.ch  (for DNS)
+
+    - alert: SyntheticProbeSlowResponse
+      expr: probe_duration_seconds{component!="", team="mdapi"} > 5
+      for: 10m
+      labels:
+        severity: warning
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }}: probe {{ $labels.probe | default $labels.instance }} slow ({{ $value }}s)"
+        description: |
+          Probe is succeeding but response time >5s for >10m. Performance degradation
+          incoming. Statuspage component {{ $labels.component }} → degraded_performance.
+
+    - alert: SyntheticProbeTLSExpiringSoon
+      expr: |
+        probe_ssl_earliest_cert_expiry{component!="", team="mdapi"} - time() < 14 * 24 * 3600
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }}: TLS cert for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+        description: |
+          cert-manager renews before 30d remaining; if this fires, automation has stalled.
+          Check: kubectl get certificate -A | grep -v True
