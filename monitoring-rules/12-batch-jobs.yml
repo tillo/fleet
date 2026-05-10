@@ -1,16 +1,11 @@
-## Meta-rule: alert when a pushed metric is stale.
+## Rules for metrics published by Windmill batch scripts via Pushgateway.
 ##
-## Convention for pushed metrics:
-##   <name>_last_run_timestamp_seconds{job="<script>", instance="<host>"}
-##
-## If a script that's expected to run every N hours hasn't pushed a fresh
-## timestamp within 2N hours, fire BatchJobStale.
-##
-## Each script being migrated from Windmill should:
-##   1. Push its metrics to http://pushgateway.monitoring.svc.cluster.local:9091/metrics/job/<name>
-##   2. Always include `<name>_last_run_timestamp_seconds` set to time.time()
-##   3. (Optional) Push business-specific gauges; PrometheusRules then alert
-##      on those.
+## Convention for any pushed batch job:
+##   1. PUT to http://pushgateway.monitoring.svc.cluster.local:9091/metrics/job/<name>
+##   2. Always include `<name>_last_run_timestamp_seconds` (epoch seconds)
+##   3. Optionally include `<name>_last_run_success` (1=ok, 0=failed)
+##   4. Optionally include any business-specific gauges; add per-script
+##      rules in their own group below.
 
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -22,12 +17,17 @@ spec:
   - name: app-batch-jobs.staleness
     rules:
     - alert: BatchJobStale
+      ## Heartbeat staleness backstop: any script that hasn't pushed in
+      ## >36h. Tight enough to catch a missed daily run with one cycle
+      ## of buffer, loose enough to ignore weekly schedules — those
+      ## should publish their own job-specific staleness rule.
       expr: |
         (
           time() - max by (job) (
             {__name__=~".+_last_run_timestamp_seconds", job!=""}
           )
-        ) > 86400
+        ) > 36 * 3600
+      for: 30m
       labels:
         severity: warning
         team: mdapi
@@ -35,24 +35,58 @@ spec:
       annotations:
         summary: "Batch job {{ $labels.job }} hasn't pushed metrics in {{ $value | humanizeDuration }}"
         description: |
-          A scheduled job has stopped pushing its `*_last_run_timestamp_seconds` metric
-          for >24h. Either the job's broken, or its schedule was disabled, or it
-          hasn't been migrated to push metrics yet.
+          A scheduled job has stopped pushing its `*_last_run_timestamp_seconds`
+          for >36h. Either the job's broken, its schedule was disabled,
+          or it hasn't been migrated to push metrics yet.
 
           Check Windmill (https://windmill.mdapi.ch) or the responsible cron source.
 
-    ## Catch all "exit code != 0" patterns. Convention: scripts also push
-    ## a `<name>_last_run_success` gauge (1=ok, 0=failed). Alert on 0.
     - alert: BatchJobLastRunFailed
+      ## Convention: scripts also push <name>_last_run_success gauge.
       expr: |
         max by (job) (
           {__name__=~".+_last_run_success", job!=""}
         ) == 0
+      for: 10m
       labels:
         severity: warning
         team: mdapi
         component: General
       annotations:
         summary: "Batch job {{ $labels.job }} reported a failed last run"
-        description: |
-          The script's `*_last_run_success` gauge is 0. Check its logs in Windmill.
+        description: "The script's `*_last_run_success` gauge is 0. Check its logs in Windmill."
+
+  - name: app-batch-jobs.rancher-backup
+    rules:
+    - alert: RancherBackupErrored
+      expr: rancher_backup_in_error == 1
+      for: 10m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Rancher backup {{ $labels.backup }} is in error state"
+        description: "Most recent reconcile of Rancher Backup CR {{ $labels.backup }} reported an error condition. Check `kubectl get backup {{ $labels.backup }} -o yaml`."
+
+    - alert: RancherBackupStale
+      expr: rancher_backup_last_snapshot_age_seconds > 26 * 3600
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Rancher backup {{ $labels.backup }} last snapshot {{ $value | humanizeDuration }} ago"
+        description: "Backup is configured for daily snapshots; last successful snapshot is older than 26h."
+
+    - alert: RancherBackupNeverSnapshotted
+      expr: rancher_backup_last_snapshot_age_seconds == -1
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Rancher backup {{ $labels.backup }} has no snapshot"
+        description: "Backup CR exists but no snapshot has ever been recorded. Check schedule and storage location."
