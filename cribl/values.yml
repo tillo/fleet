@@ -33,6 +33,10 @@ ingress:
     nginx.ingress.kubernetes.io/modsecurity-snippet: |
       SecRuleEngine On
       SecDebugLog /tmp/modsec_debug.log
+      # Cribl REST API uses PATCH/PUT/DELETE on routes, pipelines, users, etc.
+      # CRS rule 911100 (Method Enforcement) reads tx.allowed_methods at phase 1,
+      # so the override MUST come before the Include or it has no effect.
+      SecAction "id:900200,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
   tls:
     - secretName: cribl-cert
