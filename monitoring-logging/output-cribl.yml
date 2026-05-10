@@ -1,0 +1,28 @@
+## ClusterOutput → Cribl LogStream Leader's HTTP source on port 8080.
+## Cribl pipeline drops the log body after pattern match (see step 6).
+##
+## NOTE: Cribl side must have an HTTP/REST source listening on :8080
+## before this Output starts succeeding. If logs aren't arriving, check:
+##   kubectl -n cattle-logging-system logs deployment/mdapi-fluentd | grep cribl
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterOutput
+metadata:
+  name: cribl
+  namespace: cattle-logging-system
+spec:
+  http:
+    endpoint: http://logstream-leader-internal.cribl.svc.cluster.local:8080
+    content_type: application/json
+    json_array: true
+    ## Buffer locally for up to 60s then flush; on Cribl outage chunks
+    ## get retried up to retry_max_times with exponential backoff.
+    buffer:
+      type: memory
+      flush_interval: 10s
+      retry_type: exponential_backoff
+      retry_max_times: 5
+      retry_max_interval: 30s
+      chunk_limit_size: 1m
+      total_limit_size: 32m
+      overflow_action: drop_oldest_chunk

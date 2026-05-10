@@ -1,0 +1,29 @@
+## ClusterFlow selecting only docker-mailserver pod logs that mention
+## the loop-back DSN (5.4.6) or other postfix delivery failures we care about.
+## Pre-filtering at fluentbit/fluentd minimises HTTP-out volume to Cribl.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterFlow
+metadata:
+  name: postfix-loops
+  namespace: cattle-logging-system
+spec:
+  match:
+  - select:
+      namespaces:
+      - mail
+      labels:
+        app.kubernetes.io/name: docker-mailserver
+  filters:
+  - grep:
+      regexp:
+      - key: log
+        ## "loops back to myself" (5.4.6), "Connection refused" (4.4.1),
+        ## "Connection timed out" (4.4.2), spam queue full
+        pattern: '(loops back|Connection refused|Connection timed out|temporary failure|fatal:)'
+  - record_modifier:
+      records:
+      - signal: postfix_failure
+        component: Mail
+  globalOutputRefs:
+  - cribl

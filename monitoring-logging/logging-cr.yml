@@ -1,0 +1,43 @@
+## Root Logging resource — tells the operator to spawn a fluent-bit DS
+## (collector) and a fluentd Deployment (aggregator).
+##
+## No on-cluster log retention: fluentd buffers in-memory only, ships to
+## Cribl over HTTP. If Cribl is unreachable, fluentd backs up briefly and
+## drops logs; we don't write log bodies to a PVC anywhere.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: Logging
+metadata:
+  name: mdapi
+spec:
+  controlNamespace: cattle-logging-system
+
+  fluentbit:
+    image:
+      tag: 3.1.7-debug
+    resources:
+      requests:
+        cpu: 20m
+        memory: 64Mi
+      limits:
+        memory: 192Mi
+    ## Ship to fluentd's TCP forward port; fluentd handles routing to outputs.
+    targetHost: mdapi-fluentd.cattle-logging-system.svc.cluster.local
+
+  fluentd:
+    replicas: 1
+    image:
+      tag: v1.16-4.10-full
+    resources:
+      requests:
+        cpu: 50m
+        memory: 192Mi
+      limits:
+        memory: 512Mi
+    ## In-memory buffer only (no PVC); chunks flush to outputs every few seconds.
+    bufferStorageVolume:
+      emptyDir: {}
+    disablePvc: true
+    scaling:
+      drain:
+        enabled: false
