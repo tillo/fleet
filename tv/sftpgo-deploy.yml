@@ -23,10 +23,20 @@ spec:
       labels:
         app: sftpgo
     spec:
+      # Pod-level k8s admission defaults — written explicitly so Fleet drift
+      # detection doesn't flag the bundle Modified after every Keel rollout.
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
       initContainers:
       - name: sftpgo-host-keys
         image: alpine:3.20
         imagePullPolicy: IfNotPresent
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        resources: {}
         command: ["sh", "-c"]
         args:
         - |
@@ -47,6 +57,8 @@ spec:
       - name: sftpgo
         image: drakkan/sftpgo:v2.7.1-alpine
         imagePullPolicy: IfNotPresent
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
         args: ["sftpgo", "serve", "--config-file", "/etc/sftpgo/sftpgo.json"]
         env:
         - { name: SFTPGO_DEFAULT_ADMIN_USERNAME, value: "admin" }
@@ -57,19 +69,19 @@ spec:
           runAsUser: 1000
           runAsGroup: 1000
         ports:
-        - { containerPort: 2022, name: sftp }
-        - { containerPort: 2121, name: ftp }
-        - { containerPort: 8080, name: web }
-        - { containerPort: 22250, name: pasv0 }
-        - { containerPort: 22251, name: pasv1 }
-        - { containerPort: 22252, name: pasv2 }
-        - { containerPort: 22253, name: pasv3 }
-        - { containerPort: 22254, name: pasv4 }
-        - { containerPort: 22255, name: pasv5 }
-        - { containerPort: 22256, name: pasv6 }
-        - { containerPort: 22257, name: pasv7 }
-        - { containerPort: 22258, name: pasv8 }
-        - { containerPort: 22259, name: pasv9 }
+        - { containerPort: 2022, name: sftp,  protocol: TCP }
+        - { containerPort: 2121, name: ftp,   protocol: TCP }
+        - { containerPort: 8080, name: web,   protocol: TCP }
+        - { containerPort: 22250, name: pasv0, protocol: TCP }
+        - { containerPort: 22251, name: pasv1, protocol: TCP }
+        - { containerPort: 22252, name: pasv2, protocol: TCP }
+        - { containerPort: 22253, name: pasv3, protocol: TCP }
+        - { containerPort: 22254, name: pasv4, protocol: TCP }
+        - { containerPort: 22255, name: pasv5, protocol: TCP }
+        - { containerPort: 22256, name: pasv6, protocol: TCP }
+        - { containerPort: 22257, name: pasv7, protocol: TCP }
+        - { containerPort: 22258, name: pasv8, protocol: TCP }
+        - { containerPort: 22259, name: pasv9, protocol: TCP }
         resources:
           limits:
             memory: 256Mi
@@ -95,8 +107,11 @@ spec:
           name: sftpgo-oidc-secret
           readOnly: true
       - name: sftpgo-auth
-        image: python:3.13-alpine
+        # Floating major-3 alpine tag; Keel watches digest, no explicit version pin.
+        image: python:3-alpine
         imagePullPolicy: IfNotPresent
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
         command: ["python3", "/app/auth_server.py"]
         env:
         - { name: KC_ISSUER,     value: "https://idp.mdapi.ch/realms/tilloch" }
@@ -126,9 +141,11 @@ spec:
       - name: sftpgo-config
         configMap:
           name: sftpgo-config
+          defaultMode: 420
       - name: sftpgo-oidc-secret
         secret:
           secretName: sftpgo-keycloak
+          defaultMode: 420
           items:
           - key: KC_CLIENT_SECRET
             path: client_secret
