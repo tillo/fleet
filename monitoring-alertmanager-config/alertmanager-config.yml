@@ -1,0 +1,49 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: mdapi-team
+  namespace: monitoring
+spec:
+  route:
+    ## All team=mdapi alerts → our combined receiver. continue:false because
+    ## the receiver itself fans out to both statuspage and Pushover; we don't
+    ## want the chart's default Pushover receiver to also fire (would
+    ## duplicate the notification).
+    receiver: statuspage-and-pushover
+    matchers:
+    - name: team
+      value: mdapi
+      matchType: =
+    groupBy: [component, alertname]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+
+  receivers:
+  - name: statuspage-and-pushover
+    webhookConfigs:
+    - url: http://statuspage-adapter.monitoring.svc.cluster.local:8080/webhook
+      sendResolved: true
+      maxAlerts: 0   # 0 = no limit; statuspage adapter handles batches
+    pushoverConfigs:
+    - userKey:
+        name: pushover
+        key: user-key
+      token:
+        name: pushover
+        key: api-token
+      sendResolved: true
+      priority: |-
+        {{- if eq .CommonLabels.severity "critical" -}}1
+        {{- else -}}0
+        {{- end -}}
+      title: |-
+        [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.component }}: {{ .CommonLabels.alertname }}
+      message: |-
+        {{ range .Alerts -}}
+        {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .Annotations.summary }}
+        {{ end }}
+        {{ if .CommonAnnotations.description -}}
+        ---
+        {{ .CommonAnnotations.description }}
+        {{- end }}
