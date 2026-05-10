@@ -29,8 +29,10 @@ serviceMonitor:
   ## Default selector ({}) on the Prometheus CRD picks any SM. No release
   ## label needed.
 
-## NetworkPolicy is optional; skipping for simplicity (cluster-internal only).
-## In chart v3.6.0 the toggle is `enabled`, not `create` (the chart's
-## template requires `allowAll` or `customSelectors` whenever enabled).
-networkPolicy:
-  enabled: false
+## NetworkPolicy is intentionally NOT set. The chart's template renders
+## a NetworkPolicy whenever `.Values.networkPolicy` is truthy in Go-template
+## terms — i.e., a non-empty dict. The chart's default is `{}` which is
+## falsy, so leaving the key absent here lets the chart skip NP rendering.
+## Setting `networkPolicy.enabled: false` would actually ENABLE the
+## template (dict has one key → truthy) and then fail because neither
+## `allowAll` nor `customSelectors` is set. Counter-intuitive, hence this note.
