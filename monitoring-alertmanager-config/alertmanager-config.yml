@@ -5,10 +5,11 @@ metadata:
   namespace: monitoring
 spec:
   route:
-    ## Parent route is a no-op default — child routes do the actual matching.
-    ## Required because AC can only carry one `route:` with `matchers:` AND
-    ## a `routes:` array for sub-routes.
-    receiver: statuspage-and-pushover
+    ## Parent route is a TRUE no-op — alerts that don't match any child
+    ## route fall through here and get dropped. Without this, InfoInhibitor
+    ## (severity=none, no team=mdapi label) was inheriting the parent
+    ## receiver and pinging Pushover.
+    receiver: black-hole
     groupBy: [component, alertname]
     groupWait: 30s
     groupInterval: 5m
@@ -44,6 +45,10 @@ spec:
       repeatInterval: 12h
 
   receivers:
+  ## Drop everything that doesn't match a child route (Watchdog,
+  ## InfoInhibitor, info-severity from any unrelated chart).
+  - name: black-hole
+
   - name: statuspage-and-pushover
     webhookConfigs:
     - url: http://statuspage-adapter.monitoring.svc.cluster.local:8080/webhook

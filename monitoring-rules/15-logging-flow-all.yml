@@ -4,15 +4,15 @@
 ## Sources → httpraw → Live Data, or Routes → <route> → Capture). No
 ## on-cluster log retention; events stream through and out, no storage.
 ##
-## Coexists with the narrower `postfix-loops` flow (which pre-tags
-## events with signal=postfix_failure for the AM webhook route in Cribl).
-## DMS postfix-pattern lines therefore arrive at Cribl twice: once with
-## the tag (route 0 fires AM alert), once without (falls through to
-## existing routes). Volume cost is negligible vs the diagnostic value.
-##
 ## Excludes are minimal — kube-system because it's a chatty platform
 ## namespace (calico, kube-proxy, csi-node) that drowns the live tail
 ## in node-internal noise. Add others here if signal/noise gets bad.
+##
+## Note: am-relay is intentionally NOT in globalOutputRefs here. The
+## catch-all volume saturates the relay's fluentd buffer (drop_oldest_chunk
+## errors), so signal detection runs via narrow per-pattern flows:
+## ingress-nginx-logs (modsec), postfix-loops, pod-io-errors,
+## redis-bgsave-failures. Each pre-greps before shipping to am-relay.
 
 apiVersion: logging.banzaicloud.io/v1beta1
 kind: ClusterFlow
@@ -28,4 +28,3 @@ spec:
       - cattle-logging-system   # don't ship fluent-bit/fluentd's own logs
   globalOutputRefs:
   - cribl
-  - am-relay

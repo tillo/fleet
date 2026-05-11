@@ -1,0 +1,30 @@
+## ClusterFlow selecting any pod log that mentions a typical I/O error
+## pattern (PVC/Longhorn-side, kernel block layer, NFS/FUSE stale).
+## Narrow grep keeps the am-relay throughput low — the catch-all all-logs
+## flow used to feed this signal but overflowed the relay's fluentd buffer.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterFlow
+metadata:
+  name: pod-io-errors
+  namespace: cattle-logging-system
+spec:
+  match:
+  - exclude:
+      namespaces:
+      - kube-system
+      - cattle-logging-system
+  - select: {}
+  filters:
+  - grep:
+      regexp:
+      - key: log
+        ## Aligned with POD_IO_RE in cribl-am-relay/relay.yml. Keep both
+        ## in sync — too narrow on this side = false negatives; too wide
+        ## = relay buffer overflow.
+        pattern: '(\[Errno 5\] Input/output error|blk_update_request.*I/O error|EXT4-fs.*I/O error|XFS.*(metadata I/O error|writeback error)|buffer_io_error|\bEIO\b.*(read|write)|stale file handle|transport endpoint is not connected|pcfg_openfile:.*Permission denied)'
+  - record_modifier:
+      records:
+      - signal: pod_io_error
+  globalOutputRefs:
+  - am-relay

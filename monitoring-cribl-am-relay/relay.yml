@@ -48,6 +48,14 @@ data:
         r"^(?:192\.168\.|10\.|100\.(?:6[4-9]|[7-9]\d|1[0-2]\d)\.)"
     )
 
+    ## Jool NAT64 splits its v4 egress by source-v6 mark:
+    ##   192.168.164.2 = external IPv6 clients (untrusted, blocks are real)
+    ##   192.168.164.3 = internal LAN IPv6 clients (trusted, blocks are FP)
+    ## Both fall inside 192.168.0.0/16, so the TRUSTED_IP_RE above matches
+    ## them. We explicitly subtract .2 here so external NAT64-translated
+    ## blocks do NOT generate "trusted source" false-positive alerts.
+    UNTRUSTED_NAT64_EGRESS = {"192.168.164.2"}
+
     MODSEC_RE = re.compile(r"ModSecurity: Access denied")
 
     def extract_modsec_fields(line):
@@ -114,9 +122,15 @@ data:
         })
 
     ## ─── pod I/O errors ─────────────────────────────────────────────
+    ## Patterns we want to alert on. Keep aligned with the grep filter in
+    ## monitoring-rules/14a-logging-flow-pod-io.yml (too narrow there =
+    ## false negatives; too wide = relay buffer overflow on the way in).
     POD_IO_RE = re.compile(
         r"\[Errno 5\] Input/output error"
-        r"|I/O error.*block device"
+        r"|blk_update_request.*I/O error"             # kernel block layer
+        r"|EXT4-fs.*I/O error"                        # ext4 filesystem
+        r"|XFS.*(?:metadata I/O error|writeback error)"  # xfs filesystem
+        r"|buffer_io_error"                           # lost async page write
         r"|\bEIO\b.*(?:read|write)"
         r"|stale file handle"
         r"|transport endpoint is not connected"
@@ -246,6 +260,8 @@ data:
         if not fields:
             return None
         ip = fields.get("client_ip", "")
+        if ip in UNTRUSTED_NAT64_EGRESS:
+            return None
         if not TRUSTED_IP_RE.match(ip):
             return None
         return build_modsec_alert(fields)

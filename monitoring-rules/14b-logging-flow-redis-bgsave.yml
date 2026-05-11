@@ -1,0 +1,27 @@
+## ClusterFlow selecting Redis BGSAVE / RDB-save failure patterns from
+## any pod. These usually point at a stale Longhorn mount; restarting
+## the pod typically recovers. Narrow grep keeps am-relay traffic low.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterFlow
+metadata:
+  name: redis-bgsave-failures
+  namespace: cattle-logging-system
+spec:
+  match:
+  - exclude:
+      namespaces:
+      - kube-system
+      - cattle-logging-system
+  - select: {}
+  filters:
+  - grep:
+      regexp:
+      - key: log
+        ## Aligned with REDIS_BGSAVE_RE in cribl-am-relay/relay.yml.
+        pattern: '(Background saving error|Failed opening the temp RDB file|Error saving DB on disk)'
+  - record_modifier:
+      records:
+      - signal: redis_bgsave_failure
+  globalOutputRefs:
+  - am-relay
