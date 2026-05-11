@@ -24,16 +24,17 @@ ingress:
     nginx.ingress.kubernetes.io/modsecurity-snippet: |
       SecRuleEngine On
       SecRule REQUEST_URI "@beginsWith /api/w/mdapi/workspaces/tarball" "id:1001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
-      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
       # Windmill REST API uses DELETE on variables/scripts/flows/schedules
-      # and PATCH on most resources. CRS rule 911100 (Method Enforcement)
-      # reads tx.allowed_methods at phase 1; the SecAction must run
-      # AFTER the Include because crs-setup.conf resets allowed_methods
-      # back to its default. id:9001 avoids the id:900200 CRS collision.
-      # No apostrophes anywhere in this block: the outer modsecurity_rules
-      # directive is single-quoted and any apostrophe (even inside a #
-      # comment) closes the string at the nginx parser layer.
-      SecAction "id:9001,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # and PATCH on most resources. Declare id:900200 BEFORE Include so
+      # ModSec keeps OUR allowed_methods list (first-wins on duplicate
+      # IDs) and CRS's own crs-setup.conf id:900200 is dropped. Rule
+      # 911100 then sees the expanded list at phase:1 and does not add
+      # 5 to anomaly_score for DELETE/PATCH/PUT.
+      # No apostrophes in this block: the outer modsecurity_rules is
+      # single-quoted and the apostrophe closes the string at the nginx
+      # parser layer (2026-05-11 outage).
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
   tls:
     - secretName: windmill-cert
       hosts:

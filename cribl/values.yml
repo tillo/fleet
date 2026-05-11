@@ -33,18 +33,19 @@ ingress:
     nginx.ingress.kubernetes.io/modsecurity-snippet: |
       SecRuleEngine On
       SecDebugLog /tmp/modsec_debug.log
-      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
       # Cribl REST API uses PATCH/PUT/DELETE on routes, pipelines, users.
-      # Place the override AFTER the Include so it executes later in phase 1
-      # than the CRS crs-setup.conf id:900200 (which would otherwise reset
-      # NOTE: never put an apostrophe in a comment inside this snippet — the
-      # outer modsecurity_rules directive is single-quoted, and the apostrophe
-      # closes the string at the nginx parser layer (comments are stripped
-      # later). Found 2026-05-11 after a 4h ingress-nginx reload outage.
-      # tx.allowed_methods back to the GET/HEAD/POST/OPTIONS default before
-      # rule 911100 reads it). Uses id:9001 to avoid the 900200 collision —
-      # same pattern as spider3/sftpgo ingresses.
-      SecAction "id:9001,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # Pattern: declare id:900200 BEFORE Include. ModSec first-wins on
+      # duplicate IDs, so CRS crs-setup.conf id:900200 is silently
+      # dropped and our expanded tx.allowed_methods list survives. Rule
+      # 911100 then reads our list and does not add 5 to anomaly score
+      # for DELETE/PATCH/PUT. AFTER-Include with id:9001 looks correct
+      # but does NOT work: 911100 reads tx.allowed_methods at phase:1
+      # in load order, so any later SecAction runs too late.
+      # No apostrophes in this block: outer modsecurity_rules is
+      # single-quoted and the apostrophe closes the string at the nginx
+      # parser layer (2026-05-11 outage).
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
   tls:
     - secretName: cribl-cert
       hosts:
