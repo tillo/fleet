@@ -87,6 +87,19 @@ data:
         type: time
         start: "{{ today_at('00:00') }}"
         end: "{{ now() }}"
+      # Riemann integration of the synthetic 14-kW heating-power sensor →
+      # monotonically-increasing kWh counter, suitable for the Energy panel
+      # and long-term statistics.
+      - platform: integration
+        source: sensor.elco_heating_power
+        name: Elco heating energy total
+        unique_id: elco_heating_energy_total
+        unit_prefix: k
+        unit_time: h
+        method: left
+        round: 3
+        max_sub_interval:
+          minutes: 5
       - platform: integration
         source: sensor.freezer_power
         name: Freezer Energy Consumption
@@ -490,8 +503,23 @@ data:
                 {% else %}available
                 {% endif %}
               last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
-          # Cost estimate: heating runtime today × boiler input (kW) × CHF/kWh.
-          # Tunable constants are inline — swap the literals when rates change.
+          # Heating "power" — synthetic 14 kW when burner is firing, 0 otherwise.
+          # Feeds the Riemann-integration sensor (defined under top-level sensor:)
+          # which gives a monotonically-increasing kWh meter that the Energy panel
+          # can consume.
+          - name: "Elco heating power"
+            unique_id: elco_heating_power
+            unit_of_measurement: "W"
+            device_class: power
+            state_class: measurement
+            state: >-
+              {% if is_state('binary_sensor.elco_room_heating_is_active', 'on') %}14000
+              {% else %}0{% endif %}
+          # Daily cost estimate — today's runtime × kW × CHF/kWh. Resets at
+          # midnight via the underlying history_stats. NOT tracked as
+          # long-term statistics (state_class is intentionally omitted —
+          # midnight reset breaks total_increasing semantics; long-term
+          # tracking is on elco_heating_energy_total below + utility_meter).
           - name: "Elco heating cost today"
             unique_id: elco_heating_cost_today
             unit_of_measurement: "CHF"
@@ -500,6 +528,16 @@ data:
               {% set burner_kw = 14.0 %}
               {% set chf_per_kwh = 0.13 %}
               {{ (hours * burner_kw * chf_per_kwh) | round(2) }}
+            icon: mdi:currency-chf
+          # Long-term cost — current period of utility_meter × CHF/kWh.
+          - name: "Elco heating cost period"
+            unique_id: elco_heating_cost_period
+            unit_of_measurement: "CHF"
+            state_class: total_increasing
+            device_class: monetary
+            state: >-
+              {% set kwh = states('sensor.elco_heating_energy_period') | float(0) %}
+              {{ (kwh * 0.13) | round(2) }}
             icon: mdi:currency-chf
     input_number:
       elco_dhw_comfort_temp_set:
@@ -562,6 +600,19 @@ data:
     # input helper is wired here — input_text has a 255-char cap and a real
     # weekly plan JSON exceeds that. Users wanting to push schedule edits from
     # HA should fire an event or use a separate transport; see WRITES.md.
+    utility_meter:
+      # Wraps the Riemann-integrated heating energy into monthly buckets so
+      # the Energy panel can chart "heating last month" / "heating this month".
+      # cycle: monthly resets on the 1st at 00:00 local; cycle: daily for the
+      # daily-cost sensor that drives the dashboard tile.
+      elco_heating_energy_period:
+        source: sensor.elco_heating_energy_total
+        cycle: monthly
+        name: Elco heating energy period
+      elco_heating_energy_day:
+        source: sensor.elco_heating_energy_total
+        cycle: daily
+        name: Elco heating energy day
     automation elco:
       # Push alerts on any boiler-side error flip. Each *_error binary_sensor
       # already exists in the integration; without an explicit subscriber the
