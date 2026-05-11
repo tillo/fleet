@@ -15,8 +15,11 @@ metadata:
     nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
     nginx.ingress.kubernetes.io/modsecurity-snippet: |
       SecRuleEngine On
+      # SecAction id:900200 BEFORE Include — ModSec keeps first registration
+      # of a duplicate ID so CRS crs-setup.conf id:900200 is dropped and
+      # rule 911100 reads our expanded methods list. No apostrophes anywhere.
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
-      SecAction "id:9001,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
 spec:
   ingressClassName: nginx
   rules:

@@ -18,8 +18,14 @@ metadata:
     nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
     nginx.ingress.kubernetes.io/modsecurity-snippet: |
       SecRuleEngine On
+      # SFTPGo over WebDAV needs the full WebDAV verb set on top of
+      # PATCH/PUT/DELETE. Declare id:900200 BEFORE Include so it
+      # shadows CRS crs-setup.conf id:900200 (ModSec keeps first
+      # registration of a duplicate ID). Rule 911100 then reads our
+      # expanded list at phase:1 in load order and skips bumping
+      # anomaly_score. No apostrophes in this block.
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
-      SecAction "id:9001,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK"
 spec:
   ingressClassName: nginx
   rules:

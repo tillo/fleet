@@ -1,0 +1,48 @@
+## Rate-based PVC fill alert. Catches "this volume will be full within
+## 24h at the current rate" BEFORE the static FilesPVCNearlyFull
+## threshold (85%) hits. Useful when a transient runaway (log spew,
+## misbehaving service) starts filling a 100 GiB PVC at 5 GiB/hr —
+## the static threshold doesn't fire until 12+ hours later, the
+## predictive one fires within 30 min.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-pvc-growth
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-pvc-growth.predictive
+    rules:
+    - alert: PVCWillFillIn24h
+      ## predict_linear extrapolates the 6h slope of used_bytes into
+      ## the future. We alert when the predicted value 24h from now
+      ## exceeds capacity AND the volume is already past 50% full
+      ## (filters out tiny-PVC noise where the slope is huge but the
+      ## absolute number is small).
+      expr: |
+        (
+          predict_linear(kubelet_volume_stats_used_bytes[6h], 24*3600)
+          > kubelet_volume_stats_capacity_bytes
+        )
+        and on (namespace, persistentvolumeclaim) (
+          kubelet_volume_stats_used_bytes
+            / kubelet_volume_stats_capacity_bytes > 0.5
+        )
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} will fill in <24h at current rate"
+        description: |
+          The PVC is filling fast enough that linear extrapolation of the
+          last 6h of used_bytes growth predicts it will exceed capacity
+          within 24 hours. Static FilesPVCNearlyFull (85%) catches this
+          eventually but reacts too late if growth is rapid.
+
+          Investigate which process is writing: kubectl -n {{ $labels.namespace }}
+          exec into the pod, du -sh on the mount, identify the noisy
+          consumer. Common causes: app log rotation broken, transcoder
+          temp dir not being cleaned, runaway sync loop.
