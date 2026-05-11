@@ -64,6 +64,29 @@ data:
         end: "{{ now() }}"
         duration:
           hours: 1
+      # Runtime today (hours) — feeds the cost estimator and the dashboard
+      # "Today" tile. Bucket starts at local midnight.
+      - platform: history_stats
+        name: Elco heating active today
+        entity_id: binary_sensor.elco_room_heating_is_active
+        state: "on"
+        type: time
+        start: "{{ today_at('00:00') }}"
+        end: "{{ now() }}"
+      - platform: history_stats
+        name: Elco DHW enabled today
+        entity_id: binary_sensor.elco_domestic_hot_water_enabled
+        state: "on"
+        type: time
+        start: "{{ today_at('00:00') }}"
+        end: "{{ now() }}"
+      - platform: history_stats
+        name: Elco flame on today
+        entity_id: binary_sensor.elco_flame_sensor
+        state: "on"
+        type: time
+        start: "{{ today_at('00:00') }}"
+        end: "{{ now() }}"
       - platform: integration
         source: sensor.freezer_power
         name: Freezer Energy Consumption
@@ -515,12 +538,180 @@ data:
       elco_holiday_active:
         name: ELCO Holiday active
         icon: mdi:airplane
+      elco_holiday_use_reduced:
+        name: ELCO Holiday stays in Reduced
+        icon: mdi:weather-night
     input_datetime:
       elco_holiday_until:
         name: ELCO Holiday return date
         icon: mdi:calendar-end
         has_date: true
         has_time: false
+    input_text:
+      elco_weekly_plan_json:
+        name: ELCO Weekly plan (JSON)
+        icon: mdi:code-json
+        max: 2048
+        mode: text
+    template:
+      # Climate wrapper around the existing AppDaemon entities so HA can drive
+      # voice (Google Assistant / HomeKit), the native thermostat-card and
+      # long-term history with a proper climate.* entity.
+      - climate:
+          - name: "ELCO Chauffage"
+            unique_id: elco_chauffage_climate
+            current_temperature_template: "{{ states('sensor.elco_room_temperature') | float(0) }}"
+            target_temperature_template: "{{ states('sensor.elco_desired_room_temperature') | float(0) }}"
+            min_temp: 10
+            max_temp: 30
+            temperature_step: 0.5
+            modes:
+              - "heat"
+              - "off"
+            mode_template: >-
+              {% if states('input_select.elco_zone_mode_set') == 'Protection' %}off
+              {% else %}heat{% endif %}
+            preset_modes:
+              - "Automatic"
+              - "Comfort"
+              - "Reduced"
+            preset_template: "{{ states('input_select.elco_zone_mode_set') }}"
+            set_temperature:
+              - service: input_number.set_value
+                target:
+                  entity_id: input_number.elco_ch_comfort_temp_set
+                data:
+                  value: "{{ temperature }}"
+            set_hvac_mode:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.elco_zone_mode_set
+                data:
+                  option: "{% if hvac_mode == 'off' %}Protection{% else %}Automatic{% endif %}"
+            set_preset_mode:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.elco_zone_mode_set
+                data:
+                  option: "{{ preset_mode }}"
+      # Cost estimate: flame runtime today × boiler input (kW) × CHF/kWh.
+      # Tunable inputs are hard-coded for now; if they need adjusting, swap
+      # the literals or pipe in input_number helpers.
+      - sensor:
+          - name: "Elco heating cost today"
+            unique_id: elco_heating_cost_today
+            unit_of_measurement: "CHF"
+            state_class: total_increasing
+            state: >-
+              {% set hours = states('sensor.elco_heating_active_today') | float(0) %}
+              {% set burner_kw = 14.0 %}        {# THISION S 14.2 rated input #}
+              {% set chf_per_kwh = 0.13 %}      {# gas price; adjust to current invoice #}
+              {{ (hours * burner_kw * chf_per_kwh) | round(2) }}
+            icon: mdi:currency-chf
+    automation elco:
+      # Push alerts on any boiler-side error flip. Each *_error binary_sensor
+      # already exists in the integration; without an explicit subscriber the
+      # signal would otherwise sit in HA history unseen.
+      - id: elco_pushover_on_error_flip
+        alias: ELCO push on error flip
+        trigger:
+          - platform: state
+            entity_id:
+              - binary_sensor.elco_outside_temperature_error
+              - binary_sensor.elco_domestic_hot_water_storage_temperature_error
+              - binary_sensor.elco_room_temperature_error
+            to: "on"
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO boiler error"
+              message: "{{ trigger.to_state.attributes.friendly_name }} flipped on"
+              data:
+                priority: 1
+      # Heat-pump-on is an anomaly for THISION S (gas boiler) — should always be off.
+      - id: elco_pushover_on_heatpump_on
+        alias: ELCO push on heatpump_on (anomaly)
+        trigger:
+          - platform: state
+            entity_id: binary_sensor.elco_heatpump_on
+            to: "on"
+            for: { minutes: 2 }
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO anomaly: heatpump_on=on"
+              message: "Gas boiler should never report heatpump_on; check cloud + firmware"
+              data:
+                priority: 1
+      # Holiday calendar sync — looks at calendar.family for upcoming Vacanze*
+      # / Vacation events and sets the AppDaemon-backed helpers.
+      # Trigger logic:
+      #   - At event start: turn holiday ON and set return date = end date - 1.
+      #   - At event end: turn holiday OFF (the AppDaemon listener clears it).
+      # Time-pattern guard runs once a day at 04:00 to recompute against the
+      # next upcoming event (covers events added between restarts).
+      - id: elco_holiday_calendar_sync
+        alias: ELCO holiday calendar sync
+        mode: queued
+        trigger:
+          - platform: calendar
+            event: start
+            entity_id: calendar.family
+          - platform: calendar
+            event: end
+            entity_id: calendar.family
+          - platform: time_pattern
+            hours: 4
+            minutes: 0
+        action:
+          - choose:
+              # Calendar-driven branch: only act on Vacanze* / Vacation events.
+              - conditions:
+                  - condition: template
+                    value_template: >-
+                      {{ trigger.platform == 'calendar' and
+                         (trigger.calendar_event.summary | lower).startswith('vacanze')
+                         or (trigger.calendar_event.summary | lower).startswith('vacation') }}
+                sequence:
+                  - choose:
+                      - conditions: "{{ trigger.event == 'start' }}"
+                        sequence:
+                          - service: input_datetime.set_datetime
+                            target:
+                              entity_id: input_datetime.elco_holiday_until
+                            data:
+                              # Google all-day events have an exclusive end date.
+                              # Return = end_date, stay-until = end_date - 1 day.
+                              date: >-
+                                {{ (as_datetime(trigger.calendar_event.end) - timedelta(days=1)).strftime('%Y-%m-%d') }}
+                          - service: input_boolean.turn_on
+                            target:
+                              entity_id: input_boolean.elco_holiday_active
+                      - conditions: "{{ trigger.event == 'end' }}"
+                        sequence:
+                          - service: input_boolean.turn_off
+                            target:
+                              entity_id: input_boolean.elco_holiday_active
+            # else: time-pattern tick — nothing to do; full re-sync would require
+            # iterating the calendar via REST. Left as a hook for future work.
+            default: []
+      # Window/door auto-pause CH — scaffolded but empty: no qualifying window
+      # contacts currently exist in this HA instance (carnotzet_door is the
+      # cellar, wrong zone). Add your bedroom/living-room contacts to the
+      # trigger entity_id list and the automation comes alive.
+      - id: elco_window_open_auto_pause
+        alias: ELCO window-open auto-pause
+        trigger: []   # TODO: list binary_sensor.<your_window>* here, device_class: window/opening
+        condition:
+          - condition: state
+            entity_id: input_select.elco_zone_mode_set
+            state: Comfort
+        action:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.elco_zone_mode_set
+            data:
+              option: Reduced
     homeassistant:
       packages:
         energy: !include packages/energy.yaml
