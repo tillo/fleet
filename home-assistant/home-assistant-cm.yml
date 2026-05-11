@@ -503,28 +503,30 @@ data:
                 {% else %}available
                 {% endif %}
               last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
-          # Heating "power" — synthetic 14 kW when burner is firing, 0 otherwise.
-          # Feeds the Riemann-integration sensor (defined under top-level sensor:)
-          # which gives a monotonically-increasing kWh meter that the Energy panel
-          # can consume.
+          # Heating "power" — synthetic 14 kW when burner flame is firing, 0
+          # otherwise. The flame sensor is the only signal that correlates with
+          # gas consumption; room_heating_is_active just means the zone is in
+          # heating mode (not protection) — true ~all-day in winter regardless
+          # of burner state and would overstate consumption by ~10x.
           - name: "Elco heating power"
             unique_id: elco_heating_power
             unit_of_measurement: "W"
             device_class: power
             state_class: measurement
             state: >-
-              {% if is_state('binary_sensor.elco_room_heating_is_active', 'on') %}14000
+              {% if is_state('binary_sensor.elco_flame_sensor', 'on') %}14000
               {% else %}0{% endif %}
-          # Daily cost estimate — today's runtime × kW × CHF/kWh. Resets at
-          # midnight via the underlying history_stats. NOT tracked as
-          # long-term statistics (state_class is intentionally omitted —
-          # midnight reset breaks total_increasing semantics; long-term
-          # tracking is on elco_heating_energy_total below + utility_meter).
+          # Daily cost estimate — today's FLAME runtime (not zone-heating-active
+          # runtime) × kW × CHF/kWh. Resets at midnight via the underlying
+          # history_stats. NOT tracked as long-term statistics (state_class
+          # intentionally omitted — midnight reset breaks total_increasing
+          # semantics; long-term tracking is on elco_heating_energy_total
+          # below + utility_meter).
           - name: "Elco heating cost today"
             unique_id: elco_heating_cost_today
             unit_of_measurement: "CHF"
             state: >-
-              {% set hours = states('sensor.elco_heating_active_today') | float(0) %}
+              {% set hours = states('sensor.elco_flame_on_today') | float(0) %}
               {% set burner_kw = 14.0 %}
               {% set chf_per_kwh = 0.18099 %}    {# Energiapro Confort, 0-24'999 kWh/an, TTC, 2026-01 #}
               {{ (hours * burner_kw * chf_per_kwh) | round(2) }}
@@ -549,7 +551,7 @@ data:
           - name: "Elco gas price"
             unique_id: elco_gas_price
             unit_of_measurement: "CHF/kWh"
-            state: "0.18099"
+            state: "{{ 0.18099 }}"
             icon: mdi:cash
     input_number:
       elco_dhw_comfort_temp_set:
@@ -682,13 +684,20 @@ data:
             minutes: 0
         action:
           - choose:
-              # Calendar-driven branch: only act on Vacanze* / Vacation events.
+              # Calendar-driven branch: act on any summary that starts with
+              # a romance-language vacation prefix or English holiday/vacation.
+              # `vacan` covers vacanze, vacanza (it), vacances (fr),
+              # vacaciones (es), vacation/vacations (en). Parentheses are
+              # critical — without them, `and`/`or` precedence makes any
+              # non-calendar trigger with a stray 'vacation' string match.
               - conditions:
                   - condition: template
                     value_template: >-
                       {{ trigger.platform == 'calendar' and
-                         (trigger.calendar_event.summary | lower).startswith('vacanze')
-                         or (trigger.calendar_event.summary | lower).startswith('vacation') }}
+                         (
+                           (trigger.calendar_event.summary | lower).startswith('vacan')
+                           or (trigger.calendar_event.summary | lower).startswith('holiday')
+                         ) }}
                 sequence:
                   - choose:
                       - conditions: "{{ trigger.event == 'start' }}"
