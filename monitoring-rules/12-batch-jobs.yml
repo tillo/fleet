@@ -90,3 +90,75 @@ spec:
       annotations:
         summary: "Rancher backup {{ $labels.backup }} has no snapshot"
         description: "Backup CR exists but no snapshot has ever been recorded. Check schedule and storage location."
+
+  - name: app-batch-jobs.config-backup
+    rules:
+    - alert: ConfigBackupTargetFailed
+      expr: config_backup_target_success == 0
+      for: 10m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Config backup of {{ $labels.target }} failed"
+        description: "The daily config_backup job could not capture or upload config for {{ $labels.target }}. Check Windmill run logs."
+
+  - name: app-batch-jobs.rackspace-spend
+    rules:
+    - alert: RackspaceSpendOverCap
+      expr: rackspace_spot_proj_p50_usd_month > 100
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Rackspace Spot p50 projection ${{ $value | printf \"%.0f\" }}/mo exceeds $100"
+        description: "Projected monthly cost at p50 prices exceeds the cap. Review pool sizes and bids."
+
+  - name: app-batch-jobs.storage-health
+    rules:
+    - alert: StoragePoolUnhealthy
+      expr: storage_pool_healthy == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "TrueNAS pool {{ $labels.nas }}/{{ $labels.pool }} is unhealthy"
+        description: "ZFS pool {{ $labels.pool }} on {{ $labels.nas }} reports !healthy or status != ONLINE. Run midclt call pool.query on the host."
+
+    - alert: StoragePoolNearFull
+      expr: storage_pool_used_pct > 85
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "TrueNAS pool {{ $labels.nas }}/{{ $labels.pool }} is {{ $value | printf \"%.0f\" }}% full"
+        description: "ZFS pool capacity threshold reached. Prune snapshots or add disks."
+
+    - alert: SynologyArrayDegraded
+      expr: storage_synology_array_healthy == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Synology {{ $labels.nas }}/{{ $labels.array }} mdraid degraded"
+        description: "Linux mdraid array reports a missing/failed disk. Check /proc/mdstat on {{ $labels.nas }}."
+
+    - alert: SynologyVolumeNearFull
+      expr: storage_synology_volume_used_pct > 85
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Synology {{ $labels.nas }}{{ $labels.mount }} is {{ $value }}% full"
+        description: "Synology data volume capacity threshold reached."
