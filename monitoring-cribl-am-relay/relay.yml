@@ -1,0 +1,182 @@
+## Tiny relay: receive Cribl webhook POSTs (which have content-length /
+## end-of-body bugs in 4.17.1), re-POST cleanly to Alertmanager v2.
+##
+## Reads body via Transfer-Encoding-tolerant loop, fixes truncated JSON
+## arrays by appending a trailing `]` if the parse fails on `unexpected
+## EOF`, then forwards to AM. Returns 200 immediately so Cribl moves on.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cribl-am-relay-code
+  namespace: cribl
+data:
+  server.py: |
+    import json
+    import urllib.request
+    import urllib.error
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    AM_URL = "http://rancher-monitoring-alertmanager.cattle-monitoring-system.svc.cluster.local:9093/api/v2/alerts"
+
+    def forward_to_am(payload_bytes):
+        req = urllib.request.Request(
+            AM_URL, data=payload_bytes, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read()[:200]
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()[:200]
+        except Exception as e:
+            return 0, str(e).encode()[:200]
+
+    def host_to_component(host):
+        h = (host or "").lower()
+        if any(s in h for s in ("gitlab", "registry")): return "GitLab"
+        if any(s in h for s in ("mail", "rspamd", "roundcube")): return "Mail"
+        if any(s in h for s in ("idp", "auth", "keycloak", "lam")): return "Identity"
+        if any(s in h for s in ("files", "sftp", "cloud", "spider3", "owncloud")): return "Files"
+        if any(s in h for s in ("notes", "joplin")): return "Notes"
+        if any(s in h for s in ("home", "frigate", "appdaemon")): return "Home"
+        return "General"
+
+    def enrich_modsec_signal(sig):
+        """Cribl sends short signal {signal:'modsec_block',host,client_ip,rule_id,method};
+        relay expands to full AM alert with labels+annotations+endsAt."""
+        from datetime import datetime, timezone, timedelta
+        host = sig.get("host", "?")
+        ip   = sig.get("client_ip", "?")
+        rule = sig.get("rule_id", "?")
+        meth = sig.get("method", "?")
+        return {
+            "labels": {
+                "alertname": "ModSecBlockLikelyFalsePositive",
+                "team":      "mdapi",
+                "component": host_to_component(host),
+                "severity":  "warning",
+                "signal":    "modsec_block",
+                "host":      host,
+                "client_ip": ip,
+                "rule_id":   rule,
+                "method":    meth,
+            },
+            "annotations": {
+                "summary": f"WAF blocked {meth} {host} from {ip} (trusted source)",
+                "description": f"OWASP CRS rule {rule} blocked a {meth} on {host} from {ip}. Source is in a trusted CIDR (LAN/cluster/Tailscale) — likely false positive. Check ingress-nginx logs and add an exception if appropriate.",
+            },
+            "endsAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+        }
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            cl = int(self.headers.get("Content-Length", 0))
+            # Read whatever's available — Cribl lies about Content-Length.
+            try:
+                self.rfile._sock.settimeout(2)
+            except Exception:
+                pass
+            chunks = []
+            while True:
+                try:
+                    c = self.rfile.read1(8192) if cl == 0 else self.rfile.read(cl)
+                    if not c: break
+                    chunks.append(c)
+                    if cl: break
+                except Exception:
+                    break
+            body = b"".join(chunks)
+            actual = len(body)
+
+            # Try to parse as JSON. If unterminated, append `]` and try again.
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                try:
+                    parsed = json.loads(body + b"]")
+                    print(f"  RECOVERED truncated JSON ({actual}->good)", flush=True)
+                except Exception as e2:
+                    print(f"  PARSE FAILED: {e2!r} body={body!r}", flush=True)
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+            # Enrichment: Cribl pipelines send short {signal:'<sig>', ...} dicts;
+            # relay maps them to full AM PostableAlert objects.
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            alerts = []
+            for sig in parsed:
+                if not isinstance(sig, dict):
+                    continue
+                if sig.get("signal") == "modsec_block":
+                    alerts.append(enrich_modsec_signal(sig))
+                elif "labels" in sig and isinstance(sig.get("labels"), dict):
+                    # already a full alert
+                    alerts.append(sig)
+                else:
+                    print(f"  skip unrecognized payload: {sig!r}", flush=True)
+            if not alerts:
+                self.send_response(204); self.end_headers(); return
+
+            payload = json.dumps(alerts).encode()
+
+            status, resp = forward_to_am(payload)
+            print(f"  cl={cl} actual={actual} -> AM HTTP {status} ({resp[:80]!r})", flush=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"ok":true}')
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *a, **kw): pass
+
+    print(f"relay listening on :9999 → {AM_URL}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", 9999), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cribl-am-relay
+  namespace: cribl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cribl-am-relay
+  template:
+    metadata:
+      labels:
+        app: cribl-am-relay
+    spec:
+      containers:
+        - name: relay
+          image: python:3.13-alpine
+          command: [python3, /code/server.py]
+          ports:
+            - containerPort: 9999
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - name: code
+              mountPath: /code
+      volumes:
+        - name: code
+          configMap:
+            name: cribl-am-relay-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cribl-am-relay
+  namespace: cribl
+spec:
+  selector:
+    app: cribl-am-relay
+  ports:
+    - port: 9999
+      targetPort: 9999
