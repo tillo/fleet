@@ -526,7 +526,7 @@ data:
             state: >-
               {% set hours = states('sensor.elco_heating_active_today') | float(0) %}
               {% set burner_kw = 14.0 %}
-              {% set chf_per_kwh = 0.13 %}
+              {% set chf_per_kwh = 0.18099 %}    {# Energiapro Confort, 0-24'999 kWh/an, TTC, 2026-01 #}
               {{ (hours * burner_kw * chf_per_kwh) | round(2) }}
             icon: mdi:currency-chf
           # Long-term cost — current period of utility_meter × CHF/kWh.
@@ -537,16 +537,19 @@ data:
             device_class: monetary
             state: >-
               {% set kwh = states('sensor.elco_heating_energy_period') | float(0) %}
-              {{ (kwh * 0.13) | round(2) }}
+              {{ (kwh * 0.18099) | round(2) }}
             icon: mdi:currency-chf
           # Static gas price (CHF/kWh). Exposed as a sensor so HA Energy panel
           # can use "Use an entity tracking the price" rather than a hard-coded
           # number. Swap the literal when contract rates change; consumers
           # downstream pick up the new value automatically.
+          # Source: Energiapro tariff 2026-01 (Echallens distributor), Confort
+          # category, 0-24'999 kWh/an bracket, TTC = 18.099 ct./kWh. Update on
+          # contract renewal or when Energiapro publishes a new PDF.
           - name: "Elco gas price"
             unique_id: elco_gas_price
             unit_of_measurement: "CHF/kWh"
-            state: "0.13"
+            state: "0.18099"
             icon: mdi:cash
     input_number:
       elco_dhw_comfort_temp_set:
