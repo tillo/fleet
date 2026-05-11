@@ -40,3 +40,41 @@ spec:
         team: mdapi
       annotations:
         summary: "{{ $labels.namespace }}/{{ $labels.pod }} keycloak restarting frequently"
+
+    - alert: IdentityOpenLDAPUnavailable
+      ## Keycloak federates against openldap for primary user storage; if
+      ## openldap is down, Keycloak token-issue still works for cached
+      ## users but new logins and group lookups break.
+      expr: |
+        max by (namespace, deployment) (
+          kube_deployment_status_replicas_unavailable{
+            namespace="openldap", deployment=~"openldap|lam"
+          } > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Identity
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.deployment }} unavailable"
+        description: |
+          {{ $labels.deployment }} in openldap ns is down. Keycloak's user
+          federation lookups will fail; new SSO logins won't be able to
+          resolve users. `lam` is the web UI for openldap admin only —
+          openldap itself is the load-bearing one.
+
+    - alert: IdentityOpenLDAPCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="openldap", pod=~"openldap-.*|lam-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Identity
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} restarting frequently"

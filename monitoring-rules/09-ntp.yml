@@ -1,0 +1,57 @@
+## chrony stratum-1 NTP server in ntppool ns. The router (BPI-R4) and
+## every other host that asks ntp.mdapi.ch for time goes here. Single
+## replica, RWO storage for the local refclock state.
+##
+## Wire-level UDP probe via blackbox is skipped: blackbox-exporter's
+## tcp prober doesn't reliably do UDP/NTP. Coverage here is:
+##   1. Deployment availability (kube-state-metrics)
+##   2. Crashloop detection
+##
+## For "is chrony actually serving and stratum-1?" — covered by the
+## BPI-R4 health flow (bpir4_health.py pushes uptime+load that depend
+## on chrony being reachable) and by host-side `chronyc tracking` on
+## the NAS / mbptillo (logged externally).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ntp
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-ntp.workload
+    rules:
+    - alert: NtpChronyUnavailable
+      expr: |
+        max by (namespace) (
+          kube_deployment_status_replicas_unavailable{
+            namespace="ntppool", deployment="chrony"
+          } > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "chrony stratum-1 server down"
+        description: |
+          ntp.mdapi.ch (chrony) is unavailable. Every host syncing
+          against it (router, NAS, mbptillo) will drift. Watch for
+          chrony-side time-source loss too if this is a USB-GPS issue
+          — see f/infra_health/bpir4_health.py + akri usb-drift watch.
+
+    - alert: NtpChronyCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="ntppool", pod=~"chrony-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "ntppool/{{ $labels.pod }} crash-looping"

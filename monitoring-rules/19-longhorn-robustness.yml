@@ -1,0 +1,52 @@
+## Longhorn volume robustness alert.
+##
+## `longhorn_volume_robustness` is exposed by longhorn-manager with
+## these enum values:
+##   0 = unknown    (detached / no replicas / just created — IGNORE)
+##   1 = healthy
+##   2 = degraded   (one replica failed; volume still serves I/O)
+##   3 = faulted    (all replicas down; volume unusable)
+##
+## Catches the state BEFORE I/O errors surface in pod logs. The
+## existing relay-side PodIOError detector only fires when a workload
+## actually tries to read/write and fails — degraded volumes with
+## quiescent workloads (overnight, etc.) go unalerted there.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-longhorn-robustness
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-longhorn-robustness.workload
+    rules:
+    - alert: LonghornVolumeDegraded
+      expr: longhorn_volume_robustness == 2
+      for: 15m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} degraded"
+        description: |
+          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }}) is
+          attached but running with fewer replicas than configured. Auto-recovery is
+          usually fine; if it persists > 15m the rebuild has stalled. Check
+          `kubectl -n longhorn-system get volume {{ $labels.volume }} -o yaml`.
+
+    - alert: LonghornVolumeFaulted
+      expr: longhorn_volume_robustness == 3
+      for: 2m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} FAULTED"
+        description: |
+          All replicas down on volume {{ $labels.volume }}. Workloads using PVC
+          {{ $labels.pvc_namespace }}/{{ $labels.pvc }} will get I/O errors. Check
+          longhorn-system events and node disk state. Restore from backup if
+          replicas can't be recovered.
