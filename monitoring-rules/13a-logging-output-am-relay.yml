@@ -1,0 +1,34 @@
+## ClusterOutput → cribl-am-relay (direct).
+##
+## Why this exists alongside the cribl ClusterOutput: Cribl 4.17.1's
+## webhook destination truncates per-event bodies to ~150-250B and
+## lies about Content-Length, so any Cribl pipeline emitting an AM
+## alert has its labels/annotations chopped. This output sidesteps
+## Cribl entirely — fluentd ships full untruncated log records straight
+## to the relay, which parses them and POSTs proper PostableAlerts.
+##
+## The relay accepts the same wire format Cribl httpraw does (a JSON
+## array of fluentd records). It detects ModSecurity blocks in the
+## `log` field, extracts client/host/uri/rule_id/method/msg, and only
+## emits an AM alert when the source IP is in a trusted CIDR.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterOutput
+metadata:
+  name: am-relay
+  namespace: cattle-logging-system
+spec:
+  http:
+    endpoint: http://cribl-am-relay.cribl.svc.cluster.local:9999/ingest
+    content_type: application/json
+    json_array: true
+    buffer:
+      type: memory
+      flush_mode: interval
+      flush_interval: 5s
+      retry_type: exponential_backoff
+      retry_max_times: 3
+      retry_max_interval: 30s
+      chunk_limit_size: 1m
+      total_limit_size: 16m
+      overflow_action: drop_oldest_chunk

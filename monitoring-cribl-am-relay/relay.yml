@@ -13,8 +13,10 @@ metadata:
 data:
   server.py: |
     import json
+    import re
     import urllib.request
     import urllib.error
+    from datetime import datetime, timezone, timedelta
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     AM_URL = "http://rancher-monitoring-alertmanager.cattle-monitoring-system.svc.cluster.local:9093/api/v2/alerts"
@@ -42,14 +44,39 @@ data:
         if any(s in h for s in ("home", "frigate", "appdaemon")): return "Home"
         return "General"
 
-    def enrich_modsec_signal(sig):
-        """Cribl sends short signal {signal:'modsec_block',host,client_ip,rule_id,method};
-        relay expands to full AM alert with labels+annotations+endsAt."""
-        from datetime import datetime, timezone, timedelta
-        host = sig.get("host", "?")
-        ip   = sig.get("client_ip", "?")
-        rule = sig.get("rule_id", "?")
-        meth = sig.get("method", "?")
+    TRUSTED_IP_RE = re.compile(
+        r"^(?:192\.168\.|10\.|100\.(?:6[4-9]|[7-9]\d|1[0-2]\d)\.)"
+    )
+
+    MODSEC_RE = re.compile(r"ModSecurity: Access denied")
+
+    def extract_modsec_fields(line):
+        """Pull client/host/uri/id/method/msg/score from a nginx-ingress
+        ModSec error.log line. Returns None if line isn't a ModSec
+        block."""
+        if "ModSecurity: Access denied" not in line:
+            return None
+        def grab(pat):
+            m = re.search(pat, line)
+            return m.group(1) if m else ""
+        return {
+            "client_ip": grab(r"\[client ([\d.]+)\]"),
+            "host":      grab(r'\[hostname "([^"]+)"\]'),
+            "uri":       grab(r'\[uri "([^"]+)"\]'),
+            "rule_id":   grab(r'\[id "(\d+)"\]'),
+            "method":    grab(r'request: "(\w+) '),
+            "msg":       grab(r'\[msg "([^"]+)"\]'),
+            "score":     grab(r"Total Score: (\d+)"),
+        }
+
+    def build_modsec_alert(fields):
+        host = fields.get("host") or "unknown"
+        ip   = fields.get("client_ip") or "unknown"
+        rule = fields.get("rule_id") or "unknown"
+        meth = fields.get("method") or "unknown"
+        uri  = (fields.get("uri") or "")[:80]
+        msg  = (fields.get("msg") or "")[:100]
+        score = fields.get("score") or "?"
         return {
             "labels": {
                 "alertname": "ModSecBlockLikelyFalsePositive",
@@ -64,10 +91,27 @@ data:
             },
             "annotations": {
                 "summary": f"WAF blocked {meth} {host} from {ip} (trusted source)",
-                "description": f"OWASP CRS rule {rule} blocked a {meth} on {host} from {ip}. Source is in a trusted CIDR (LAN/cluster/Tailscale) — likely false positive. Check ingress-nginx logs and add an exception if appropriate.",
+                "description": (
+                    f"OWASP CRS rule {rule} blocked {meth} {host}{uri} from {ip}. "
+                    f"Anomaly score {score}. ModSec msg: {msg}. "
+                    f"Source is in a trusted CIDR (LAN/cluster/Tailscale) — "
+                    f"likely false positive."
+                ),
             },
             "endsAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
         }
+
+    def enrich_modsec_signal(sig):
+        """Legacy: Cribl-built short signal dict → full AM alert.
+        Kept for backwards compatibility with the cribl_blocks_to_am
+        pipeline, which doesn't see the full log line."""
+        return build_modsec_alert({
+            "client_ip": sig.get("client_ip", ""),
+            "host":      sig.get("host", ""),
+            "rule_id":   sig.get("rule_id", ""),
+            "method":    sig.get("method", ""),
+            "uri":       sig.get("uri", ""),
+        })
 
     class H(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -102,21 +146,36 @@ data:
                     self.end_headers()
                     return
 
-            # Enrichment: Cribl pipelines send short {signal:'<sig>', ...} dicts;
-            # relay maps them to full AM PostableAlert objects.
+            # Two ingestion paths:
+            # 1) /ingest — fluentd ships a JSON array of records, each with
+            #    a `log` field. We do our own ModSec detection + extraction
+            #    on the full untruncated log line. Skips Cribl entirely.
+            # 2) any other path — legacy Cribl short-signal format.
             if isinstance(parsed, dict):
                 parsed = [parsed]
+
             alerts = []
-            for sig in parsed:
-                if not isinstance(sig, dict):
+            for ev in parsed:
+                if not isinstance(ev, dict):
                     continue
-                if sig.get("signal") == "modsec_block":
-                    alerts.append(enrich_modsec_signal(sig))
-                elif "labels" in sig and isinstance(sig.get("labels"), dict):
-                    # already a full alert
-                    alerts.append(sig)
+
+                if self.path == "/ingest":
+                    line = ev.get("log") or ev.get("message") or ev.get("_raw") or ""
+                    line = line if isinstance(line, str) else str(line)
+                    fields = extract_modsec_fields(line)
+                    if not fields:
+                        continue
+                    ip = fields.get("client_ip", "")
+                    if not TRUSTED_IP_RE.match(ip):
+                        continue  # untrusted source — bot scan, drop
+                    alerts.append(build_modsec_alert(fields))
+                elif ev.get("signal") == "modsec_block":
+                    alerts.append(enrich_modsec_signal(ev))
+                elif "labels" in ev and isinstance(ev.get("labels"), dict):
+                    alerts.append(ev)
                 else:
-                    print(f"  skip unrecognized payload: {sig!r}", flush=True)
+                    print(f"  skip unrecognized payload: {str(ev)[:120]!r}", flush=True)
+
             if not alerts:
                 self.send_response(204); self.end_headers(); return
 
