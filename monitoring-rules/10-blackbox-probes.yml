@@ -19,7 +19,7 @@ metadata:
 spec:
   jobName: mail-smtp
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: smtp_banner
   targets:
     staticConfig:
@@ -40,7 +40,7 @@ metadata:
 spec:
   jobName: mail-imaps
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: imaps_starttls
   targets:
     staticConfig:
@@ -61,7 +61,7 @@ metadata:
 spec:
   jobName: mail-webmail
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_any_redirect
   targets:
     staticConfig:
@@ -84,12 +84,15 @@ metadata:
 spec:
   jobName: identity-keycloak
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_2xx
   targets:
     staticConfig:
       static:
-        - https://idp.mdapi.ch/health/ready
+        ## Keycloak doesn't expose /health/ready on the user-facing
+        ## ingress in this version. /realms/master returns the realm
+        ## metadata JSON with a 200 when the server is up.
+        - https://idp.mdapi.ch/realms/master
       labels:
         component: Identity
         team: mdapi
@@ -107,7 +110,7 @@ metadata:
 spec:
   jobName: gitlab-webservice
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_2xx
   targets:
     staticConfig:
@@ -128,7 +131,7 @@ metadata:
 spec:
   jobName: gitlab-registry
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_any_redirect
   targets:
     staticConfig:
@@ -151,7 +154,7 @@ metadata:
 spec:
   jobName: files
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_any_redirect
   targets:
     staticConfig:
@@ -175,7 +178,7 @@ metadata:
 spec:
   jobName: notes-joplin
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_any_redirect
   targets:
     staticConfig:
@@ -198,7 +201,7 @@ metadata:
 spec:
   jobName: websites
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: http_any_redirect
   targets:
     staticConfig:
@@ -228,12 +231,18 @@ metadata:
 spec:
   jobName: dns-public
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: dns_mdapi
   targets:
     staticConfig:
       static:
-        - dns.mdapi.ch:53
+        ## LoadBalancer external IP of the nameserver-dns service. The
+        ## dns.mdapi.ch A record points at the OLD nameserver IP
+        ## (192.168.1.191) which doesn't serve port 53 — TODO fix the
+        ## A record in BIND once the right config is identified. For
+        ## now probe the actual LB IP so we verify the authoritative
+        ## resolver is up.
+        - 192.168.1.53:53
       labels:
         component: DNS
         team: mdapi
@@ -255,7 +264,7 @@ metadata:
 spec:
   jobName: dns-external
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: dns_mdapi
   targets:
     staticConfig:
@@ -276,7 +285,7 @@ metadata:
 spec:
   jobName: dns-external
   prober:
-    url: blackbox:9115
+    url: blackbox.monitoring.svc.cluster.local:9115
   module: dns_mdapi
   targets:
     staticConfig:
