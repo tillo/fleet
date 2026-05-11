@@ -490,6 +490,17 @@ data:
                 {% else %}available
                 {% endif %}
               last_update: "{{ as_timestamp(states.input_text.applefindmy.last_updated)|timestamp_custom ('%d/%m/%Y %H:%Mh') }}"
+          # Cost estimate: heating runtime today × boiler input (kW) × CHF/kWh.
+          # Tunable constants are inline — swap the literals when rates change.
+          - name: "Elco heating cost today"
+            unique_id: elco_heating_cost_today
+            unit_of_measurement: "CHF"
+            state: >-
+              {% set hours = states('sensor.elco_heating_active_today') | float(0) %}
+              {% set burner_kw = 14.0 %}
+              {% set chf_per_kwh = 0.13 %}
+              {{ (hours * burner_kw * chf_per_kwh) | round(2) }}
+            icon: mdi:currency-chf
     input_number:
       elco_dhw_comfort_temp_set:
         name: ELCO DHW comfort setpoint
@@ -547,67 +558,10 @@ data:
         icon: mdi:calendar-end
         has_date: true
         has_time: false
-    input_text:
-      elco_weekly_plan_json:
-        name: ELCO Weekly plan (JSON)
-        icon: mdi:code-json
-        max: 2048
-        mode: text
-    template:
-      # Climate wrapper around the existing AppDaemon entities so HA can drive
-      # voice (Google Assistant / HomeKit), the native thermostat-card and
-      # long-term history with a proper climate.* entity.
-      - climate:
-          - name: "ELCO Chauffage"
-            unique_id: elco_chauffage_climate
-            current_temperature_template: "{{ states('sensor.elco_room_temperature') | float(0) }}"
-            target_temperature_template: "{{ states('sensor.elco_desired_room_temperature') | float(0) }}"
-            min_temp: 10
-            max_temp: 30
-            temperature_step: 0.5
-            modes:
-              - "heat"
-              - "off"
-            mode_template: >-
-              {% if states('input_select.elco_zone_mode_set') == 'Protection' %}off
-              {% else %}heat{% endif %}
-            preset_modes:
-              - "Automatic"
-              - "Comfort"
-              - "Reduced"
-            preset_template: "{{ states('input_select.elco_zone_mode_set') }}"
-            set_temperature:
-              - service: input_number.set_value
-                target:
-                  entity_id: input_number.elco_ch_comfort_temp_set
-                data:
-                  value: "{{ temperature }}"
-            set_hvac_mode:
-              - service: input_select.select_option
-                target:
-                  entity_id: input_select.elco_zone_mode_set
-                data:
-                  option: "{% if hvac_mode == 'off' %}Protection{% else %}Automatic{% endif %}"
-            set_preset_mode:
-              - service: input_select.select_option
-                target:
-                  entity_id: input_select.elco_zone_mode_set
-                data:
-                  option: "{{ preset_mode }}"
-      # Cost estimate: flame runtime today × boiler input (kW) × CHF/kWh.
-      # Tunable inputs are hard-coded for now; if they need adjusting, swap
-      # the literals or pipe in input_number helpers.
-      - sensor:
-          - name: "Elco heating cost today"
-            unique_id: elco_heating_cost_today
-            unit_of_measurement: "CHF"
-            state_class: total_increasing
-            state: >-
-              {% set hours = states('sensor.elco_heating_active_today') | float(0) %}
-              {% set burner_kw = 14.0 %}        {# THISION S 14.2 rated input #}
-              {% set chf_per_kwh = 0.13 %}      {# gas price; adjust to current invoice #}
-              {{ (hours * burner_kw * chf_per_kwh) | round(2) }}
-            icon: mdi:currency-chf
+    # NOTE: schedule write-back is exposed by the AppDaemon listener but no HA
+    # input helper is wired here — input_text has a 255-char cap and a real
+    # weekly plan JSON exceeds that. Users wanting to push schedule edits from
+    # HA should fire an event or use a separate transport; see WRITES.md.
     automation elco:
       # Push alerts on any boiler-side error flip. Each *_error binary_sensor
       # already exists in the integration; without an explicit subscriber the
