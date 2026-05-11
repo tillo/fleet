@@ -556,6 +556,40 @@ data:
             unit_of_measurement: "CHF/kWh"
             state: "{{ 0.18099 }}"
             icon: mdi:cash
+      # Trigger-based template: periodically call calendar.get_events to fetch
+      # the next 365 days of events from calendar.family and surface those
+      # matching the holiday-automation prefix (vacan*/holiday*). The dashboard
+      # holiday card reads `events` from this sensor's attributes.
+      - trigger:
+          - platform: homeassistant
+            event: start
+          - platform: time_pattern
+            hours: '*'
+            minutes: 7
+        action:
+          - service: calendar.get_events
+            target:
+              entity_id: calendar.family
+            data:
+              duration:
+                hours: 8760    # ~365 days
+            response_variable: agenda
+        sensor:
+          - name: "Elco upcoming holidays"
+            unique_id: elco_upcoming_holidays
+            icon: mdi:airplane-clock
+            state: >-
+              {% set events = (agenda.get('calendar.family', {}).get('events') or [])
+                 | selectattr('summary', 'defined')
+                 | selectattr('summary', 'match', '(?i)^(vacan|holiday)')
+                 | list %}
+              {{ events | count }}
+            attributes:
+              events: >-
+                {{ (agenda.get('calendar.family', {}).get('events') or [])
+                   | selectattr('summary', 'defined')
+                   | selectattr('summary', 'match', '(?i)^(vacan|holiday)')
+                   | list }}
     input_number:
       elco_dhw_comfort_temp_set:
         name: ELCO DHW comfort setpoint
