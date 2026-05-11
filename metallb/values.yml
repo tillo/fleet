@@ -1,0 +1,22 @@
+# Phase 1: install MetalLB with no pools.
+# Without an IPAddressPool + L2Advertisement, the controller and speaker
+# do nothing — they sit idle alongside PureLB. Pools added in Phase 2+.
+#
+# L2 mode only (no FRR/BGP for now). RKE2 + canal compatible.
+# Coexists with Harvester's kube-vip (different IP ranges, kube-vip's
+# enable_service_security gates it to opted-in Services only).
+
+speaker:
+  # Drop the FRR sidecar — we're L2-only.
+  frr:
+    enabled: false
+  # tolerate Harvester taints so speaker runs on every node
+  tolerations:
+    - operator: Exists
+      effect: NoSchedule
+    - operator: Exists
+      effect: NoExecute
+
+controller:
+  # 1 replica is fine for HA — controller only assigns IPs, not data path
+  replicaCount: 1
