@@ -556,16 +556,23 @@ data:
             unit_of_measurement: "CHF/kWh"
             state: "{{ 0.18099 }}"
             icon: mdi:cash
-      # Trigger-based template: periodically call calendar.get_events to fetch
-      # the next 365 days of events from calendar.family and surface those
-      # matching the holiday-automation prefix (vacan*/holiday*). The dashboard
-      # holiday card reads `events` from this sensor's attributes.
+      # Trigger-based template: re-fetches calendar.get_events on multiple
+      # signals so the dashboard reflects calendar changes promptly:
+      #   - HA start (initial seed)
+      #   - every 15 min (aligns with HA's own Google Calendar poll cadence)
+      #   - on calendar.family state change (catches edits to the "next" event)
+      #   - on a custom `elco_refresh_holidays` event (manual button hook)
+      # The custom event makes far-future edits visible without waiting for the
+      # 15-min tick — HA's Google poll alone won't notice them.
       - trigger:
           - platform: homeassistant
             event: start
           - platform: time_pattern
-            hours: '*'
-            minutes: 7
+            minutes: '/15'
+          - platform: state
+            entity_id: calendar.family
+          - platform: event
+            event_type: elco_refresh_holidays
         action:
           - service: calendar.get_events
             target:
@@ -647,6 +654,10 @@ data:
         icon: mdi:calendar-end
         has_date: true
         has_time: false
+    input_button:
+      elco_holidays_refresh:
+        name: ELCO Refresh upcoming holidays
+        icon: mdi:calendar-refresh
     # NOTE: schedule write-back is exposed by the AppDaemon listener but no HA
     # input helper is wired here — input_text has a 255-char cap and a real
     # weekly plan JSON exceeds that. Users wanting to push schedule edits from
@@ -775,6 +786,20 @@ data:
               entity_id: input_select.elco_zone_mode_set
             data:
               option: Reduced
+      # Manual "refresh" pipeline: button → force HA to poll calendar.family
+      # AND fire event for the template sensor to recompute. The combined hop
+      # catches both near-future (covered by HA's poll → state_changed) and
+      # far-future (covered by the event-triggered re-run) edits.
+      - id: elco_holidays_refresh
+        alias: ELCO refresh upcoming holidays
+        trigger:
+          - platform: state
+            entity_id: input_button.elco_holidays_refresh
+        action:
+          - service: homeassistant.update_entity
+            target:
+              entity_id: calendar.family
+          - event: elco_refresh_holidays
     homeassistant:
       packages:
         energy: !include packages/energy.yaml
