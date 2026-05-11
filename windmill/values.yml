@@ -25,6 +25,15 @@ ingress:
       SecRuleEngine On
       SecRule REQUEST_URI "@beginsWith /api/w/mdapi/workspaces/tarball" "id:1001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # Windmill REST API uses DELETE on variables/scripts/flows/schedules
+      # and PATCH on most resources. CRS rule 911100 (Method Enforcement)
+      # reads tx.allowed_methods at phase 1; the SecAction must run
+      # AFTER the Include because crs-setup.conf resets allowed_methods
+      # back to its default. id:9001 avoids the id:900200 CRS collision.
+      # No apostrophes anywhere in this block: the outer modsecurity_rules
+      # directive is single-quoted and any apostrophe (even inside a #
+      # comment) closes the string at the nginx parser layer.
+      SecAction "id:9001,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
   tls:
     - secretName: windmill-cert
       hosts:
