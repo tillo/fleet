@@ -2,15 +2,19 @@
 # Without an IPAddressPool + L2Advertisement, the controller and speaker
 # do nothing — they sit idle alongside PureLB. Pools added in Phase 2+.
 #
-# L2 mode only (no FRR/BGP for now). RKE2 + canal compatible.
+# L2 mode only (no FRR/BGP). RKE2 + canal compatible.
 # Coexists with Harvester's kube-vip (different IP ranges, kube-vip's
 # enable_service_security gates it to opted-in Services only).
 
+# Metrics port off 7472 — PureLB's lbnodeagent already binds host:7472
+# and the speaker DaemonSet runs hostNetwork, so the default collides
+# and pods stay Pending until PureLB is gone.
+prometheus:
+  metricsPort: 7475
+
 speaker:
-  # Drop the FRR sidecar — we're L2-only.
   frr:
     enabled: false
-  # tolerate Harvester taints so speaker runs on every node
   tolerations:
     - operator: Exists
       effect: NoSchedule
@@ -18,5 +22,4 @@ speaker:
       effect: NoExecute
 
 controller:
-  # 1 replica is fine for HA — controller only assigns IPs, not data path
   replicaCount: 1
