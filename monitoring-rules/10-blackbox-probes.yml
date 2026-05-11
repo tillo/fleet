@@ -238,3 +238,51 @@ spec:
         component: DNS
         team: mdapi
         probe: dns_authoritative
+---
+## External-internet view: arbitrary recursive resolvers must be able
+## to resolve mdapi.ch A. Verifies the full delegation chain (registrar
+## → public NS → authoritative response) is reachable from outside.
+## Two independent resolvers so a single Cloudflare/Google outage
+## doesn't false-fire — alert only fires if both consecutive probes
+## fail.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-external-cloudflare
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-external
+  prober:
+    url: blackbox:9115
+  module: dns_mdapi
+  targets:
+    staticConfig:
+      static:
+        - 1.1.1.1:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: dns_external_cloudflare
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-external-google
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-external
+  prober:
+    url: blackbox:9115
+  module: dns_mdapi
+  targets:
+    staticConfig:
+      static:
+        - 8.8.8.8:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: dns_external_google
