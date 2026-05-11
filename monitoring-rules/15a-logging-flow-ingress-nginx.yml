@@ -1,0 +1,21 @@
+## Targeted ClusterFlow shipping ONLY rke2-ingress-nginx-controller logs
+## to Cribl. The catch-all `all-logs` flow excludes kube-system entirely
+## (calico/kube-proxy noise drowns the live tail) but we still want
+## ingress logs there for ModSec block detection and access-pattern
+## analysis. Selecting by app.kubernetes.io/name avoids re-enabling the
+## rest of kube-system.
+
+apiVersion: logging.banzaicloud.io/v1beta1
+kind: ClusterFlow
+metadata:
+  name: ingress-nginx-logs
+  namespace: cattle-logging-system
+spec:
+  match:
+  - select:
+      labels:
+        app.kubernetes.io/name: rke2-ingress-nginx
+      namespaces:
+      - kube-system
+  globalOutputRefs:
+  - cribl
