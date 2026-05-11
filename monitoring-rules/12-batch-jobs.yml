@@ -162,3 +162,241 @@ spec:
       annotations:
         summary: "Synology {{ $labels.nas }}{{ $labels.mount }} is {{ $value }}% full"
         description: "Synology data volume capacity threshold reached."
+
+  - name: app-batch-jobs.bpir4
+    rules:
+    - alert: Bpir4WanDown
+      expr: bpir4_wan_up == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 WAN is down"
+        description: "PPPoE WAN reports no IP. HA storm/PON automations may already be acting; this is the slow-cron-side confirmation."
+    - alert: Bpir4OverlayNearFull
+      expr: bpir4_overlay_used_pct > 80
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 /overlay is {{ $value }}% full"
+        description: "Router overlay filesystem near full — config writes may fail."
+    - alert: Bpir4LoadHigh
+      expr: bpir4_load_1m > 2
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 load1 is {{ $value }}"
+        description: "Sustained load on the router. Check page-pool / SFP storm sensors."
+    - alert: Bpir4KernelErrors
+      expr: bpir4_kernel_errors_count > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 has {{ $value }} kernel error(s) in logread"
+        description: "Recent logread output contains kernel error/oom/panic/oops lines. Inspect via boot-reason.sh / pstore."
+
+  - name: app-batch-jobs.gitlab-minio
+    rules:
+    - alert: MinioDown
+      expr: gitlab_minio_up == 0
+      for: 10m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "MinIO /minio/health/live failing"
+        description: "MinIO at minio.home.tillo.ch is not responding. Affects GitLab backups, runner cache, Rancher backup."
+    - alert: GitlabBackupStale
+      expr: gitlab_backup_age_days > 2
+      for: 30m
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "GitLab backup is {{ $value }}d old"
+        description: "Newest object in gitlab-backups bucket is older than the 2-day threshold."
+    - alert: GitlabRunnerPodNotReady
+      expr: gitlab_runner_pod_ready < gitlab_runner_pod_desired
+      for: 15m
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "GitLab runner pod {{ $value }} of desired ready"
+        description: "Runner deployment in bootstrap ns not at full strength."
+    - alert: GitlabGroupRunnersOffline
+      expr: gitlab_group_runners_offline > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab group runner(s) offline"
+        description: "One or more group runners are not online. Check the runner host."
+
+  - name: app-batch-jobs.cve-scan
+    rules:
+    - alert: PodImageCriticalCves
+      expr: max by (image) (pod_image_cve_count{severity="critical"}) > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Critical CVE(s) found in image {{ $labels.image }}"
+        description: "Most recent grype scan reported >= 1 CRITICAL CVE. Pin a fixed version or pull-policy=Always to refresh."
+
+  - name: app-batch-jobs.cluster-waste
+    rules:
+    - alert: ClusterPendingPodsTooLong
+      expr: cluster_pending_pods_count > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} pod(s) Pending > 60min"
+        description: "User workloads stuck in Pending. Check scheduler events / resource pressure / PVC bind."
+    - alert: ClusterUnknownNodeAutoDeleted
+      expr: cluster_unknown_nodes_deleted_this_run > 0
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Auto-deleted {{ $value }} Unknown-state node(s)"
+        description: "resource_waste.py removed nodes stuck in NotReady > 15min. New nodes should re-join automatically."
+
+  - name: app-batch-jobs.upgrade
+    rules:
+    - alert: ComponentUpgradeAvailable
+      ## info-only — surfaces upgrade availability so it appears as an
+      ## AM-tracked alert (firing + resolved) rather than a one-shot
+      ## Monday-morning Pushover that needs manual triage.
+      expr: component_upgrade_available == 1
+      for: 30m
+      labels:
+        severity: info
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }} upgrade available"
+        description: "{{ $labels.component }} has a newer same-minor release. Plan an upgrade window."
+
+  - name: app-batch-jobs.host-updates
+    rules:
+    - alert: HostUpdateAvailable
+      expr: host_update_available == 1
+      for: 30m
+      labels:
+        severity: info
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.host }} ({{ $labels.kind }}) has updates available"
+        description: "Schedule an update window for {{ $labels.host }}."
+
+  - name: app-batch-jobs.longhorn-labels
+    rules:
+    - alert: LonghornLabelEnforcerPatched
+      ## Fires when a run actually patched labels — signals that a new
+      ## PVC appeared without the recurring-job labels. Tells you the
+      ## platform default is missing on a newly created workload.
+      expr: longhorn_label_enforcer_pvcs_patched > 0
+      labels:
+        severity: info
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn label enforcer patched {{ $value }} PVC(s)"
+        description: "New PVC(s) appeared without the standard recurring-job labels. The enforcer added them; consider where the default should live (Helm chart? Operator?)."
+    - alert: LonghornLabelEnforcerErrors
+      expr: longhorn_label_enforcer_pvcs_errors > 0
+      for: 10m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn label enforcer had {{ $value }} error(s)"
+        description: "Enforcer failed to patch labels on one or more PVCs. Check the Windmill run."
+
+  - name: app-batch-jobs.infra-health
+    rules:
+    - alert: FleetBundlesNotReady
+      expr: fleet_bundle_deployments_not_ready > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} Fleet BundleDeployment(s) not Ready"
+        description: "Check via `kubectl --context mdapi-rancher get bundledeployments -A | grep -v Ready`."
+    - alert: CertExpiringSoon
+      expr: cert_expiry_days < 30
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Cert {{ $labels.namespace }}/{{ $labels.cert }} expires in {{ $value }}d"
+        description: "cert-manager Certificate close to expiry; investigate renewal."
+    - alert: LonghornBackupStale
+      expr: longhorn_backup_age_days > 70
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn backup {{ $labels.namespace }}/{{ $labels.pvc }} is {{ $value }}d old"
+        description: "PVC backup older than the 70d staleness threshold."
+    - alert: LonghornBackupMissing
+      expr: longhorn_backup_age_days == -1
+      for: 1d
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn backup {{ $labels.namespace }}/{{ $labels.pvc }} never recorded"
+        description: "BackupVolume exists but lastBackupAt is empty. Check Longhorn recurring jobs."
+    - alert: LonghornVolumeUnhealthy
+      expr: longhorn_volume_unhealthy == 1
+      for: 15m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.namespace }}/{{ $labels.pvc }} unhealthy"
+        description: "Robustness != healthy or state in (faulted, error)."
+    - alert: NodeDiskHigh
+      expr: node_disk_used_pct > 80
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.node }}:{{ $labels.mount }} is {{ $value }}% full"
+        description: "Node filesystem usage > 80%. Investigate growth source."
