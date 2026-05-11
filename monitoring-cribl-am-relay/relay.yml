@@ -154,27 +154,26 @@ data:
             if isinstance(parsed, dict):
                 parsed = [parsed]
 
+            # /ingest is the only supported path. Legacy Cribl webhook
+            # (POST /) is dropped because Cribl 4.17.1 truncates events
+            # and we get back garbage host=? alerts — the fluentd direct
+            # path supersedes it.
+            if self.path != "/ingest":
+                self.send_response(204); self.end_headers(); return
+
             alerts = []
             for ev in parsed:
                 if not isinstance(ev, dict):
                     continue
-
-                if self.path == "/ingest":
-                    line = ev.get("log") or ev.get("message") or ev.get("_raw") or ""
-                    line = line if isinstance(line, str) else str(line)
-                    fields = extract_modsec_fields(line)
-                    if not fields:
-                        continue
-                    ip = fields.get("client_ip", "")
-                    if not TRUSTED_IP_RE.match(ip):
-                        continue  # untrusted source — bot scan, drop
-                    alerts.append(build_modsec_alert(fields))
-                elif ev.get("signal") == "modsec_block":
-                    alerts.append(enrich_modsec_signal(ev))
-                elif "labels" in ev and isinstance(ev.get("labels"), dict):
-                    alerts.append(ev)
-                else:
-                    print(f"  skip unrecognized payload: {str(ev)[:120]!r}", flush=True)
+                line = ev.get("log") or ev.get("message") or ev.get("_raw") or ""
+                line = line if isinstance(line, str) else str(line)
+                fields = extract_modsec_fields(line)
+                if not fields:
+                    continue
+                ip = fields.get("client_ip", "")
+                if not TRUSTED_IP_RE.match(ip):
+                    continue  # untrusted source — bot scan, drop
+                alerts.append(build_modsec_alert(fields))
 
             if not alerts:
                 self.send_response(204); self.end_headers(); return
