@@ -1,4 +1,15 @@
 certificate: mail-cert
+# Track our own daily-rebuilt image (upstream :edge + apt security upgrade)
+# instead of the docker.io upstream tag which is frozen at v15.1.0 (2025-08-12).
+image:
+  name: registry.mdapi.ch/mdapi/docker-mailserver
+  tag: latest
+  pullPolicy: Always
+# Chart doesn't expose imagePullSecrets, so we provide our own ServiceAccount
+# via extraDeploy below and skip the chart's SA template.
+serviceAccount:
+  create: false
+  name: docker-mailserver
 deployment:
   env:
     ACCOUNT_PROVISIONER: LDAP
@@ -265,6 +276,12 @@ configMaps:
       done
       newaliases
 extraDeploy:
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: docker-mailserver
+  imagePullSecrets:
+  - name: mdapi-registry
 - apiVersion: external-secrets.io/v1
   kind: ExternalSecret
   metadata:
@@ -294,7 +311,9 @@ extraDeploy:
           key: /mdapi/mail/docker-mailserver-env-secret/LDAP_BIND_PW
         secretKey: LDAP_BIND_PW
 keel:
-  policy: minor
+  # We track :latest now (our own daily-rebuilt image); use force policy so
+  # Keel re-pulls on every poll regardless of tag (since the tag stays "latest").
+  policy: force
   trigger: poll
   pollSchedule: "@every 4h"
   images:
