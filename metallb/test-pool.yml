@@ -1,0 +1,26 @@
+# TEST-1 scoped pool: only Services labelled lb.mdapi.ch=metallb-test get .100.
+# This pool will be removed/replaced once production pool is in.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: test-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.1.100/32
+  serviceAllocation:
+    priority: 100
+    serviceSelectors:
+      - matchLabels:
+          lb.mdapi.ch: metallb-test
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: test-pool-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - test-pool
+  interfaces:
+    - mgmt-br

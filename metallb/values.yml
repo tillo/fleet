@@ -1,25 +1,19 @@
-# Phase 1: install MetalLB with no pools.
-# Without an IPAddressPool + L2Advertisement, the controller and speaker
-# do nothing — they sit idle alongside PureLB. Pools added in Phase 2+.
-#
-# L2 mode only (no FRR/BGP). RKE2 + canal compatible.
-# Coexists with Harvester's kube-vip (different IP ranges, kube-vip's
-# enable_service_security gates it to opted-in Services only).
+# MetalLB install for test/migration. Single test pool initially; production
+# pools (192.168.1.40-99) added as we migrate Services off PureLB+kube-vip.
 
-# Metrics port off 7472 — PureLB's lbnodeagent already binds host:7472
-# and the speaker DaemonSet runs hostNetwork, so the default collides
-# and pods stay Pending until PureLB is gone.
+# Metrics off 7472 — historic conflict with PureLB lbnodeagent.
 prometheus:
   metricsPort: 7475
 
 speaker:
   frr:
     enabled: false
-  tolerations:
-    - operator: Exists
-      effect: NoSchedule
-    - operator: Exists
-      effect: NoExecute
 
 controller:
   replicaCount: 1
+
+# Webhook intercepts ONLY metallb.io CRDs (verified live: rules.resources is
+# {bgppeers, ipaddresspools, bgpadvertisements, communities, bfdprofiles,
+# l2advertisements}). It never touches Service objects. Default failurePolicy=Fail
+# is therefore safe — only writes to MetalLB CRDs would block if controller is
+# down. Leaving as-is.
