@@ -81,6 +81,12 @@ spec:
           value: '31.3.128.49, test-ipv6.alpinedc.ch'
         - name: RECONNECT
           value: '1'
+        # Reset /etc/resolv.conf before the run script reads original_nameserver.
+        # openresolv (run by wg-quick) overwrites this file with VPN DNS, and the
+        # file is a host bind-mount that survives container restarts — without
+        # this, a restart locks DNS bootstrap behind a not-yet-up wg0.
+        - name: PRE_UP
+          value: 'printf "nameserver 10.53.0.10\n" > /etc/resolv.conf'
         - name: POST_UP
           value: 'sleep 10; apk add --no-cache transmission-remote && transmission-remote -p $(cat /pia-shared/port.dat)'
         - name: POST_RECONNECT
