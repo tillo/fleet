@@ -568,6 +568,35 @@ data:
             unit_of_measurement: "CHF/kWh"
             state: "{{ 0.18099 }}"
             icon: mdi:cash
+      # Trigger-based template: monthly history of elco_heating_energy_total
+      # via recorder.statistics_during_period. Refreshed every 6 hours and on
+      # HA start. Powers the "this month / last month / 2 months ago / same
+      # month last year" comparison card. Entries beyond what HA has recorded
+      # come back missing → dashboard markdown falls back to "—".
+      - trigger:
+          - platform: homeassistant
+            event: start
+          - platform: time_pattern
+            hours: '/6'
+        action:
+          - service: recorder.statistics_during_period
+            data:
+              start_time: >-
+                {{ (now().replace(day=1, hour=0, minute=0, second=0,
+                    microsecond=0) - timedelta(days=400)).replace(day=1).isoformat() }}
+              period: month
+              statistic_ids:
+                - sensor.elco_heating_energy_total
+              types:
+                - change
+            response_variable: monthly_stats
+        sensor:
+          - name: "Elco heating monthly history"
+            unique_id: elco_heating_monthly_history
+            state: >-
+              {{ (monthly_stats.get('sensor.elco_heating_energy_total') or []) | length }}
+            attributes:
+              history: "{{ monthly_stats.get('sensor.elco_heating_energy_total') or [] }}"
       # Trigger-based template: re-fetches calendar.get_events on multiple
       # signals so the dashboard reflects calendar changes promptly:
       #   - HA start (initial seed)
