@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: bootstrap
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+
+    # Single-node deployment: replication_factor=1.
+    replication_factor = 1
+    consistency_mode = "consistent"
+
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "garage-0.garage-headless.bootstrap.svc.cluster.local:3901"
+    # rpc_secret loaded from /etc/garage/secret.env (env var GARAGE_RPC_SECRET)
+
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "[::]:3900"
+    # No root_domain: GitLab uses path-style addressing.
+
+    [s3_web]
+    bind_addr = "[::]:3902"
+    root_domain = ".web.garage.bootstrap.svc.cluster.local"
+    index = "index.html"
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    # admin_token + metrics_token loaded from secret env vars.

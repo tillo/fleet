@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: bootstrap
+spec:
+  selector:
+    app: valkey
+  ports:
+  - { name: valkey, port: 6379, targetPort: 6379 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey
+  namespace: bootstrap
+spec:
+  serviceName: valkey
+  replicas: 1
+  selector:
+    matchLabels:
+      app: valkey
+  template:
+    metadata:
+      labels:
+        app: valkey
+    spec:
+      securityContext:
+        # Match the valkey container's expected uid (999 on the official
+        # bullseye image; alpine variant matches).
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+      containers:
+      - name: valkey
+        image: valkey/valkey:9.0.4-alpine3.23
+        command: [valkey-server]
+        args:
+        - --requirepass
+        - $(VALKEY_PASSWORD)
+        - --appendonly
+        - "yes"
+        - --appendfsync
+        - everysec
+        - --maxmemory-policy
+        - allkeys-lru
+        - --dir
+        - /data
+        env:
+        - name: VALKEY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: valkey-password
+              key: password
+        ports:
+        - { name: valkey, containerPort: 6379 }
+        readinessProbe:
+          exec:
+            command: [sh, -c, 'valkey-cli -a "$VALKEY_PASSWORD" --no-auth-warning ping | grep -q PONG']
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: [sh, -c, 'valkey-cli -a "$VALKEY_PASSWORD" --no-auth-warning ping | grep -q PONG']
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /data }
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: "1",  memory: 2Gi }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 5Gi } }

@@ -1,0 +1,70 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gitlab-pg
+  namespace: bootstrap
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "400"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+    # GitLab's required extensions, plus pg_stat_statements which our
+    # bundled bitnami install already has loaded.
+    shared_preload_libraries:
+    - pg_stat_statements
+
+  bootstrap:
+    initdb:
+      database: gitlabhq_production
+      owner: gitlab
+      # CNPG auto-creates a Secret `gitlab-pg-app` with the generated
+      # password. We read it post-deploy and stage it in akeyless / GitLab
+      # values for the cutover.
+      postInitTemplateSQL:
+      - CREATE EXTENSION IF NOT EXISTS pg_trgm
+      - CREATE EXTENSION IF NOT EXISTS btree_gist
+      - CREATE EXTENSION IF NOT EXISTS amcheck
+      - CREATE EXTENSION IF NOT EXISTS pg_stat_statements
+
+  backup:
+    barmanObjectStore:
+      # WAL + base backups land in MinIO on salt/pepper (independent of
+      # the prod cluster's storage layer, which is what we want for DR).
+      destinationPath: s3://gitlab-pg-backup
+      endpointURL: https://api.minio.home.tillo.ch
+      s3Credentials:
+        accessKeyId:
+          name: gitlab-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: gitlab-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+        immediateCheckpoint: false
+        jobs: 2
+    retentionPolicy: "14d"
+---
+# Daily base backup at 03:00 Europe/Zurich.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: gitlab-pg-daily
+  namespace: bootstrap
+spec:
+  cluster:
+    name: gitlab-pg
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  immediate: false
