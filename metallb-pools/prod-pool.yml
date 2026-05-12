@@ -1,0 +1,27 @@
+# Production MetalLB pool — same range as PureLB's old default pool.
+# Open allocation: any Service with spec.loadBalancerClass=metallb in any
+# namespace can pull from it. The --lb-class=metallb on the controller
+# is what gates participation; no per-pool selectors needed.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: prod-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.1.40-192.168.1.99
+  autoAssign: true
+  avoidBuggyIPs: false
+---
+# L2Advertisement scoped to mgmt-br only — speakers won't ARP from any
+# other host interface. Matches our LAN topology.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: prod-pool-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - prod-pool
+  interfaces:
+    - mgmt-br
