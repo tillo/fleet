@@ -32,6 +32,13 @@ zammadConfig:
       failureThreshold: 40  # 40 * 4s = 160s max startup time (up from 80s) to survive slow DB warm-up
 
 postgresql:
+  # bitnamilegacy froze 2025-08-28; pin to the latest available within the major
+  # to claw back recent CVE patches without a 17→x major-version migration.
+  image:
+    tag: 17.6.0-debian-12-r4
+  metrics:
+    image:
+      tag: 0.17.1-debian-12-r16
   primary:
     resources:
       limits:
@@ -43,6 +50,12 @@ postgresql:
     extendedConfiguration: |
       effective_cache_size = 256MB
       work_mem = 8MB
+
+elasticsearch:
+  # Same legacy freeze; bump only the sysctl init image — main ES image is
+  # stuck at 8.18.0 (no newer 8.x in legacy; 9.x is a major).
+  sysctlImage:
+    tag: 12-debian-12-r51
 
 # Note: Elasticsearch runs in single-node mode and will show YELLOW status due to unassigned
 # replica shards. This is expected and harmless. To turn it GREEN, run once after ES is up:
