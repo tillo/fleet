@@ -39,6 +39,33 @@ data:
       report_state: true
       expose_by_default: true
       secure_devices_pin: '6544'
+      entity_config:
+        # ELCO heating helpers — clean voice names so "Hey Google, set heating
+        # comfort to 21" routes to the right input_number / input_select.
+        input_number.elco_ch_comfort_temp_set:
+          name: "Heating comfort temperature"
+          aliases:
+            - Heating setpoint
+            - Comfort temperature
+        input_number.elco_ch_reduced_temp_set:
+          name: "Heating reduced temperature"
+          aliases:
+            - Reduced temperature
+        input_select.elco_zone_mode_set:
+          name: "Heating mode"
+          aliases:
+            - Boiler mode
+            - Heating zone mode
+        input_number.elco_dhw_comfort_temp_set:
+          name: "Hot water temperature"
+          aliases:
+            - Hot water setpoint
+        input_select.elco_dhw_mode_set:
+          name: "Hot water mode"
+        input_boolean.elco_holiday_active:
+          name: "Boiler holiday"
+          aliases:
+            - Heating holiday
     command_line:
       - sensor:
           name: Home Assistant DB size
@@ -87,6 +114,24 @@ data:
         type: time
         start: "{{ today_at('00:00') }}"
         end: "{{ now() }}"
+      # Rolling 24h average of outside temperature — used by the heating-degree-day
+      # template sensor for normalised cost-per-HDD.
+      - platform: statistics
+        name: Elco outside temp 24h avg
+        unique_id: elco_outside_temp_24h_avg
+        entity_id: sensor.elco_outside_temperature
+        state_characteristic: mean
+        max_age: { hours: 24 }
+        sampling_size: 10000
+      # Rolling 7d mean of the daily-resetting cost-today sensor. The template
+      # wrapper above just rounds it; this raw sensor does the maths.
+      - platform: statistics
+        name: Elco heating cost 7d mean raw
+        unique_id: elco_heating_cost_7d_mean_raw
+        entity_id: sensor.elco_heating_cost_today
+        state_characteristic: mean
+        max_age: { days: 7 }
+        sampling_size: 10000
       # Min/max temperature sensors for the boiler-status and hot-water graphs
       # (the native graph-footer card has no min/max labels). 48h window for
       # room (matches the graph), 24h for DHW.
@@ -599,6 +644,35 @@ data:
             unit_of_measurement: "CHF/kWh"
             state: "{{ 0.18099 }}"
             icon: mdi:cash
+          # Heating-degree-day for today (base 18 °C). HDD = max(0, base − T_outside_avg).
+          # Multiplied by daily heating cost gives a per-HDD efficiency metric
+          # that normalises across mild/cold months. Trending up = HX fouling,
+          # insulation drift, or boiler degradation.
+          - name: "Elco heating degree day today"
+            unique_id: elco_heating_degree_day_today
+            unit_of_measurement: "K·d"
+            state: >-
+              {% set t = states('sensor.elco_outside_temp_24h_avg') | float(none) %}
+              {% if t is none %}unknown
+              {% else %}{{ [0, 18 - t] | max | round(2) }}{% endif %}
+            icon: mdi:snowflake-thermometer
+          - name: "Elco cost per HDD today"
+            unique_id: elco_cost_per_hdd_today
+            unit_of_measurement: "CHF/K·d"
+            state: >-
+              {% set cost = states('sensor.elco_heating_cost_today') | float(0) %}
+              {% set hdd = states('sensor.elco_heating_degree_day_today') | float(0) %}
+              {% if hdd > 0.1 %}{{ (cost / hdd) | round(3) }}
+              {% else %}0{% endif %}
+            icon: mdi:cash
+          # Rolling 7-day average of daily heating cost — used by the
+          # cost-anomaly alarm. The underlying sensor is daily-resetting, so
+          # `mean` over 7d is an approximation (weighted toward today's
+          # accumulating value); good enough for anomaly detection.
+          - name: "Elco heating cost 7d mean"
+            unique_id: elco_heating_cost_7d_mean
+            unit_of_measurement: "CHF"
+            state: "{{ states('sensor.elco_heating_cost_7d_mean_raw') | float(0) | round(2) }}"
       # NOTE: there is no `recorder.statistics_during_period` SERVICE — it
       # exists only as a WebSocket command (recorder/statistics_during_period).
       # The dashboard's "this month / last month" comparison relies on the
@@ -834,6 +908,132 @@ data:
               entity_id: input_select.elco_zone_mode_set
             data:
               option: Reduced
+      # Burner short-cycling: > 12 flame on/off transitions in the past hour
+      # for ≥15 min suggests a tuning or HX issue (oversized burner, sticky
+      # thermostat). Catch it before it damages the heat exchanger.
+      - id: elco_burner_short_cycling
+        alias: ELCO burner short-cycling
+        trigger:
+          - platform: numeric_state
+            entity_id: sensor.elco_flame_on_count_last_hour
+            above: 12
+            for: { minutes: 15 }
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO burner short-cycling"
+              message: >-
+                Flame cycled {{ states('sensor.elco_flame_on_count_last_hour') }} times in the past hour
+                (>12 sustained). Check setpoints, possible HX fouling or short-cycling.
+              data: { priority: 0 }
+      # DHW Legionella weekly cycle: Wednesday 03:00, bump DHW comfort to 65°C
+      # for 1h, then restore the pre-cycle setpoint via a scene snapshot.
+      # Kills Legionella per EU recommendation (≥60°C weekly).
+      - id: elco_dhw_legionella
+        alias: ELCO DHW Legionella weekly cycle
+        trigger:
+          - platform: time
+            at: '03:00:00'
+        condition:
+          - condition: time
+            weekday: [wed]
+        action:
+          - service: scene.create
+            data:
+              scene_id: elco_dhw_pre_legionella
+              snapshot_entities:
+                - input_number.elco_dhw_comfort_temp_set
+          - service: input_number.set_value
+            target:
+              entity_id: input_number.elco_dhw_comfort_temp_set
+            data: { value: 65 }
+          - delay: { hours: 1 }
+          - service: scene.turn_on
+            target:
+              entity_id: scene.elco_dhw_pre_legionella
+          - service: notify.pushover
+            data:
+              title: "ELCO DHW Legionella cycle complete"
+              message: >-
+                DHW boosted to 65°C for 1h, restored to
+                {{ states('input_number.elco_dhw_comfort_temp_set') }}°C.
+      # Frost-protection alarm during an active holiday: room dropping below
+      # 12°C while the boiler is supposed to be in protection mode means the
+      # gateway is offline or the boiler is failing. Priority 1 (Pushover).
+      - id: elco_holiday_frost_alarm
+        alias: ELCO frost-protection alarm during holiday
+        trigger:
+          - platform: numeric_state
+            entity_id: sensor.elco_room_temperature
+            below: 12
+            for: { minutes: 20 }
+        condition:
+          - condition: state
+            entity_id: binary_sensor.elco_holiday_active
+            state: 'on'
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO frost-protection alarm"
+              message: >-
+                Room at {{ states('sensor.elco_room_temperature') }}°C during holiday.
+                Boiler may be offline. Check immediately — pipes at risk.
+              data: { priority: 1 }
+      # Cloud-stale alarm: no new sample from Remocon cloud in 30+ min.
+      # AppDaemon polls every refresh_rate min (10 by default); if no update
+      # in 30 min, the gateway is offline or the cloud is unreachable.
+      - id: elco_cloud_stale
+        alias: ELCO Remocon cloud stale
+        trigger:
+          - platform: time_pattern
+            minutes: '/5'
+        condition:
+          - condition: template
+            value_template: >-
+              {% set s = states.sensor.elco_room_temperature %}
+              {% if s is none %}false
+              {% else %}{{ (now() - s.last_updated).total_seconds() > 1800 }}{% endif %}
+          - condition: template
+            # throttle: only fire every 60 min so we don't spam Pushover
+            value_template: >-
+              {% set last = states.automation.elco_cloud_stale.attributes.last_triggered %}
+              {{ last is none or (now() - last).total_seconds() > 3600 }}
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO Remocon cloud stale"
+              message: >-
+                No sensor update in 30+ min. AppDaemon, the Remocon gateway,
+                or Ariston cloud is unreachable.
+              data: { priority: 0 }
+      # Daily heating-cost anomaly: today's cost > 2× prior-days-this-month
+      # average (excluding today), evaluated at 22:00 (boiler has had ~all
+      # day to accumulate). Skipped if prior-day average too small for the
+      # ratio to be meaningful.
+      - id: elco_cost_anomaly
+        alias: ELCO daily heating-cost anomaly
+        trigger:
+          - platform: time
+            at: '22:00:00'
+        condition:
+          - condition: template
+            value_template: >-
+              {% set today_cost = states('sensor.elco_heating_cost_today') | float(0) %}
+              {% set month_cost = (states('sensor.elco_heating_energy_period') | float(0)) * 0.18099 %}
+              {% set days = now().day %}
+              {% if days > 1 %}
+                {% set prior_avg = (month_cost - today_cost) / (days - 1) %}
+                {{ today_cost > 2 * prior_avg and prior_avg > 0.5 }}
+              {% else %}false{% endif %}
+        action:
+          - service: notify.pushover
+            data:
+              title: "ELCO daily cost spike"
+              message: >-
+                Today {{ states('sensor.elco_heating_cost_today') }} CHF — more than
+                2× the prior-days month-to-date average. Check for stuck call-for-heat,
+                fouled HX, or chimney damper issue.
+              data: { priority: 0 }
       # Manual "refresh" pipeline: button → force HA to poll calendar.family
       # AND fire event for the template sensor to recompute. The combined hop
       # catches both near-future (covered by HA's poll → state_changed) and
