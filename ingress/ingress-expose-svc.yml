@@ -4,21 +4,15 @@ metadata:
   name: ingress-expose
   namespace: kube-system
   annotations:
-    # Reproduces the exact bootstrap pattern Harvester uses at install:
-    # the vip ConfigMap in harvester-system carries ip=.191 hwAddress=2e:5d:...
-    # and Harvester's installer materialises it as a kube-vip-claimed Service
-    # with these four annotations. requestedIP is the legacy form kube-vip
-    # actually parses; loadbalancerIPs=0.0.0.0 is the sentinel telling kube-vip
-    # to source the IP from requestedIP.
-    kube-vip.io/hwaddr: "2e:5d:3f:fd:57:a6"
+    # Static IP for kube-vip. NOT the bootstrap pattern — that uses
+    # loadbalancerIPs=0.0.0.0 + hwaddr to trigger DHCP-mode allocation
+    # (per harvester-system/vip ConfigMap which has mode: dhcp).
+    # We don't have a DHCP server reachable from this kube-vip with the
+    # bootstrap MAC registered, so DHCP mode times out. Use static IP.
     kube-vip.io/ignore-service-security: "true"
-    kube-vip.io/loadbalancerIPs: "0.0.0.0"
-    kube-vip.io/requestedIP: "192.168.1.191"
+    kube-vip.io/loadbalancerIPs: "192.168.1.191"
 spec:
   type: LoadBalancer
-  # spec.loadBalancerIP=192.168.1.191 is out of PureLB's 40-99 pool, so PureLB
-  # skips and kube-vip can claim. (Deprecated field but still honored by
-  # both controllers.)
   loadBalancerIP: 192.168.1.191
   externalTrafficPolicy: Local
   selector:
