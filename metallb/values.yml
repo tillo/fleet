@@ -1,19 +1,26 @@
-# MetalLB install for test/migration. Single test pool initially; production
-# pools (192.168.1.40-99) added as we migrate Services off PureLB+kube-vip.
+# MetalLB install with strict opt-in via --lb-class.
+#
+# WHY --lb-class: without it, MetalLB controller actively clears
+# status.loadBalancer.ingress on Services whose IP isn't in any of its
+# pools (Red Hat KB 7034718, MetalLB issue #2396). With this flag set,
+# MetalLB ignores every LoadBalancer Service that doesn't carry
+# spec.loadBalancerClass=metallb. Pure opt-in. Safe coexistence with
+# Harvester's kube-vip and PureLB.
 
 # Metrics off 7472 — historic conflict with PureLB lbnodeagent.
 prometheus:
   metricsPort: 7475
 
+controller:
+  replicaCount: 1
+  # Only manage Services with spec.loadBalancerClass=metallb.
+  loadBalancerClass: metallb
+
 speaker:
   frr:
     enabled: false
 
-controller:
-  replicaCount: 1
-
-# Webhook intercepts ONLY metallb.io CRDs (verified live: rules.resources is
-# {bgppeers, ipaddresspools, bgpadvertisements, communities, bfdprofiles,
-# l2advertisements}). It never touches Service objects. Default failurePolicy=Fail
-# is therefore safe — only writes to MetalLB CRDs would block if controller is
-# down. Leaving as-is.
+# The validating webhook intercepts only metallb.io CRDs (verified live —
+# rules.resources is {bgppeers, ipaddresspools, bgpadvertisements,
+# communities, bfdprofiles, l2advertisements}). Default failurePolicy=Fail
+# is therefore safe — only writes to MetalLB's own CRDs would block.
