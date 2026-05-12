@@ -4,16 +4,21 @@ metadata:
   name: ingress-expose
   namespace: kube-system
   annotations:
-    # kube-vip claims this Service because of the security-ignore opt-in;
-    # vipHost + hwaddr are set by kube-vip at runtime (ignored via
-    # fleet.yaml comparePatches).
+    # Reproduces the exact bootstrap pattern Harvester uses at install:
+    # the vip ConfigMap in harvester-system carries ip=.191 hwAddress=2e:5d:...
+    # and Harvester's installer materialises it as a kube-vip-claimed Service
+    # with these four annotations. requestedIP is the legacy form kube-vip
+    # actually parses; loadbalancerIPs=0.0.0.0 is the sentinel telling kube-vip
+    # to source the IP from requestedIP.
+    kube-vip.io/hwaddr: "2e:5d:3f:fd:57:a6"
     kube-vip.io/ignore-service-security: "true"
-    kube-vip.io/loadbalancerIPs: 192.168.1.191
+    kube-vip.io/loadbalancerIPs: "0.0.0.0"
+    kube-vip.io/requestedIP: "192.168.1.191"
 spec:
   type: LoadBalancer
-  # spec.loadBalancerIP pins .191 explicitly. PureLB's default pool is
-  # 192.168.1.40-99 — .191 is out-of-pool, so PureLB skips this Service.
-  # kube-vip sees the annotation + the spec field and claims it.
+  # spec.loadBalancerIP=192.168.1.191 is out of PureLB's 40-99 pool, so PureLB
+  # skips and kube-vip can claim. (Deprecated field but still honored by
+  # both controllers.)
   loadBalancerIP: 192.168.1.191
   externalTrafficPolicy: Local
   selector:
