@@ -24,6 +24,13 @@ metadata:
       SecAuditLog /dev/stdout
       SecDebugLog /tmp/modsec_debug.log
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # Roundcube is a mail webapp, so the literal word "mail" appears in
+      # its routing params (_task=mail, _url=_task=mail&_mbox=INBOX, etc.).
+      # Rule 932235 treats "mail" as a Unix command name (mail(1)) and
+      # fires on every mail-task URL. Disable it on this host. Other
+      # 93xxxx PHP/LFI rules stay active so real Roundcube exploitation
+      # paths remain covered.
+      SecRuleRemoveById 932235
       SecRule REQUEST_URI "@rx ^/\?_task=(?:login|mail&_unlock=loading)" \
         "id:1000,\
         phase:1,\
