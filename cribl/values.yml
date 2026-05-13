@@ -68,6 +68,11 @@ ingress:
       # parser layer (2026-05-11 outage).
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # Cribl /api/v1/system/metrics?filterExp=name.startsWith(...) is a JS-like
+      # expression that rule 942151 (SQL function name detected) misidentifies
+      # as SQL injection. Scope-disable on the metrics endpoint only.
+      SecRule REQUEST_URI "@beginsWith /api/v1/system/metrics" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=942151"
   tls:
     - secretName: cribl-cert
       hosts:

@@ -22,8 +22,14 @@ metadata:
       SecAuditLog /dev/stdout
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
-      SecRule REQUEST_URI "@rx ^/remote\.php/(dav|webdav)/" \
-        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-rce"
+      # File uploads to OwnCloud carry arbitrary Content-Type (e.g.
+      # application/vnd.openxmlformats-officedocument.* for Office files,
+      # image/jpeg, application/pdf) that aren't in the CRS default
+      # tx.allowed_request_content_type whitelist. Scope-disable 920420
+      # (and 920430, the protocol-version-not-allowed cousin that also
+      # fires on some upload clients) on the WebDAV upload endpoints only.
+      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
       location = /.well-known/carddav { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
