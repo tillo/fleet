@@ -305,6 +305,27 @@ spec:
         summary: "Auto-deleted {{ $value }} Unknown-state node(s)"
         description: "resource_waste.py removed nodes stuck in NotReady > 15min. New nodes should re-join automatically."
 
+  - name: app-batch-jobs.image-builder-health
+    rules:
+    - alert: GitlabImageBuilderSilent
+      ## Each non-archived mdapi/* image-builder is on a 4-hourly schedule
+      ## (6 pipelines / 24h). The detection script pushes the per-project
+      ## count daily; this fires when a project drops below 4 — late enough
+      ## that one missed run doesn't alert, early enough that two missed
+      ## runs do.
+      expr: gitlab_image_builder_pipelines_24h{job="gitlab_image_builder_health"} < 4
+      for: 30h
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "GitLab project mdapi/{{ $labels.project }} only ran {{ $value }} pipelines in last 24h"
+        description: |
+          A 4-hourly image-builder schedule appears to have stopped firing.
+          Check the project's schedule at https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
+          and the lint at `fleet/scripts/check-image-builder-schedules.py`.
+
   - name: app-batch-jobs.upgrade
     rules:
     - alert: ComponentUpgradeAvailable
