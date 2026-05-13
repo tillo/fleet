@@ -11,9 +11,13 @@ spec:
     # Aggregate by namespace so a single alert per affected site.
     - alert: WebsiteUnavailable
       expr: |
-        kube_deployment_status_replicas_unavailable{
-          namespace=~"spider3|coiffuredreams|dellambrogio|ivodellambrogio|mdapiorg|textopolis|tillo|flame"
-        } > 0
+        ( kube_deployment_spec_replicas{
+            namespace=~"spider3|coiffuredreams|dellambrogio|ivodellambrogio|mdapiorg|textopolis|tillo|flame"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace=~"spider3|coiffuredreams|dellambrogio|ivodellambrogio|mdapiorg|textopolis|tillo|flame"
+          }
+        ) > 0
       for: 5m
       labels:
         severity: critical

@@ -9,9 +9,13 @@ spec:
     rules:
     - alert: TechnitiumUnavailable
       expr: |
-        kube_deployment_status_replicas_unavailable{
-          namespace="technitium", deployment="technitium"
-        } > 0
+        ( kube_deployment_spec_replicas{
+            namespace="technitium", deployment="technitium"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="technitium", deployment="technitium"
+          }
+        ) > 0
       for: 3m
       labels:
         severity: critical

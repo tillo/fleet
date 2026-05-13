@@ -9,9 +9,13 @@ spec:
     rules:
     - alert: GitLabWebserviceUnavailable
       expr: |
-        kube_deployment_status_replicas_unavailable{
-          namespace="bootstrap", deployment=~"gitlab-webservice-.*"
-        } > 0
+        ( kube_deployment_spec_replicas{
+            namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+          }
+        ) > 0
       for: 5m
       labels:
         severity: critical
@@ -39,9 +43,13 @@ spec:
 
     - alert: GitLabSidekiqDown
       expr: |
-        kube_deployment_status_replicas_unavailable{
-          namespace="bootstrap", deployment=~"gitlab-sidekiq-.*"
-        } > 0
+        ( kube_deployment_spec_replicas{
+            namespace="bootstrap", deployment=~"gitlab-sidekiq-.*"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="bootstrap", deployment=~"gitlab-sidekiq-.*"
+          }
+        ) > 0
       for: 10m
       labels:
         severity: warning

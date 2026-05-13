@@ -9,10 +9,15 @@ spec:
     rules:
     - alert: FilesDeploymentUnavailable
       expr: |
-        kube_deployment_status_replicas_unavailable{
-          namespace=~"owncloud|spider3|tv",
-          deployment=~"owncloud|spider3|sftpgo"
-        } > 0
+        ( kube_deployment_spec_replicas{
+            namespace=~"owncloud|spider3|tv",
+            deployment=~"owncloud|spider3|sftpgo"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace=~"owncloud|spider3|tv",
+            deployment=~"owncloud|spider3|sftpgo"
+          }
+        ) > 0
       for: 5m
       labels:
         severity: critical

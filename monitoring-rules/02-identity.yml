@@ -10,10 +10,13 @@ spec:
     - alert: IdentityKeycloakUnavailable
       expr: |
         max by (namespace, deployment) (
-          kube_deployment_status_replicas_unavailable{
-            namespace=~"keycloak|envuassu",
-            deployment="keycloak"
-          } > 0
+          ( kube_deployment_spec_replicas{
+              namespace=~"keycloak|envuassu", deployment="keycloak"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace=~"keycloak|envuassu", deployment="keycloak"
+            }
+          ) > 0
         )
       for: 3m
       labels:
@@ -47,9 +50,13 @@ spec:
       ## users but new logins and group lookups break.
       expr: |
         max by (namespace, deployment) (
-          kube_deployment_status_replicas_unavailable{
-            namespace="openldap", deployment=~"openldap|lam"
-          } > 0
+          ( kube_deployment_spec_replicas{
+              namespace="openldap", deployment=~"openldap|lam"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="openldap", deployment=~"openldap|lam"
+            }
+          ) > 0
         )
       for: 5m
       labels:

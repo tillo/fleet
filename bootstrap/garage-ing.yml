@@ -1,0 +1,58 @@
+## Public Ingress for the bootstrap-namespace Garage S3 endpoint.
+##
+## Reason for existence: GitLab's container registry (registry.mdapi.ch)
+## stores layer blobs in this Garage instance and 307-redirects pulls to
+## presigned S3 URLs. Previously the registry's `regionendpoint` was the
+## in-cluster `http://garage.bootstrap.svc.cluster.local:3900`, so the
+## presigned URL's hostname only resolves via CoreDNS — but containerd's
+## image pull runs in the node's network namespace using the host's
+## resolv.conf (BPI-R4 at 192.168.1.1), which doesn't know cluster-internal
+## SVC names. Every fresh image pull (incl. all `:latest` repulls) failed
+## with `no such host` until the cached layer was reused.
+##
+## Switching the registry's `regionendpoint` to `https://garage-bootstrap.mdapi.ch`
+## (this Ingress) makes the presigned URL hostname publicly resolvable; nodes
+## reach Garage through the standard ingress-nginx → garage:3900 path.
+##
+## Notes:
+##   - ModSec is DISABLED: S3 PUT bodies are arbitrary binary (layer blobs);
+##     CRS rules would block every push.
+##   - proxy-body-size is unlimited — image layers can be multi-GB.
+##   - proxy timeouts are 600s for slow node-side pulls.
+##   - SigV4 signs the Host header (`garage-bootstrap.mdapi.ch`); nginx
+##     preserves the client Host upstream so Garage validates the signature
+##     against the same value.
+##   - Garage uses path-style addressing only (no `root_domain` under
+##     `[s3_api]` in garage-cm.yml), so it doesn't care which Host header
+##     reaches it.
+##   - The bucket has no public-read policy; all access requires SigV4 over
+##     valid credentials, so exposing this endpoint publicly is safe.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garage
+  namespace: bootstrap
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: garage-bootstrap.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port:
+                  number: 3900
+  tls:
+    - hosts:
+        - garage-bootstrap.mdapi.ch
+      secretName: garage-bootstrap-cert

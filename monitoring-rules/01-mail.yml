@@ -10,7 +10,9 @@ spec:
     - alert: MailDeploymentUnavailable
       expr: |
         max by (namespace, deployment) (
-          kube_deployment_status_replicas_unavailable{namespace="mail"} > 0
+          ( kube_deployment_spec_replicas{namespace="mail"}
+            - kube_deployment_status_replicas_available{namespace="mail"}
+          ) > 0
         )
       for: 5m
       labels:

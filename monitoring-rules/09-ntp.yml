@@ -24,9 +24,13 @@ spec:
     - alert: NtpChronyUnavailable
       expr: |
         max by (namespace) (
-          kube_deployment_status_replicas_unavailable{
-            namespace="ntppool", deployment="chrony"
-          } > 0
+          ( kube_deployment_spec_replicas{
+              namespace="ntppool", deployment="chrony"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="ntppool", deployment="chrony"
+            }
+          ) > 0
         )
       for: 5m
       labels:

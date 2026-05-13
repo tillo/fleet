@@ -22,10 +22,15 @@ spec:
     - alert: MonitoringComponentDown
       expr: |
         max by (namespace, deployment) (
-          kube_deployment_status_replicas_unavailable{
-            namespace=~"cribl|monitoring|cattle-logging-system",
-            deployment=~"logstream-leader|statuspage-adapter|rancher-logging|blackbox|monitoring-grafana|pushgateway|prometheus-adapter|kube-state-metrics"
-          } > 0
+          ( kube_deployment_spec_replicas{
+              namespace=~"cribl|monitoring|cattle-logging-system",
+              deployment=~"logstream-leader|statuspage-adapter|rancher-logging|blackbox|monitoring-grafana|pushgateway|prometheus-adapter|kube-state-metrics"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace=~"cribl|monitoring|cattle-logging-system",
+              deployment=~"logstream-leader|statuspage-adapter|rancher-logging|blackbox|monitoring-grafana|pushgateway|prometheus-adapter|kube-state-metrics"
+            }
+          ) > 0
         )
       for: 5m
       labels:
