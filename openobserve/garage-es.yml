@@ -1,0 +1,43 @@
+# Garage cluster-internal tokens (RPC, admin, metrics) — generated once by user
+# and stored in Akeyless before first deploy.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: garage-tokens
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: garage-tokens
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/garage/rpc-secret }
+    secretKey: GARAGE_RPC_SECRET
+  - remoteRef: { key: /mdapi/openobserve/garage/admin-token }
+    secretKey: GARAGE_ADMIN_TOKEN
+  - remoteRef: { key: /mdapi/openobserve/garage/metrics-token }
+    secretKey: GARAGE_METRICS_TOKEN
+---
+# S3 access creds for OpenObserve — populated AFTER Garage is up via
+# `garage key new --name openobserve`, then pushed to Akeyless.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: garage-openobserve-s3-creds
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: garage-openobserve-s3-creds
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/garage/o2-access-key }
+    secretKey: access_key
+  - remoteRef: { key: /mdapi/openobserve/garage/o2-secret-key }
+    secretKey: secret_key

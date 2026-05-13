@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openobserve
+  namespace: openobserve
+  annotations:
+    keel.sh/policy: minor
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 24h"
+spec:
+  serviceName: openobserve
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openobserve
+  template:
+    metadata:
+      labels:
+        app: openobserve
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+      - name: openobserve
+        image: public.ecr.aws/zinclabs/openobserve:latest
+        imagePullPolicy: Always
+        envFrom:
+        - configMapRef:
+            name: openobserve-config
+        - secretRef:
+            name: openobserve-admin
+        env:
+        - name: ZO_S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: garage-openobserve-s3-creds
+              key: access_key
+        - name: ZO_S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: garage-openobserve-s3-creds
+              key: secret_key
+        ports:
+        - { name: http, containerPort: 5080 }
+        - { name: grpc, containerPort: 5081 }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /data }
+        resources:
+          requests: { cpu: 200m, memory: 512Mi }
+          limits:   { cpu: "2",  memory: 4Gi }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 10Gi } }
