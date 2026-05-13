@@ -16,15 +16,16 @@ spec:
   groups:
   - name: app-batch-jobs.staleness
     rules:
+    ## Two-tier staleness: a 36h threshold for daily-cadence jobs, and a
+    ## 192h (8d) threshold for weekly jobs. Weekly jobs are listed
+    ## explicitly so we don't silently widen daily-job staleness.
     - alert: BatchJobStale
-      ## Heartbeat staleness backstop: any script that hasn't pushed in
-      ## >36h. Tight enough to catch a missed daily run with one cycle
-      ## of buffer, loose enough to ignore weekly schedules — those
-      ## should publish their own job-specific staleness rule.
       expr: |
         (
           time() - max by (job) (
-            {__name__=~".+_last_run_timestamp_seconds", job!=""}
+            {__name__=~".+_last_run_timestamp_seconds",
+             job!="",
+             job!~"resource_waste|weekly_version_check|non_k8s_update_check|bpir4_health|storage_health|rackspace_spend|weekly_infra_health|keel_update_log|fleet_maxhistory_audit|gitlab_registry_cleanup_audit"}
           )
         ) > 36 * 3600
       for: 30m
@@ -40,6 +41,26 @@ spec:
           or it hasn't been migrated to push metrics yet.
 
           Check Windmill (https://windmill.mdapi.ch) or the responsible cron source.
+
+    - alert: BatchJobStaleWeekly
+      expr: |
+        (
+          time() - max by (job) (
+            {__name__=~".+_last_run_timestamp_seconds",
+             job=~"resource_waste|weekly_version_check|non_k8s_update_check|bpir4_health|storage_health|rackspace_spend|weekly_infra_health|keel_update_log|fleet_maxhistory_audit|gitlab_registry_cleanup_audit"}
+          )
+        ) > 192 * 3600
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: General
+      annotations:
+        summary: "Weekly batch job {{ $labels.job }} hasn't pushed metrics in {{ $value | humanizeDuration }}"
+        description: |
+          A weekly-cadence job has stopped pushing its `*_last_run_timestamp_seconds`
+          for >8 days — i.e. it missed a Monday firing. Check the schedule and
+          Windmill run history.
 
     - alert: BatchJobLastRunFailed
       ## Convention: scripts also push <name>_last_run_success gauge.
