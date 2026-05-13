@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garage
+  namespace: transit
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # S3 multi-part PUTs need a generous body limit (registry images, big
+    # backups). Same value as console.minio.
+    nginx.ingress.kubernetes.io/proxy-body-size: 10g
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.garage.home.tillo.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port:
+                  number: 30188
+    - host: console.garage.home.tillo.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port:
+                  number: 30186
+  tls:
+    - hosts:
+        - api.garage.home.tillo.ch
+      secretName: garage-api-cert
+    - hosts:
+        - console.garage.home.tillo.ch
+      secretName: garage-console-cert
