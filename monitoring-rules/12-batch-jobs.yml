@@ -323,8 +323,25 @@ spec:
         summary: "GitLab project mdapi/{{ $labels.project }} only ran {{ $value }} pipelines in last 24h"
         description: |
           A 4-hourly image-builder schedule appears to have stopped firing.
-          Check the project's schedule at https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
-          and the lint at `fleet/scripts/check-image-builder-schedules.py`.
+          Check https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
+          (full detection logic in Windmill: f/infra_health/gitlab_image_builder_health).
+
+    - alert: GitlabImageBuilderScheduleCollision
+      ## Two image-builders sharing the same cron minute = unnecessary runner
+      ## contention. The detection script publishes the count of colliding
+      ## cron strings; >0 means at least one minute slot is over-subscribed.
+      expr: gitlab_image_builder_schedule_collisions{job="gitlab_image_builder_health"} > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: GitLab
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab image-builder schedule(s) collide on the same cron minute"
+        description: |
+          Two or more mdapi/* projects use the same `<M> <H> * * *` schedule.
+          Inspect the latest Windmill run of f/infra_health/gitlab_image_builder_health
+          for the `schedule_collisions` field listing the offenders.
 
   - name: app-batch-jobs.upgrade
     rules:
