@@ -8,3 +8,15 @@ dependsOn:
   - name: mdapi-prod-external-secrets
 helm:
   maxHistory: 25
+
+# VPA (mode=Auto) writes resources.requests/limits onto running pods.
+# Strip the resources block from both sides before diff so Fleet stops
+# flagging the bundle as Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: spider3
+    namespace: spider3
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
