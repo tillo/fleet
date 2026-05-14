@@ -28,13 +28,27 @@ spec:
     ## components). Suppresses the always-firing infrastructure of
     ## Watchdog/InfoInhibitor and the very noisy CPUThrottlingHigh
     ## (which fires on perfectly healthy bursty workloads).
+    ##
+    ## LonghornVolumeStatusWarning is also suppressed here — it's the
+    ## upstream Longhorn chart's rule firing on `robustness == 2`, but
+    ## our team=mdapi LonghornVolumeDegraded fires on the same
+    ## condition with a better description. Duplicates would double up
+    ## Pushover noise; the inhibit_rules block below also handles the
+    ## case where the chart rule fires for cluster-internal volumes
+    ## that don't have a pvc_namespace/pvc label pair (engine images,
+    ## etc.).
+    ##
+    ## KubeJobFailed is suppressed because we already have
+    ## BatchJobLastRunFailed / BatchJobStale from the Pushgateway path
+    ## for jobs we care about; the chart rule fires once per Failed
+    ## Job object and never auto-resolves until the Job is GC'd.
     - receiver: pushover-bundled
       matchers:
       - name: severity
         value: warning|critical
         matchType: "=~"
       - name: alertname
-        value: Watchdog|InfoInhibitor|CPUThrottlingHigh|KubeCPUOvercommit
+        value: Watchdog|InfoInhibitor|CPUThrottlingHigh|KubeCPUOvercommit|LonghornVolumeStatusWarning|KubeJobFailed
         matchType: "!~"
       - name: team
         value: mdapi
@@ -43,6 +57,20 @@ spec:
       groupWait: 1m
       groupInterval: 10m
       repeatInterval: 12h
+
+  inhibitRules:
+  ## Inside the team=mdapi alert set: when we're already alerting on a
+  ## degraded Longhorn volume, the chart-side warning is redundant. The
+  ## matcher pair here is on labels both rules carry; even if the
+  ## upstream alert fires through some other receiver, this still mutes
+  ## it in the Alertmanager UI.
+  - sourceMatch:
+    - name: alertname
+      value: LonghornVolumeDegraded
+    targetMatch:
+    - name: alertname
+      value: LonghornVolumeStatusWarning
+    equal: [pvc_namespace, pvc]
 
   receivers:
   ## Drop everything that doesn't match a child route (Watchdog,

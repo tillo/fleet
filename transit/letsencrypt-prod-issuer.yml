@@ -10,6 +10,20 @@ spec:
       name: letsencrypt-prod
     server: https://acme-v02.api.letsencrypt.org/directory
     solvers:
+      # home.tillo.ch is delegated to technitium-primary, NOT to
+      # ns.mdapi.ch (the BIND9 server below). A TSIG nsupdate against
+      # ns.mdapi.ch for *.home.tillo.ch is rejected as NOTAUTH, which
+      # cert-manager's rfc2136 wrapper surfaces as "dns: bad
+      # authentication". cert-manager picks the most-specific dnsZone
+      # match, so listing home.tillo.ch first with http01 makes those
+      # names go through the public ingress challenge path. The host
+      # has a publicly resolvable A record, so http01 is fine.
+      - http01:
+          ingress:
+            class: nginx
+        selector:
+          dnsZones:
+            - home.tillo.ch
       - dns01:
           rfc2136:
             nameserver: 31.3.128.59:53

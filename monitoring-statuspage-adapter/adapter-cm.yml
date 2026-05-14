@@ -26,22 +26,41 @@ data:
     """
     Alertmanager -> statuspage.io component-state adapter.
 
-    Listens on :8080/webhook for Alertmanager v4 webhook POSTs.
-    For each alert in the payload:
-      - reads label `component` (must match a key in components.json)
-      - reads label `severity` (critical | warning)
-      - if alert.status == "firing":   sets component to major_outage (critical) or degraded_performance (warning)
-      - if alert.status == "resolved": sets component to operational
+    Two paths keep statuspage components in sync with reality:
 
-    Group-aware: per-component, picks the worst current state from the active alerts in the group.
+    1. WEBHOOK path (reactive, low-latency)
+       Alertmanager POSTs to /webhook on every alert state change. We
+       group alerts by `component` label and PATCH worst-status per comp.
+
+    2. RECONCILE path (periodic, drift-safe)
+       Background thread polls Alertmanager's /api/v2/alerts every
+       RECONCILE_INTERVAL_SEC and PATCHes any component whose derived
+       status differs from the last value we sent. Catches cases where:
+         - an alert-rule rewrite makes a previously-firing alert silently
+           disappear (no resolved webhook is ever emitted)
+         - a webhook POST is lost (adapter OOM at exactly that moment)
+         - components are manually toggled in the statuspage UI and now
+           disagree with reality
+
+    Both paths read severity (critical/warning/info) and translate to
+    statuspage states (major_outage / degraded_performance / operational).
     """
-    import json, os, sys, time, urllib.parse, urllib.request, urllib.error
+    import json, os, sys, threading, time, urllib.parse, urllib.request, urllib.error
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     PAGE_ID    = os.environ["STATUSPAGE_PAGE_ID"]
     API_KEY    = os.environ["STATUSPAGE_API_KEY"]
     COMPONENTS = json.loads(open("/etc/adapter/components.json").read())
     BIND_PORT  = int(os.environ.get("BIND_PORT", "8080"))
+    AM_URL     = os.environ.get("ALERTMANAGER_URL",
+                                "http://rancher-monitoring-alertmanager.cattle-monitoring-system.svc.cluster.local:9093")
+    RECONCILE_INTERVAL_SEC = int(os.environ.get("RECONCILE_INTERVAL_SEC", "60"))
+
+    # Cache of (component_id -> last_status_we_sent). Updated by both
+    # the webhook path and the reconcile path; used to suppress no-op
+    # PATCHes (saves API quota, avoids audit-log spam on statuspage).
+    LAST_SENT = {}
+    LAST_SENT_LOCK = threading.Lock()
 
     # severity -> statuspage status (firing case). Resolved always -> operational.
     SEVERITY_STATUS = {
@@ -61,7 +80,10 @@ data:
         print(msg, file=sys.stderr, flush=True)
 
     def patch_component(component_id: str, status: str):
-        """Set a single component's status via PATCH."""
+        """Set a single component's status via PATCH. Suppress if unchanged."""
+        with LAST_SENT_LOCK:
+            if LAST_SENT.get(component_id) == status:
+                return 0  # cached, no-op
         body = json.dumps({"component": {"status": status}}).encode()
         req = urllib.request.Request(
             f"https://api.statuspage.io/v1/pages/{PAGE_ID}/components/{component_id}",
@@ -71,6 +93,8 @@ data:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
+                with LAST_SENT_LOCK:
+                    LAST_SENT[component_id] = status
                 return r.status
         except urllib.error.HTTPError as e:
             log(f"statuspage PATCH {component_id} -> {status}: HTTP {e.code} {e.read().decode()[:200]}")
@@ -144,7 +168,46 @@ data:
             if body:
                 self.wfile.write(body.encode())
 
+    def reconcile_once():
+        """Fetch active alerts from Alertmanager, derive worst-status per
+        component, PATCH any that have drifted."""
+        try:
+            req = urllib.request.Request(f"{AM_URL}/api/v2/alerts")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                alerts = json.loads(r.read())
+        except Exception as e:
+            log(f"reconcile: fetch alertmanager failed: {e}")
+            return
+        # Build per-component active-alert lists (firing only).
+        by_component = {comp: [] for comp in COMPONENTS}
+        for a in alerts:
+            if a.get("status", {}).get("state") != "active":
+                continue
+            comp = a.get("labels", {}).get("component")
+            if comp in by_component:
+                # Synthesize a webhook-style "firing" alert shape so
+                # derive_status() can read it without branching.
+                by_component[comp].append({
+                    "status": "firing",
+                    "labels": a.get("labels", {}),
+                })
+        for comp, comp_alerts in by_component.items():
+            cid = COMPONENTS[comp]
+            target = derive_status(comp_alerts)
+            code = patch_component(cid, target)
+            if code and code != 0:
+                log(f"reconcile: {comp}({cid})={target} http={code}")
+
+    def reconcile_loop():
+        # Stagger 30s before first run so webhooks settle.
+        time.sleep(30)
+        while True:
+            reconcile_once()
+            time.sleep(RECONCILE_INTERVAL_SEC)
+
     if __name__ == "__main__":
         log(f"adapter starting on :{BIND_PORT}")
         log(f"loaded {len(COMPONENTS)} components: {sorted(COMPONENTS.keys())}")
+        log(f"reconcile against {AM_URL} every {RECONCILE_INTERVAL_SEC}s")
+        threading.Thread(target=reconcile_loop, daemon=True).start()
         HTTPServer(("0.0.0.0", BIND_PORT), H).serve_forever()
