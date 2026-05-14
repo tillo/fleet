@@ -16,18 +16,31 @@ spec:
   groups:
   - name: app-batch-jobs.staleness
     rules:
-    ## Two-tier staleness: a 36h threshold for daily-cadence jobs, and a
-    ## 192h (8d) threshold for weekly jobs. Weekly jobs are listed
-    ## explicitly so we don't silently widen daily-job staleness.
+    ## Single per-job staleness rule, replacing the previous two-tier
+    ## BatchJobStale + BatchJobStaleWeekly which relied on a hand-edited
+    ## regex of weekly job names. The Windmill probe
+    ## `f/infra_health/schedule_cadence_map` publishes
+    ## `windmill_schedule_interval_seconds` per job (basename of script
+    ## path) every day; this rule joins on `job` and triggers when the
+    ## last-run timestamp is older than 2× that interval.
+    ##
+    ## 2× gives one missed run of grace before alerting:
+    ##   - daily jobs (interval 86400): stale at 48h
+    ##   - weekly jobs (interval 604800): stale at 14d
+    ##   - monthly jobs (interval 2678400): stale at 62d
+    ##   - 5-min probes (interval 300): stale at 10min
+    ## Adding a new scheduled probe needs no change here.
     - alert: BatchJobStale
       expr: |
         (
           time() - max by (job) (
-            {__name__=~".+_last_run_timestamp_seconds",
-             job!="",
-             job!~"resource_waste|weekly_version_check|non_k8s_update_check|bpir4_health|storage_health|rackspace_spend|keel_update_log|fleet_maxhistory_audit|gitlab_registry_cleanup_audit|backup_label_enforcer"}
+            {__name__=~".+_last_run_timestamp_seconds", job!=""}
           )
-        ) > 36 * 3600
+        )
+        >
+        on (job) group_left() (
+          max by (job) (windmill_schedule_interval_seconds) * 2
+        )
       for: 30m
       labels:
         severity: warning
@@ -37,30 +50,15 @@ spec:
         summary: "Batch job {{ $labels.job }} hasn't pushed metrics in {{ $value | humanizeDuration }}"
         description: |
           A scheduled job has stopped pushing its `*_last_run_timestamp_seconds`
-          for >36h. Either the job's broken, its schedule was disabled,
-          or it hasn't been migrated to push metrics yet.
+          for more than 2× its scheduled interval (one missed run of grace).
+          Threshold is read live from `windmill_schedule_interval_seconds`,
+          which f/infra_health/schedule_cadence_map publishes daily from the
+          Windmill schedule list.
 
-          Check Windmill (https://windmill.mdapi.ch) or the responsible cron source.
+          Either the job is broken, its schedule was disabled, or its
+          basename(script_path) doesn't match the pushgateway job label.
 
-    - alert: BatchJobStaleWeekly
-      expr: |
-        (
-          time() - max by (job) (
-            {__name__=~".+_last_run_timestamp_seconds",
-             job=~"resource_waste|weekly_version_check|non_k8s_update_check|bpir4_health|storage_health|rackspace_spend|keel_update_log|fleet_maxhistory_audit|gitlab_registry_cleanup_audit|backup_label_enforcer"}
-          )
-        ) > 192 * 3600
-      for: 30m
-      labels:
-        severity: warning
-        team: mdapi
-        component: General
-      annotations:
-        summary: "Weekly batch job {{ $labels.job }} hasn't pushed metrics in {{ $value | humanizeDuration }}"
-        description: |
-          A weekly-cadence job has stopped pushing its `*_last_run_timestamp_seconds`
-          for >8 days — i.e. it missed a Monday firing. Check the schedule and
-          Windmill run history.
+          Check Windmill (https://windmill.mdapi.ch) or the cron source.
 
     - alert: BatchJobLastRunFailed
       ## Convention: scripts also push <name>_last_run_success gauge.
