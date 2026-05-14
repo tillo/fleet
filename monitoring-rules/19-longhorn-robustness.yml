@@ -55,10 +55,16 @@ spec:
       ## A WO (write-only) replica's `progress%` is reported by the
       ## f/infra_health/longhorn_rebuild_stuck Windmill probe every 5 min.
       ## If the gauge sits unchanged for ≥15 min while still 0 < progress < 100,
-      ## the rebuild stalled. Longhorn does NOT auto-recover this — the manual
-      ## fix is `kubectl delete replica <name>` so auto-balance reschedules.
-      ## Caught the 2026-05-14 owncloud-data stall at 53%/0 MB/s manually;
-      ## this is the automation.
+      ## the rebuild stalled. Longhorn does NOT auto-recover stalled WO
+      ## rebuilds on its own — the manual fix is to delete the replica so
+      ## auto-balance reschedules.
+      ##
+      ## The probe **also auto-unstucks** the replica after 30 min of no
+      ## progress (one deletion per probe run, cap=1). So if you see this
+      ## alert it means either (a) the stall started <30 min ago and the
+      ## probe hasn't kicked in yet, or (b) the auto-delete failed for
+      ## some reason (likely Rancher API/permissions). If the alert
+      ## persists past 35 min, check Windmill run logs for the probe.
       ##
       ## changes(...[15m]) == 0 means no observed change in last 15 min.
       ## Combined with `for: 5m` we get an effective 20-min stall window.
@@ -75,7 +81,8 @@ spec:
         summary: "Longhorn rebuild stalled: {{ $labels.volume }} (replica {{ $labels.replica }}) at {{ $value }}%"
         description: |
           The rebuild of replica {{ $labels.replica }} on volume {{ $labels.volume }}
-          has been at {{ $value }}% with no change for ≥15 min. Longhorn doesn't
-          self-recover stalled WO rebuilds. Fix:
+          has been at {{ $value }}% with no change for ≥15 min. The
+          f/infra_health/longhorn_rebuild_stuck probe will auto-delete the replica
+          after 30 min total stall (one per run). If you want to act sooner:
             kubectl --context=mdapi-prod -n longhorn-system delete replica {{ $labels.replica }}
           Auto-balance (best-effort) will re-schedule on a healthier node.
