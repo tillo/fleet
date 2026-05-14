@@ -1,0 +1,72 @@
+## Weekly maintenance for the Joplin events table.
+##
+## Joplin Server writes one row to `events` per item change (note edit,
+## share update, etc.). Old rows beyond what any client still polls for
+## are dead weight — but Joplin Server has no built-in retention path.
+##
+## Background:
+## On 2026-05-14 the events table had 273,502 rows going back to
+## 2023-12-22 (17 months unvacuumed, 2.5 GB on a 5 GiB PVC). Postgres
+## defaults of work_mem=4 MB couldn't hold a GROUP BY of that size,
+## TaskService #11 ("Process shared items") hung, and every MCP call
+## timed out as "retry later".
+##
+## This CronJob keeps `events` to a 30-day rolling window so the bloat
+## can't return. VACUUM (regular, not FULL) marks dead pages reusable
+## without rewriting the file or locking it long.
+##
+## Schedule: Sundays 03:30 Europe/Zurich. Cheap, low-traffic window.
+##
+## Safety: DELETE is bounded to created_time < now - 30d. Joplin clients
+## sync incrementally by `cursor`; events older than 30 days are well
+## past any active sync horizon.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-events-cleanup
+  namespace: joplin
+spec:
+  schedule: "30 3 * * 0"
+  timeZone: Europe/Zurich
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: cleanup
+            image: mirror.gcr.io/postgres:17
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: PGHOST
+              value: postgres.joplin.svc.cluster.local
+            - name: PGUSER
+              value: joplin
+            - name: PGDATABASE
+              value: joplin
+            envFrom:
+            - secretRef:
+                name: postgres-env-secret
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              cutoff_ms=$(date -d '30 days ago' +%s)000
+              echo "Deleting events older than $(date -d '30 days ago' -Is) (cutoff=$cutoff_ms)..."
+              psql -v ON_ERROR_STOP=1 -c "DELETE FROM events WHERE created_time < $cutoff_ms;"
+              echo "VACUUM ANALYZE events..."
+              psql -v ON_ERROR_STOP=1 -c "VACUUM (ANALYZE) events;"
+              echo "Stats after cleanup:"
+              psql -v ON_ERROR_STOP=1 -c "SELECT pg_size_pretty(pg_total_relation_size('events')) AS size, (SELECT count(*) FROM events) AS rows;"
+            resources:
+              requests:
+                cpu: 25m
+                memory: 64Mi
+              limits:
+                memory: 128Mi

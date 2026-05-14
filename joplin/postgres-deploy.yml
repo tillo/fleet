@@ -24,6 +24,21 @@ spec:
         - name: postgres
           image: mirror.gcr.io/postgres:17
           imagePullPolicy: Always
+          # Tuned for the Joplin events table (~50 k rows steady-state
+          # after the 2026-05-14 cleanup of 17 months of unvacuumed audit
+          # rows). Postgres defaults of shared_buffers=128MB and
+          # work_mem=4MB couldn't hold the events GROUP BY in memory, so
+          # every TaskService #11 ("Process shared items") tick spilled
+          # to disk and starved the MCP path.
+          args:
+            - -c
+            - shared_buffers=256MB
+            - -c
+            - work_mem=16MB
+            - -c
+            - maintenance_work_mem=128MB
+            - -c
+            - effective_cache_size=512MB
           env:
             - name: TZ
               value: Europe/Zurich
@@ -37,9 +52,9 @@ spec:
           resources:
             requests:
               cpu: 25m
-              memory: 336Mi
-            limits:
               memory: 512Mi
+            limits:
+              memory: 768Mi
           ports:
             - name: postgres
               containerPort: 5432
