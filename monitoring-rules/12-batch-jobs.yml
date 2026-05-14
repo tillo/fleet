@@ -270,20 +270,40 @@ spec:
 
   - name: app-batch-jobs.cve-scan
     rules:
-    - alert: PodImageCriticalCves
-      ## Demoted to info severity: per-image alerts on `:latest` upstream
-      ## images are mostly unactionable (we pull fresh on restart anyway)
-      ## and were producing 50+ warning notifications. Critical CVEs on
-      ## pinned versions show up via the weekly version checks.
-      expr: max by (image) (pod_image_cve_count{severity="critical"}) > 0
+    - alert: NamespaceWithCriticalCves
+      ## Aggregated from per-image to per-namespace on 2026-05-14: with
+      ## ~50 :latest upstream images flagged, the per-image variant was
+      ## producing 50+ info entries in the AM UI for the same generic
+      ## "an upstream image has CVEs" condition. The data is still
+      ## queryable per-image via `pod_image_cve_count{severity="critical"}`;
+      ## this rule just collapses the alert surface.
+      ##
+      ## Joins the scan output (image-keyed) with kube_pod_container_info
+      ## (namespace+image keyed) so we can group_left a namespace onto
+      ## each vulnerable image. Result: one alert per namespace, value =
+      ## count of distinct images with critical CVEs in that namespace.
+      expr: |
+        count by (namespace) (
+          kube_pod_container_info
+          * on (image) group_left()
+          (pod_image_cve_count{severity="critical"} > 0)
+        )
       for: 30m
       labels:
         severity: info
         component: General
         team: mdapi
       annotations:
-        summary: "Critical CVE(s) found in image {{ $labels.image }}"
-        description: "Most recent grype scan reported >= 1 CRITICAL CVE. Pin a fixed version or pull-policy=Always to refresh."
+        summary: "{{ $labels.namespace }}: {{ $value }} container image(s) with critical CVE(s)"
+        description: |
+          Most recent grype scan flagged {{ $value }} image(s) in
+          namespace `{{ $labels.namespace }}` with at least one CRITICAL CVE.
+
+          Drill in:
+            pod_image_cve_count{severity="critical"} > 0
+          and join with kube_pod_container_info on `image` to see which
+          pods are affected. Mitigations: pin a fixed version, set
+          pull-policy=Always to refresh, or accept (for :latest upstream).
 
   - name: app-batch-jobs.cluster-waste
     rules:
