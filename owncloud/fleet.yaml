@@ -5,9 +5,13 @@ namespaceLabels:
   cdenv.mdapi.ch: prod
 helm:
   maxHistory: 25
-# VPA (mode=Auto) writes resources.requests/limits onto running pods.
-# Strip the resources block from both sides before diff so Fleet stops
-# flagging the bundle as Modified.
+# Two sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running
+#      pods after start.
+#   2. Keel (`keel.sh/policy: minor|major`) auto-bumps the image tag
+#      on its poll cadence (e.g. postgres:17 → postgres:17.9,
+#      owncloud/server:10 → 10.16.2, redis:7 → 7.4.9).
+# Strip both fields from the diff so Fleet stops flagging Modified.
 diff:
   comparePatches:
   - apiVersion: apps/v1
@@ -16,15 +20,18 @@ diff:
     namespace: owncloud
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
   - apiVersion: apps/v1
     kind: Deployment
     name: owncloud
     namespace: owncloud
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
   - apiVersion: apps/v1
     kind: Deployment
     name: redis
     namespace: owncloud
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
