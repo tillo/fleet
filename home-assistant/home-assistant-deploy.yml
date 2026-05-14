@@ -19,6 +19,27 @@ spec:
       labels:
         app: home-assistant
     spec:
+      initContainers:
+      # One-shot bootstrap (2026-05-14 migration): on first run after the
+      # ConfigMap-subPath mount was removed, the PVC has
+      # /config/configuration.yaml.bootstrap but no /config/configuration.yaml.
+      # Rename it into place. On subsequent restarts this is a no-op.
+      - name: bootstrap-configuration
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          if [ -f /config/configuration.yaml.bootstrap ] && [ ! -f /config/configuration.yaml ]; then
+            mv /config/configuration.yaml.bootstrap /config/configuration.yaml
+            echo "bootstrap-configuration: installed configuration.yaml from .bootstrap"
+          else
+            echo "bootstrap-configuration: nothing to do (target=$( [ -f /config/configuration.yaml ] && echo present || echo absent ), bootstrap=$( [ -f /config/configuration.yaml.bootstrap ] && echo present || echo absent ))"
+          fi
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
       containers:
       - name: home-assistant
         image: ghcr.io/home-assistant/home-assistant:latest
@@ -47,9 +68,9 @@ spec:
         volumeMounts:
         - name: home-assistant-data
           mountPath: /config
-        - name: home-assistant-config
-          mountPath: /config/configuration.yaml
-          subPath: configuration.yaml
+        # configuration.yaml lives on the PVC (home-assistant-data) since
+        # 2026-05-14 — see bootstrap-configuration initContainer above and the
+        # home-assistant-bootstrap ConfigMap (kept as DR seed, not mounted).
         - name: home-assistant-secrets
           mountPath: /config/secrets.yaml
           subPath: secrets.yaml
@@ -62,9 +83,8 @@ spec:
       - name: home-assistant-data
         persistentVolumeClaim:
           claimName: home-assistant-data
-      - name: home-assistant-config
-        configMap:
-          name: home-assistant-config
+      # home-assistant-config volume removed 2026-05-14 (configuration.yaml on PVC).
+      # The home-assistant-bootstrap ConfigMap still exists in fleet as a DR seed.
       - name: home-assistant-secrets
         secret:
           secretName: home-assistant-secrets
