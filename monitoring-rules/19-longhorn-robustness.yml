@@ -50,3 +50,32 @@ spec:
           {{ $labels.pvc_namespace }}/{{ $labels.pvc }} will get I/O errors. Check
           longhorn-system events and node disk state. Restore from backup if
           replicas can't be recovered.
+
+    - alert: LonghornRebuildStuck
+      ## A WO (write-only) replica's `progress%` is reported by the
+      ## f/infra_health/longhorn_rebuild_stuck Windmill probe every 5 min.
+      ## If the gauge sits unchanged for ≥15 min while still 0 < progress < 100,
+      ## the rebuild stalled. Longhorn does NOT auto-recover this — the manual
+      ## fix is `kubectl delete replica <name>` so auto-balance reschedules.
+      ## Caught the 2026-05-14 owncloud-data stall at 53%/0 MB/s manually;
+      ## this is the automation.
+      ##
+      ## changes(...[15m]) == 0 means no observed change in last 15 min.
+      ## Combined with `for: 5m` we get an effective 20-min stall window.
+      expr: |
+        changes(longhorn_replica_rebuild_progress[15m]) == 0
+          and longhorn_replica_rebuild_progress > 0
+          and longhorn_replica_rebuild_progress < 100
+      for: 5m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn rebuild stalled: {{ $labels.volume }} (replica {{ $labels.replica }}) at {{ $value }}%"
+        description: |
+          The rebuild of replica {{ $labels.replica }} on volume {{ $labels.volume }}
+          has been at {{ $value }}% with no change for ≥15 min. Longhorn doesn't
+          self-recover stalled WO rebuilds. Fix:
+            kubectl --context=mdapi-prod -n longhorn-system delete replica {{ $labels.replica }}
+          Auto-balance (best-effort) will re-schedule on a healthier node.
