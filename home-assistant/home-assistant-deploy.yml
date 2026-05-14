@@ -20,10 +20,12 @@ spec:
         app: home-assistant
     spec:
       initContainers:
-      # One-shot bootstrap (2026-05-14 migration): on first run after the
-      # ConfigMap-subPath mount was removed, the PVC has
-      # /config/configuration.yaml.bootstrap but no /config/configuration.yaml.
-      # Rename it into place. On subsequent restarts this is a no-op.
+      # Bootstrap initContainer (2026-05-14 migration):
+      # If a /config/configuration.yaml.bootstrap exists on the PVC AND the
+      # real configuration.yaml is missing OR empty (0 bytes — happened on the
+      # initial migration because the PVC had a 0-byte stub from pre-CM-mount
+      # days), promote .bootstrap to configuration.yaml. On normal restarts,
+      # this is a no-op because configuration.yaml is present and non-empty.
       - name: bootstrap-configuration
         image: busybox:1.36
         command:
@@ -31,11 +33,11 @@ spec:
         - -c
         - |
           set -e
-          if [ -f /config/configuration.yaml.bootstrap ] && [ ! -f /config/configuration.yaml ]; then
-            mv /config/configuration.yaml.bootstrap /config/configuration.yaml
-            echo "bootstrap-configuration: installed configuration.yaml from .bootstrap"
+          if [ -f /config/configuration.yaml.bootstrap ] && [ ! -s /config/configuration.yaml ]; then
+            mv -f /config/configuration.yaml.bootstrap /config/configuration.yaml
+            echo "bootstrap-configuration: installed configuration.yaml from .bootstrap (target was missing or empty)"
           else
-            echo "bootstrap-configuration: nothing to do (target=$( [ -f /config/configuration.yaml ] && echo present || echo absent ), bootstrap=$( [ -f /config/configuration.yaml.bootstrap ] && echo present || echo absent ))"
+            echo "bootstrap-configuration: nothing to do (target=$( [ -s /config/configuration.yaml ] && echo non-empty || echo missing-or-empty ), bootstrap=$( [ -f /config/configuration.yaml.bootstrap ] && echo present || echo absent ))"
           fi
         volumeMounts:
         - name: home-assistant-data
