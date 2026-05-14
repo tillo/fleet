@@ -28,6 +28,12 @@ metadata:
       # accurate, and so flipping to SecRuleEngine On later does not break the
       # Joplin MCP sync. No apostrophes anywhere — see docs warning.
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # Joplin sync uploads note bodies and resource attachments as
+      # application/octet-stream. Extend the CRS default content-type list
+      # so rule 920420 stops firing on legitimate sync traffic. CRS init
+      # (rule 901160) only sets the default when the variable is unset,
+      # so a phase:1 SecAction before the Include wins.
+      SecAction "id:900201,phase:1,nolog,pass,t:none,setvar:tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/reports+json| |application/csp-report| |application/octet-stream|"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
 spec:
   ingressClassName: nginx
