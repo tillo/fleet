@@ -46,7 +46,7 @@ data:
     statuspage states (major_outage / degraded_performance / operational).
     """
     import json, os, sys, threading, time, urllib.parse, urllib.request, urllib.error
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     PAGE_ID    = os.environ["STATUSPAGE_PAGE_ID"]
     API_KEY    = os.environ["STATUSPAGE_API_KEY"]
@@ -210,4 +210,9 @@ data:
         log(f"loaded {len(COMPONENTS)} components: {sorted(COMPONENTS.keys())}")
         log(f"reconcile against {AM_URL} every {RECONCILE_INTERVAL_SEC}s")
         threading.Thread(target=reconcile_loop, daemon=True).start()
-        HTTPServer(("0.0.0.0", BIND_PORT), H).serve_forever()
+        # ThreadingHTTPServer (vs HTTPServer) handles each request in its
+        # own thread, so /healthz can respond even when a /webhook POST
+        # is busy doing PATCH calls to statuspage.io. Without this the
+        # kubelet readiness probe timed out (3s) the moment a webhook
+        # arrived during reconcile, and the pod got SIGKILLed.
+        ThreadingHTTPServer(("0.0.0.0", BIND_PORT), H).serve_forever()
