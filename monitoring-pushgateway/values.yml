@@ -29,6 +29,26 @@ serviceMonitor:
   ## Default selector ({}) on the Prometheus CRD picks any SM. No release
   ## label needed.
 
+## Expose Pushgateway to off-cluster pushers (BPI-R4 router, future devices)
+## via an internal-only ingress. Hostname is LAN-resolved via BPI-R4 dnsmasq
+## (list address '/pushgateway.mdapi.ch/192.168.1.191') so it never leaves
+## the home network. Source range whitelist enforces that at the ingress.
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.0.0/16,10.0.0.0/8"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+  hosts:
+    - pushgateway.mdapi.ch
+  path: /
+  pathType: Prefix
+  tls:
+    - hosts:
+        - pushgateway.mdapi.ch
+      secretName: pushgateway-mdapi-ch-tls
+
 ## NetworkPolicy is intentionally NOT set. The chart's template renders
 ## a NetworkPolicy whenever `.Values.networkPolicy` is truthy in Go-template
 ## terms — i.e., a non-empty dict. The chart's default is `{}` which is
