@@ -284,9 +284,11 @@ spec:
       ## count of distinct images with critical CVEs in that namespace.
       expr: |
         count by (namespace) (
-          kube_pod_container_info
-          * on (image) group_left()
-          (pod_image_cve_count{severity="critical"} > 0)
+          group by (namespace, image) (
+            kube_pod_container_info
+            * on (image) group_left()
+            (pod_image_cve_count{severity="critical"} > 0)
+          )
         )
       for: 30m
       labels:
