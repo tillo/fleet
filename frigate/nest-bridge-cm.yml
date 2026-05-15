@@ -86,6 +86,10 @@ data:
         pc.addTransceiver('video', direction='recvonly')
         pc.createDataChannel('data')
         offer = await pc.createOffer()
+        # SDM is strict: m= lines must appear in order audio,video,application.
+        # Log the order to verify.
+        ml = [line for line in offer.sdp.split('\n') if line.startswith('m=')]
+        log.info(f'offer m-lines: {[l.strip() for l in ml]}')
         await pc.setLocalDescription(offer)
 
         log.info('GenerateWebRtcStream...')
