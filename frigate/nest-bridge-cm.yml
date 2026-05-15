@@ -82,7 +82,24 @@ data:
         expires_at = results.get('expiresAt')
         log.info(f'Stream OK media_id={media_id[:10]}... expires_at={expires_at}')
 
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type='answer'))
+        # Google SDM's answer SDP has a non-standard a=candidate: line format
+        # (e.g. `a=candidate:0 udp ...` skipping the RFC-5245 component-id
+        # field) that aiortc's strict parser rejects. Strip ICE candidates
+        # from the answer — aiortc will still complete the DTLS handshake
+        # using STUN/TURN discovered through the offer side.
+        clean_lines = []
+        stripped = 0
+        for line in answer_sdp.replace('\r\n', '\n').split('\n'):
+            if line.startswith('a=candidate:'):
+                stripped += 1
+                if stripped <= 2:
+                    log.info(f'Stripping non-standard candidate: {line[:120]}')
+                continue
+            clean_lines.append(line)
+        clean_sdp = '\r\n'.join(clean_lines)
+        log.info(f'Stripped {stripped} a=candidate lines from answer')
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
 
         recorder = MediaRecorder(RTSP_URL, format='rtsp',
                                  options={'rtsp_transport': 'tcp'})
