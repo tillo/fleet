@@ -115,6 +115,16 @@ data:
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
 
+        @pc.on('connectionstatechange')
+        async def _state():
+            log.info(f'peer connectionState={pc.connectionState}')
+        @pc.on('iceconnectionstatechange')
+        async def _ice():
+            log.info(f'peer iceConnectionState={pc.iceConnectionState}')
+        @pc.on('signalingstatechange')
+        async def _sig():
+            log.info(f'peer signalingState={pc.signalingState}')
+
         recorder = MediaRecorder(RTSP_URL, format='rtsp',
                                  options={'rtsp_transport': 'tcp'})
         @pc.on('track')
@@ -122,7 +132,12 @@ data:
             log.info(f'Track: kind={track.kind} id={track.id}')
             recorder.addTrack(track)
 
-        await asyncio.sleep(2)
+        # Wait up to 10 s for at least one track + connection to stabilise.
+        for _ in range(20):
+            if pc.connectionState == 'connected':
+                break
+            await asyncio.sleep(0.5)
+        log.info(f'After-wait state: connection={pc.connectionState} ice={pc.iceConnectionState}')
         await recorder.start()
         log.info(f'Pushing to {RTSP_URL}')
 
