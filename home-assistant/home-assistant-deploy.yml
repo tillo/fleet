@@ -81,6 +81,35 @@ spec:
             akri.sh/akri-home-assistant: "1"
           requests:
             akri.sh/akri-home-assistant: "1"
+      # Sidecar: hourly off-site sync of /config/backups → Garage S3.
+      # Local retention is unchanged (auto_backup keeps the rolling window).
+      - name: rclone-backups-s3
+        image: rclone/rclone:1.69
+        command:
+        - sh
+        - -c
+        - |
+          set -u
+          : "${BUCKET:?BUCKET env required}"
+          while true; do
+            rclone copy --min-age 1h --transfers 4 --s3-no-check-bucket \
+              /config/backups "garage:${BUCKET}" 2>&1 || true
+            sleep 3600
+          done
+        envFrom:
+        - secretRef:
+            name: garage-ha-backup-s3
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
       volumes:
       - name: home-assistant-data
         persistentVolumeClaim:

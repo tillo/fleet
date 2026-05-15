@@ -53,6 +53,35 @@ spec:
           mountPath: /dev/shm
         - name: frigate-tmp
           mountPath: /tmp
+      # Sidecar: 6-hourly off-site sync of /media/frigate/recordings → Garage S3.
+      # Skips files newer than 24h so Frigate's local retention drives local TTL.
+      - name: rclone-recordings-s3
+        image: rclone/rclone:1.69
+        command:
+        - sh
+        - -c
+        - |
+          set -u
+          : "${BUCKET:?BUCKET env required}"
+          while true; do
+            rclone copy --min-age 24h --transfers 4 --s3-no-check-bucket \
+              /media/frigate/recordings "garage:${BUCKET}" 2>&1 || true
+            sleep 21600
+          done
+        envFrom:
+        - secretRef:
+            name: garage-frigate-s3
+        volumeMounts:
+        - name: frigate-media
+          mountPath: /media
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 1
+            memory: 512Mi
       volumes:
       - name: frigate-config
         persistentVolumeClaim:

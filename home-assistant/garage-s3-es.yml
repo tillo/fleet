@@ -1,0 +1,32 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: garage-ha-backup-s3
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: garage-ha-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        RCLONE_CONFIG_GARAGE_TYPE: "s3"
+        RCLONE_CONFIG_GARAGE_PROVIDER: "Other"
+        RCLONE_CONFIG_GARAGE_ENDPOINT: "http://garage.bootstrap.svc.cluster.local:3900"
+        RCLONE_CONFIG_GARAGE_REGION: "garage"
+        RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID: "{{ .access_key }}"
+        RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY: "{{ .secret_key }}"
+        BUCKET: "home-assistant-backups"
+
+  data:
+    - remoteRef:
+        key: /mdapi/home-assistant/garage-s3/access_key
+      secretKey: access_key
+    - remoteRef:
+        key: /mdapi/home-assistant/garage-s3/secret_key
+      secretKey: secret_key
