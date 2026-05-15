@@ -134,13 +134,18 @@ spec:
         summary: "esphome dashboard down"
         description: "Device firmware editor unavailable. Devices keep running; this only blocks OTA updates."
 
-    ## Frigate camera silently offline — ffmpeg dies or RTSP stream stalls
-    ## while Frigate as a whole keeps running. HA's Frigate/go2rtc integration
-    ## drops hass_entity_available for the camera. Caught balconycam-2026-05-15.
+    ## Frigate / Nest camera silently offline — ffmpeg dies, the RTSP/WebRTC
+    ## stream stalls, or the upstream Nest device is unreachable. HA's
+    ## Frigate/Nest integration drops hass_entity_available for the camera.
+    ## Excludes camera.pwhtillo_guest (static QR-code "camera" — local file
+    ## sensor, never has a producer feeding it).
     - alert: FrigateCameraOffline
       expr: |
         max by (entity, friendly_name) (
-          hass_entity_available{domain="camera"} == 0
+          hass_entity_available{
+            domain="camera",
+            entity!~"camera\\.(pwhtillo_guest|.*_qr|.*_static)"
+          } == 0
         )
       for: 15m
       labels:
@@ -151,8 +156,9 @@ spec:
         summary: "Camera offline: {{ $labels.friendly_name }}"
         description: |
           Camera entity {{ $labels.entity }} has been unavailable for 15m.
-          Usually means go2rtc lost the upstream RTSP/Nest stream — check
-          go2rtc producers and re-auth Nest tokens if applicable.
+          For Frigate cams: check go2rtc producers (`/api/streams?src=<name>`)
+          and ffmpeg logs. For Nest cams: a Google SDM 500 on the device
+          usually means the Nest cam itself is offline — check Google Home app.
 
     ## HA backup integration tracks last successful + last failed timestamps.
     ## binary_sensor.auto_backup_backup_status: 0 healthy, 1 last attempt failed.
