@@ -170,3 +170,56 @@ spec:
           >10m. Failover replica unavailable — primary is a SPOF until the
           secondary recovers. Lower severity because clients currently route
           to primary only (externalTrafficPolicy=Local).
+
+    - alert: TechnitiumServFailHigh
+      ## Exporter publishes the rolling last-hour SERVFAIL count; alert when
+      ## the upstream-resolver error rate breaches our normal background.
+      ## Baseline observed is single-digit/hour, so >30/h is anomalous.
+      expr: technitium_dns_request_result_count{server="primary", result="server_failure"} > 30
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary: {{ $value }} SERVFAILs in the last hour"
+        description: |
+          Upstream forwarder (NextDNS UDP failover) is returning SERVFAIL at
+          a higher-than-normal rate. Check forwarder reachability and the
+          recursive resolver path. Drill in via OpenObserve stream
+          technitium_queries with rcode='ServerFailure' for the affected
+          qnames/clients.
+
+    - alert: TechnitiumQueryLogLagging
+      ## Pushgateway metric pushed by Windmill technitium_query_log_to_o2.
+      ## Steady-state lag should track the schedule interval (60s); >5min
+      ## means the cursor is stuck or OpenObserve ingest is failing.
+      expr: technitium_query_log_lag_seconds > 300
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium → OpenObserve ingest lag {{ $value | humanizeDuration }}"
+        description: |
+          The Windmill technitium_query_log_to_o2 job is reporting a
+          steady-state lag >5min. Either Technitium /api/logs/query is slow,
+          OpenObserve _json ingest is failing, or the cursor is stuck.
+          Look at the job's recent runs in Windmill and tail the OpenObserve
+          ingester logs.
+
+    - alert: TechnitiumQueryLogStale
+      expr: time() - technitium_query_log_last_run_timestamp_seconds > 600
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium query-log probe hasn't pushed in >10min"
+        description: |
+          Windmill technitium_query_log_to_o2 stopped pushing to Pushgateway.
+          Either the schedule was disabled, the worker is stuck, or
+          Pushgateway is unreachable. Other Technitium query-log alerts will
+          be silently broken until this resolves.
