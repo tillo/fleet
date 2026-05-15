@@ -101,14 +101,16 @@ spec:
       # from the frigate-nest-balconycam secret (created out of band via
       # kubectl — not in fleet, since fleet has a remote at gitlab.mdapi.ch).
       - name: nest-bridge-balconycam
-        image: python:3.13-slim
+        image: python:3.12-slim
         imagePullPolicy: IfNotPresent
         command:
         - sh
         - -c
         - |
           set -eu
-          # aiortc + PyAV ship manylinux wheels with bundled libs; no apt needed.
+          # python:3.12 has manylinux wheels for av/aiortc — no compiler needed.
+          # python:3.13 would force a source build (av cp313 wheels not shipped
+          # at the time of writing).
           pip install --quiet --no-cache-dir 'aiortc==1.13.0' 2>&1 | tail -3
           exec python3 /scripts/bridge.py
         envFrom:
