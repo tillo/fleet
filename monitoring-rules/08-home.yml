@@ -133,3 +133,110 @@ spec:
       annotations:
         summary: "esphome dashboard down"
         description: "Device firmware editor unavailable. Devices keep running; this only blocks OTA updates."
+
+    ## Frigate camera silently offline — ffmpeg dies or RTSP stream stalls
+    ## while Frigate as a whole keeps running. HA's Frigate/go2rtc integration
+    ## drops hass_entity_available for the camera. Caught balconycam-2026-05-15.
+    - alert: FrigateCameraOffline
+      expr: |
+        max by (entity, friendly_name) (
+          hass_entity_available{domain="camera"} == 0
+        )
+      for: 15m
+      labels:
+        severity: warning
+        component: Home
+        team: mdapi
+      annotations:
+        summary: "Camera offline: {{ $labels.friendly_name }}"
+        description: |
+          Camera entity {{ $labels.entity }} has been unavailable for 15m.
+          Usually means go2rtc lost the upstream RTSP/Nest stream — check
+          go2rtc producers and re-auth Nest tokens if applicable.
+
+    ## HA backup integration tracks last successful + last failed timestamps.
+    ## binary_sensor.auto_backup_backup_status: 0 healthy, 1 last attempt failed.
+    ## sensor.auto_backup_monitored_backups < expected count → retention regression.
+    - alert: HomeAssistantBackupFailed
+      expr: |
+        hass_binary_sensor_state{entity="binary_sensor.auto_backup_backup_status"} == 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Home
+        team: mdapi
+      annotations:
+        summary: "HA Auto Backup last attempt failed"
+        description: |
+          binary_sensor.auto_backup_backup_status reports failure for >30m.
+          Check sensor.auto_backup_last_failure for the error and verify
+          the rclone-backups-s3 sidecar push to Garage.
+
+    ## Same signal projected through the monitored-count: if HA suddenly
+    ## drops below 15 monitored backups, retention/rotation went wrong.
+    - alert: HomeAssistantBackupCountLow
+      expr: |
+        hass_sensor_state{entity="sensor.auto_backup_monitored_backups"} < 15
+      for: 1h
+      labels:
+        severity: info
+        component: Home
+        team: mdapi
+      annotations:
+        summary: "HA Auto Backup monitored count {{ $value }} (<15)"
+        description: |
+          Expected ~20 daily/weekly/monthly retained backups. Current count
+          is unusually low — verify auto_backup add-on is purging correctly.
+
+    ## Battery-powered devices (Zigbee/Z-Wave/BLE). Project current discharge
+    ## rate forward 48h and warn if the device will hit 0% — earlier signal
+    ## than the bare 20% threshold.
+    - alert: BatteryLowPredictive
+      expr: |
+        predict_linear(hass_sensor_battery_percent[7d], 48 * 3600) < 0
+        and hass_sensor_battery_percent < 40
+      for: 1h
+      labels:
+        severity: info
+        component: Home
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.friendly_name }} battery will deplete in <48h"
+        description: |
+          7d linear projection puts {{ $labels.entity }} below 0% within
+          48h (current {{ $value | printf "%.0f" }}%). Replace battery now.
+
+    ## Cross-namespace heartbeat: BPI-R4 router pushes sensor.bpi_r4_heartbeat
+    ## every minute (epoch seconds). >5 min stale = router lost network to HA,
+    ## or health-snapshot.sh died. Last-resort canary for the homelab uplink
+    ## that doesn't depend on the cluster-side Pushgateway path.
+    - alert: BpiR4HeartbeatStale
+      expr: |
+        time() - max(hass_sensor_state{entity="sensor.bpi_r4_heartbeat"}) > 300
+      for: 3m
+      labels:
+        severity: warning
+        component: Router
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 sensor heartbeat stale (>5min)"
+        description: |
+          The BPI-R4 router has not pushed sensor.bpi_r4_heartbeat to HA
+          in >5 min. Either the router is unreachable, the script
+          health-snapshot.sh died, or HA stopped accepting writes.
+
+    ## Garage cluster degradation — fewer ok nodes than total. Each Garage
+    ## instance is single-node so any degradation is fatal for backup writes.
+    - alert: GarageClusterDegraded
+      expr: |
+        max by (namespace) (cluster_storage_nodes - cluster_storage_nodes_ok) > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "Garage {{ $labels.namespace }} cluster degraded"
+        description: |
+          {{ $value }} Garage node(s) reporting not-ok in {{ $labels.namespace }}.
+          Backup writes will fail. Check pod status and disk health.

@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frigate-dashboard
+  labels:
+    grafana_dashboard: "1"
+data:
+  frigate.json: |
+    {
+      "schemaVersion": 36,
+      "version": 1,
+      "uid": "frigate-overview",
+      "title": "Frigate — Cameras & Detection",
+      "tags": ["frigate", "home-assistant", "mdapi"],
+      "timezone": "browser",
+      "editable": true,
+      "time": {"from": "now-24h", "to": "now"},
+      "refresh": "30s",
+      "templating": {
+        "list": [
+          {"name": "datasource", "type": "datasource", "query": "prometheus", "current": {"text": "Prometheus", "value": "Prometheus"}, "hide": 0},
+          {"name": "camera", "type": "query", "datasource": {"type": "prometheus", "uid": "$datasource"},
+            "query": "label_values(hass_entity_available{domain=\"camera\"}, entity)",
+            "refresh": 2, "includeAll": true, "multi": true, "current": {"text": "All", "value": "$__all"}}
+        ]
+      },
+      "panels": [
+        {"id": 1, "type": "stat", "title": "Cameras online",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(hass_entity_available{domain=\"camera\"})", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}}
+        },
+        {"id": 2, "type": "stat", "title": "Cameras offline",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+          "targets": [{"expr": "count(hass_entity_available{domain=\"camera\"} == 0)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+        },
+        {"id": 3, "type": "stat", "title": "Motion events (24h)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(increase(hass_state_change_total{entity=~\"binary_sensor\\\\..*cam.*_motion\"}[24h]))", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}}
+        },
+        {"id": 4, "type": "stat", "title": "Person detections (24h)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 0, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(increase(hass_state_change_total{entity=~\"binary_sensor\\\\..*_person_occupancy\"}[24h]))", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}}
+        },
+        {"id": 5, "type": "stat", "title": "Frigate pod restarts (24h)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=\"frigate\"}[24h]))", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+        },
+        {"id": 6, "type": "stat", "title": "PVC frigate-media usage",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+          "targets": [{"expr": "kubelet_volume_stats_used_bytes{namespace=\"frigate\", persistentvolumeclaim=\"frigate-media\"} / kubelet_volume_stats_capacity_bytes{namespace=\"frigate\", persistentvolumeclaim=\"frigate-media\"}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.7}, {"color": "red", "value": 0.9}]}}}
+        },
+        {"id": 10, "type": "timeseries", "title": "Camera availability over time",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 4, "w": 24, "h": 6},
+          "targets": [{"expr": "hass_entity_available{entity=~\"$camera\"}", "legendFormat": "{{friendly_name}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"min": 0, "max": 1, "custom": {"lineWidth": 2, "drawStyle": "line", "fillOpacity": 10}, "mappings": [{"options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}, "type": "value"}]}}
+        },
+        {"id": 20, "type": "timeseries", "title": "Motion event rate (per minute)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 10, "w": 12, "h": 8},
+          "targets": [{"expr": "rate(hass_state_change_total{entity=~\"binary_sensor\\\\..*cam.*_motion\"}[5m]) * 60", "legendFormat": "{{friendly_name}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 1, "fillOpacity": 5}}},
+          "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}}
+        },
+        {"id": 21, "type": "timeseries", "title": "Object detections per minute",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 10, "w": 12, "h": 8},
+          "targets": [{"expr": "rate(hass_state_change_total{entity=~\"binary_sensor\\\\..*_(person|car|cat|bird|bicycle)_occupancy\"}[5m]) * 60", "legendFormat": "{{friendly_name}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 1, "fillOpacity": 5}}},
+          "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}}
+        },
+        {"id": 30, "type": "timeseries", "title": "Frigate pod CPU",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 18, "w": 12, "h": 6},
+          "targets": [{"expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"frigate\", container!=\"\", container!=\"POD\"}[5m]))", "legendFormat": "{{pod}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 2, "custom": {"lineWidth": 1, "fillOpacity": 5}}}
+        },
+        {"id": 31, "type": "timeseries", "title": "Frigate pod memory",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 18, "w": 12, "h": 6},
+          "targets": [{"expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"frigate\", container!=\"\", container!=\"POD\"})", "legendFormat": "{{pod}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "bytes", "custom": {"lineWidth": 1, "fillOpacity": 5}}}
+        },
+        {"id": 40, "type": "table", "title": "Cameras — current state",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 24, "w": 12, "h": 6},
+          "targets": [{"expr": "hass_entity_available{domain=\"camera\"}", "legendFormat": "{{friendly_name}}", "refId": "A", "instant": true, "format": "table"}],
+          "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"text": "OFFLINE", "color": "red"}, "1": {"text": "ONLINE", "color": "green"}}, "type": "value"}]}}
+        },
+        {"id": 41, "type": "bargauge", "title": "Object counts (live)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 24, "w": 12, "h": 6},
+          "targets": [{"expr": "topk(15, hass_sensor_state{entity=~\"sensor\\\\..*cam.*_(person|car|cat|bird|bicycle|motorcycle)_count\"} > 0)", "legendFormat": "{{friendly_name}}", "refId": "A", "instant": true}],
+          "options": {"orientation": "horizontal", "displayMode": "gradient"}
+        }
+      ]
+    }

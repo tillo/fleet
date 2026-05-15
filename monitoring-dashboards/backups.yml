@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backups-dashboard
+  labels:
+    grafana_dashboard: "1"
+data:
+  backups.json: |
+    {
+      "schemaVersion": 36,
+      "version": 1,
+      "uid": "backup-landscape",
+      "title": "Backup Landscape — Garage / Longhorn / HA",
+      "tags": ["backup", "longhorn", "garage", "mdapi"],
+      "timezone": "browser",
+      "editable": true,
+      "time": {"from": "now-24h", "to": "now"},
+      "refresh": "1m",
+      "templating": {
+        "list": [
+          {"name": "datasource", "type": "datasource", "query": "prometheus", "current": {"text": "Prometheus", "value": "Prometheus"}, "hide": 0}
+        ]
+      },
+      "panels": [
+        {"id": 1, "type": "row", "title": "Garage S3 cluster health", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}, "collapsed": false},
+        {"id": 10, "type": "stat", "title": "Garage instances reporting",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 1, "w": 4, "h": 4},
+          "targets": [{"expr": "count(count by (namespace) (cluster_storage_nodes))", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 2}]}}}
+        },
+        {"id": 11, "type": "stat", "title": "Garage nodes OK (sum)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 4, "y": 1, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(cluster_storage_nodes_ok)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 2}]}}}
+        },
+        {"id": 12, "type": "stat", "title": "Garage degraded nodes",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 8, "y": 1, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(cluster_storage_nodes - cluster_storage_nodes_ok)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+        },
+        {"id": 13, "type": "stat", "title": "Buckets total",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 1, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(table_size{table_name=\"bucket_v2\"})", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short"}}
+        },
+        {"id": 14, "type": "stat", "title": "Objects (cluster-wide)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 16, "y": 1, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(table_size{table_name=\"object\"})", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}}
+        },
+        {"id": 15, "type": "stat", "title": "S3 write rate (5m avg)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 20, "y": 1, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(rate(block_bytes_written[5m]))", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "Bps"}}
+        },
+        {"id": 20, "type": "timeseries", "title": "Block bytes written / read",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 5, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "sum by (namespace) (rate(block_bytes_written[5m]))", "legendFormat": "{{namespace}} write", "refId": "A"},
+            {"expr": "sum by (namespace) (rate(block_bytes_read[5m]))", "legendFormat": "{{namespace}} read", "refId": "B"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "Bps", "custom": {"lineWidth": 1, "fillOpacity": 5}}}
+        },
+        {"id": 21, "type": "timeseries", "title": "S3 API requests / min",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 5, "w": 12, "h": 7},
+          "targets": [{"expr": "sum by (namespace, api_endpoint) (rate(api_s3_request_counter[5m]) * 60)", "legendFormat": "{{namespace}}/{{api_endpoint}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 1, "fillOpacity": 3}}},
+          "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["last", "max"]}}
+        },
+        {"id": 22, "type": "timeseries", "title": "Objects + buckets growth (per Garage)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 12, "w": 24, "h": 6},
+          "targets": [
+            {"expr": "table_size{table_name=\"object\"}", "legendFormat": "{{namespace}} objects", "refId": "A"},
+            {"expr": "table_size{table_name=\"bucket_v2\"}", "legendFormat": "{{namespace}} buckets", "refId": "B"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "short", "custom": {"lineWidth": 1, "fillOpacity": 3}}}
+        },
+        {"id": 30, "type": "row", "title": "Longhorn snapshots & backups", "gridPos": {"x": 0, "y": 18, "w": 24, "h": 1}, "collapsed": false},
+        {"id": 31, "type": "stat", "title": "Longhorn volumes total",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 19, "w": 4, "h": 4},
+          "targets": [{"expr": "count(longhorn_volume_state)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short"}}
+        },
+        {"id": 32, "type": "stat", "title": "Longhorn volumes degraded",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 4, "y": 19, "w": 4, "h": 4},
+          "targets": [{"expr": "count(longhorn_volume_robustness == 2)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 3}]}}}
+        },
+        {"id": 33, "type": "stat", "title": "Longhorn total size",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 8, "y": 19, "w": 4, "h": 4},
+          "targets": [{"expr": "sum(longhorn_volume_actual_size_bytes)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "bytes"}}
+        },
+        {"id": 34, "type": "stat", "title": "HA Auto Backup count",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 19, "w": 4, "h": 4},
+          "targets": [{"expr": "hass_sensor_state{entity=\"sensor.auto_backup_monitored_backups\"}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 10}, {"color": "green", "value": 15}]}}}
+        },
+        {"id": 35, "type": "stat", "title": "HA last backup status",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 16, "y": 19, "w": 4, "h": 4},
+          "targets": [{"expr": "hass_binary_sensor_state{entity=\"binary_sensor.auto_backup_backup_status\"}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"text": "OK", "color": "green"}, "1": {"text": "FAILED", "color": "red"}}, "type": "value"}]}}
+        },
+        {"id": 36, "type": "stat", "title": "Rancher backups (last 24h)",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 20, "y": 19, "w": 4, "h": 4},
+          "targets": [{"expr": "count by (target) (rancher_backup_last_success_timestamp_seconds > 0)", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "short"}}
+        },
+        {"id": 40, "type": "table", "title": "Top 20 Longhorn volumes by size",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 23, "w": 12, "h": 10},
+          "targets": [{"expr": "topk(20, longhorn_volume_actual_size_bytes)", "refId": "A", "instant": true, "format": "table"}],
+          "fieldConfig": {"defaults": {"unit": "bytes"}}
+        },
+        {"id": 41, "type": "table", "title": "Top 20 PVCs by used bytes",
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 23, "w": 12, "h": 10},
+          "targets": [{"expr": "topk(20, kubelet_volume_stats_used_bytes)", "refId": "A", "instant": true, "format": "table"}],
+          "fieldConfig": {"defaults": {"unit": "bytes"}}
+        }
+      ]
+    }
