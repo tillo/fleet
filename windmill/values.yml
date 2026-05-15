@@ -40,6 +40,13 @@ ingress:
       # single-quoted and the apostrophe closes the string at the nginx
       # parser layer (2026-05-11 outage).
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # The wmill node SDK (workspace tarball backup, resource downloads)
+      # sets Content-Type: application/octet-stream on GET requests. CRS
+      # rule 920420 fires on that MIME type by default. Extend the
+      # allowed list in phase:1 before the Include so 920420 stops
+      # firing on legitimate authenticated API traffic. Same pattern as
+      # joplin/joplin-ing.yml cf3e8c3.
+      SecAction "id:900201,phase:1,nolog,pass,t:none,setvar:tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/reports+json| |application/csp-report| |application/octet-stream|"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
   tls:
     - secretName: windmill-cert
