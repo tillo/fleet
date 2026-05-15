@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: roundcube-mariadb
+  namespace: mail
+  annotations:
+    keel.sh/policy: patch
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 24h"
+spec:
+  serviceName: roundcube-mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: roundcube-mariadb
+  template:
+    metadata:
+      labels:
+        app: roundcube-mariadb
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+      - name: mariadb
+        image: mariadb:12.2.2
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: mysql
+          containerPort: 3306
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: MARIADB_AUTO_UPGRADE
+          value: "1"
+        - name: MARIADB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: roundcube-mariadb-credentials
+              key: mariadb-root-password
+        - name: MARIADB_DATABASE
+          value: roundcube
+        - name: MARIADB_USER
+          value: roundcube
+        - name: MARIADB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: roundcube-mariadb-credentials
+              key: mariadb-password
+        readinessProbe:
+          exec:
+            command: ["sh", "-c", "mariadb-admin ping -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["sh", "-c", "mariadb-admin ping -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        recurring-job.longhorn.io/source: enabled
+        recurring-job-group.longhorn.io/default: enabled
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: harvester-longhorn-2replicas
+      resources:
+        requests:
+          storage: 10Gi
