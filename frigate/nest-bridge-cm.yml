@@ -25,12 +25,7 @@ data:
     import asyncio, json, os, sys, time, logging, signal
     import urllib.request, urllib.parse, urllib.error
 
-    from aiortc import (
-        RTCPeerConnection,
-        RTCSessionDescription,
-        RTCConfiguration,
-        RTCBundlePolicy,
-    )
+    from aiortc import RTCPeerConnection, RTCSessionDescription
     from aiortc.contrib.media import MediaRecorder, MediaBlackhole
 
     # Set to 1 to test pure WebRTC reception (no RTSP push). If the connection
@@ -75,21 +70,15 @@ data:
         atok = get_access_token()
         log.info(f'OAuth token OK, device={DEV[:20]}...')
 
-        # MAX_BUNDLE forces audio + video + datachannel onto a single
-        # transport — works around aiortc/aiortc#1414 where the default
-        # BALANCED policy can leave a transceiver on a closed transport
-        # after Google's BUNDLE rewrite. SDM API rejects offers missing
-        # any of the three m-lines (audio, video, application) so the
-        # data channel must stay — just unused.
-        pc = RTCPeerConnection(RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE))
+        # SDM mandates the offer contain audio,video,application m-lines in
+        # that order. With default (BALANCED) policy aiortc emits them in the
+        # order we add them, which SDM accepts. MAX_BUNDLE reorders and
+        # gets the offer rejected with HTTP 400 — keep BALANCED.
+        pc = RTCPeerConnection()
         pc.addTransceiver('audio', direction='recvonly')
         pc.addTransceiver('video', direction='recvonly')
         pc.createDataChannel('data')
         offer = await pc.createOffer()
-        # SDM is strict: m= lines must appear in order audio,video,application.
-        # Log the order to verify.
-        ml = [line for line in offer.sdp.split('\n') if line.startswith('m=')]
-        log.info(f'offer m-lines: {[l.strip() for l in ml]}')
         await pc.setLocalDescription(offer)
 
         log.info('GenerateWebRtcStream...')
