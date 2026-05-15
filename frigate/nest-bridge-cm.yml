@@ -87,36 +87,55 @@ data:
         expires_at = results.get('expiresAt')
         log.info(f'Stream OK media_id={media_id[:10]}... expires_at={expires_at}')
 
-        # Google SDM's answer SDP has a non-standard a=candidate: line format
-        # — the RFC-5245 component-id field (always 1 for media) is omitted
-        # and there's a leading space after `candidate:`. e.g.
-        #   a=candidate: 1 udp 2113932031 74.125.247.237 19305 typ host ...
-        # vs RFC:
-        #   a=candidate:1 1 udp 2113932031 74.125.247.237 19305 typ host ...
-        # aiortc's parser rejects the former. Rewrite the line by inserting
-        # `1` (component-id) after the foundation so candidates parse and ICE
-        # completes — otherwise tracks never arrive and the recorder has
-        # nothing to forward.
-        clean_lines = []
-        fixed = 0
-        for line in answer_sdp.replace('\r\n', '\n').split('\n'):
-            if line.startswith('a=candidate:'):
-                payload = line[len('a=candidate:'):].lstrip()
-                bits = payload.split()
-                # Detect: foundation transport[udp/tcp] priority ... — missing
-                # component-id at bits[1]. RFC-compliant would have an int at
-                # bits[1]; if bits[1] is non-numeric, inject component-id 1.
-                if len(bits) >= 2 and not bits[1].isdigit():
-                    fixed += 1
-                    fixed_payload = bits[0] + ' 1 ' + ' '.join(bits[1:])
-                    if fixed <= 2:
-                        log.info(f'Fixing candidate (missing component-id): {payload[:120]}')
-                    clean_lines.append('a=candidate:' + fixed_payload)
+        # Apply both Google SDM SDP workarounds that python-google-nest-sdm
+        # carries (PR allenporter/python-google-nest-sdm#1116, merged 2024-09).
+        # aiortc has the same strict SDP validator as chromium>=143 / firefox,
+        # so both fixes are required:
+        #
+        # (1) Direction mismatch — Google returns `a=sendrecv` for audio/video
+        #     even when the offer is `a=recvonly`. RFC 3264 requires the
+        #     answer direction to be the converse of the offer. Without fix,
+        #     aiortc completes ICE/DTLS but the peer drops ~20-25 s later
+        #     because no media flows in the bogus reverse direction.
+        # (2) Missing foundation in ICE candidates — Google writes
+        #     `a=candidate: 1 udp ...` (note the leading space) instead of
+        #     `a=candidate:<foundation> 1 udp ...`. aiortc's parser raises
+        #     `ValueError: invalid literal for int(): 'udp'` on these.
+
+        # (1) Direction fix
+        def _direction_fix(sdp: str, kind: str) -> str:
+            in_section = False
+            out = []
+            for line in sdp.split('\r\n'):
+                if line.startswith('m='):
+                    in_section = line.startswith(f'm={kind}')
+                if in_section and line == 'a=sendrecv':
+                    out.append('a=sendonly')
                     continue
-            clean_lines.append(line)
-        clean_sdp = '\r\n'.join(clean_lines)
-        if fixed:
-            log.info(f'Rewrote {fixed} non-standard a=candidate lines')
+                out.append(line)
+            return '\r\n'.join(out)
+
+        # Our offer is recvonly for both audio + video. Always apply the fix.
+        clean_sdp = answer_sdp.replace('\n', '\r\n').replace('\r\r\n', '\r\n')
+        clean_sdp = _direction_fix(clean_sdp, 'video')
+        clean_sdp = _direction_fix(clean_sdp, 'audio')
+
+        # (2) Foundation fix — Google's candidate line:
+        #   a=candidate: 1 udp 2113932031 74.125.247.237 19305 typ host ...
+        # becomes:
+        #   a=candidate:N 1 udp 2113932031 74.125.247.237 19305 typ host ...
+        # (matches PR #1116 — assign incrementing index as foundation).
+        out_lines = []
+        index = 1
+        for line in clean_sdp.split('\r\n'):
+            if line.startswith('a=candidate: '):
+                out_lines.append(line.replace('a=candidate: ', f'a=candidate:{index} '))
+                index += 1
+                continue
+            out_lines.append(line)
+        clean_sdp = '\r\n'.join(out_lines)
+        log.info(f'Applied SDP fixes (direction recv->send for our recvonly offer, '
+                 f'foundation injection on {index-1} candidates)')
 
         # Define recorder + register handlers BEFORE setRemoteDescription so
         # we don't miss the initial track-added events.
