@@ -294,3 +294,74 @@ spec:
         component: DNS
         team: mdapi
         probe: dns_external_google
+
+# ====== Technitium ======
+## Three probes against the home.tillo.ch zone:
+## * vip — the LoadBalancer ExternalIP 192.168.1.54 as clients see it
+## * primary-pod / secondary-pod — direct ClusterIP probes that catch the
+##   externalTrafficPolicy=Local routing skew (secondary gets no client
+##   traffic via the VIP until kube-vip moves it; per-pod probes ensure
+##   both replicas actually answer).
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-technitium-vip
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-technitium
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_home_tillo
+  targets:
+    staticConfig:
+      static:
+        - 192.168.1.54:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: technitium_vip
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-technitium-primary-pod
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-technitium
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_home_tillo
+  targets:
+    staticConfig:
+      static:
+        - technitium-primary.technitium.svc.cluster.local:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: technitium_primary_pod
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-technitium-secondary-pod
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-technitium
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_home_tillo
+  targets:
+    staticConfig:
+      static:
+        - technitium-secondary.technitium.svc.cluster.local:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: technitium_secondary_pod

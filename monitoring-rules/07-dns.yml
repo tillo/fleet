@@ -128,3 +128,45 @@ spec:
         description: |
           technitium_zone_backup completed but reported failure. Check Windmill
           job output for the upload error (Garage creds, bucket, network).
+
+    - alert: TechnitiumVipDnsDown
+      expr: probe_success{probe="technitium_vip"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium LoadBalancer VIP (192.168.1.54) not resolving"
+        description: |
+          Blackbox DNS probe against the technitium-dns LB VIP failed for >2m.
+          Clients pointed at 192.168.1.54 (BPI-R4 conditional forward,
+          DHCP-assigned resolvers) are not getting answers.
+
+    - alert: TechnitiumPrimaryPodDnsDown
+      expr: probe_success{probe="technitium_primary_pod"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary pod not answering DNS"
+        description: |
+          Blackbox DNS probe against technitium-primary service failed for >2m.
+          The authoritative pod for home.tillo.ch is unresponsive.
+
+    - alert: TechnitiumSecondaryPodDnsDown
+      expr: probe_success{probe="technitium_secondary_pod"} == 0
+      for: 10m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium secondary pod not answering DNS"
+        description: |
+          Blackbox DNS probe against technitium-secondary service failed for
+          >10m. Failover replica unavailable — primary is a SPOF until the
+          secondary recovers. Lower severity because clients currently route
+          to primary only (externalTrafficPolicy=Local).
