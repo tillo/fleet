@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Picked up by the Grafana sidecar in cattle-monitoring-system.
+  # Namespace is cattle-dashboards (set by this bundle's fleet.yaml).
+  name: bpi-r4-dashboard
+  labels:
+    grafana_dashboard: "1"
+data:
+  bpi-r4.json: |
+    {
+      "schemaVersion": 36,
+      "version": 1,
+      "uid": "bpi-r4-overview",
+      "title": "BPI-R4 Router — Overview",
+      "tags": ["bpi-r4", "router", "mdapi"],
+      "timezone": "browser",
+      "editable": true,
+      "time": {"from": "now-6h", "to": "now"},
+      "refresh": "30s",
+      "templating": {
+        "list": [
+          {"name": "datasource", "type": "datasource", "query": "prometheus", "current": {"text": "Prometheus", "value": "Prometheus"}, "hide": 0}
+        ]
+      },
+      "panels": [
+        {"id": 1, "type": "stat", "title": "Uptime", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_uptime_seconds", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 600}, {"color": "green", "value": 3600}]}}}
+        },
+        {"id": 2, "type": "stat", "title": "WAN Carrier", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 3, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_wan_carrier", "refId": "A"}],
+          "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}, "type": "value"}], "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}}
+        },
+        {"id": 3, "type": "stat", "title": "PPPoE Session", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 6, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_pppoe_uptime_seconds", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "s", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 60}, {"color": "green", "value": 600}]}}}
+        },
+        {"id": 4, "type": "stat", "title": "PPPoE Flaps", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 9, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_pppoe_flap_count", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 5}]}}}
+        },
+        {"id": 5, "type": "stat", "title": "DNS Fallback", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_dns_fallback_active", "refId": "A"}],
+          "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"text": "OK", "color": "green"}, "1": {"text": "FALLBACK", "color": "red"}}, "type": "value"}]}}
+        },
+        {"id": 6, "type": "stat", "title": "Conntrack", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 15, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_conntrack_count", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 50000}, {"color": "red", "value": 80000}]}}}
+        },
+        {"id": 7, "type": "stat", "title": "Load (1m)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 18, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_load1", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}, {"color": "red", "value": 2}]}}}
+        },
+        {"id": 8, "type": "stat", "title": "Pstore Records", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 21, "y": 0, "w": 3, "h": 4},
+          "targets": [{"expr": "bpi_r4_pstore_record_count", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+        },
+
+        {"id": 10, "type": "timeseries", "title": "WAN throughput", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 4, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "rate(bpi_r4_wan_tx_bytes_total[1m]) * 8", "legendFormat": "TX (bps)", "refId": "A"},
+            {"expr": "rate(bpi_r4_wan_rx_bytes_total[1m]) * 8", "legendFormat": "RX (bps)", "refId": "B"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "bps", "custom": {"drawStyle": "line", "fillOpacity": 10}}}
+        },
+        {"id": 11, "type": "timeseries", "title": "Per-interface TX throughput", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 4, "w": 12, "h": 7},
+          "targets": [{"expr": "rate(bpi_r4_iface_tx_bytes_total[1m]) * 8", "legendFormat": "{{iface}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "bps", "custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+
+        {"id": 20, "type": "timeseries", "title": "SFP optical power (TX / RX)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 11, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "bpi_r4_sfp_tx_dbm", "legendFormat": "SFP TX (dBm)", "refId": "A"},
+            {"expr": "bpi_r4_sfp_rx_dbm", "legendFormat": "SFP RX (dBm)", "refId": "B"},
+            {"expr": "bpi_r4_onu_tx_power_dbm", "legendFormat": "ONU TX (dBm)", "refId": "C"},
+            {"expr": "bpi_r4_onu_rx_power_dbm", "legendFormat": "ONU RX (dBm)", "refId": "D"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "none", "custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+        {"id": 21, "type": "timeseries", "title": "SFP module temperature + bias", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 11, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "bpi_r4_sfp_temp_c", "legendFormat": "SFP temp (°C)", "refId": "A"},
+            {"expr": "bpi_r4_onu_temperature_c", "legendFormat": "ONU temp (°C)", "refId": "B"},
+            {"expr": "bpi_r4_sfp_bias_ma", "legendFormat": "SFP bias (mA)", "refId": "C"}
+          ],
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+
+        {"id": 30, "type": "timeseries", "title": "SFP TX-fault IRQ rate / min", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 18, "w": 12, "h": 7},
+          "targets": [{"expr": "rate(bpi_r4_irq_sfp1_tx_fault_total[1m]) * 60", "legendFormat": "tx-fault/min", "refId": "A"}],
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 100}, {"color": "red", "value": 1000}]}}}
+        },
+        {"id": 31, "type": "timeseries", "title": "Page pool stall + softnet drop rate", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 18, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "bpi_r4_page_pool_stall_seconds", "legendFormat": "page_pool age (s)", "refId": "A"},
+            {"expr": "rate(bpi_r4_softnet_drop_total[1m])", "legendFormat": "softnet drops/s", "refId": "B"}
+          ],
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+
+        {"id": 40, "type": "timeseries", "title": "Watchdog heartbeat age (s)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 25, "w": 12, "h": 7},
+          "targets": [{"expr": "bpi_r4_watchdog_age_seconds", "legendFormat": "{{name}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 0}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 90}, {"color": "red", "value": 180}]}}}
+        },
+        {"id": 41, "type": "timeseries", "title": "WireGuard handshake age (s)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 25, "w": 12, "h": 7},
+          "targets": [{"expr": "bpi_r4_wireguard_last_handshake_age_seconds < 86400", "legendFormat": "{{iface}}/{{peer}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+
+        {"id": 50, "type": "stat", "title": "Chrony stratum", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 32, "w": 4, "h": 4},
+          "targets": [{"expr": "bpi_r4_chrony_stratum", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 3}, {"color": "red", "value": 5}]}}}
+        },
+        {"id": 51, "type": "stat", "title": "Chrony peers reachable", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 4, "y": 32, "w": 4, "h": 4},
+          "targets": [{"expr": "bpi_r4_chrony_peers_reachable", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 1}, {"color": "green", "value": 2}]}}}
+        },
+        {"id": 52, "type": "stat", "title": "ONU PLOAM", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 8, "y": 32, "w": 4, "h": 4},
+          "targets": [{"expr": "bpi_r4_onu_ploam_state", "refId": "A"}],
+          "fieldConfig": {"defaults": {"mappings": [{"options": {"5": {"text": "O5", "color": "green"}}, "type": "value"}], "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 5}]}}}
+        },
+        {"id": 53, "type": "stat", "title": "ONU LODS", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 32, "w": 4, "h": 4},
+          "targets": [{"expr": "bpi_r4_onu_lods_events_total", "refId": "A"}]
+        },
+        {"id": 54, "type": "stat", "title": "ONU temp (°C)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 16, "y": 32, "w": 4, "h": 4},
+          "targets": [{"expr": "bpi_r4_onu_temperature_c", "refId": "A"}]
+        },
+        {"id": 55, "type": "stat", "title": "Active SFP alarms", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 20, "y": 32, "w": 4, "h": 4},
+          "targets": [{"expr": "bpi_r4_sfp_alarms", "refId": "A"}],
+          "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}}
+        },
+
+        {"id": 60, "type": "timeseries", "title": "Chrony offset & root delay", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 36, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "bpi_r4_chrony_last_offset_seconds * 1000", "legendFormat": "last offset (ms)", "refId": "A"},
+            {"expr": "bpi_r4_chrony_rms_offset_seconds * 1000", "legendFormat": "RMS offset (ms)", "refId": "B"},
+            {"expr": "bpi_r4_chrony_root_delay_seconds * 1000", "legendFormat": "root delay (ms)", "refId": "C"}
+          ],
+          "fieldConfig": {"defaults": {"unit": "ms", "custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+        {"id": 61, "type": "timeseries", "title": "ONU error counters (rate)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 36, "w": 12, "h": 7},
+          "targets": [
+            {"expr": "rate(bpi_r4_onu_bip_errors_total[5m])", "legendFormat": "BIP/s", "refId": "A"},
+            {"expr": "rate(bpi_r4_onu_hec_uncorr_total[5m])", "legendFormat": "GEM HEC uncorr/s", "refId": "B"},
+            {"expr": "rate(bpi_r4_onu_xgem_hec_uncorr_total[5m])", "legendFormat": "XGEM HEC/s", "refId": "C"},
+            {"expr": "rate(bpi_r4_onu_disc_gem_frames_total[5m])", "legendFormat": "GEM discards/s", "refId": "D"}
+          ],
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        }
+      ]
+    }

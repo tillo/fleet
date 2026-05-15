@@ -1,0 +1,213 @@
+## BPI-R4 router health alerts.
+##
+## Metrics are pushed every minute from the router by
+## /usr/local/bin/metrics-push.sh (and chrony-metrics.sh, onu-metrics.sh)
+## into Pushgateway under jobs `bpi_r4`, `bpi_r4_chrony`, `bpi_r4_onu`.
+## See ~/openwrt-25.12-tillo and CLAUDE.md for the producer side.
+##
+## All thresholds chosen from observed steady-state baselines (see
+## /etc/last_health.jsonl + /etc/last_ddm.jsonl on the router for
+## historical traces).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-bpi-r4
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-bpi-r4.optical
+    rules:
+    - alert: BpiR4SfpRxPowerLow
+      ## XGS-PON downstream sensitivity threshold for the OEM
+      ## XGSPONST2001 module. Baseline -15 dBm; -22 dBm is where
+      ## bit-error rate starts climbing.
+      expr: bpi_r4_sfp_rx_dbm < -22
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP RX optical power low ({{ $value }} dBm)"
+        description: |
+          Downstream optical receive power below sensitivity threshold.
+          Check fibre splice, ONU laser drift, or upstream OLT issue.
+          Run `ethtool -m sfp-wan` on the router for full DDM dump.
+
+    - alert: BpiR4SfpTxPowerLow
+      ## Baseline +5 dBm; +2 dBm is the alarm threshold per module
+      ## datasheet.
+      expr: bpi_r4_sfp_tx_dbm < 2
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP TX optical power low ({{ $value }} dBm)"
+        description: |
+          Module laser bias may be failing or the laser itself is
+          ageing out. Module death is the next step.
+
+    - alert: BpiR4SfpHot
+      expr: bpi_r4_sfp_temp_c > 70
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP module hot ({{ $value }}°C)"
+        description: |
+          SFP module above 70 °C. Sustained operation here shortens
+          laser lifetime. Check rack airflow / module heatsink.
+
+    - alert: BpiR4SfpAlarmActive
+      ## DDM module reports its own alarms; any one is worth surfacing.
+      expr: bpi_r4_sfp_alarms > 0
+      for: 2m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP module reports {{ $value }} active alarm(s)"
+        description: "Check `ethtool -m sfp-wan` for which thresholds are tripped."
+
+  - name: app-bpi-r4.connectivity
+    rules:
+    - alert: BpiR4PppoeFlappy
+      ## > 3 flaps over 24h indicates either a flaky ISP session or
+      ## SFP-side carrier glitching forcing PPPoE re-dial.
+      expr: increase(bpi_r4_pppoe_flap_count[24h]) > 3
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE flapped {{ $value }}x in 24h"
+        description: |
+          PPPoE session has reconnected unusually often. Cross-check
+          `bpi_r4_irq_sfp1_tx_fault_total` rate (SFP wedge precursor)
+          and ONU PLOAM state.
+
+    - alert: BpiR4WanCarrierDown
+      ## Direct WAN link-down, distinct from PPPoE staleness.
+      expr: bpi_r4_wan_carrier == 0
+      for: 2m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 WAN carrier down"
+        description: "sfp-wan reports carrier=0. SFP unplugged or ONU/fibre fault."
+
+    - alert: BpiR4DnsFallbackActive
+      ## Technitium probe failing means dnsmasq is falling back to
+      ## NextDNS. Functional but loses local zone resolution.
+      expr: bpi_r4_dns_fallback_active == 1
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: DNS }
+      annotations:
+        summary: "BPI-R4 DNS in fallback mode (Technitium unreachable)"
+        description: |
+          dnsmasq is serving via NextDNS because Technitium
+          (192.168.1.54) is not answering. Local zone names like
+          home.tillo.ch will fail until Technitium recovers.
+
+  - name: app-bpi-r4.platform
+    rules:
+    - alert: BpiR4SfpTxFaultStorm
+      ## Baseline ~2/min (we measure 6/min steady). Storm is 100+/min
+      ## sustained. 1000+/min is the wedge-precursor regime where the
+      ## router-side sysrq-c escalation fires.
+      expr: rate(bpi_r4_irq_sfp1_tx_fault_total[5m]) * 60 > 100
+      for: 3m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP1 TX-fault IRQs storming ({{ $value }}/min)"
+        description: |
+          Sustained TX-fault IRQ storm — known wedge precursor on this
+          MT7988a SFP driver. Storm-watch on the router will sysrq-t at
+          3 consec min and sysrq-c at 5 consec min (gate armed).
+
+    - alert: BpiR4PagePoolStall
+      ## MTK page_pool leak — known kernel bug. age > 0 means a release
+      ## has been pending; growing age means leak escalating.
+      expr: bpi_r4_page_pool_stall_seconds > 60
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 page_pool stall age {{ $value }}s"
+        description: |
+          MTK eth_soc page_pool has been unable to release a buffer for
+          {{ $value }}s. Router-side page-pool-watch will sysrq-t at
+          600s and sysrq-c at 720s if gate armed. Manual investigation
+          via /etc/last_stall.txt if it triggered there.
+
+    - alert: BpiR4WatchdogStuck
+      ## Any per-minute cron watchdog gone silent — could be cron
+      ## starvation, FS corruption, or a script bug. Detected when
+      ## heartbeat-file age exceeds 3 minutes.
+      expr: bpi_r4_watchdog_age_seconds > 180
+      for: 2m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 watchdog '{{ $labels.name }}' stuck ({{ $value }}s)"
+        description: |
+          The {{ $labels.name }} watchdog hasn't touched its heartbeat
+          file in {{ $value }}s. Cron starvation, FS read-only, or the
+          script crashed without procd respawn. Check
+          `logread | grep {{ $labels.name }}` on the router.
+
+    - alert: BpiR4CrashCaptured
+      ## Heads-up only — pstore-archive.sh has already uploaded the
+      ## dump to OpenObserve stream `bpi_r4_crashes`. Use this alert as
+      ## a "go read the dump" notification, not as a fault to fix.
+      expr: bpi_r4_pstore_record_count > 0 and changes(bpi_r4_pstore_record_count[5m]) > 0
+      for: 1m
+      labels: { severity: info, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 captured a crash on last boot ({{ $value }} record)"
+        description: |
+          Pstore record present after reboot. Full dump uploaded to
+          OpenObserve under stream `bpi_r4_crashes`. Snapshot copy
+          preserved at /etc/pstore-snapshots/<ts>/ on the router.
+
+    - alert: BpiR4SoftnetDropsGrowing
+      ## Drops can happen at NIC bring-up (we observed 111 baseline
+      ## post-boot); only alert if the rate is non-trivial sustained.
+      expr: rate(bpi_r4_softnet_drop_total[5m]) > 10
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 softnet dropping {{ $value }} packets/s"
+        description: |
+          Sustained softnet backlog drops — CPU is the bottleneck or
+          a softirq is starving. Drill into `cat /proc/net/softnet_stat`
+          on the router.
+
+  - name: app-bpi-r4.chrony
+    rules:
+    - alert: BpiR4ChronyUnsynchronised
+      ## stratum 0 reported when chrony itself is the source (GPS PPS);
+      ## any value >= 4 means we've cascaded far away from a real source.
+      expr: bpi_r4_chrony_stratum >= 4
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Time }
+      annotations:
+        summary: "BPI-R4 chrony stratum {{ $value }} (degraded)"
+        description: |
+          chronyd has lost or backed off from its preferred upstream.
+          Cross-check whether GPS PPS / chrony peers are reachable.
+
+    - alert: BpiR4ChronyOffsetHigh
+      ## ±5 ms is generous for a LAN-served NTP source.
+      expr: abs(bpi_r4_chrony_last_offset_seconds) > 0.005
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Time }
+      annotations:
+        summary: "BPI-R4 chrony offset {{ $value }}s vs upstream"
+        description: |
+          Local clock drift exceeds 5 ms vs the chosen reference.
+          Investigate jitter, GPS lock loss, or thermal effects.
+
+  - name: app-bpi-r4.wireguard
+    rules:
+    - alert: BpiR4WireguardPeerStale
+      ## > 1h since last handshake usually means a peer is unreachable.
+      ## Wireguard re-keys every ~2 min when active.
+      expr: bpi_r4_wireguard_last_handshake_age_seconds > 3600
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: VPN }
+      annotations:
+        summary: "BPI-R4 WG peer {{ $labels.iface }}/{{ $labels.peer }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          No handshake from this WireGuard peer in over an hour. Either
+          the peer is offline, its public IP changed, or the tunnel
+          MTU is broken.
