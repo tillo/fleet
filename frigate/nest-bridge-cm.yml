@@ -75,15 +75,16 @@ data:
         atok = get_access_token()
         log.info(f'OAuth token OK, device={DEV[:20]}...')
 
-        # MAX_BUNDLE forces audio + video onto a single transport — works
-        # around aiortc/aiortc#1414 where the default BALANCED policy can
-        # leave a transceiver on a closed transport after Google's BUNDLE
-        # rewrite, so one of audio/video "succeeds" ICE but never receives.
-        # Also: skip the data channel — Google echoes it into a 3rd m-line
-        # that aggravates the same bundle bug, and we don't use it anyway.
+        # MAX_BUNDLE forces audio + video + datachannel onto a single
+        # transport — works around aiortc/aiortc#1414 where the default
+        # BALANCED policy can leave a transceiver on a closed transport
+        # after Google's BUNDLE rewrite. SDM API rejects offers missing
+        # any of the three m-lines (audio, video, application) so the
+        # data channel must stay — just unused.
         pc = RTCPeerConnection(RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE))
         pc.addTransceiver('audio', direction='recvonly')
         pc.addTransceiver('video', direction='recvonly')
+        pc.createDataChannel('data')
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
