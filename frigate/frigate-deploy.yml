@@ -19,6 +19,28 @@ spec:
       labels:
         app: frigate
     spec:
+      # Frigate 0.17.1 ships go2rtc 1.9.10. Newer go2rtc (1.9.14) has WebRTC
+      # ICE/Filter rework that may fix the SDP offer Google's SDM service
+      # rejects with 500 for some Nest cam generations (see balconycam). The
+      # initContainer downloads the upstream binary; the frigate container
+      # mounts it over the bundled path via subPath.
+      initContainers:
+      - name: fetch-go2rtc
+        image: busybox:1.37
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          cd /go2rtc-override
+          if [ ! -x go2rtc ]; then
+            wget -qO go2rtc https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64
+            chmod +x go2rtc
+          fi
+          /go2rtc-override/go2rtc --version
+        volumeMounts:
+        - name: go2rtc-override
+          mountPath: /go2rtc-override
       containers:
       - name: frigate
         image: ghcr.io/blakeblackshear/frigate:stable
@@ -53,6 +75,9 @@ spec:
           mountPath: /dev/shm
         - name: frigate-tmp
           mountPath: /tmp
+        - name: go2rtc-override
+          mountPath: /usr/local/go2rtc/bin/go2rtc
+          subPath: go2rtc
       # Sidecar: 6-hourly off-site sync of /media/frigate/recordings → Garage S3.
       # Skips files newer than 24h so Frigate's local retention drives local TTL.
       - name: rclone-recordings-s3
@@ -97,3 +122,6 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 1G
+      - name: go2rtc-override
+        emptyDir:
+          sizeLimit: 100M
