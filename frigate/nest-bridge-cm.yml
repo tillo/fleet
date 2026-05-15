@@ -83,21 +83,35 @@ data:
         log.info(f'Stream OK media_id={media_id[:10]}... expires_at={expires_at}')
 
         # Google SDM's answer SDP has a non-standard a=candidate: line format
-        # (e.g. `a=candidate:0 udp ...` skipping the RFC-5245 component-id
-        # field) that aiortc's strict parser rejects. Strip ICE candidates
-        # from the answer — aiortc will still complete the DTLS handshake
-        # using STUN/TURN discovered through the offer side.
+        # — the RFC-5245 component-id field (always 1 for media) is omitted
+        # and there's a leading space after `candidate:`. e.g.
+        #   a=candidate: 1 udp 2113932031 74.125.247.237 19305 typ host ...
+        # vs RFC:
+        #   a=candidate:1 1 udp 2113932031 74.125.247.237 19305 typ host ...
+        # aiortc's parser rejects the former. Rewrite the line by inserting
+        # `1` (component-id) after the foundation so candidates parse and ICE
+        # completes — otherwise tracks never arrive and the recorder has
+        # nothing to forward.
         clean_lines = []
-        stripped = 0
+        fixed = 0
         for line in answer_sdp.replace('\r\n', '\n').split('\n'):
             if line.startswith('a=candidate:'):
-                stripped += 1
-                if stripped <= 2:
-                    log.info(f'Stripping non-standard candidate: {line[:120]}')
-                continue
+                payload = line[len('a=candidate:'):].lstrip()
+                bits = payload.split()
+                # Detect: foundation transport[udp/tcp] priority ... — missing
+                # component-id at bits[1]. RFC-compliant would have an int at
+                # bits[1]; if bits[1] is non-numeric, inject component-id 1.
+                if len(bits) >= 2 and not bits[1].isdigit():
+                    fixed += 1
+                    fixed_payload = bits[0] + ' 1 ' + ' '.join(bits[1:])
+                    if fixed <= 2:
+                        log.info(f'Fixing candidate (missing component-id): {payload[:120]}')
+                    clean_lines.append('a=candidate:' + fixed_payload)
+                    continue
             clean_lines.append(line)
         clean_sdp = '\r\n'.join(clean_lines)
-        log.info(f'Stripped {stripped} a=candidate lines from answer')
+        if fixed:
+            log.info(f'Rewrote {fixed} non-standard a=candidate lines')
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
 
