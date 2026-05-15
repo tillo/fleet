@@ -16,6 +16,27 @@ metadata:
   namespace: monitoring
 spec:
   groups:
+  ## Recording rules — pre-computed aggregates so alerts and dashboard
+  ## panels read cheaper, stable derived series instead of recomputing
+  ## rate() at every query. Convention: bpi_r4:<name>:<op><window>
+  - name: app-bpi-r4.recording
+    interval: 30s
+    rules:
+    - record: bpi_r4:wan_tx_bps:rate5m
+      expr: rate(bpi_r4_wan_tx_bytes_total[5m]) * 8
+    - record: bpi_r4:wan_rx_bps:rate5m
+      expr: rate(bpi_r4_wan_rx_bytes_total[5m]) * 8
+    - record: bpi_r4:sfp_tx_fault_per_min:rate1m
+      expr: rate(bpi_r4_irq_sfp1_tx_fault_total[1m]) * 60
+    - record: bpi_r4:iface_tx_bps:rate1m
+      expr: rate(bpi_r4_iface_tx_bytes_total[1m]) * 8
+    - record: bpi_r4:iface_rx_bps:rate1m
+      expr: rate(bpi_r4_iface_rx_bytes_total[1m]) * 8
+    - record: bpi_r4:softnet_drops_per_s:rate1m
+      expr: rate(bpi_r4_softnet_drop_total[1m])
+    - record: bpi_r4:onu_bip_errors_per_s:rate5m
+      expr: rate(bpi_r4_onu_bip_errors_total[5m])
+
   - name: app-bpi-r4.optical
     rules:
     - alert: BpiR4SfpRxPowerLow
@@ -127,7 +148,7 @@ spec:
       ## Baseline ~2/min (we measure 6/min steady). Storm is 100+/min
       ## sustained. 1000+/min is the wedge-precursor regime where the
       ## router-side sysrq-c escalation fires.
-      expr: rate(bpi_r4_irq_sfp1_tx_fault_total[5m]) * 60 > 100
+      expr: bpi_r4:sfp_tx_fault_per_min:rate1m > 100
       for: 3m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
@@ -183,7 +204,7 @@ spec:
     - alert: BpiR4SoftnetDropsGrowing
       ## Drops can happen at NIC bring-up (we observed 111 baseline
       ## post-boot); only alert if the rate is non-trivial sustained.
-      expr: rate(bpi_r4_softnet_drop_total[5m]) > 10
+      expr: bpi_r4:softnet_drops_per_s:rate1m > 10
       for: 5m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
