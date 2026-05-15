@@ -25,7 +25,12 @@ data:
     import asyncio, json, os, sys, time, logging, signal
     import urllib.request, urllib.parse, urllib.error
 
-    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc import (
+        RTCPeerConnection,
+        RTCSessionDescription,
+        RTCConfiguration,
+        RTCBundlePolicy,
+    )
     from aiortc.contrib.media import MediaRecorder, MediaBlackhole
 
     # Set to 1 to test pure WebRTC reception (no RTSP push). If the connection
@@ -70,10 +75,15 @@ data:
         atok = get_access_token()
         log.info(f'OAuth token OK, device={DEV[:20]}...')
 
-        pc = RTCPeerConnection()
+        # MAX_BUNDLE forces audio + video onto a single transport — works
+        # around aiortc/aiortc#1414 where the default BALANCED policy can
+        # leave a transceiver on a closed transport after Google's BUNDLE
+        # rewrite, so one of audio/video "succeeds" ICE but never receives.
+        # Also: skip the data channel — Google echoes it into a 3rd m-line
+        # that aggravates the same bundle bug, and we don't use it anyway.
+        pc = RTCPeerConnection(RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_BUNDLE))
         pc.addTransceiver('audio', direction='recvonly')
         pc.addTransceiver('video', direction='recvonly')
-        pc.createDataChannel('data')
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
