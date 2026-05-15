@@ -78,6 +78,51 @@ spec:
         - name: go2rtc-override
           mountPath: /usr/local/go2rtc/bin/go2rtc
           subPath: go2rtc
+      # Sidecar: RTSP relay receiving from nest-bridge-balconycam below and
+      # serving RTSP pull to Frigate's go2rtc. Pod-loopback only, no auth.
+      # Rollback: delete this container + the nest-bridge-balconycam below
+      # + revert balconycam's source in /config/config.yaml to the nest: URL.
+      - name: mediamtx
+        image: bluenviron/mediamtx:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8555
+          name: rtsp-relay
+        volumeMounts:
+        - name: nest-bridge-scripts
+          mountPath: /mediamtx.yml
+          subPath: mediamtx.yml
+        resources:
+          requests: {cpu: 20m, memory: 32Mi}
+          limits: {cpu: 1, memory: 256Mi}
+      # Sidecar: aiortc-based WebRTC bridge for balconycam. Negotiates the
+      # WebRTC stream with Google SDM (the same way HA does, which works) and
+      # republishes it as RTSP to the mediamtx sidecar above. Pulls creds
+      # from the frigate-nest-balconycam secret (created out of band via
+      # kubectl — not in fleet, since fleet has a remote at gitlab.mdapi.ch).
+      - name: nest-bridge-balconycam
+        image: python:3.13-slim
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          # aiortc + PyAV ship manylinux wheels with bundled libs; no apt needed.
+          pip install --quiet --no-cache-dir 'aiortc==1.13.0' 2>&1 | tail -3
+          exec python3 /scripts/bridge.py
+        envFrom:
+        - secretRef:
+            name: frigate-nest-balconycam
+        env:
+        - name: RTSP_OUT_URL
+          value: rtsp://127.0.0.1:8555/balconycam
+        volumeMounts:
+        - name: nest-bridge-scripts
+          mountPath: /scripts
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: 1, memory: 512Mi}
       # Sidecar: 6-hourly off-site sync of /media/frigate/recordings → Garage S3.
       # Skips files newer than 24h so Frigate's local retention drives local TTL.
       - name: rclone-recordings-s3
@@ -125,3 +170,6 @@ spec:
       - name: go2rtc-override
         emptyDir:
           sizeLimit: 100M
+      - name: nest-bridge-scripts
+        configMap:
+          name: frigate-nest-bridge

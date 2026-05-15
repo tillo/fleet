@@ -1,0 +1,153 @@
+## Bridge sidecar config — Google Nest WebRTC → local RTSP.
+##
+## Why this exists: go2rtc's nest: driver (1.9.10 / 1.9.14) generates an SDP
+## offer that Google's SDM service rejects with HTTP 500 for some Nest cam
+## generations (proven on balconycam, while garagecam works fine on the same
+## OAuth / project / refresh_token). HA works because it uses aiortc, which
+## produces a more standard offer. This bridge runs the same aiortc path
+## inside a sidecar and republishes the received media as RTSP via MediaMTX,
+## which Frigate's go2rtc then consumes via plain rtsp://127.0.0.1:8555/...
+##
+## When upstream go2rtc fixes the SDP for Nest cams, rollback is two changes:
+##   1. /config/config.yaml on the frigate PVC: re-enable the nest: line for
+##      balconycam and remove the rtsp:// line.
+##   2. frigate-deploy.yml: delete the mediamtx + nest-bridge-balconycam
+##      containers and the nest-bridge-scripts volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frigate-nest-bridge
+  namespace: frigate
+data:
+  bridge.py: |
+    #!/usr/bin/env python3
+    """Bridge Google Nest SDM WebRTC stream to local RTSP via aiortc + PyAV."""
+    import asyncio, json, os, sys, time, logging, signal
+    import urllib.request, urllib.parse, urllib.error
+
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc.contrib.media import MediaRecorder
+
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    log = logging.getLogger('nest-bridge')
+
+    CID = os.environ['NEST_CLIENT_ID']
+    CSEC = os.environ['NEST_CLIENT_SECRET']
+    RTOK = os.environ['NEST_REFRESH_TOKEN']
+    PROJ = os.environ['NEST_PROJECT_ID']
+    DEV = os.environ['NEST_DEVICE_ID']
+    RTSP_URL = os.environ.get('RTSP_OUT_URL', 'rtsp://127.0.0.1:8555/balconycam')
+
+    def get_access_token():
+        req = urllib.request.Request(
+            'https://www.googleapis.com/oauth2/v4/token',
+            data=urllib.parse.urlencode({
+                'client_id': CID, 'client_secret': CSEC,
+                'refresh_token': RTOK, 'grant_type': 'refresh_token',
+            }).encode(),
+            method='POST',
+        )
+        return json.loads(urllib.request.urlopen(req, timeout=10).read())['access_token']
+
+    def sdm_execute(atok, command, params):
+        url = f'https://smartdevicemanagement.googleapis.com/v1/enterprises/{PROJ}/devices/{DEV}:executeCommand'
+        body = json.dumps({'command': command, 'params': params}).encode()
+        req = urllib.request.Request(url, data=body, method='POST')
+        req.add_header('Authorization', f'Bearer {atok}')
+        req.add_header('Content-Type', 'application/json')
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=30).read())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"SDM {command} HTTP {e.code}: {e.read().decode()[:200]}")
+
+    async def run_session():
+        atok = get_access_token()
+        log.info(f'OAuth token OK, device={DEV[:20]}...')
+
+        pc = RTCPeerConnection()
+        pc.addTransceiver('audio', direction='recvonly')
+        pc.addTransceiver('video', direction='recvonly')
+        pc.createDataChannel('data')
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+
+        log.info('GenerateWebRtcStream...')
+        resp = sdm_execute(atok,
+                           'sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream',
+                           {'offerSdp': pc.localDescription.sdp})
+        results = resp.get('results', {})
+        answer_sdp = results.get('answerSdp')
+        media_id = results.get('mediaSessionId')
+        expires_at = results.get('expiresAt')
+        log.info(f'Stream OK media_id={media_id[:10]}... expires_at={expires_at}')
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type='answer'))
+
+        recorder = MediaRecorder(RTSP_URL, format='rtsp',
+                                 options={'rtsp_transport': 'tcp'})
+        @pc.on('track')
+        def on_track(track):
+            log.info(f'Track: kind={track.kind} id={track.id}')
+            recorder.addTrack(track)
+
+        await asyncio.sleep(2)
+        await recorder.start()
+        log.info(f'Pushing to {RTSP_URL}')
+
+        # SDM WebRTC streams expire after 5 min. Extend every 4 min.
+        extend_at = time.time() + 240
+        try:
+            while True:
+                await asyncio.sleep(5)
+                if pc.connectionState in ('failed', 'closed', 'disconnected'):
+                    log.warning(f'Peer state {pc.connectionState}, restarting session')
+                    return
+                if time.time() >= extend_at:
+                    atok = get_access_token()
+                    ext = sdm_execute(atok,
+                                      'sdm.devices.commands.CameraLiveStream.ExtendWebRtcStream',
+                                      {'mediaSessionId': media_id})
+                    expires_at = ext.get('results', {}).get('expiresAt')
+                    log.info(f'Extended stream, expires_at={expires_at}')
+                    extend_at = time.time() + 240
+        finally:
+            try: await recorder.stop()
+            except Exception: pass
+            try: await pc.close()
+            except Exception: pass
+
+    async def main():
+        backoff = 5
+        while True:
+            try:
+                await run_session()
+                backoff = 5
+            except Exception as e:
+                log.exception(f'Session failed: {e}')
+                backoff = min(backoff * 2, 300)
+            log.info(f'Reconnecting in {backoff}s')
+            await asyncio.sleep(backoff)
+
+    def _shutdown(*a):
+        log.info('SIGTERM')
+        sys.exit(0)
+
+    if __name__ == '__main__':
+        signal.signal(signal.SIGTERM, _shutdown)
+        asyncio.run(main())
+
+  mediamtx.yml: |
+    # Single-purpose RTSP relay: accept RTSP PUSH from the nest-bridge
+    # sidecar on port 8555 and serve RTSP PULL on the same port for Frigate's
+    # go2rtc. No transcoding, no auth — pod-local loopback only.
+    logLevel: info
+    rtspAddress: :8555
+    rtmpDisable: yes
+    hlsDisable: yes
+    webrtcDisable: yes
+    srtDisable: yes
+    api: no
+    metrics: no
+    paths:
+      all_others:
