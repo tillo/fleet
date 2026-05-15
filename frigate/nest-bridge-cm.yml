@@ -118,16 +118,14 @@ data:
         if fixed:
             log.info(f'Rewrote {fixed} non-standard a=candidate lines')
 
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
-
-        # Wait for the connection to settle and tracks to be signalled.
-        for _ in range(20):
-            if pc.connectionState == 'connected':
-                break
-            await asyncio.sleep(0.5)
-        log.info(f'After-wait state: connection={pc.connectionState} ice={pc.iceConnectionState}')
-        await recorder.start()
-        log.info(f'Recorder started ({"blackhole" if DIAG_BLACKHOLE else RTSP_URL})')
+        # Define recorder + register handlers BEFORE setRemoteDescription so
+        # we don't miss the initial track-added events.
+        if DIAG_BLACKHOLE:
+            log.info('DIAG mode: using MediaBlackhole (no RTSP push)')
+            recorder = MediaBlackhole()
+        else:
+            recorder = MediaRecorder(RTSP_URL, format='rtsp',
+                                     options={'rtsp_transport': 'tcp'})
 
         @pc.on('connectionstatechange')
         async def _state():
@@ -139,20 +137,21 @@ data:
         async def _sig():
             log.info(f'peer signalingState={pc.signalingState}')
 
-        if DIAG_BLACKHOLE:
-            log.info('DIAG mode: using MediaBlackhole (no RTSP push)')
-            recorder = MediaBlackhole()
-        else:
-            recorder = MediaRecorder(RTSP_URL, format='rtsp',
-                                     options={'rtsp_transport': 'tcp'})
-
-        track_count = 0
         @pc.on('track')
         def on_track(track):
-            nonlocal_track_log(track)
-            recorder.addTrack(track)
-        def nonlocal_track_log(track):
             log.info(f'Track received: kind={track.kind} id={track.id}')
+            recorder.addTrack(track)
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
+
+        # Wait for the connection to settle and tracks to be signalled.
+        for _ in range(20):
+            if pc.connectionState == 'connected':
+                break
+            await asyncio.sleep(0.5)
+        log.info(f'After-wait state: connection={pc.connectionState} ice={pc.iceConnectionState}')
+        await recorder.start()
+        log.info(f'Recorder started ({"blackhole" if DIAG_BLACKHOLE else RTSP_URL})')
 
         # SDM WebRTC streams expire after 5 min. Extend every 4 min.
         extend_at = time.time() + 240
