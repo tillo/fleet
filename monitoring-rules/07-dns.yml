@@ -43,3 +43,88 @@ spec:
         team: mdapi
       annotations:
         summary: "{{ $labels.namespace }}/{{ $labels.pod }} restarting frequently"
+
+    - alert: TechnitiumNotifyRefused
+      expr: technitium_notify_refused_log_5m > 0
+      for: 10m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary→secondary NOTIFY refused ({{ $value }} in last 5m)"
+        description: |
+          Primary's DNS NOTIFY is being refused by the secondary. Zone changes
+          (incl. DHCP-driven A/PTR updates) will only propagate on SOA refresh
+          (15min), causing stale records on the secondary.
+          Check secondary's notifyAllowedNetworks setting (must include pod CIDR).
+
+    - alert: TechnitiumNotifyFailedZones
+      expr: technitium_notify_failed_zones{instance="primary"} > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary has {{ $value }} zones with NOTIFY failures"
+        description: |
+          Zones flagged notifyFailed=true on primary. Replication to secondary
+          may be lagging up to SOA refresh interval.
+
+    - alert: TechnitiumZoneCountMismatch
+      expr: |
+        abs(
+          technitium_zone_count{instance="primary"}
+          - on() technitium_zone_count{instance="secondary"}
+        ) > 1
+      for: 30m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary/secondary zone count differs by {{ $value }}"
+        description: |
+          Number of zones on primary vs secondary diverged for >30m. Check
+          secondary's AXFR pull from primary and notifyAllowedNetworks ACL.
+
+    - alert: TechnitiumHealthProbeStale
+      expr: time() - technitium_health_last_run_timestamp_seconds > 900
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium health probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill technitium_health probe hasn't pushed in >15m. Either the
+          probe is failing or Pushgateway is down. Other Technitium alerts
+          using these metrics will be silently broken until this resolves.
+
+    - alert: TechnitiumBackupStale
+      expr: time() - technitium_backup_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium backup older than 2 days"
+        description: |
+          Daily zone-backup probe hasn't successfully run in >48h. Garage
+          unreachable, credentials wrong, or the Windmill schedule disabled.
+
+    - alert: TechnitiumBackupFailed
+      expr: technitium_backup_last_run_success == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Last Technitium backup run failed"
+        description: |
+          technitium_zone_backup completed but reported failure. Check Windmill
+          job output for the upload error (Garage creds, bucket, network).

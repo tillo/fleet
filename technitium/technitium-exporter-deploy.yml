@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: technitium-exporter
+  namespace: technitium
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: technitium-exporter
+  template:
+    metadata:
+      labels:
+        app: technitium-exporter
+    spec:
+      containers:
+      - name: exporter
+        image: ghcr.io/brioche-works/technitium-dns-prometheus-exporter:master
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        env:
+        - name: TECHNITIUM_API_PRIMARY_BASE_URL
+          value: http://technitium-primary.technitium.svc.cluster.local:5380/
+        - name: TECHNITIUM_API_PRIMARY_LABEL
+          value: primary
+        - name: TECHNITIUM_API_PRIMARY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: technitium-exporter-tokens
+              key: TECHNITIUM_API_PRIMARY_TOKEN
+        - name: TECHNITIUM_API_SECONDARY_BASE_URL
+          value: http://technitium-secondary.technitium.svc.cluster.local:5380/
+        - name: TECHNITIUM_API_SECONDARY_LABEL
+          value: secondary
+        - name: TECHNITIUM_API_SECONDARY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: technitium-exporter-tokens
+              key: TECHNITIUM_API_SECONDARY_TOKEN
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
