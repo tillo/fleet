@@ -26,7 +26,12 @@ data:
     import urllib.request, urllib.parse, urllib.error
 
     from aiortc import RTCPeerConnection, RTCSessionDescription
-    from aiortc.contrib.media import MediaRecorder
+    from aiortc.contrib.media import MediaRecorder, MediaBlackhole
+
+    # Set to 1 to test pure WebRTC reception (no RTSP push). If the connection
+    # stays alive >2 min in this mode the issue is in MediaRecorder/PyAV's
+    # RTSP path; if it still dies fast, the WebRTC layer itself has a problem.
+    DIAG_BLACKHOLE = os.environ.get('DIAG_BLACKHOLE', '0') == '1'
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -115,6 +120,15 @@ data:
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
 
+        # Wait for the connection to settle and tracks to be signalled.
+        for _ in range(20):
+            if pc.connectionState == 'connected':
+                break
+            await asyncio.sleep(0.5)
+        log.info(f'After-wait state: connection={pc.connectionState} ice={pc.iceConnectionState}')
+        await recorder.start()
+        log.info(f'Recorder started ({"blackhole" if DIAG_BLACKHOLE else RTSP_URL})')
+
         @pc.on('connectionstatechange')
         async def _state():
             log.info(f'peer connectionState={pc.connectionState}')
@@ -125,21 +139,20 @@ data:
         async def _sig():
             log.info(f'peer signalingState={pc.signalingState}')
 
-        recorder = MediaRecorder(RTSP_URL, format='rtsp',
-                                 options={'rtsp_transport': 'tcp'})
+        if DIAG_BLACKHOLE:
+            log.info('DIAG mode: using MediaBlackhole (no RTSP push)')
+            recorder = MediaBlackhole()
+        else:
+            recorder = MediaRecorder(RTSP_URL, format='rtsp',
+                                     options={'rtsp_transport': 'tcp'})
+
+        track_count = 0
         @pc.on('track')
         def on_track(track):
-            log.info(f'Track: kind={track.kind} id={track.id}')
+            nonlocal_track_log(track)
             recorder.addTrack(track)
-
-        # Wait up to 10 s for at least one track + connection to stabilise.
-        for _ in range(20):
-            if pc.connectionState == 'connected':
-                break
-            await asyncio.sleep(0.5)
-        log.info(f'After-wait state: connection={pc.connectionState} ice={pc.iceConnectionState}')
-        await recorder.start()
-        log.info(f'Pushing to {RTSP_URL}')
+        def nonlocal_track_log(track):
+            log.info(f'Track received: kind={track.kind} id={track.id}')
 
         # SDM WebRTC streams expire after 5 min. Extend every 4 min.
         extend_at = time.time() + 240
