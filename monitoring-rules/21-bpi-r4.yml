@@ -223,7 +223,12 @@ spec:
     - alert: BpiR4WireguardPeerStale
       ## > 1h since last handshake usually means a peer is unreachable.
       ## Wireguard re-keys every ~2 min when active.
-      expr: bpi_r4_wireguard_last_handshake_age_seconds > 3600
+      ##
+      ## Upper bound (1 year) excludes peers that have NEVER handshaken
+      ## — the producer pushes age = now - 0 for those, surfacing as
+      ## ~1157 days. Configured-but-never-connected peers are router
+      ## hygiene, not a tunnel-down condition.
+      expr: bpi_r4_wireguard_last_handshake_age_seconds > 3600 < 31536000
       for: 5m
       labels: { severity: warning, team: mdapi, component: VPN }
       annotations:
