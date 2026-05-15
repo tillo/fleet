@@ -38,17 +38,20 @@ spec:
     ## that don't have a pvc_namespace/pvc label pair (engine images,
     ## etc.).
     ##
-    ## KubeJobFailed is suppressed because we already have
-    ## BatchJobLastRunFailed / BatchJobStale from the Pushgateway path
-    ## for jobs we care about; the chart rule fires once per Failed
-    ## Job object and never auto-resolves until the Job is GC'd.
+    ## KubeJobFailed and KubeJobNotCompleted are suppressed because we
+    ## already have BatchJobLastRunFailed / BatchJobStale from the
+    ## Pushgateway path for jobs we care about. Chart-side KubeJobFailed
+    ## fires once per Failed Job object and never auto-resolves until
+    ## the Job is GC'd; KubeJobNotCompleted fires after 12h on any
+    ## long-running job (e.g. multi-day rclone migrations) which is
+    ## almost always intentional.
     - receiver: pushover-bundled
       matchers:
       - name: severity
         value: warning|critical
         matchType: "=~"
       - name: alertname
-        value: Watchdog|InfoInhibitor|CPUThrottlingHigh|KubeCPUOvercommit|LonghornVolumeStatusWarning|KubeJobFailed
+        value: Watchdog|InfoInhibitor|CPUThrottlingHigh|KubeCPUOvercommit|LonghornVolumeStatusWarning|KubeJobFailed|KubeJobNotCompleted
         matchType: "!~"
       - name: team
         value: mdapi

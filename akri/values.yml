@@ -1,12 +1,15 @@
 udev:
   discovery:
     enabled: true
-    # Chart default 10m/24m is too tight; CPUThrottlingHigh fired on
-    # akri-udev-discovery DaemonSet pods.
+    # USB enumeration is bursty: idle most of the time but spikes during
+    # discovery cycles. With cpuLimit=100m, every cycle hit the cgroup
+    # ceiling and fired CPUThrottlingHigh on all three nodes. Bumped
+    # request to give the scheduler a realistic hint and lifted limit
+    # so transient bursts aren't throttled.
     resources:
-      cpuRequest: 25m
+      cpuRequest: 50m
       memoryRequest: 32Mi
-      cpuLimit: 100m
+      cpuLimit: 300m
       memoryLimit: 64Mi
 controller:
   resources:
