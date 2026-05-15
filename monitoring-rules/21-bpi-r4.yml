@@ -63,6 +63,27 @@ spec:
         summary: "BPI-R4 SFP module reports {{ $value }} active alarm(s)"
         description: "Check `ethtool -m sfp-wan` for which thresholds are tripped."
 
+  - name: app-bpi-r4.optical-link
+    rules:
+    - alert: BpiR4OnuPloamDegraded
+      ## PLOAM state is encoded by Lantiq/MaxLinear firmware as state*10 +
+      ## substate. 51 = O5.1 (operational, datapath active) is the only
+      ## healthy steady state. Anything else for > 2 min indicates ranging
+      ## loss, intermittent LODS (52), emergency stop (60), or stuck
+      ## ranging (40). The HA-side power-cycle automation handles the
+      ## persistent case; this alert flags any deviation for inspection.
+      expr: bpi_r4_onu_ploam_state != 51
+      for: 2m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 ONU PLOAM in state {{ $value }} (not O5.1)"
+        description: |
+          ONU is not in O5.1 (operational). Encoding: state*10 + substate.
+            10/11/12 = O1, 20 = O2 standby, 30 = O3 serial number,
+            40 = O4 ranging, 50/51/52 = O5 operational, 52 = intermittent
+            LODS, 60 = O6 emergency stop, 70 = O7 stop, 80/81/82 = O8/O9.
+          Check ONU optical link, fibre splice, OLT-side provisioning.
+
   - name: app-bpi-r4.connectivity
     rules:
     - alert: BpiR4PppoeFlappy
