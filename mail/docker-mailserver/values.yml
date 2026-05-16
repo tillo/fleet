@@ -11,6 +11,18 @@ serviceAccount:
   create: false
   name: docker-mailserver
 deployment:
+  # Keel watches these annotations to auto-redeploy on new image digest.
+  # We track :latest of our own daily-rebuilt image at registry.mdapi.ch
+  # — force policy re-pulls on every poll regardless of tag.
+  # pull-secret tells Keel which Secret in this ns holds the registry creds,
+  # since the chart can't put imagePullSecrets on the PodSpec (it bolts the
+  # secret onto a ServiceAccount via extraDeploy instead — fine for kubelet
+  # pulls, invisible to Keel's HEAD requests).
+  annotations:
+    keel.sh/policy: force
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    keel.sh/pull-secret: mdapi-registry
   env:
     ACCOUNT_PROVISIONER: LDAP
     LOG_LEVEL: info
@@ -316,16 +328,3 @@ extraDeploy:
       - remoteRef:
           key: /mdapi/mail/docker-mailserver-env-secret/LDAP_BIND_PW
         secretKey: LDAP_BIND_PW
-keel:
-  # We track :latest now (our own daily-rebuilt image); use force policy so
-  # Keel re-pulls on every poll regardless of tag (since the tag stays "latest").
-  policy: force
-  trigger: poll
-  pollSchedule: "@every 4h"
-  # Helm provider doesn't auto-discover the workload's imagePullSecrets — we
-  # have to point Keel at the registry creds explicitly, else it gets a 401
-  # polling registry.mdapi.ch/mdapi/* and skips.
-  secrets:
-    - mdapi-registry
-  images:
-    - repository: image.name
