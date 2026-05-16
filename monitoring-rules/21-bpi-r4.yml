@@ -2,12 +2,35 @@
 ##
 ## Metrics are pushed every minute from the router by
 ## /usr/local/bin/metrics-push.sh (and chrony-metrics.sh, onu-metrics.sh)
-## into Pushgateway under jobs `bpi_r4`, `bpi_r4_chrony`, `bpi_r4_onu`.
+## into Pushgateway under jobs `bpi_r4`, `bpi_r4_chrony`, `bpi_r4_onu`,
+## `bpi_r4_emmc`, `bpi_r4_nlbwmon`, `bpi_r4_pppoe`.
 ## See ~/openwrt-25.12-tillo and CLAUDE.md for the producer side.
 ##
 ## All thresholds chosen from observed steady-state baselines (see
 ## /etc/last_health.jsonl + /etc/last_ddm.jsonl on the router for
 ## historical traces).
+##
+## ──────────────────────────────────────────────────────────────────────
+## Synthetic alert canary — monthly validation procedure
+## ──────────────────────────────────────────────────────────────────────
+## Goal: prove that an alert here actually reaches Pushover end-to-end
+## (Prom rule → Alertmanager → Pushover gateway). Run on the 1st of each
+## month during a quiet window:
+##
+## 1. SSH the router. Stop the cron job whose stale-push will fire
+##    BpiR4PushgatewayJob5mStale fastest:
+##        /etc/init.d/cron stop && killall -STOP chrony-metrics.sh
+##    Wait ~16 minutes (5m cron + 15m threshold + a buffer).
+## 2. Confirm Pushover alert "BPI-R4 Pushgateway job bpi_r4_chrony stale"
+##    arrives on the on-call phone.
+## 3. Restore: `/etc/init.d/cron start; killall -CONT chrony-metrics.sh`.
+##    Alert should auto-resolve within one scrape interval.
+##
+## If step 2 fails, escalate — Alertmanager routing or Pushover gateway
+## is broken and *every* router alert is also blocked.
+##
+## DO NOT run a real PPPoE flap (e.g. `ifdown wan`) — household impact
+## is real, and the stale-push canary exercises the same path.
 
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -370,6 +393,26 @@ spec:
           eMMC lifetime estimate exceeded 80% on at least one zone
           (A = SLC reserve, B = MLC main). Plan replacement.
 
+  - name: app-bpi-r4.pppoe-session
+    rules:
+    - alert: BpiR4PppoeSessionThrashing
+      ## Counter increments only on session-id transitions (LCP up after
+      ## a real re-auth or BRAS-side reset). > 2 per hour = thrashing.
+      ## Reset-safe via max-min trick (router reboot resets the counter).
+      expr: |
+        (
+          max_over_time(bpi_r4_pppoe_session_changes_total[1h])
+          - min_over_time(bpi_r4_pppoe_session_changes_total[1h])
+        ) > 2
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE session re-established {{ $value }} times in 1h"
+        description: |
+          PPP session-id is changing too often. Indicates BRAS-side
+          tear-downs, LCP keepalive failures, or local pppd respawn loop.
+          Check `logread | grep -i pppd` on the router.
+
   - name: app-bpi-r4.pppoe-rtt
     rules:
     - alert: BpiR4PppoePeerLoss
@@ -426,6 +469,133 @@ spec:
           /usr/local/bin/{{ $labels.script }}.sh took >30s in its last run.
           Check for proc-walking loops (busybox awk on /proc/net/nf_conntrack
           can hit 100s on a busy router; see the dropped flow-metrics.sh).
+
+  - name: app-bpi-r4.pushgateway-staleness
+    ## Detects total cron-daemon failure or network partition between router
+    ## and Pushgateway — local cron_last_completion_age can't catch this
+    ## because the gauge itself stops being pushed. Threshold is 2× the cron
+    ## interval to allow one missed cycle without paging.
+    rules:
+    - alert: BpiR4PushgatewayJobStale1m
+      expr: time() - push_time_seconds{job=~"bpi_r4|bpi_r4_pppoe"} > 300
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Pushgateway job {{ $labels.job }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          The {{ $labels.job }} 1-minute cron hasn't pushed in >5min.
+          Either cron is dead, the script crashed, or network/Pushgateway
+          is unreachable from the router. SSH the router and check cron+
+          `/var/log` for failures.
+
+    - alert: BpiR4PushgatewayJob5mStale
+      expr: time() - push_time_seconds{job=~"bpi_r4_chrony|bpi_r4_nlbwmon|bpi_r4_onu"} > 900
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Pushgateway job {{ $labels.job }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          5-minute cron hasn't pushed in >15min. Same triage as 1m alert.
+
+    - alert: BpiR4PushgatewayJobHourlyStale
+      expr: time() - push_time_seconds{job="bpi_r4_emmc"} > 7200
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Pushgateway job {{ $labels.job }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          Hourly cron hasn't pushed in >2h. Same triage as 1m alert.
+
+  - name: app-bpi-r4.conntrack
+    rules:
+    - alert: BpiR4SynFlood
+      ## Normal load ~100–300 SYN_RECV; sustained >1500 = backlog of
+      ## half-open conns, classic SYN-flood symptom.
+      expr: bpi_r4_conntrack_tcp_state{state="SYN_RECV"} > 1500
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 TCP SYN_RECV {{ $value }} sustained — possible flood"
+        description: |
+          Half-open connection table is growing. Likely external scan or
+          SYN-flood. Confirm via per-port destination distribution in
+          /proc/net/nf_conntrack and consider tightening syncookies.
+
+    - alert: BpiR4HwOffloadStalled
+      ## ppe1/ppe2 entries normally grow with traffic; a sustained 0 on
+      ## both means HW offload disabled (config drift, kernel oops, or
+      ## flow_offload init failed).
+      expr: bpi_r4_mtk_ppe_entries{engine="ppe1"} + bpi_r4_mtk_ppe_entries{engine="ppe2"} == 0
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 MTK PPE flow-offload engine has zero entries"
+        description: |
+          Both PPE engines empty for 10m — HW NAT/flow offload is
+          inactive. Throughput will fall back to slow-path and CPU usage
+          will spike. Check `dmesg | grep -i mtk_ppe` and the nftables
+          flowtable definition.
+
+  - name: app-bpi-r4.psi
+    ## Pressure Stall Information — CPU/memory/IO/IRQ contention.
+    ## `some` = at least one task stalled; `full` = all tasks stalled
+    ## (catastrophic for non-CPU resources). Thresholds tuned for a
+    ## router that should rarely block — 30% sustained = saturation.
+    rules:
+    - alert: BpiR4CpuPressureHigh
+      expr: bpi_r4_psi_pressure_pct{resource="cpu",kind="some",window="60"} > 30
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 CPU pressure {{ $value }}% (some-60s) > 30 for 10m"
+        description: |
+          Router CPU is saturated — at least one task stalled >30% of the
+          time over a 60s window. Suspect a runaway cron or DDoS-class
+          packet rate. Check /proc/loadavg, top, and the cron-runtime panel.
+
+    - alert: BpiR4MemPressureFull
+      expr: bpi_r4_psi_pressure_pct{resource="memory",kind="full",window="60"} > 5
+      for: 10m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 memory FULL pressure {{ $value }}% — OOM imminent"
+        description: |
+          ALL tasks stalled on memory >5% of the time. On a router with
+          4 GiB RAM this means a leak or huge conntrack table. Inspect
+          /proc/meminfo and conntrack count immediately — OOM-kill of
+          netifd/dnsmasq imminent.
+
+    - alert: BpiR4IoPressureHigh
+      expr: bpi_r4_psi_pressure_pct{resource="io",kind="some",window="300"} > 20
+      for: 15m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 IO pressure {{ $value }}% sustained — eMMC stress"
+        description: |
+          IO some-300s > 20% sustained 15m. Likely heavy log/pstore write
+          activity or eMMC wear-leveling thrashing. Cross-reference
+          bpi_r4_emmc_writes_completed_total rate and life_used_pct.
+
+  - name: app-bpi-r4.nlbwmon
+    rules:
+    - alert: BpiR4NlbwmonEnobufs
+      ## nlbwmon prints "Netlink receive failure: Out of memory" when the
+      ## netlink recv buffer overflows — every event is a lost batch of
+      ## flow updates. Counter is reset-safe (max-min over 1h).
+      expr: |
+        (
+          max_over_time(bpi_r4_nlbwmon_enobufs_total[1h])
+          - min_over_time(bpi_r4_nlbwmon_enobufs_total[1h])
+        ) > 0
+      for: 15m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 nlbwmon dropped netlink batches ({{ $value }} in 1h)"
+        description: |
+          nlbwmon NETLINK_ENOBUFS — flow accounting is losing data.
+          Buffer is 16 MiB; sustained drops mean traffic spike exceeds
+          drain rate. Inspect /var/log on bpi-r4 and consider lowering
+          refresh_interval or shedding accounted subnets.
 
   - name: app-bpi-r4.speedtest
     rules:
