@@ -231,6 +231,31 @@ spec:
           in >5 min. Either the router is unreachable, the script
           health-snapshot.sh died, or HA stopped accepting writes.
 
+    ## Catch integration regressions hiding in HA's baseline of unavailable
+    ## entities. A large block of "dead" entities is normal here (devices
+    ## that are pending, seasonal, or not always on), so we alert on jumps
+    ## per domain rather than absolute counts. >10 newly-unavailable entities
+    ## in a single domain over 1h almost always means an integration/hub/
+    ## bridge dropped off, not a few stragglers powering down.
+    - alert: HomeAssistantUnavailableEntitiesSpike
+      expr: |
+        (count by (domain) (hass_entity_available == 0))
+        - (count by (domain) ((hass_entity_available offset 1h) == 0))
+        > 10
+      for: 30m
+      labels:
+        severity: warning
+        component: Home
+        team: mdapi
+      annotations:
+        summary: "HA domain '{{ $labels.domain }}' lost {{ $value }} entities in 1h"
+        description: |
+          {{ $value }} more entities in domain '{{ $labels.domain }}' became
+          unavailable compared to 1h ago. Probable causes: integration token
+          expired, hub/bridge offline, network segment down. Use the HA
+          Developer Tools → States filter `state:unavailable domain:{{ $labels.domain }}`
+          to identify the cluster of dropped entities.
+
     ## Garage cluster degradation — fewer ok nodes than total. Each Garage
     ## instance is single-node so any degradation is fatal for backup writes.
     - alert: GarageClusterDegraded
