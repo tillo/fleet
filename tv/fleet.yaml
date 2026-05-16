@@ -5,12 +5,14 @@ namespaceLabels:
   cdenv.mdapi.ch: prod
 helm:
   maxHistory: 25
-# Two sources of expected drift between fleet manifest and live state:
+# Sources of expected drift between fleet manifest and live state:
 #   1. VPA (mode=Auto) writes resources.requests/limits onto running
 #      pods after start.
-#   2. Keel (`keel.sh/policy: minor`) auto-bumps the image tag on its
-#      poll cadence (drakkan/sftpgo:v2.7-alpine → v2.7.1-alpine).
-# Strip both fields from the diff so Fleet stops flagging Modified.
+#   2. Keel (`keel.sh/policy: minor`) auto-bumps the image tag and
+#      writes keel.sh/update-time onto the pod template.
+#   3. Manual `kubectl rollout restart` writes kubectl.kubernetes.io/
+#      restartedAt onto the pod template.
+# Strip these from the diff so Fleet stops flagging Modified.
 diff:
   comparePatches:
   - apiVersion: apps/v1
@@ -20,3 +22,6 @@ diff:
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
     - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"

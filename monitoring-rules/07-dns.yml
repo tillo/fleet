@@ -223,3 +223,29 @@ spec:
           Either the schedule was disabled, the worker is stuck, or
           Pushgateway is unreachable. Other Technitium query-log alerts will
           be silently broken until this resolves.
+
+    - alert: TechnitiumDhcpNoEndpoints
+      ## technitium-dhcp Service has selector app=technitium-primary, so its
+      ## endpoint set is empty whenever the primary pod is not Ready. The
+      ## existing TechnitiumPrimaryPodDnsDown catches DNS on port 53 but the
+      ## DHCP service on UDP/67 has no blackbox equivalent. Use the kube-state
+      ## endpoint metric to detect zero ready DHCP backends.
+      expr: |
+        sum by (namespace, service) (
+          kube_endpoint_address{
+            namespace="technitium", endpoint="technitium-dhcp", ready="true"
+          }
+        ) < 1
+      for: 3m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium DHCP service has no ready endpoints (LAN leases stop renewing)"
+        description: |
+          The LoadBalancer 192.168.1.55 on UDP/67 will silently drop client
+          packets — DHCPDISCOVER/REQUEST get no answer, existing leases keep
+          working until expiry, then clients lose addresses.
+          Single-active by design (Technitium has no DHCP failover protocol).
+          Manual cutover: see fleet/technitium/DHCP-FAILOVER-RUNBOOK.md.
