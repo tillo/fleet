@@ -7,6 +7,11 @@ metadata:
     cert-manager.io/issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/backend-protocol: HTTPS
     nginx.ingress.kubernetes.io/proxy-body-size: 10g
+    # MinIO bucket LIST on the 1.27M-object harvester-backup bucket
+    # takes well over nginx's 60s default; ingress returned 504 mid-LIST
+    # and stalled rclone copy. 300s comfortably covers full-bucket scans.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
     # Publish api.minio + console.minio A records into home.tillo.ch
     # (Technitium primary) pointing at the harvester-managed ingress VIP.
     external-dns.alpha.kubernetes.io/manage: mdapi
