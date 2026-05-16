@@ -459,8 +459,11 @@ spec:
     rules:
     - alert: BpiR4CronSlow
       ## Surfacing cron-script overruns. A minute-cadence script taking
-      ## > 30s burns 50% of its slot just on bookkeeping.
-      expr: bpi_r4_cron_runtime_seconds > 30
+      ## > 30s burns 50% of its slot just on bookkeeping. conntrack-state-
+      ## metrics walks /proc/net/nf_conntrack which the kernel locks; at
+      ## 30k+ entries a single pass costs ~90s sys time, so it lives on a
+      ## 5-min cron and is excluded here — see BpiR4ConntrackCronSlow.
+      expr: bpi_r4_cron_runtime_seconds{script!="conntrack-state-metrics"} > 30
       for: 10m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
@@ -469,6 +472,20 @@ spec:
           /usr/local/bin/{{ $labels.script }}.sh took >30s in its last run.
           Check for proc-walking loops (busybox awk on /proc/net/nf_conntrack
           can hit 100s on a busy router; see the dropped flow-metrics.sh).
+
+    - alert: BpiR4ConntrackCronSlow
+      ## conntrack-state-metrics on a 5-min cron walks 30-50k entries —
+      ## ~90s at steady state. Alert if it overruns its slot (>240s = 80% of
+      ## interval), which usually means table runaway.
+      expr: bpi_r4_cron_runtime_seconds{script="conntrack-state-metrics"} > 240
+      for: 15m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 conntrack state metrics taking {{ $value }}s — table runaway?"
+        description: |
+          conntrack-state-metrics is exceeding 240s. Either nf_conntrack
+          has grown past safe levels or PPE offload broke (everything
+          falling back to slow path). Check bpi_r4_conntrack_count.
 
   - name: app-bpi-r4.pushgateway-staleness
     ## Detects total cron-daemon failure or network partition between router
