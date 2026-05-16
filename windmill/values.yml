@@ -7,6 +7,52 @@ postgresql:
 windmill:
   baseDomain: windmill.mdapi.ch
   baseProtocol: https
+  # Override the chart's default workerGroups list to bump the default
+  # group's memory limit from 2Gi → 4Gi. Required since the
+  # scrypted_data_backup script streams a ~50 MiB tarball + base64
+  # buffers, peaking ~250 MiB; under load the shared worker pod can
+  # easily exceed 2Gi across concurrent jobs. Helm lists don't merge
+  # so we must re-declare all 3 chart-default groups verbatim.
+  workerGroups:
+    - name: default
+      replicas: 3
+      mode: worker
+      controller: Deployment
+      privileged: true
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      terminationGracePeriodSeconds: 604800
+      resources:
+        limits:
+          memory: 4Gi
+    - name: native
+      replicas: 1
+      mode: worker
+      controller: Deployment
+      privileged: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      extraEnv:
+        - name: NATIVE_MODE
+          value: "true"
+        - name: SLEEP_QUEUE
+          value: "200"
+      resources:
+        limits:
+          memory: 2Gi
+    - name: gpu
+      replicas: 0
+      mode: worker
+      controller: Deployment
+      privileged: true
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      resources:
+        limits:
+          memory: 2Gi
 ingress:
   annotations:
     cert-manager.io/issuer: letsencrypt-prod
