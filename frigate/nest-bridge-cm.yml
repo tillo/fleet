@@ -81,10 +81,24 @@ data:
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
+        # Sanitize the offer the same way Scrypted's google-device-access
+        # plugin does before posting to SDM (plugins/google-device-access/
+        # src/main.ts L172-174). Two SDM-specific quirks:
+        #   - SDM doesn't support trickle ICE; strip a=ice-options:trickle
+        #     so Google doesn't get confused expecting incremental candidates.
+        #   - aiortc can emit `a=sendrecv` on a transceiver we set to recvonly
+        #     in some negotiations. SDM mirrors whatever direction we send
+        #     back as `sendrecv` in the answer, which breaks the connection
+        #     ~20 s in. Force all directions to recvonly defensively.
+        offer_sdp = pc.localDescription.sdp
+        offer_sdp = offer_sdp.replace('a=ice-options:trickle\r\n', '')
+        offer_sdp = offer_sdp.replace('a=ice-options:trickle\n', '')
+        offer_sdp = offer_sdp.replace('a=sendrecv', 'a=recvonly')
+
         log.info('GenerateWebRtcStream...')
         resp = sdm_execute(atok,
                            'sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream',
-                           {'offerSdp': pc.localDescription.sdp})
+                           {'offerSdp': offer_sdp})
         results = resp.get('results', {})
         answer_sdp = results.get('answerSdp')
         media_id = results.get('mediaSessionId')
