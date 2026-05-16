@@ -45,13 +45,19 @@ spec:
     ## the Job is GC'd; KubeJobNotCompleted fires after 12h on any
     ## long-running job (e.g. multi-day rclone migrations) which is
     ## almost always intentional.
+    ##
+    ## NodeBondingDegraded fires forever on all 3 nodes because each
+    ## bare-metal box has a 2-slave LACP bond (mgmt-bo) with only one
+    ## NIC physically cabled — by design. Slaves have Link Failure
+    ## Count 0; the "missing" slave never had carrier. Re-enable this
+    ## alert only if both NICs ever get plugged on any node.
     - receiver: pushover-bundled
       matchers:
       - name: severity
         value: warning|critical
         matchType: "=~"
       - name: alertname
-        value: Watchdog|InfoInhibitor|CPUThrottlingHigh|KubeCPUOvercommit|LonghornVolumeStatusWarning|KubeJobFailed|KubeJobNotCompleted
+        value: Watchdog|InfoInhibitor|CPUThrottlingHigh|KubeCPUOvercommit|LonghornVolumeStatusWarning|KubeJobFailed|KubeJobNotCompleted|NodeBondingDegraded
         matchType: "!~"
       - name: team
         value: mdapi
