@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+Fleet manifest lint — catches two classes of foot-gun that have caused real
+outages on this cluster:
+
+  (A) Keel policy=force without match-tag — lets Keel jump to ANY newer
+      tag in the repo. Caused the 2026-05-16 mail outage when the
+      `:cache` BuildKit blob got pulled instead of `:latest`.
+
+  (B) comparePatches strips image on containers/0 but the Deployment has
+      additional containers that ARE also Keel-managed (sidecars). Caused
+      persistent Fleet drift on tv/sftpgo.
+
+Exit code is non-zero if any check fails. Run locally or wire into CI.
+"""
+
+import sys, pathlib, re, json
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write("ERROR: PyYAML required. pip install pyyaml\n")
+    sys.exit(2)
+
+REPO = pathlib.Path(__file__).resolve().parent
+errors: list[str] = []
+warnings: list[str] = []
+
+
+def all_yaml_files() -> list[pathlib.Path]:
+    return [
+        p for p in REPO.rglob("*.y*ml")
+        if not any(part.startswith(".") for part in p.relative_to(REPO).parts)
+    ]
+
+
+def load_docs(path: pathlib.Path):
+    try:
+        return list(yaml.safe_load_all(path.read_text()))
+    except yaml.YAMLError as e:
+        warnings.append(f"{path.relative_to(REPO)}: YAML parse error: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Check A — Keel policy=force MUST have match-tag: "true"
+# ---------------------------------------------------------------------------
+# Grep-level on raw text: keel annotations may live inside Helm values
+# (arbitrary depth) so a full YAML walk would have to know the chart schema.
+# Substring grep is good enough — false positives here would require someone
+# to deliberately comment-write the strings without using them.
+RE_FORCE = re.compile(r"keel\.sh/policy:\s*[\"']?force[\"']?")
+RE_MATCH = re.compile(r"keel\.sh/match-tag:\s*[\"']?true[\"']?")
+
+for path in all_yaml_files():
+    text = path.read_text()
+    if RE_FORCE.search(text) and not RE_MATCH.search(text):
+        errors.append(
+            f"[KEEL-FORCE-NO-MATCH-TAG] {path.relative_to(REPO)}: "
+            'has `keel.sh/policy: force` but no `keel.sh/match-tag: "true"`. '
+            "Keel will jump to any newer tag in the repo (mail outage 2026-05-16)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Check B — comparePatches stripping containers/0/image while the
+# Deployment has additional containers
+# ---------------------------------------------------------------------------
+# Find every fleet.yaml that strips `/spec/template/spec/containers/0/image`,
+# then look at sibling files (same directory and below) for the named
+# Deployment. If that Deployment has >1 container, warn — the additional
+# containers may also be Keel-tracked and need their own op:remove.
+
+def find_deployment(start: pathlib.Path, name: str, namespace: str | None):
+    """Search start dir + subdirs for a Deployment with matching name."""
+    for cand in start.rglob("*.y*ml"):
+        if cand.name in ("fleet.yaml", "fleet.yml"):
+            continue
+        for doc in load_docs(cand):
+            if not isinstance(doc, dict):
+                continue
+            if doc.get("kind") != "Deployment":
+                continue
+            md = doc.get("metadata", {})
+            if md.get("name") != name:
+                continue
+            if namespace and md.get("namespace") and md["namespace"] != namespace:
+                continue
+            return cand, doc
+    return None, None
+
+
+for fleet_yaml in REPO.rglob("fleet.y*ml"):
+    docs = load_docs(fleet_yaml)
+    if not docs:
+        continue
+    root = docs[0] if isinstance(docs[0], dict) else {}
+    patches = (root.get("diff") or {}).get("comparePatches") or []
+    for patch in patches:
+        if not isinstance(patch, dict):
+            continue
+        if patch.get("kind") != "Deployment":
+            continue
+        ops = patch.get("operations") or []
+        # collect every "op:remove" on /spec/template/spec/containers/N/image
+        stripped_idxs = set()
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            if op.get("op") != "remove":
+                continue
+            m = re.fullmatch(
+                r"/spec/template/spec/containers/(\d+)/image", op.get("path", "")
+            )
+            if m:
+                stripped_idxs.add(int(m.group(1)))
+        if not stripped_idxs:
+            continue
+        cand, dep = find_deployment(
+            fleet_yaml.parent, patch.get("name", ""), patch.get("namespace")
+        )
+        if not dep:
+            continue
+        containers = (
+            dep.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [])
+        )
+        all_idxs = set(range(len(containers)))
+        missing = sorted(all_idxs - stripped_idxs)
+        if missing:
+            missing_names = [containers[i].get("name", f"#{i}") for i in missing]
+            errors.append(
+                f"[COMPAREPATCH-MULTI-CONTAINER] {fleet_yaml.relative_to(REPO)}: "
+                f"comparePatch for Deployment/{patch['name']} strips image on "
+                f"containers{sorted(stripped_idxs)} but the Deployment "
+                f"({cand.relative_to(REPO)}) has {len(containers)} containers; "
+                f"missing: {missing_names}. "
+                "If any of those containers are Keel-tracked, this bundle will "
+                "stay Modified (sftpgo-auth drift 2026-05-16)."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+for w in warnings:
+    print(f"WARN  {w}")
+for e in errors:
+    print(f"FAIL  {e}")
+
+if errors:
+    print(f"\n{len(errors)} error(s), {len(warnings)} warning(s).")
+    sys.exit(1)
+print(f"OK — {len(warnings)} warning(s), 0 errors.")
