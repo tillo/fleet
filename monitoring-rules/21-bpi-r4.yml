@@ -36,6 +36,14 @@ spec:
       expr: rate(bpi_r4_softnet_drop_total[1m])
     - record: bpi_r4:onu_bip_errors_per_s:rate5m
       expr: rate(bpi_r4_onu_bip_errors_total[5m])
+    - record: bpi_r4:tcp_retrans_per_s:rate5m
+      expr: rate(bpi_r4_tcp_retrans_segs_total[5m])
+    - record: bpi_r4:conntrack_full_ratio
+      expr: bpi_r4_conntrack_count / bpi_r4_conntrack_max
+    - record: bpi_r4:tcp_retrans_ratio:rate5m
+      ## Retransmits as a fraction of total OutSegs — robust to traffic volume.
+      ## We don't push OutSegs (yet) so this is here for when we do.
+      expr: rate(bpi_r4_tcp_retrans_segs_total[5m]) / clamp_min(rate(bpi_r4_tcp_passive_opens_total[5m]) + rate(bpi_r4_tcp_active_opens_total[5m]), 1)
 
   - name: app-bpi-r4.optical
     rules:
@@ -260,3 +268,107 @@ spec:
           No handshake from this WireGuard peer in over an hour. Either
           the peer is offline, its public IP changed, or the tunnel
           MTU is broken.
+
+  - name: app-bpi-r4.ipv6
+    rules:
+    - alert: BpiR4Ipv6PdLost
+      ## IA_PD lease present means ISP is still delegating the /56.
+      ## If this drops to 0 while WAN carrier+PPPoE are up, the ISP
+      ## stopped delegating us a prefix — internal IPv6 will break
+      ## within the previous prefix's valid lifetime.
+      expr: bpi_r4_ipv6_pd_present == 0 and bpi_r4_wan_carrier == 1
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 IPv6 prefix delegation lost (WAN up)"
+        description: |
+          `ubus call network.interface.wan_6 status` reports no
+          ipv6-prefix. Internal IPv6 will continue to work until
+          existing leases expire (~24h) then drop. Investigate odhcp6c
+          or upstream PPPoE re-establishment.
+
+    - alert: BpiR4OdhcpdDown
+      ## odhcpd dying = no RAs and no DHCPv6. Clients lose IPv6 default
+      ## route as their current RA's lifetime expires (default 1800s).
+      expr: bpi_r4_odhcpd_running == 0
+      for: 2m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 odhcpd down (no RAs / DHCPv6 server)"
+        description: |
+          odhcpd process not running. Internal LAN clients will lose
+          IPv6 default routes as their RA lifetimes expire. SSH and
+          `/etc/init.d/odhcpd start`.
+
+  - name: app-bpi-r4.platform-resources
+    rules:
+    - alert: BpiR4ConntrackHigh
+      ## Approaching nf_conntrack_max forces older entries to be evicted
+      ## and degrades connection setup latency. /etc/config/firewall
+      ## tuning is the fix; alert when we're at 70%.
+      expr: bpi_r4:conntrack_full_ratio > 0.70
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 conntrack table {{ $value | humanizePercentage }} full"
+        description: |
+          nf_conntrack_count / nf_conntrack_max exceeded 70%. Bump
+          /proc/sys/net/netfilter/nf_conntrack_max or shorten flow
+          timeouts. Check bpi_r4_active_flows for top sources.
+
+    - alert: BpiR4TcpRetransmitsHigh
+      ## Baseline is < 0.2 retransmits/s on this device. A sustained
+      ## spike usually means WAN-side packet loss or routing instability.
+      expr: bpi_r4:tcp_retrans_per_s:rate5m > 5
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 TCP host-stack retransmits {{ $value }}/s"
+        description: |
+          Local TCP stack on the router is retransmitting unusually
+          often (mostly outbound from the router itself: ssh, acme,
+          chrony peers). Check WAN packet loss.
+
+  - name: app-bpi-r4.storage
+    rules:
+    - alert: BpiR4EmmcPreEolWarning
+      ## pre_eol_info enum:
+      ##   1 = Normal (>80% reserves) — healthy
+      ##   2 = Warning (<80%)         — flag
+      ##   3 = Urgent  (<20%)         — replace soon
+      expr: bpi_r4_emmc_pre_eol_info >= 2
+      for: 1h
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 eMMC pre-EOL state {{ $value }} (1=Normal,2=Warning,3=Urgent)"
+        description: |
+          eMMC reserved-block pool is depleting. Plan replacement
+          (Kingston 8GTF4R-class). `mmc extcsd read /dev/mmcblk0` for
+          full health dump (mmc-utils landed in build c489b57).
+
+    - alert: BpiR4EmmcLifeHigh
+      ## life_used_pct is the midpoint of the EXT_CSD 10% bucket
+      ## (5/15/.../95) or 100 if exceeded. Either Type A (SLC) or
+      ## Type B (MLC) above 80 = approaching wear-out.
+      expr: bpi_r4_emmc_life_used_pct > 80
+      for: 1h
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 eMMC type-{{ $labels.type }} {{ $value }}% used"
+        description: |
+          eMMC lifetime estimate exceeded 80% on at least one zone
+          (A = SLC reserve, B = MLC main). Plan replacement.
+
+  - name: app-bpi-r4.speedtest
+    rules:
+    - alert: BpiR4SpeedtestStale
+      ## Weekly cron — if we miss two consecutive runs the job is broken.
+      expr: time() - bpi_r4_speedtest_last_run_timestamp_seconds > 1209600
+      for: 1h
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 speedtest hasn't completed in 14d"
+        description: |
+          Weekly speedtest cron isn't pushing. Likely speedtest.net
+          CLI broken or lock-file stuck. Run `/usr/local/bin/speedtest-metrics.sh`
+          on the router manually.
