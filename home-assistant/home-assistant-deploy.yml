@@ -19,6 +19,11 @@ spec:
       labels:
         app: home-assistant
     spec:
+      # Pinned to the node that physically hosts the Zigbee USB stick.
+      # Pod is privileged, so /dev access is granted unconditionally —
+      # no device plugin needed. Edit this if the stick is moved.
+      nodeSelector:
+        kubernetes.io/hostname: qui
       initContainers:
       # Bootstrap initContainer (2026-05-14 migration):
       # If a /config/configuration.yaml.bootstrap exists on the PVC AND the
@@ -76,11 +81,7 @@ spec:
         - name: home-assistant-secrets
           mountPath: /config/secrets.yaml
           subPath: secrets.yaml
-        resources:
-          limits:
-            akri.sh/akri-home-assistant: "1"
-          requests:
-            akri.sh/akri-home-assistant: "1"
+        resources: {}
       # Sidecar: hourly off-site sync of /config/backups → Garage S3.
       # Local retention is unchanged (auto_backup keeps the rolling window).
       - name: rclone-backups-s3

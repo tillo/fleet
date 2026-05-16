@@ -9,6 +9,10 @@ metadata:
     keel.sh/trigger: poll
     keel.sh/pollSchedule: "@every 4h"
 spec:
+  # Recreate so the old pod releases /dev/ttyUSB0 before the new one
+  # tries to claim it (GPS USB serial, single-writer).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: chrony
@@ -18,6 +22,11 @@ spec:
       labels:
         app: chrony
     spec:
+      # Pinned to the node that physically hosts the GPS USB UART.
+      # Pod is privileged, so /dev access is granted unconditionally —
+      # no device plugin needed. Edit this if the GPS is moved.
+      nodeSelector:
+        kubernetes.io/hostname: qui
       containers:
       - name: chrony
         image: registry.mdapi.ch/mdapi/chrony:latest
@@ -38,10 +47,6 @@ spec:
           value: "false"
         - name: ENABLE_GPS
           value: "true"
-        resources:
-          limits:
-            akri.sh/akri-chrony: "1"
-          requests:
-            akri.sh/akri-chrony: "1"
+        resources: {}
       imagePullSecrets:
       - name: mdapi-registry
