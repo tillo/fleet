@@ -1,0 +1,63 @@
+## Scrypted — a TS/Node platform we deploy ONLY as a WebRTC↔RTSP bridge for the
+## Nest Balcony cam, after the aiortc bridge stalled at the ~20 s SDM peer drop
+## (community converges on Scrypted for this; see Frigate/go2rtc/koush forums).
+##
+## Architecture: Scrypted's google-device-access plugin does the SDM signaling +
+## WebRTC, the rebroadcast plugin republishes as RTSP on a pod-local port, and
+## Frigate's go2rtc consumes plain `rtsp://scrypted.scrypted.svc:11041/balconycam`.
+##
+## Bridge networking (not host) — we don't need HomeKit/mDNS for this use case.
+## Initial admin setup + Google Device Access plugin OAuth must be done through
+## the web UI at https://scrypted.mdapi.ch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scrypted
+  namespace: scrypted
+  annotations:
+    keel.sh/policy: minor
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: scrypted
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: scrypted
+    spec:
+      containers:
+      - name: scrypted
+        image: ghcr.io/koush/scrypted:v0.144.1-noble-full
+        imagePullPolicy: IfNotPresent
+        ports:
+        - { containerPort: 10443, name: web-https }
+        - { containerPort: 11080, name: web-http }
+        - { containerPort: 11041, name: rtsp-rebcast }
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: SCRYPTED_VOLUME
+          value: /server/volume
+        # SCRYPTED_DOCKER_AVAHI=false because we're on bridge networking and
+        # don't use HomeKit; saves the avahi/dbus complexity.
+        - name: SCRYPTED_DOCKER_AVAHI
+          value: "false"
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 4
+            memory: 4Gi
+        volumeMounts:
+        - name: scrypted-data
+          mountPath: /server/volume
+      volumes:
+      - name: scrypted-data
+        persistentVolumeClaim:
+          claimName: scrypted-data

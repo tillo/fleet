@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scrypted
+  namespace: scrypted
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Scrypted has WebSocket-heavy plugin pages; keep connections open.
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    flame.pawelmalak/type: app
+    flame.pawelmalak/name: Scrypted
+    flame.pawelmalak/url: https://scrypted.mdapi.ch
+    flame.pawelmalak/category: Domotics
+    flame.pawelmalak/order: '40'
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: scrypted.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: scrypted
+                port:
+                  number: 10443
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - scrypted.mdapi.ch
+      secretName: scrypted-cert
