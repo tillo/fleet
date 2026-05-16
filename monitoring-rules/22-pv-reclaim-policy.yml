@@ -1,0 +1,56 @@
+## PV reclaim-policy backup-coverage alarm.
+##
+## Source: gauge `pv_reclaim_policy_violation{namespace,pvc,reason}`
+## pushed by Windmill `f/infra_health/pv_reclaim_policy_analysis`
+## (daily 08:00 Zurich). Any Delete-policy PV that doesn't match
+## either SAFE_DELETE patterns, a Longhorn recurring-job-group label,
+## or the BACKED_UP_BY_WINDMILL allowlist gets a violation row.
+##
+## 24h `for:` deliberately wide so transient catalog gaps during
+## namespace creation / chart upgrades don't fire — and aligns with
+## the daily audit cadence (one missed run shouldn't page).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-pv-reclaim-policy
+  namespace: monitoring
+spec:
+  groups:
+  - name: app-pv-reclaim-policy.coverage
+    rules:
+    - alert: PVMissingBackupStrategy
+      expr: pv_reclaim_policy_violation == 1
+      for: 24h
+      labels:
+        severity: warning
+        component: storage
+      annotations:
+        summary: 'PV {{ $labels.namespace }}/{{ $labels.pvc }} has no backup strategy'
+        description: |
+          PV bound to {{ $labels.namespace }}/{{ $labels.pvc }} uses reclaimPolicy: Delete
+          but does NOT match any backup-coverage rule:
+            - not in SAFE_DELETE (ephemeral by name/pattern)
+            - no recurring-job-group.longhorn.io/* label
+            - not in f/infra_health/pv_reclaim_policy_analysis BACKED_UP_BY_WINDMILL
+          Reason: {{ $labels.reason }}.
+          Either flip the PV to Retain, add a Longhorn recurring backup label,
+          or wire up a Windmill backup script and add it to the allowlist.
+
+    - alert: PVReclaimPolicyAuditStale
+      ## Audit script not pushing fresh metrics: gauge stops updating.
+      ## Pushgateway keeps the last value forever; freshness lives in
+      ## the dedicated _last_run_timestamp_seconds gauge.
+      expr: |
+        (time() - pv_reclaim_policy_analysis_last_run_timestamp_seconds) > 36*3600
+      for: 30m
+      labels:
+        severity: warning
+        component: storage
+      annotations:
+        summary: 'PV reclaim policy audit stale (>36h since last successful run)'
+        description: |
+          f/infra_health/pv_reclaim_policy_analysis hasn't pushed a fresh
+          timestamp gauge in >36h. Daily schedule is broken or the
+          push to Pushgateway is failing — alert masks the data, fix the
+          probe.
