@@ -78,54 +78,62 @@ spec:
         - name: go2rtc-override
           mountPath: /usr/local/go2rtc/bin/go2rtc
           subPath: go2rtc
-      # === Nest WebRTC bridge sidecars ====================================
-      # mediamtx: pod-local RTSP relay receiving from the aiortc bridge below
-      # and serving RTSP pull to Frigate's go2rtc on 127.0.0.1:8555.
-      # nest-bridge-balconycam: aiortc-based WebRTC client that negotiates
-      # the stream with Google SDM. Applies both SDP fixes
-      # (allenporter/python-google-nest-sdm#1116) — direction sendrecv→sendonly
-      # for our recvonly offer, and ICE candidate foundation injection. The
-      # direction fix is what was killing the connection ~23 s in.
-      - name: mediamtx
-        image: bluenviron/mediamtx:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 8555
-          name: rtsp-relay
-        volumeMounts:
-        - name: nest-bridge-scripts
-          mountPath: /mediamtx.yml
-          subPath: mediamtx.yml
-        resources:
-          requests: {cpu: 20m, memory: 32Mi}
-          limits: {cpu: 1, memory: 256Mi}
-      - name: nest-bridge-balconycam
-        image: python:3.12-slim
-        imagePullPolicy: IfNotPresent
-        command:
-        - sh
-        - -c
-        - |
-          set -eu
-          pip install --quiet --no-cache-dir 'aiortc>=1.14' 2>&1 | tail -5
-          exec python3 /scripts/bridge.py
-        envFrom:
-        - secretRef:
-            name: frigate-nest-balconycam
-        env:
-        - name: RTSP_OUT_URL
-          value: rtsp://127.0.0.1:8555/balconycam
-        # Flipped to "0" now that re-consent fixed SDM state for balcony +
-        # we have a fresh refresh_token in the Secret. Bridge will use
-        # MediaRecorder to push RTSP to mediamtx for Frigate to consume.
-        - name: DIAG_BLACKHOLE
-          value: "0"
-        volumeMounts:
-        - name: nest-bridge-scripts
-          mountPath: /scripts
-        resources:
-          requests: {cpu: 100m, memory: 128Mi}
-          limits: {cpu: 1, memory: 512Mi}
+      # === Nest WebRTC bridge sidecars — CURRENTLY DISABLED ==============
+      # Outcome of the full investigation (2026-05-15..16):
+      #
+      # 1. Google SDM returns 500 for balconycam GenerateWebRtcStream from
+      #    server-side WebRTC clients (Scrypted, our aiortc bridge) but
+      #    works for browsers (HA UI, Google Home app). Confirmed asymmetric
+      #    even after fresh re-consent on partner-connection c1289797.
+      # 2. With the SDP fixes (google-nest-sdm#1116 + Scrypted offer
+      #    sanitization) our bridge briefly opens the WebRTC peer, gets
+      #    media flowing, then Google's peer drops at ~20 s every cycle.
+      # 3. 20s up / 5s down is too fast for Frigate's ffmpeg DESCRIBE to
+      #    catch the publish window, so the stream is unusable in practice
+      #    and the bridge's 5s retry burns SDM quota (impacting HA too).
+      #
+      # Sidecars + ConfigMap + Secret stay in tree so re-enabling is a
+      # single uncomment + push if Google ever fixes the SDM state for
+      # balcony (the cam works in HA + Google Home, so it's a per-device
+      # backend quirk we can't fix from our side).
+      # -----------------------------------------------------------------
+      # - name: mediamtx
+      #   image: bluenviron/mediamtx:latest
+      #   imagePullPolicy: Always
+      #   ports:
+      #   - containerPort: 8555
+      #     name: rtsp-relay
+      #   volumeMounts:
+      #   - name: nest-bridge-scripts
+      #     mountPath: /mediamtx.yml
+      #     subPath: mediamtx.yml
+      #   resources:
+      #     requests: {cpu: 20m, memory: 32Mi}
+      #     limits: {cpu: 1, memory: 256Mi}
+      # - name: nest-bridge-balconycam
+      #   image: python:3.12-slim
+      #   imagePullPolicy: IfNotPresent
+      #   command:
+      #   - sh
+      #   - -c
+      #   - |
+      #     set -eu
+      #     pip install --quiet --no-cache-dir 'aiortc>=1.14' 2>&1 | tail -5
+      #     exec python3 /scripts/bridge.py
+      #   envFrom:
+      #   - secretRef:
+      #       name: frigate-nest-balconycam
+      #   env:
+      #   - name: RTSP_OUT_URL
+      #     value: rtsp://127.0.0.1:8555/balconycam
+      #   - name: DIAG_BLACKHOLE
+      #     value: "0"
+      #   volumeMounts:
+      #   - name: nest-bridge-scripts
+      #     mountPath: /scripts
+      #   resources:
+      #     requests: {cpu: 100m, memory: 128Mi}
+      #     limits: {cpu: 1, memory: 512Mi}
       # =================================================================
       # Sidecar: 6-hourly off-site sync of /media/frigate/recordings → Garage S3.
       # Skips files newer than 24h so Frigate's local retention drives local TTL.
@@ -174,6 +182,6 @@ spec:
       - name: go2rtc-override
         emptyDir:
           sizeLimit: 100M
-      - name: nest-bridge-scripts
-        configMap:
-          name: frigate-nest-bridge
+      # - name: nest-bridge-scripts   # re-add with the sidecar block above
+      #   configMap:
+      #     name: frigate-nest-bridge
