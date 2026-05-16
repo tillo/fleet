@@ -1,0 +1,43 @@
+## Witness node for the salt+pepper Garage cluster (bare-metal, dxflrs/
+## garage:v2.3.0). With replication_factor=2 and only 2 storage nodes,
+## consistency_mode='consistent' would block writes when either node is
+## briefly unavailable, so salt+pepper were configured with
+## consistency_mode='dangerous' — which triggers Garage issue #1403
+## (InvalidPart / NoSuchUpload on CompleteMultipartUpload).
+##
+## This witness adds a 3rd quorum participant (zone=witness, capacity=0)
+## so salt+pepper can flip back to consistency_mode='consistent' without
+## losing single-node-down tolerance: a 2-of-3 quorum is still met even
+## if salt OR pepper is offline.
+##
+## bootstrap_peers contains the node IDs + rpc_public_addr of the two
+## storage nodes; the witness will discover them on startup.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: garage-witness
+data:
+  garage.toml: |
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+
+    replication_factor = 2
+    consistency_mode = "consistent"
+
+    rpc_bind_addr = "[::]:3901"
+    # The salt+pepper nodes reach us on this advertised public address.
+    # Matches the MetalLB Service IP in garage-svc.yml.
+    rpc_public_addr = "192.168.1.59:3901"
+    # rpc_secret loaded from secret env var GARAGE_RPC_SECRET
+
+    bootstrap_peers = [
+      "592e884a4fdfbe437b409d5bf9a34a6ba3d885ef32839d9a79dd1def76312f13@192.168.1.207:30187",
+      "4c16d09386a4b26c266a3257267498d4894b6570334bdee9efa02f931d16a8a3@192.168.1.219:30187",
+    ]
+
+    [admin]
+    api_bind_addr = "[::]:3903"
+    # admin_token + metrics_token loaded from secret env vars.

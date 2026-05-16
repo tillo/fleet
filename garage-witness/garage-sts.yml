@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: garage
+  namespace: garage-witness
+spec:
+  serviceName: garage-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: garage-witness
+  template:
+    metadata:
+      labels:
+        app: garage-witness
+    spec:
+      containers:
+      - name: garage
+        image: dxflrs/garage:v2.3.0
+        env:
+        - name: GARAGE_CONFIG_FILE
+          value: /etc/garage/garage.toml
+        envFrom:
+        - secretRef:
+            name: garage-tokens
+        ports:
+        - { name: rpc, containerPort: 3901 }
+        - { name: admin, containerPort: 3903 }
+        # No S3 / S3-web — this node serves no client traffic, only RPC
+        # quorum participation. TCP probes only (Garage /health returns
+        # 503 until the layout is bootstrapped on first install).
+        readinessProbe:
+          tcpSocket: { port: 3901 }
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket: { port: 3901 }
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: meta, mountPath: /var/lib/garage/meta }
+        - { name: data, mountPath: /var/lib/garage/data }
+        - { name: config, mountPath: /etc/garage/garage.toml, subPath: garage.toml }
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: 500m, memory: 1Gi }
+      volumes:
+      - name: config
+        configMap:
+          name: garage-config
+  volumeClaimTemplates:
+  - metadata:
+      name: meta
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 5Gi } }
+  # Even with capacity=0 Garage insists on a data dir. Keep it small.
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 5Gi } }
