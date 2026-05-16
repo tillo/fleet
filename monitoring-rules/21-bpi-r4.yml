@@ -44,6 +44,9 @@ spec:
       ## Retransmits as a fraction of total OutSegs — robust to traffic volume.
       ## We don't push OutSegs (yet) so this is here for when we do.
       expr: rate(bpi_r4_tcp_retrans_segs_total[5m]) / clamp_min(rate(bpi_r4_tcp_passive_opens_total[5m]) + rate(bpi_r4_tcp_active_opens_total[5m]), 1)
+    - record: bpi_r4:emmc_write_bytes_per_s:rate5m
+      ## sector-units (512 B) → bytes; useful for write-amplification trending.
+      expr: rate(bpi_r4_emmc_sectors_written_total[5m]) * 512
 
   - name: app-bpi-r4.optical
     rules:
@@ -118,9 +121,17 @@ spec:
     - alert: BpiR4PppoeFlappy
       ## > 3 flaps over 24h indicates either a flaky ISP session or
       ## SFP-side carrier glitching forcing PPPoE re-dial.
-      ## `for: 30m` ride-out so a single boot-time dial after a reboot
-      ## doesn't fire instantly while uptime is < 1h.
-      expr: increase(bpi_r4_pppoe_flap_count[24h]) > 3
+      ##
+      ## Uses max_over_time - min_over_time instead of increase(): the
+      ## counter lives in /etc and survives reboot, but during ops bursts
+      ## (sysupgrade-flash sequences) it can still reset, and increase()
+      ## reset-compensation produces 24h totals that include each reset
+      ## as a phantom flap (caught us 2026-05-15 and 2026-05-16 with
+      ## values 3.000051… just past the > 3 threshold). The delta of
+      ## (max - min) over the window is reset-resilient: max reflects
+      ## the highest peak in the window, min reflects the lowest
+      ## post-reset trough, and the difference is the real net growth.
+      expr: (max_over_time(bpi_r4_pppoe_flap_count[24h]) - min_over_time(bpi_r4_pppoe_flap_count[24h])) > 3
       for: 30m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
@@ -358,6 +369,63 @@ spec:
         description: |
           eMMC lifetime estimate exceeded 80% on at least one zone
           (A = SLC reserve, B = MLC main). Plan replacement.
+
+  - name: app-bpi-r4.pppoe-rtt
+    rules:
+    - alert: BpiR4PppoePeerLoss
+      ## Per-minute 5-ping sample; loss > 0 sustained means real WAN path issues.
+      expr: bpi_r4_pppoe_packet_loss_pct > 0
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE peer packet loss {{ $value }}%"
+        description: |
+          ICMP loss to the PPPoE peer ({{ $labels.peer }}) sustained
+          over 5 min. Usually upstream / ISP-side rather than the
+          router itself. Cross-check ONU optical Rx + carrier.
+
+    - alert: BpiR4PppoeRttHigh
+      ## Baseline 4-5 ms over LAN→PPPoE→ISP edge. > 50 ms sustained is
+      ## indicative of bufferbloat or upstream congestion.
+      expr: bpi_r4_pppoe_rtt_ms{stat="avg"} > 50
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE peer RTT {{ $value }} ms (baseline 4-5 ms)"
+        description: |
+          Avg RTT to PPPoE peer 10× baseline. Likely upstream
+          congestion or bufferbloat on the SQM path.
+
+  - name: app-bpi-r4.hue-plug
+    rules:
+    - alert: BpiR4HuePlugUnavailable
+      ## The Internet Hue plug is the only path to power-cycle ONU+router
+      ## from HA. If unavailable, ALL of our recovery automations are dead.
+      expr: max(hass_entity_available{entity="light.hue_smart_plug_1"}) == 0
+      for: 10m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Internet Hue plug unavailable (HA can't talk to it)"
+        description: |
+          HA reports the Internet Hue plug as unavailable for >10 min.
+          All router/ONU power-cycle automations are non-functional
+          until this clears. Check Hue bridge + ZigBee mesh; the plug
+          itself may need to be unplugged-replugged.
+
+  - name: app-bpi-r4.cron-runtime
+    rules:
+    - alert: BpiR4CronSlow
+      ## Surfacing cron-script overruns. A minute-cadence script taking
+      ## > 30s burns 50% of its slot just on bookkeeping.
+      expr: bpi_r4_cron_runtime_seconds > 30
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 cron script {{ $labels.script }} runtime {{ $value }}s"
+        description: |
+          /usr/local/bin/{{ $labels.script }}.sh took >30s in its last run.
+          Check for proc-walking loops (busybox awk on /proc/net/nf_conntrack
+          can hit 100s on a busy router; see the dropped flow-metrics.sh).
 
   - name: app-bpi-r4.speedtest
     rules:

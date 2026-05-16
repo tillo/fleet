@@ -234,6 +234,50 @@ data:
             {"expr": "bpi_r4_speedtest_jitter_ms", "legendFormat": "jitter", "refId": "B"}
           ],
           "fieldConfig": {"defaults": {"unit": "ms", "custom": {"drawStyle": "points", "pointSize": 8, "fillOpacity": 0}}}
+        },
+
+        {"id": 100, "type": "timeseries", "title": "PPPoE peer RTT (avg ms) + packet loss", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 61, "w": 12, "h": 7},
+          "description": "ICMP RTT to the PPPoE peer (5-sample average per minute). Predicts WAN-side instability before the session flaps.",
+          "targets": [
+            {"expr": "bpi_r4_pppoe_rtt_ms{stat=\"avg\"}", "legendFormat": "avg RTT (ms)", "refId": "A"},
+            {"expr": "bpi_r4_pppoe_rtt_ms{stat=\"max\"}", "legendFormat": "max RTT (ms)", "refId": "B"},
+            {"expr": "bpi_r4_pppoe_packet_loss_pct", "legendFormat": "loss %", "refId": "C"}
+          ],
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+        {"id": 101, "type": "timeseries", "title": "Cron-script runtime (s)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 61, "w": 12, "h": 7},
+          "description": "Wall-clock runtime of each cron-driven script (written by /usr/local/bin/timed-run.sh wrapper). Surfaces whichever script is responsible for any load-avg climb.",
+          "targets": [{"expr": "bpi_r4_cron_runtime_seconds", "legendFormat": "{{script}}", "refId": "A"}],
+          "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "fillOpacity": 0}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 10}, {"color": "red", "value": 30}]}}}
+        },
+
+        {"id": 110, "type": "timeseries", "title": "eMMC IO (writes/s) — write amplification proxy", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 0, "y": 68, "w": 12, "h": 7},
+          "description": "Sectors are 512 B; multiply by 512 for bytes/s. Sustained high writes shorten eMMC lifetime — cross-reference with bpi_r4_emmc_life_used_pct.",
+          "targets": [
+            {"expr": "rate(bpi_r4_emmc_sectors_written_total[5m]) * 512", "legendFormat": "bytes written/s", "refId": "A"},
+            {"expr": "rate(bpi_r4_emmc_writes_completed_total[5m])", "legendFormat": "write IOPS", "refId": "B"},
+            {"expr": "rate(bpi_r4_emmc_reads_completed_total[5m])", "legendFormat": "read IOPS", "refId": "C"}
+          ],
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 0}}}
+        },
+        {"id": 111, "type": "stat", "title": "Internet plug (Hue)", "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "gridPos": {"x": 12, "y": 68, "w": 6, "h": 7},
+          "description": "Plug is on/off-only (no power sensor). 0 = HA can't talk to plug (Hue bridge or ZigBee issue); 1 = available. brightness 100 = on, 0 = off.",
+          "targets": [
+            {"expr": "max(hass_entity_available{entity=\"light.hue_smart_plug_1\"})", "legendFormat": "available", "refId": "A"},
+            {"expr": "max(hass_light_brightness_percent{entity=\"light.hue_smart_plug_1\"})", "legendFormat": "on/off", "refId": "B"}
+          ],
+          "fieldConfig": {"defaults": {"mappings": [{"options": {"0": {"text": "✗", "color": "red"}, "100": {"text": "ON", "color": "green"}, "1": {"text": "OK", "color": "green"}}, "type": "value"}]}}
+        },
+        {"id": 112, "type": "text", "title": "ha_events / router_logs / bpi_r4_crashes — OpenObserve", "datasource": null,
+          "gridPos": {"x": 18, "y": 68, "w": 6, "h": 7},
+          "options": {
+            "mode": "markdown",
+            "content": "**Search the related log streams in OpenObserve:**\n\n- 🛠 [`ha_events`](https://logs.mdapi.ch/web/logs?stream=ha_events) — automation triggers + 5-min outcomes\n- 🪵 [`router_logs`](https://logs.mdapi.ch/web/logs?stream=router_logs) — full router syslog\n- 💥 [`bpi_r4_crashes`](https://logs.mdapi.ch/web/logs?stream=bpi_r4_crashes) — archived pstore dumps\n\nUse `from`/`to` parameters in OpenObserve to pin to the dashboard time range."
+          }
         }
       ]
     }
