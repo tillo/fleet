@@ -256,6 +256,26 @@ spec:
           Developer Tools → States filter `state:unavailable domain:{{ $labels.domain }}`
           to identify the cluster of dropped entities.
 
+    ## SolarEdge inverter at 0W during solid daytime hours = inverter
+    ## or cloud-poll lost contact (not weather — even overcast produces).
+    ## Hour gate is UTC 09–16 (covers 10–18 CET / 11–18 CEST).
+    - alert: SolarEdgeInverterOfflineDaytime
+      expr: |
+        hass_sensor_state{entity="sensor.solaredge_m1_ac_power"} == 0
+        and on() (hour() >= 9)
+        and on() (hour() <= 16)
+      for: 2h
+      labels:
+        severity: warning
+        component: Home
+        team: mdapi
+      annotations:
+        summary: "SolarEdge M1 at 0W mid-day"
+        description: |
+          Inverter has reported 0 W AC for 2h between 09–16 UTC.
+          Likely SolarEdge cloud API outage, modem offline, or
+          inverter fault. Check https://monitoring.solaredge.com.
+
     ## Garage cluster degradation — fewer ok nodes than total. Each Garage
     ## instance is single-node so any degradation is fatal for backup writes.
     - alert: GarageClusterDegraded
