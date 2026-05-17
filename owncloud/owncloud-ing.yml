@@ -21,16 +21,19 @@ metadata:
       SecAuditLogFormat JSON
       SecAuditLog /dev/stdout
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
-      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
       # File uploads to OwnCloud carry arbitrary Content-Type (e.g.
       # application/vnd.openxmlformats-officedocument.* for Office files,
       # image/jpeg, application/pdf) outside the CRS default
       # tx.allowed_request_content_type whitelist. Scope-disable 920420
       # plus 920430 (protocol-version-not-allowed cousin that also
       # fires on some upload clients) on the WebDAV upload endpoints only.
-      # No apostrophes anywhere in this block — see the docs warning.
+      # MUST be declared before the CRS Include: within phase:1, rules execute
+      # in declaration order, so a ctl:ruleRemoveById placed after the Include
+      # runs too late — 920420 has already fired and added 5 to the anomaly
+      # score by then. No apostrophes anywhere in this block — see the docs warning.
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
         "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
       location = /.well-known/carddav { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
