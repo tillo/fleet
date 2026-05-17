@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meshcentral
+  namespace: meshcentral
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 6h"
+spec:
+  selector:
+    matchLabels:
+      app: meshcentral
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: meshcentral
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: meshcentral
+        image: ghcr.io/ylianst/meshcentral:latest
+        ports:
+        - name: web
+          containerPort: 4430
+        - name: redir
+          containerPort: 8080
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: NODE_ENV
+          value: production
+        volumeMounts:
+        - name: data
+          mountPath: /opt/meshcentral/meshcentral-data
+          subPath: data
+        - name: data
+          mountPath: /opt/meshcentral/meshcentral-files
+          subPath: files
+        - name: data
+          mountPath: /opt/meshcentral/meshcentral-backups
+          subPath: backups
+        - name: data
+          mountPath: /opt/meshcentral/meshcentral-web
+          subPath: web
+        - name: config
+          mountPath: /opt/meshcentral/meshcentral-data/config.json
+          subPath: config.json
+          readOnly: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        readinessProbe:
+          tcpSocket:
+            port: 4430
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 4430
+          initialDelaySeconds: 60
+          periodSeconds: 30
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: meshcentral-data
+      - name: config
+        configMap:
+          name: meshcentral-config
