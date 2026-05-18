@@ -78,24 +78,34 @@ spec:
         - name: go2rtc-override
           mountPath: /usr/local/go2rtc/bin/go2rtc
           subPath: go2rtc
-      # === Nest WebRTC bridge sidecars — CURRENTLY DISABLED ==============
-      # Outcome of the full investigation (2026-05-15..16):
+      # === Nest WebRTC bridge sidecars — DISABLED, NOT NEEDED ============
+      # 2026-05-18 update to the original story below: the "Google peer
+      # drops at ~20 s every cycle" symptom was caused by a stale SDM
+      # device handle (the balconycam ID in our refresh_token's grant no
+      # longer matched the device after some prior re-pair in Google
+      # Home). After remove + re-add in Google Home, fresh OAuth consent
+      # via the partnerconnections URL with prompt=consent, and updating
+      # NEST_REFRESH_TOKEN + NEST_DEVICE_ID in the frigate-nest-balconycam
+      # secret, the device works perfectly through go2rtc's NATIVE
+      # `nest://` connector on the PVC config — no Python bridge needed.
+      # The bridge was a workaround for the wrong root cause.
       #
-      # 1. Google SDM returns 500 for balconycam GenerateWebRtcStream from
-      #    server-side WebRTC clients (Scrypted, our aiortc bridge) but
-      #    works for browsers (HA UI, Google Home app). Confirmed asymmetric
-      #    even after fresh re-consent on partner-connection c1289797.
-      # 2. With the SDP fixes (google-nest-sdm#1116 + Scrypted offer
-      #    sanitization) our bridge briefly opens the WebRTC peer, gets
-      #    media flowing, then Google's peer drops at ~20 s every cycle.
-      # 3. 20s up / 5s down is too fast for Frigate's ffmpeg DESCRIBE to
-      #    catch the publish window, so the stream is unusable in practice
-      #    and the bridge's 5s retry burns SDM quota (impacting HA too).
-      #
-      # Sidecars + ConfigMap + Secret stay in tree so re-enabling is a
-      # single uncomment + push if Google ever fixes the SDM state for
-      # balcony (the cam works in HA + Google Home, so it's a per-device
-      # backend quirk we can't fix from our side).
+      # Original investigation notes preserved below for posterity. Leave
+      # the sidecar block commented out; if balconycam ever flakes again,
+      # first re-run the SDM remove/re-add/re-grant cycle before
+      # re-enabling the bridge.
+      # -----------------------------------------------------------------
+      # Original (pre-2026-05-18) investigation:
+      # 1. Google SDM returned 500 for balconycam GenerateWebRtcStream
+      #    from server-side WebRTC clients (Scrypted, our aiortc bridge)
+      #    but worked for browsers — explained by the stale device
+      #    handle, not a per-device backend quirk.
+      # 2. With SDP fixes (google-nest-sdm#1116 + Scrypted offer
+      #    sanitization) the bridge briefly opened the WebRTC peer, got
+      #    media flowing, then Google's peer dropped at ~20 s.
+      # 3. ~20 s up / ~5 s down was too fast for Frigate's ffmpeg
+      #    DESCRIBE to catch the publish window; bridge's 5 s retry
+      #    burned SDM quota.
       # -----------------------------------------------------------------
       # - name: mediamtx
       #   image: bluenviron/mediamtx:latest
