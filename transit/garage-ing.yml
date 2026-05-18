@@ -24,6 +24,15 @@ metadata:
     # Publish api.garage + console.garage A records into home.tillo.ch
     # (Technitium primary) pointing at the harvester-managed ingress VIP.
     external-dns.alpha.kubernetes.io/manage: mdapi
+    # console.garage = khairul169/garage-webui on salt+pepper. webui keeps
+    # session state in-process; without cookie affinity the post-login GET /
+    # round-robins to the other backend, finds no session, and bounces back
+    # to /login. S3 clients on api.garage don't carry cookies so api load
+    # balancing is unaffected (falls back to nginx default LB).
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "garage-webui-affinity"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "86400"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "86400"
 spec:
   ingressClassName: nginx
   rules:
