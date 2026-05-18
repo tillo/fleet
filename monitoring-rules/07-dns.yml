@@ -89,6 +89,97 @@ spec:
           Number of zones on primary vs secondary diverged for >30m. Check
           secondary's AXFR pull from primary and notifyAllowedNetworks ACL.
 
+    - alert: TechnitiumZoneListDrift
+      ## Catches the case TechnitiumZoneCountMismatch misses: same total but
+      ## different sets (one zone dropped on a side, another added) — e.g.
+      ## the 77.168.192.in-addr.arpa reverse-zone drift surfaced in the
+      ## 2026-05-17 DNS audit. Source: Windmill technitium_zone_diff,
+      ## scheduled 03:15 Zurich nightly.
+      expr: (technitium_zone_diff_primary_only + technitium_zone_diff_secondary_only) > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium zone-list drift: {{ $value }} zones differ between pods"
+        description: |
+          Primary and secondary disagree on which zones exist. Run the
+          technitium_zone_diff Windmill script to see which side has what;
+          most likely fix is adding the missing zone as Secondary on the
+          pod that lacks it (or Catalog Zone if you have appetite for the
+          structural fix).
+
+    - alert: TechnitiumZoneDiffStale
+      expr: time() - technitium_zone_diff_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium zone-diff probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill technitium_zone_diff hasn't successfully pushed in >48h.
+          The zone-list drift alert is silently broken until this resolves.
+
+    - alert: DNSSECRRSIGNearExpiry
+      ## Earliest DNSKEY RRSIG signature expiry per signed zone. Source:
+      ## Windmill dnssec_rrsig_expiry, scheduled 06:30 Zurich daily.
+      ## 9 owned signed zones tracked (5 in-house BIND9 + 4 Infomaniak).
+      expr: dnssec_rrsig_expiry_seconds < 7 * 24 * 3600 and dnssec_rrsig_expiry_seconds >= 0
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC RRSIG for {{ $labels.zone }} expires in {{ $value | humanizeDuration }}"
+        description: |
+          The earliest DNSKEY RRSIG for {{ $labels.zone }} will expire in
+          less than 7 days. Roll the signing key (in-house: BIND9 inline
+          re-sign; Infomaniak: automatic but re-validate after).
+
+    - alert: DNSSECRRSIGExpired
+      expr: dnssec_rrsig_expiry_seconds < 0
+      for: 10m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC RRSIG for {{ $labels.zone }} has expired"
+        description: |
+          Resolvers doing DNSSEC validation will return SERVFAIL for
+          {{ $labels.zone }}. Re-sign the zone immediately.
+
+    - alert: DNSSECRRSIGLookupFailing
+      expr: dnssec_rrsig_lookup_ok == 0
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC DNSKEY lookup failing for {{ $labels.zone }}"
+        description: |
+          dig DNSKEY against 9.9.9.9 returned no RRSIG for {{ $labels.zone }}
+          for >1h. Either DNSSEC was disabled at the zone, the zone is
+          unreachable, or 9.9.9.9 is blocking the query.
+
+    - alert: DNSSECRRSIGExpiryProbeStale
+      expr: time() - dnssec_rrsig_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC RRSIG expiry probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill dnssec_rrsig_expiry hasn't successfully pushed in >48h.
+          The expiry alerts are silently broken until this resolves.
+
     - alert: TechnitiumHealthProbeStale
       expr: time() - technitium_health_last_run_timestamp_seconds > 900
       for: 5m
