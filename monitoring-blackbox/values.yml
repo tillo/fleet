@@ -105,3 +105,49 @@ config:
         validate_answer_rrs:
           fail_if_not_matches_regexp:
             - "192\\.168\\.1\\.54"
+
+    ## ns.mdapi.ch (BIND9 authoritative for mdapi.ch + 12 other owned zones)
+    ## modules. UDP path uses the default transport; TCP variant verifies
+    ## ns.mdapi.ch's TCP/53 listener (required for large DNSSEC responses);
+    ## DNSSEC variant turns on DO bit and the validating resolver's AD bit
+    ## so we catch a chain-of-trust break from outside the cluster.
+    dns_ns_mdapi_udp:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        transport_protocol: udp
+        query_name: "mdapi.ch"
+        query_type: "SOA"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "ns\\.mdapi\\.ch\\."
+
+    dns_ns_mdapi_tcp:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        transport_protocol: tcp
+        query_name: "mdapi.ch"
+        query_type: "SOA"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "ns\\.mdapi\\.ch\\."
+
+    dns_ns_mdapi_dnssec:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        transport_protocol: udp
+        query_name: "mdapi.ch"
+        query_type: "DNSKEY"
+        # Require the DNSKEY RRset itself (validates the signed origin and
+        # that the EDNS DO bit yielded a usable answer).
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "DNSKEY"

@@ -258,17 +258,83 @@ spec:
   targets:
     staticConfig:
       static:
-        ## LoadBalancer external IP of the nameserver-dns service. The
-        ## dns.mdapi.ch A record points at the OLD nameserver IP
-        ## (192.168.1.191) which doesn't serve port 53 — TODO fix the
-        ## A record in BIND once the right config is identified. For
-        ## now probe the actual LB IP so we verify the authoritative
-        ## resolver is up.
+        ## ns.mdapi.ch (192.168.1.53) is BIND9's authoritative LB. The
+        ## A record was fixed in zone 2026-05-18; ns-mdapi-ch-{udp,tcp,
+        ## dnssec} probes below give us the full K-integration coverage
+        ## (UDP+TCP+DNSSEC-AD+SOA-serial). This dns_mdapi probe stays
+        ## for historical compatibility with the dns_authoritative alert.
         - 192.168.1.53:53
       labels:
         component: DNS
         team: mdapi
         probe: dns_authoritative
+---
+## K-integration (DNS audit 2026-05-17): blackbox probe for
+## ns.mdapi.ch covering UDP + TCP + DNSSEC. Catches secondary NS
+## desync (puck.nether.net / ns2.afraid.org) and DNSSEC chain break
+## from outside the cluster.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ns-mdapi-ch-udp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-ns-mdapi
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_ns_mdapi_udp
+  targets:
+    staticConfig:
+      static:
+        - ns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: ns_mdapi_ch_udp
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ns-mdapi-ch-tcp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-ns-mdapi
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_ns_mdapi_tcp
+  targets:
+    staticConfig:
+      static:
+        - ns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: ns_mdapi_ch_tcp
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ns-mdapi-ch-dnssec
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-ns-mdapi
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_ns_mdapi_dnssec
+  targets:
+    staticConfig:
+      static:
+        - ns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: ns_mdapi_ch_dnssec
 ---
 ## External-internet view: arbitrary recursive resolvers must be able
 ## to resolve mdapi.ch A. Verifies the full delegation chain (registrar
