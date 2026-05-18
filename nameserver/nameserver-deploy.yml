@@ -32,6 +32,18 @@ spec:
       containers:
         - name: nameserver
           image: registry.mdapi.ch/mdapi/nameserver:latest
+          ## Default Always means every pod restart waits on a fresh pull
+          ## against registry.mdapi.ch → gitlab.mdapi.ch JWT auth. On
+          ## 2026-05-18 a Valkey/Longhorn outage made GitLab JWT return
+          ## 502, blocking the registry pull, and the resulting nameserver
+          ## restart took BIND9 (and therefore in-cluster DNS) down with
+          ## it. IfNotPresent breaks that dependency loop — the cached
+          ## image on each node is enough to restart the pod when GitLab
+          ## is unavailable. Trade-off: Keel detects new image SHAs but
+          ## the pull won't happen until the cache evicts; for nameserver
+          ## that's acceptable because image bumps are infrequent and a
+          ## manual `kubectl rollout restart` is fine.
+          imagePullPolicy: IfNotPresent
           ports:
             - name: dns-tcp
               containerPort: 53
