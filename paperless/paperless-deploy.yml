@@ -8,10 +8,14 @@
 ##   - Data lives on /usr/src/paperless/data + /media + /export + /consume
 ##     all backed by the single 100Gi Longhorn PVC.
 ##
-## Auth = LDAP via django-auth-ldap. Bind user is the read-only
-## uid=paperless-bind,ou=People,dc=mdapi,dc=ch (created 2026-05-19).
-## Access restricted to members of cn=DMS,ou=group,dc=mdapi,dc=ch
-## (currently mdellambrogio + elisadellambrogio).
+## Auth = Keycloak OIDC via django-allauth (the paperless-ngx 2.18 image
+## does not bundle python-ldap, so direct LDAP bind isn't an option).
+## Keycloak realm `tilloch` at idp.mdapi.ch is itself LDAP-federated,
+## so users sign in with their existing LDAP credentials via the "MDAPI"
+## button on the login page. Local `tillo` admin login stays enabled.
+## First successful login auto-creates the Django user (SOCIAL_AUTO_SIGNUP).
+## Joint document visibility is set up post-login via paperless's group
+## `DMS` + default View+Change permissions on both users.
 ##
 ## Mail = IMAP poll of documents@mdapi.ch (LDAP-managed mailbox,
 ## also created 2026-05-19). Rule routing handled via the UI after
@@ -86,22 +90,15 @@ spec:
               value: "http://127.0.0.1:9998"
             - name: PAPERLESS_TIKA_GOTENBERG_ENDPOINT
               value: "http://127.0.0.1:3000"
-            # ---- LDAP auth (django-auth-ldap) ----
-            - name: PAPERLESS_AUTH_LDAP_SERVER_URI
-              value: "ldap://openldap.openldap.svc.cluster.local"
-            - name: PAPERLESS_AUTH_LDAP_BIND_DN
-              value: "uid=paperless-bind,ou=People,dc=mdapi,dc=ch"
-            - name: PAPERLESS_AUTH_LDAP_USER_SEARCH
-              value: "ou=People,dc=mdapi,dc=ch|SCOPE_SUBTREE|(&(objectClass=posixAccount)(uid=%(user)s))"
-            - name: PAPERLESS_AUTH_LDAP_USER_ATTR_MAP
-              value: "first_name=givenName, last_name=sn, email=mail"
-            - name: PAPERLESS_AUTH_LDAP_GROUP_SEARCH
-              value: "ou=group,dc=mdapi,dc=ch|SCOPE_SUBTREE|(objectClass=groupOfNames)"
-            - name: PAPERLESS_AUTH_LDAP_GROUP_TYPE
-              value: "GroupOfNamesType"
-            - name: PAPERLESS_AUTH_LDAP_REQUIRE_GROUP
-              value: "cn=DMS,ou=group,dc=mdapi,dc=ch"
-            # ---- Email ingest ----
+            # ---- OIDC (django-allauth + Keycloak realm tilloch) ----
+            ## PAPERLESS_SOCIALACCOUNT_PROVIDERS comes from the rendered
+            ## paperless-oidc-secret (full JSON with the Akeyless secret
+            ## substituted in at sync time). See paperless-es.yml.
+            - name: PAPERLESS_APPS
+              value: "allauth.socialaccount.providers.openid_connect"
+            - name: PAPERLESS_SOCIAL_AUTO_SIGNUP
+              value: "True"
+            # ---- Consume / filename layout ----
             - name: PAPERLESS_CONSUMER_ENABLE_BARCODES
               value: "true"
             - name: PAPERLESS_CONSUMER_ENABLE_ASN_BARCODE
@@ -112,6 +109,8 @@ spec:
           envFrom:
             - secretRef:
                 name: paperless-env-secret
+            - secretRef:
+                name: paperless-oidc-secret
           volumeMounts:
             - name: data
               mountPath: /usr/src/paperless/data

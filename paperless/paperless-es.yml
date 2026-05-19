@@ -1,12 +1,17 @@
 ## Application-level secrets for paperless-ngx.
 ##
-## The four values were generated on 2026-05-19:
-##   /mdapi/paperless/db-password         CNPG superuser pw (also paperless DB owner)
-##   /mdapi/paperless/secret-key          Django SECRET_KEY
-##   /mdapi/paperless/imap-password       LDAP userPassword of `documents@mdapi.ch`
-##                                         (paperless authenticates to dovecot with this)
-##   /mdapi/paperless/ldap-bind-password  Read-only LDAP bind user
-##                                         (uid=paperless-bind,ou=People,dc=mdapi,dc=ch)
+## Akeyless keys:
+##   /mdapi/paperless/db-password           CNPG superuser pw (also paperless DB owner)
+##   /mdapi/paperless/secret-key            Django SECRET_KEY
+##   /mdapi/paperless/imap-password         LDAP userPassword of `documents@mdapi.ch`
+##                                           (paperless authenticates to dovecot with this)
+##   /mdapi/paperless/oidc-client-secret    Keycloak OIDC client secret
+##                                           (realm tilloch, client_id paperless)
+##
+## ldap-bind-password is retained in Akeyless but no longer wired here —
+## the paperless-ngx 2.18 image does not bundle python-ldap, so we use
+## django-allauth + Keycloak OIDC instead (Keycloak federates to LDAP,
+## so users still authenticate with their existing LDAP credentials).
 
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
@@ -30,9 +35,31 @@ spec:
     - remoteRef:
         key: /mdapi/paperless/imap-password
       secretKey: PAPERLESS_MAIL_PASSWORD
+---
+## OIDC provider JSON for django-allauth. Rendered at sync time with the
+## Akeyless-managed client secret substituted in. Display name "MDAPI"
+## appears as the SSO button label on the paperless login page.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-oidc-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-oidc-secret
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        PAPERLESS_SOCIALACCOUNT_PROVIDERS: |
+          {"openid_connect":{"APPS":[{"provider_id":"keycloak","name":"MDAPI","client_id":"paperless","secret":"{{ .clientSecret }}","settings":{"server_url":"https://idp.mdapi.ch/realms/tilloch/.well-known/openid-configuration"}}]}}
+  data:
     - remoteRef:
-        key: /mdapi/paperless/ldap-bind-password
-      secretKey: PAPERLESS_AUTH_LDAP_BIND_PASSWORD
+        key: /mdapi/paperless/oidc-client-secret
+      secretKey: clientSecret
 ---
 ## CNPG bootstrap reads this Secret to set the `paperless` role password.
 apiVersion: external-secrets.io/v1
