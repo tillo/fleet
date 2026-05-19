@@ -35,6 +35,17 @@ spec:
     - remoteRef:
         key: /mdapi/paperless/imap-password
       secretKey: PAPERLESS_MAIL_PASSWORD
+    ## Pre-obscured form of the same password, for the consume-puller rclone
+    ## sidecar's RCLONE_CONFIG_OWNCLOUD_PASS env var (rclone WebDAV requires
+    ## the password env var to be in obscured form; doing it at container
+    ## startup via `rclone obscure` and `export` proved fragile because the
+    ## runtime export was not visibly reaching the rclone subprocess).
+    ## If the plain password rotates, re-obscure (rclone obscure '<plain>')
+    ## and update BOTH /mdapi/paperless/imap-password and
+    ## /mdapi/paperless/imap-password-rclone-obscured in lockstep.
+    - remoteRef:
+        key: /mdapi/paperless/imap-password-rclone-obscured
+      secretKey: RCLONE_CONFIG_OWNCLOUD_PASS
 ---
 ## OIDC provider JSON for django-allauth. Rendered at sync time with the
 ## Akeyless-managed client secret substituted in. Display name "MDAPI"

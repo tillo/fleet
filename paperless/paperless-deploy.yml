@@ -190,16 +190,19 @@ spec:
         ## back to the UUID. The display name "Documents Mailbox" is still
         ## what shows up in shares.
         ##
-        ## rclone's WebDAV password env var requires an obscured value, so
-        ## the loop runs `rclone obscure` once at startup against the plain
-        ## LDAP password mounted from paperless-env-secret.
+        ## rclone's WebDAV password env var must be in obscured form. We
+        ## store the pre-obscured value in Akeyless at
+        ## /mdapi/paperless/imap-password-rclone-obscured and pull it
+        ## straight into RCLONE_CONFIG_OWNCLOUD_PASS via secretKeyRef —
+        ## doing the obscure at container startup proved fragile (export
+        ## in a sh -c "..." script did not reach the rclone subprocess
+        ## reliably). See paperless-es.yml for the password-rotation note.
         - name: consume-puller
           image: rclone/rclone:latest
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c"]
           args:
             - |
-              export RCLONE_CONFIG_OWNCLOUD_PASS=$(rclone obscure "$OWNCLOUD_PLAIN_PASS")
               echo "[$(date -Iseconds)] consume-puller started"
               while true; do
                 rclone move \
@@ -211,11 +214,6 @@ spec:
                 sleep 300
               done
           env:
-            - name: OWNCLOUD_PLAIN_PASS
-              valueFrom:
-                secretKeyRef:
-                  name: paperless-env-secret
-                  key: PAPERLESS_MAIL_PASSWORD
             - name: RCLONE_CONFIG_OWNCLOUD_TYPE
               value: "webdav"
             - name: RCLONE_CONFIG_OWNCLOUD_URL
@@ -224,6 +222,11 @@ spec:
               value: "owncloud"
             - name: RCLONE_CONFIG_OWNCLOUD_USER
               value: "documents"
+            - name: RCLONE_CONFIG_OWNCLOUD_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: paperless-env-secret
+                  key: RCLONE_CONFIG_OWNCLOUD_PASS
           volumeMounts:
             - name: data
               mountPath: /consume
