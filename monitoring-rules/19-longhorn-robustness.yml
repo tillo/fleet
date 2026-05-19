@@ -112,3 +112,61 @@ spec:
             kubectl --context=mdapi-prod -n {{ $labels.pvc_namespace }} delete pod -l <selector>
           Followup: file the EIO event for the Longhorn-instability Open item
           if this is the n-th occurrence in the same window.
+
+    - alert: LonghornEIOAutohealSilentDegradation
+      ## Mode C (active `ls -laR` filesystem probe) of the EIO auto-healer
+      ## caught a silently-degraded pod — one whose Longhorn volume returns
+      ## EIO at the FS layer but where the app never logged the error to
+      ## stdout, so Modes A (CrashLoopBackOff) and B (Running + log scan)
+      ## missed it. The pod has already been auto-deleted (or rate-limited).
+      ##
+      ## This alert is informational — the script is also acting. It fires
+      ## per detection to give visibility into "how often is the silent path
+      ## being hit", which is a leading indicator that the underlying
+      ## Longhorn instability is worse than visible log noise suggests.
+      ##
+      ## for: 0m because the metric blips to 0 on the next 5-min run after
+      ## the heal completes.
+      expr: longhorn_eio_detected_fs_probe_count > 0
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn EIO auto-healer Mode C caught {{ $value }} silently-degraded pod(s)"
+        description: |
+          The active `ls -laR <mount>` probe found {{ $value }} pod(s) with
+          Longhorn-backed volumes returning EIO that did NOT surface in stdout.
+          The first 2026-05-19 cases were openldap/lam (config/ subtree EIO)
+          and openldap configs after the qua node's instance-manager fault.
+          Check the latest Windmill run logs:
+            f/infra_health/longhorn_eio_autoheal → detected_pods[]
+          Pods are auto-deleted (subject to per-pod 30-min cooldown and
+          global 6/h cap). If this fires repeatedly for the same pod, the
+          underlying Longhorn volume has a persistent FS corruption and
+          needs replica rebuild or restore from backup, not just a pod cycle.
+
+    - alert: LonghornEIOAutohealRateLimited
+      ## The autoheal hit its global 6/hour delete cap. This means EIO is
+      ## storming across multiple pods — the underlying Longhorn fault is
+      ## severe enough that automated healing alone won't restore service.
+      ## Operator should investigate root cause (instance-manager logs,
+      ## node disk health, replica rebuild) rather than just letting the
+      ## healer churn.
+      expr: longhorn_eio_autoheal_global_cap_hit > 0
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn EIO auto-healer hit global 6/h delete cap"
+        description: |
+          The EIO auto-healer has detected enough EIO events that its
+          per-hour safety cap is blocking further pod deletes. This is
+          almost always a Longhorn instance-manager fault (one node's
+          data plane is dead while the control plane reports healthy).
+          Check the windmill job logs for the affected pods and node,
+          then:
+            kubectl --context=mdapi-prod -n longhorn-system logs -l app=longhorn-manager --tail 200 | grep -i 'eio\|i/o error'
+          Likely action: cordon the node, force-replicate volumes off it,
+          inspect dmesg/SMART for hardware fault.
