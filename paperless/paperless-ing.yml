@@ -32,7 +32,12 @@ metadata:
       ## updates, PUT for replace, DELETE for removal. CRS default
       ## tx.allowed_methods is GET HEAD POST OPTIONS so anything else
       ## scores 5 on rule 911100 and trips the 949110 anomaly threshold.
-      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      ## Cannot override via setvar:tx.allowed_methods - the value needs
+      ## ModSec single quotes around the space-separated list, but the
+      ## entire modsecurity_rules block is wrapped in single quotes by
+      ## nginx-ingress, so inner single quotes are not possible. Use
+      ## ctl:ruleRemoveById=911100 scoped to /api/ instead.
+      SecRule REQUEST_URI "@beginsWith /api/" "id:1002,phase:1,pass,nolog,ctl:ruleRemoveById=911100"
       SecRule REQUEST_URI "@beginsWith /api/documents/post_document" "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     flame.pawelmalak/type: app
