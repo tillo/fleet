@@ -86,3 +86,29 @@ spec:
           after 30 min total stall (one per run). If you want to act sooner:
             kubectl --context=mdapi-prod -n longhorn-system delete replica {{ $labels.replica }}
           Auto-balance (best-effort) will re-schedule on a healthier node.
+
+    - alert: LonghornVolumeReadOnlyRemount
+      ## Catches the silent-degraded failure mode that bit cribl + 4 *arr/Plex pods
+      ## on 2026-05-19: the engine returned EIO long enough for the consumer's
+      ## ext4 to flip the block device read-only, Longhorn manager logs "Failed
+      ## to remount read only volume", but the pod stays Running (writes fail
+      ## silently). LonghornVolumeFaulted and the EIO auto-healer both miss it.
+      ## Only true recovery is a pod delete to force a fresh mount.
+      expr: longhorn_volume_file_system_read_only > 0
+      for: 2m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} mounted read-only"
+        description: |
+          Filesystem on Longhorn volume {{ $labels.volume }} (PVC
+          {{ $labels.pvc_namespace }}/{{ $labels.pvc }}) flipped to read-only,
+          typically after an EIO burst from the engine. The consumer pod will
+          appear Running but its writes fail silently — services degrade with
+          no log noise. Recover by deleting the pod so it re-attaches with a
+          fresh rw mount:
+            kubectl --context=mdapi-prod -n {{ $labels.pvc_namespace }} delete pod -l <selector>
+          Followup: file the EIO event for the Longhorn-instability Open item
+          if this is the n-th occurrence in the same window.
