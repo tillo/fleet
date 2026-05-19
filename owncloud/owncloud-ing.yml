@@ -29,19 +29,29 @@ metadata:
       # fires on some upload clients) on the WebDAV upload endpoints only.
       #
       # 941100 (libinjection XSS) and 941130 (XSS attribute-vector matching
-      # xmlns=) also fire on every WebDAV introspection request that carries
-      # an XML body: rclone PROPFIND sends <propfind xmlns="DAV:">... and the
-      # default Content-Type comes through as application/x-www-form-urlencoded
-      # so CRS parses the XML as ARGS and the libinjection + xmlns= rules
-      # each add 5 to the anomaly score → 949110 blocks at threshold 5.
-      # Confirmed against rclone 1.74.1 from the paperless consume-puller pod.
+      # xmlns=) fire on WebDAV introspection requests that carry an XML body
+      # with a Content-Type header — the parsed body trips libinjection +
+      # xmlns= attribute rules. Disabled below via ctl:ruleRemoveByTag=
+      # attack-xss for /remote.php/dav/, /remote.php/webdav/, /public.php/
+      # webdav/.
+      #
+      # 920340 ("Request Containing Content, but Missing Content-Type")
+      # blocks rclone specifically: its WebDAV client omits Content-Type
+      # entirely (curl by default sends application/x-www-form-urlencoded,
+      # which is why curl passes but rclone doesn't). Disabled below on
+      # the same WebDAV paths since legitimate WebDAV clients can lawfully
+      # omit Content-Type on requests where the body is implied by the
+      # method (PROPFIND default body etc.).
+      #
+      # All carveouts confirmed against rclone 1.74.1 from the paperless
+      # consume-puller pod.
       #
       # MUST be declared before the CRS Include: within phase:1, rules execute
       # in declaration order, so a ctl:ruleRemoveById placed after the Include
       # runs too late — 920420 has already fired and added 5 to the anomaly
       # score by then. No apostrophes anywhere in this block — see the docs warning.
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430,ctl:ruleRemoveById=920340"
       SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
         "id:1002,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
       SecRule REQUEST_URI "@beginsWith /remote.php/webdav/" \
