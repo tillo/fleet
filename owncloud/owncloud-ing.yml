@@ -27,12 +27,21 @@ metadata:
       # tx.allowed_request_content_type whitelist. Scope-disable 920420
       # plus 920430 (protocol-version-not-allowed cousin that also
       # fires on some upload clients) on the WebDAV upload endpoints only.
+      #
+      # 941100 (libinjection XSS) and 941130 (XSS attribute-vector matching
+      # xmlns=) also fire on every WebDAV introspection request that carries
+      # an XML body: rclone PROPFIND sends <propfind xmlns="DAV:">... and the
+      # default Content-Type comes through as application/x-www-form-urlencoded
+      # so CRS parses the XML as ARGS and the libinjection + xmlns= rules
+      # each add 5 to the anomaly score → 949110 blocks at threshold 5.
+      # Confirmed against rclone 1.74.1 from the paperless consume-puller pod.
+      #
       # MUST be declared before the CRS Include: within phase:1, rules execute
       # in declaration order, so a ctl:ruleRemoveById placed after the Include
       # runs too late — 920420 has already fired and added 5 to the anomaly
       # score by then. No apostrophes anywhere in this block — see the docs warning.
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430,ctl:ruleRemoveById=941100,ctl:ruleRemoveById=941130"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
