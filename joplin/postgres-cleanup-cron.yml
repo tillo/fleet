@@ -49,9 +49,15 @@ spec:
               value: joplin
             - name: PGDATABASE
               value: joplin
-            envFrom:
-            - secretRef:
-                name: postgres-env-secret
+            # psql reads PGPASSWORD; the secret stores it under POSTGRES_PASSWORD
+            # (shared key name with the postgres StatefulSet's own env). Map it
+            # explicitly so the cleanup script doesn't prompt for a password and
+            # silently fail with "fe_sendauth: no password supplied".
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-env-secret
+                  key: POSTGRES_PASSWORD
             command:
             - /bin/sh
             - -c
