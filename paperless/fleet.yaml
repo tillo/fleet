@@ -1,0 +1,28 @@
+defaultNamespace: paperless
+namespace: paperless
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+
+## Strip VPA-managed resources from comparePatches so Fleet doesn't
+## thrash on the postgres / paperless / sidecar containers.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: paperless
+    namespace: paperless
+    jsonPointers:
+    - "/spec/template/spec/containers/0/resources"
+    - "/spec/template/spec/containers/1/resources"
+    - "/spec/template/spec/containers/2/resources"
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: paperless-valkey
+    namespace: paperless
+    jsonPointers:
+    - "/spec/template/spec/containers/0/resources"

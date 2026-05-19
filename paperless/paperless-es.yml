@@ -1,0 +1,59 @@
+## Application-level secrets for paperless-ngx.
+##
+## The four values were generated on 2026-05-19:
+##   /mdapi/paperless/db-password         CNPG superuser pw (also paperless DB owner)
+##   /mdapi/paperless/secret-key          Django SECRET_KEY
+##   /mdapi/paperless/imap-password       LDAP userPassword of `documents@mdapi.ch`
+##                                         (paperless authenticates to dovecot with this)
+##   /mdapi/paperless/ldap-bind-password  Read-only LDAP bind user
+##                                         (uid=paperless-bind,ou=People,dc=mdapi,dc=ch)
+
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-env-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-env-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/paperless/secret-key
+      secretKey: PAPERLESS_SECRET_KEY
+    - remoteRef:
+        key: /mdapi/paperless/db-password
+      secretKey: PAPERLESS_DBPASS
+    - remoteRef:
+        key: /mdapi/paperless/imap-password
+      secretKey: PAPERLESS_MAIL_PASSWORD
+    - remoteRef:
+        key: /mdapi/paperless/ldap-bind-password
+      secretKey: PAPERLESS_AUTH_LDAP_BIND_PASSWORD
+---
+## CNPG bootstrap reads this Secret to set the `paperless` role password.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-pg-app-credentials
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-pg-app-credentials
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      data:
+        username: paperless
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/paperless/db-password
+      secretKey: password

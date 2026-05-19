@@ -1,0 +1,54 @@
+## Lightweight in-cluster Valkey for paperless-ngx Celery broker.
+## Ephemeral: queue is rebuildable, no PVC needed.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperless-valkey
+  namespace: paperless
+  annotations:
+    keel.sh/policy: minor
+    keel.sh/trigger: poll
+spec:
+  selector:
+    matchLabels:
+      app: paperless-valkey
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: paperless-valkey
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:8
+          imagePullPolicy: IfNotPresent
+          args: ["--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+          ports:
+            - name: valkey
+              containerPort: 6379
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits:   {cpu: 1,    memory: 384Mi}
+          readinessProbe:
+            tcpSocket: {port: valkey}
+            initialDelaySeconds: 5
+          livenessProbe:
+            tcpSocket: {port: valkey}
+            initialDelaySeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperless-valkey
+  namespace: paperless
+spec:
+  type: ClusterIP
+  selector:
+    app: paperless-valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey

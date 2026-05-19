@@ -1,0 +1,79 @@
+## Dedicated CNPG single-node Postgres for paperless-ngx.
+##
+## Mirrors fleet/bootstrap/cnpg-cluster.yml. paperless's metadata sits
+## here; documents themselves live on the Longhorn PVC mounted into the
+## paperless pod (paperless-ngx has no native S3 backend; the nightly
+## `document_exporter` to Garage is the off-cluster backup path).
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: paperless-pg
+  namespace: paperless
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: 128MB
+      effective_cache_size: 384MB
+
+  bootstrap:
+    initdb:
+      database: paperless
+      owner: paperless
+      secret:
+        name: paperless-pg-app-credentials
+
+  backup:
+    barmanObjectStore:
+      ## Postgres backups go to the same Garage bucket pattern as the
+      ## other CNPG clusters. Path is per-cluster.
+      destinationPath: s3://paperless-pg-backup
+      endpointURL: https://api.garage.home.tillo.ch
+      s3Credentials:
+        accessKeyId:
+          name: paperless-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: paperless-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 2
+      memory: 1Gi
+---
+## Garage credentials for CNPG WAL/base backups. Reuses the
+## bootstrap-namespace key (read-only access scoped to its bucket).
+## A dedicated bucket + key per cluster is the cleaner long-term move;
+## tracked separately.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-pg-backup-s3
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-pg-backup-s3
+    creationPolicy: Owner
+  data:
+    - remoteRef: { key: /mdapi/bootstrap/cnpg/garage-backup-access-key }
+      secretKey: ACCESS_KEY_ID
+    - remoteRef: { key: /mdapi/bootstrap/cnpg/garage-backup-secret-key }
+      secretKey: ACCESS_SECRET_KEY
