@@ -56,6 +56,16 @@ metadata:
         "id:1005,phase:1,pass,nolog,ctl:ruleRemoveById=920430"
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
         "id:1006,phase:1,pass,nolog,ctl:ruleRemoveById=920340"
+      # 920440 (URL file extension restricted by policy) blocks GET on any
+      # WebDAV file whose name ends in .conf, .log, .bak, .ini, etc. The
+      # extension comes from user-owned content stored in OwnCloud, not from
+      # a server-side path; the rule was designed to block direct fetches of
+      # web-server config files (Apache /server-status, /.htaccess) and does
+      # not apply when the filename is just user data inside a WebDAV path.
+      # Triggered 2026-05-19 on mdellambrogio fetching lighttpd.conf from
+      # LithiumArchive2025/.
+      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
+        "id:1007,phase:1,pass,nolog,ctl:ruleRemoveById=920440"
       SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
         "id:1002,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
       SecRule REQUEST_URI "@beginsWith /remote.php/webdav/" \
