@@ -8,21 +8,33 @@ dependsOn:
 helm:
   maxHistory: 25
 
-## Strip VPA-managed resources from comparePatches so Fleet doesn't
-## thrash on the postgres / paperless / sidecar containers.
+# Two sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running
+#      pods after start.
+#   2. Keel (`keel.sh/policy: minor`) auto-bumps the image tag on its
+#      poll cadence (e.g. paperless-ngx:2.18 -> :2.20.15).
+# Strip both fields from the diff so Fleet stops flagging Modified.
+# paperless Deployment containers: 0 paperless, 1 tika, 2 gotenberg,
+# 3 consume-puller.
 diff:
   comparePatches:
   - apiVersion: apps/v1
     kind: Deployment
     name: paperless
     namespace: paperless
-    jsonPointers:
-    - "/spec/template/spec/containers/0/resources"
-    - "/spec/template/spec/containers/1/resources"
-    - "/spec/template/spec/containers/2/resources"
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/1/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/1/image"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/2/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/2/image"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/3/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/3/image"}
   - apiVersion: apps/v1
     kind: Deployment
     name: paperless-valkey
     namespace: paperless
-    jsonPointers:
-    - "/spec/template/spec/containers/0/resources"
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
