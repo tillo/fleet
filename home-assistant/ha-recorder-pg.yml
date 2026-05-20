@@ -1,0 +1,79 @@
+## Dedicated CNPG single-node Postgres for the Home Assistant recorder.
+##
+## Replaces the on-PVC SQLite home-assistant_v2.db, which hit the SQLite
+## ~32766 SQL-variable ceiling on recorder.purge once states_meta grew
+## past 500k rows. Postgres has no IN-list cap, autovacuums incrementally,
+## and supports concurrent reads while the recorder writes.
+##
+## Mirrors fleet/paperless/paperless-cnpg.yml. HA points at this via
+## recorder.db_url in configuration.yaml (on the HA PVC).
+##
+## Barman/Garage backup intentionally omitted on initial deploy — added
+## as a fast-follow once the SQLite -> Postgres migration is verified.
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: ha-recorder-pg
+  namespace: home-assistant
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 30Gi
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+      ## recorder is write-heavy with frequent purges; give autovacuum
+      ## room and keep WAL modest.
+      maintenance_work_mem: 128MB
+
+  bootstrap:
+    initdb:
+      database: homeassistant
+      owner: homeassistant
+      secret:
+        name: ha-recorder-pg-app
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int
+      # renders as a perpetual Fleet "Modified" diff (2 vs "2").
+      cpu: "2"
+      memory: 2Gi
+---
+## App-role credentials for the recorder database. CNPG initdb reads this
+## Secret to set the `homeassistant` role password; HA's recorder.db_url
+## uses the same value.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ha-recorder-pg-app
+  namespace: home-assistant
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ha-recorder-pg-app
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      data:
+        username: homeassistant
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/home-assistant/recorder-db-password
+      secretKey: password
