@@ -35,7 +35,12 @@ spec:
     kind: Deployment
     name: joplin
   updatePolicy:
-    updateMode: Auto
+    # Initial, not Auto: VPA right-sizes requests at pod creation but never
+    # evicts running pods. Auto-mode eviction churn left the 2-replica
+    # Deployment at 1/2 for ~3.5 min while the evicted pod's replacement
+    # re-pulled the 563 MB joplin/server:latest image, tripping the
+    # replica-availability alert.
+    updateMode: Initial
   resourcePolicy:
     containerPolicies:
     - containerName: joplin
