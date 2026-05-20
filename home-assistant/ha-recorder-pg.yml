@@ -8,8 +8,9 @@
 ## Mirrors fleet/paperless/paperless-cnpg.yml. HA points at this via
 ## recorder.db_url in configuration.yaml (on the HA PVC).
 ##
-## Barman/Garage backup intentionally omitted on initial deploy — added
-## as a fast-follow once the SQLite -> Postgres migration is verified.
+## Barman WAL + base backups go to the salt/pepper Garage bucket
+## s3://homeassistant-pg-backup; the garage_offsite_backup Windmill job
+## then replicates that bucket to B2 + o2switch.
 
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -40,6 +41,25 @@ spec:
       owner: homeassistant
       secret:
         name: ha-recorder-pg-app
+
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://homeassistant-pg-backup
+      endpointURL: https://api.garage.home.tillo.ch
+      s3Credentials:
+        accessKeyId:
+          name: ha-recorder-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: ha-recorder-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        ## Garage validates the SigV4 region scope on HeadBucket; barman
+        ## defaults to us-east-1, so the region must be set explicitly.
+        region:
+          name: ha-recorder-pg-backup-s3
+          key: REGION
+      wal:
+        compression: gzip
 
   resources:
     requests:
@@ -77,3 +97,41 @@ spec:
     - remoteRef:
         key: /mdapi/home-assistant/recorder-db-password
       secretKey: password
+---
+## Garage credentials for CNPG WAL/base backups. Dedicated key
+## 'ha-recorder-pg-backup', scoped read-write to s3://homeassistant-pg-backup
+## on the salt/pepper Garage cluster.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ha-recorder-pg-backup-s3
+  namespace: home-assistant
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ha-recorder-pg-backup-s3
+    creationPolicy: Owner
+  data:
+    - remoteRef: { key: /mdapi/home-assistant/garage-backup-access-key }
+      secretKey: ACCESS_KEY_ID
+    - remoteRef: { key: /mdapi/home-assistant/garage-backup-secret-key }
+      secretKey: ACCESS_SECRET_KEY
+    - remoteRef: { key: /mdapi/home-assistant/garage-region }
+      secretKey: REGION
+---
+## Nightly base backup at 03:30 (WAL is streamed continuously). CNPG
+## ScheduledBackup; retention managed by Garage bucket lifecycle / the
+## offsite job, not barman here.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: ha-recorder-pg-daily
+  namespace: home-assistant
+spec:
+  schedule: "0 30 3 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: ha-recorder-pg
