@@ -49,8 +49,15 @@ spec:
       ## for this pod — it doesn't need them.
       enableServiceLinks: false
       containers:
+        ## Keep this tag at/above the DB migration level. Keel
+        ## (keel.sh/policy: minor) auto-bumps the live image, but a
+        ## Fleet full re-apply (on any bundle change) rewrites this
+        ## value — if it is lower than the version that last migrated
+        ## the DB, the code downgrades below the schema and tag/object
+        ## creation 500s on missing treenode columns. Bumped 2.18 ->
+        ## 2.20.15 on 2026-05-20 after exactly that happened.
         - name: paperless
-          image: ghcr.io/paperless-ngx/paperless-ngx:2.18
+          image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
