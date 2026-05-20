@@ -22,34 +22,16 @@ metadata:
       SecAuditLog /dev/stdout
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
       # Carveouts MUST precede the Include: phase:1 rules run in declaration
-      # order, so a ctl placed after the Include fires too late. No
-      # apostrophes in this block. Keep it compact: the whole snippet renders
-      # into one nginx quoted token, which nginx caps at roughly 4096 bytes.
-      # 920420/920430: WebDAV uploads carry Content-Types outside the CRS
-      # whitelist. 920340: the rclone WebDAV client omits Content-Type.
-      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420"
-      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1005,phase:1,pass,nolog,ctl:ruleRemoveById=920430"
-      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1006,phase:1,pass,nolog,ctl:ruleRemoveById=920340"
-      # 920440: blocks GET of user files whose name ends .conf/.log/.bak etc.
-      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1007,phase:1,pass,nolog,ctl:ruleRemoveById=920440"
-      # 930130: blocks GET of user files named like config/backup files
-      # (config.txt, _config.yml, *.sql.gz) via the restricted-files list.
-      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
-        "id:1009,phase:1,pass,nolog,ctl:ruleRemoveById=930130"
-      # attack-xss: WebDAV XML introspection bodies trip libinjection + xmlns=.
-      SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
-        "id:1002,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
-      SecRule REQUEST_URI "@beginsWith /remote.php/webdav/" \
-        "id:1003,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
-      SecRule REQUEST_URI "@beginsWith /public.php/webdav/" \
-        "id:1004,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
+      # order, so a ctl placed after the Include fires too late.
+      # WebDAV file-sync paths carry arbitrary user file names and bytes, so
+      # CRS request inspection there yields only false positives (LFI/XSS/SQLi
+      # rules tripping on file names and contents). Disable the rule engine
+      # for those paths outright; the web UI, OAuth2 and every other path on
+      # this host stay fully WAF-protected.
+      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav|webdav))/" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleEngine=Off"
       # 934110 (SSRF: metadata URL in param) flags the RFC 8252 loopback
-      # redirect_uri of native OAuth2 clients; harmless across the oauth2 app
-      # (authorize + api/v1/token both echo redirect_uri).
+      # redirect_uri of native OAuth2 clients; harmless across the oauth2 app.
       SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/" \
         "id:1008,phase:1,pass,nolog,ctl:ruleRemoveById=934110"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
