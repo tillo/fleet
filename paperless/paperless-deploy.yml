@@ -26,9 +26,6 @@ kind: Deployment
 metadata:
   name: paperless
   namespace: paperless
-  annotations:
-    keel.sh/policy: minor
-    keel.sh/trigger: poll
 spec:
   selector:
     matchLabels:
@@ -49,15 +46,15 @@ spec:
       ## for this pod — it doesn't need them.
       enableServiceLinks: false
       containers:
-        ## Keep this tag at/above the DB migration level. Keel
-        ## (keel.sh/policy: minor) auto-bumps the live image, but a
-        ## Fleet full re-apply (on any bundle change) rewrites this
-        ## value — if it is lower than the version that last migrated
-        ## the DB, the code downgrades below the schema and tag/object
-        ## creation 500s on missing treenode columns. Bumped 2.18 ->
-        ## 2.20.15 on 2026-05-20 after exactly that happened.
+        ## Image tag is managed by Fleet imageScan (see fleet.yaml): Fleet
+        ## scans ghcr, commits the new tag onto the line below, then applies
+        ## it — git stays the single source of truth so a re-apply can never
+        ## downgrade below the DB migration level. (A 2.18 downgrade on
+        ## 2026-05-20 broke tag creation: code behind the treenode schema.)
+        ## Keel was removed here to avoid two controllers owning the image.
+        ## The trailing comment is the imageScan marker — do not delete it.
         - name: paperless
-          image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15
+          image: ghcr.io/paperless-ngx/paperless-ngx:2.20.15 # {"$imagescan": "paperless"}
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

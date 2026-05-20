@@ -8,14 +8,18 @@ dependsOn:
 helm:
   maxHistory: 25
 
-# Two sources of expected drift between fleet manifest and live state:
-#   1. VPA (mode=Auto) writes resources.requests/limits onto running
-#      pods after start.
-#   2. Keel (`keel.sh/policy: minor`) auto-bumps the image tag on its
-#      poll cadence (e.g. paperless-ngx:2.18 -> :2.20.15).
-# Strip both fields from the diff so Fleet stops flagging Modified.
-# paperless Deployment containers: 0 paperless, 1 tika, 2 gotenberg,
-# 3 consume-puller.
+# VPA (mode=Auto) writes resources.requests/limits onto running pods
+# after start — strip resources from the diff so Fleet does not flag
+# the bundle Modified. paperless Deployment containers: 0 paperless,
+# 1 tika, 2 gotenberg, 3 consume-puller.
+#
+# The paperless-ngx image is managed by Fleet imageScan (below), not
+# Keel: paperless-ngx publishes no major-track floating tag and :latest
+# would cross into 3.x, so Fleet scans the registry and commits the new
+# tag straight into paperless-deploy.yml. Git stays the single source of
+# truth, so a Fleet re-apply can never downgrade the running code below
+# the DB migration level. Keel was removed from the paperless Deployment
+# to avoid two controllers owning the image field.
 diff:
   comparePatches:
   - apiVersion: apps/v1
@@ -24,17 +28,22 @@ diff:
     namespace: paperless
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
     - {"op": "remove", "path": "/spec/template/spec/containers/1/resources"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/1/image"}
     - {"op": "remove", "path": "/spec/template/spec/containers/2/resources"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/2/image"}
     - {"op": "remove", "path": "/spec/template/spec/containers/3/resources"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/3/image"}
   - apiVersion: apps/v1
     kind: Deployment
     name: paperless-valkey
     namespace: paperless
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
+
+# Fleet imageScan: scan ghcr for newer paperless-ngx within the 2.x line
+# (never auto-jump to 3.0) and commit the tag into paperless-deploy.yml,
+# where the image line carries the `# {"$imagescan": "paperless"}` marker.
+imageScans:
+- image: ghcr.io/paperless-ngx/paperless-ngx
+  policy:
+    semver:
+      range: ">=2.20.15 <3.0.0"
+  tagName: paperless
