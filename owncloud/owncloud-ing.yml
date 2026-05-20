@@ -21,57 +21,32 @@ metadata:
       SecAuditLogFormat JSON
       SecAuditLog /dev/stdout
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
-      # File uploads to OwnCloud carry arbitrary Content-Type (e.g.
-      # application/vnd.openxmlformats-officedocument.* for Office files,
-      # image/jpeg, application/pdf) outside the CRS default
-      # tx.allowed_request_content_type whitelist. Scope-disable 920420
-      # plus 920430 (protocol-version-not-allowed cousin that also
-      # fires on some upload clients) on the WebDAV upload endpoints only.
-      #
-      # 941100 (libinjection XSS) and 941130 (XSS attribute-vector matching
-      # xmlns=) fire on WebDAV introspection requests that carry an XML body
-      # with a Content-Type header — the parsed body trips libinjection +
-      # xmlns= attribute rules. Disabled below via ctl:ruleRemoveByTag=
-      # attack-xss for /remote.php/dav/, /remote.php/webdav/, /public.php/
-      # webdav/.
-      #
-      # 920340 ("Request Containing Content, but Missing Content-Type")
-      # blocks rclone specifically: its WebDAV client omits Content-Type
-      # entirely (curl by default sends application/x-www-form-urlencoded,
-      # which is why curl passes but rclone does not). Disabled below on
-      # the same WebDAV paths since legitimate WebDAV clients can lawfully
-      # omit Content-Type on requests where the body is implied by the
-      # method (PROPFIND default body etc.).
-      #
-      # All carveouts confirmed against rclone 1.74.1 from the paperless
-      # consume-puller pod.
-      #
-      # MUST be declared before the CRS Include: within phase:1, rules execute
-      # in declaration order, so a ctl:ruleRemoveById placed after the Include
-      # runs too late — 920420 has already fired and added 5 to the anomaly
-      # score by then. No apostrophes anywhere in this block — see the docs warning.
+      # Carveouts MUST precede the Include: phase:1 rules run in declaration
+      # order, so a ctl placed after the Include fires too late. No
+      # apostrophes in this block. Keep it compact: the whole snippet renders
+      # into one nginx quoted token, which nginx caps at roughly 4096 bytes.
+      # 920420/920430: WebDAV uploads carry Content-Types outside the CRS
+      # whitelist. 920340: the rclone WebDAV client omits Content-Type.
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
         "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420"
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
         "id:1005,phase:1,pass,nolog,ctl:ruleRemoveById=920430"
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
         "id:1006,phase:1,pass,nolog,ctl:ruleRemoveById=920340"
-      # 920440 (URL file extension restricted by policy) blocks GET on any
-      # WebDAV file whose name ends in .conf, .log, .bak, .ini, etc. The
-      # extension comes from user-owned content stored in OwnCloud, not from
-      # a server-side path; the rule was designed to block direct fetches of
-      # web-server config files (Apache /server-status, /.htaccess) and does
-      # not apply when the filename is just user data inside a WebDAV path.
-      # Triggered 2026-05-19 on mdellambrogio fetching lighttpd.conf from
-      # LithiumArchive2025/.
+      # 920440: blocks GET of user files whose name ends .conf/.log/.bak etc.
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav/files|webdav))/" \
         "id:1007,phase:1,pass,nolog,ctl:ruleRemoveById=920440"
+      # attack-xss: WebDAV XML introspection bodies trip libinjection + xmlns=.
       SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
         "id:1002,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
       SecRule REQUEST_URI "@beginsWith /remote.php/webdav/" \
         "id:1003,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
       SecRule REQUEST_URI "@beginsWith /public.php/webdav/" \
         "id:1004,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-xss"
+      # 934110 (SSRF: metadata URL in param) flags the RFC 8252 loopback
+      # redirect_uri of native OAuth2 clients; harmless on the authorize EP.
+      SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/authorize" \
+        "id:1008,phase:1,pass,nolog,ctl:ruleRemoveById=934110"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
