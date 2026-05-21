@@ -203,6 +203,16 @@ spec:
         - name: consume-puller
           image: rclone/rclone:latest
           imagePullPolicy: IfNotPresent
+          ## Run as paperless's uid/gid (1000) — NOT root. rclone creates the
+          ## /consume subdirectories as it mirrors the OwnCloud folder tree;
+          ## if it runs as root those dirs are root:root 0755 and paperless's
+          ## uid-1000 celery worker cannot delete the source file after
+          ## consuming it ([Errno 13] → infinite re-OCR loop). uid 1000 owns
+          ## the /consume volume root, so rclone writes fine and every dir it
+          ## creates stays deletable by the worker.
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
           command: ["sh", "-c"]
           args:
             - |
