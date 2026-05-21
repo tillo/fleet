@@ -54,5 +54,22 @@ spec:
         - name: ENABLE_GPS
           value: "false"
         resources: {}
+        # chronyc exits non-zero ("Cannot talk to daemon") if chronyd is not
+        # running — so a wedged startup can no longer hide behind a false
+        # "1/1 Running". (k8s ignores the image's Docker HEALTHCHECK.)
+        livenessProbe:
+          exec:
+            command: ["chronyc", "-n", "tracking"]
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command: ["chronyc", "-n", "tracking"]
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
       imagePullSecrets:
       - name: mdapi-registry
