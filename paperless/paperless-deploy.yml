@@ -319,6 +319,17 @@ spec:
                   os.makedirs(dest, exist_ok=True)
                   with py7zr.SevenZipFile(path, "r") as z:
                       z.extractall(path=dest)
+              def normalize(dest):
+                  ## py7zr's extractall can reproduce a 000 file mode from the
+                  ## archive — paperless (uid 1000) must be able to READ the
+                  ## file to consume it. Force sane modes on everything.
+                  for r, ds, fs in os.walk(dest):
+                      for x in ds:
+                          try: os.chmod(os.path.join(r, x), 0o755)
+                          except OSError: pass
+                      for x in fs:
+                          try: os.chmod(os.path.join(r, x), 0o644)
+                          except OSError: pass
               print("[archive-extractor] started (7z %s)" % ("on" if HAVE_7Z else "off"), flush=True)
               while True:
                   try:
@@ -334,7 +345,9 @@ spec:
                                   if time.time() - os.path.getmtime(p) < SETTLE: continue
                               except OSError: continue
                               try:
-                                  fn(p, os.path.splitext(p)[0])
+                                  dest = os.path.splitext(p)[0]
+                                  fn(p, dest)
+                                  normalize(dest)
                                   os.remove(p)
                                   print("[archive-extractor] extracted: " + p, flush=True)
                               except Exception as e:
