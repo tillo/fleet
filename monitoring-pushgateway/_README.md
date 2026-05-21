@@ -19,11 +19,11 @@ For each Windmill script being migrated:
    metrics = f'''
    gitlab_backup_age_seconds {time.time() - last_backup_ts}
    gitlab_backup_size_bytes {size}
-   gitlab_minio_health_last_run_timestamp_seconds {time.time()}
-   gitlab_minio_health_last_run_success {1 if success else 0}
+   gitlab_backup_health_last_run_timestamp_seconds {time.time()}
+   gitlab_backup_health_last_run_success {1 if success else 0}
    '''
    urllib.request.urlopen(
-       'http://pushgateway.monitoring.svc.cluster.local:9091/metrics/job/gitlab_minio_health',
+       'http://pushgateway.monitoring.svc.cluster.local:9091/metrics/job/gitlab_backup_health',
        data=metrics.strip().encode(),
        method='POST',
    )
@@ -47,7 +47,7 @@ catch a silently-disabled script.
 1. `keel_update_log` — informational, no notify, easiest to flip
 2. `rancher_backup_check` — single signal (snapshot age)
 3. `rackspace_spend` — single signal (monthly $ proj)
-4. `gitlab_minio_health` — handful of signals (backup age, runner pod count)
+4. `gitlab_backup_health` — handful of signals (backup age, runner pod count)
 5. `pv_reclaim_policy_analysis` — informational
 6. `bpir4_health` — multiple signals; needs the BPI-R4 SSH wrapper to push
 7. `storage_health` — TrueNAS pool fill + Synology RAID; one push per host
