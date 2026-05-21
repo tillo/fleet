@@ -1,0 +1,85 @@
+## In-cluster split-horizon resolver (unbound).
+## Answers the override set in unbound-cm.yml locally and forwards everything
+## else to Technitium. Replaces the per-record address= override list that
+## lived on the BPI-R4 dnsmasq.
+##
+## NOTE: subPath ConfigMap mounts do NOT auto-refresh — after editing
+## unbound.conf run: kubectl -n split-horizon rollout restart deploy/unbound
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbound
+  namespace: split-horizon
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: unbound
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: unbound
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: unbound
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: unbound
+        image: klutchell/unbound:latest
+        command: ["unbound"]
+        args: ["-d", "-p", "-c", "/etc/unbound/unbound.conf"]
+        ports:
+        - name: dns-udp
+          containerPort: 53
+          protocol: UDP
+        - name: dns-tcp
+          containerPort: 53
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+            add: ["NET_BIND_SERVICE"]
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        livenessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        volumeMounts:
+        - name: config
+          mountPath: /etc/unbound/unbound.conf
+          subPath: unbound.conf
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: unbound-config

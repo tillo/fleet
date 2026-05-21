@@ -1,0 +1,29 @@
+## LoadBalancer for the split-horizon resolver — takes over 192.168.1.1, the
+## per-segment DNS VIP every client already points at.
+##
+## CUTOVER: 192.168.1.1 must be removed from the BPI-R4 VIPs and added to a
+## MetalLB pool before it can be allocated here (see the cutover runbook).
+## Until then this Service stays Pending — harmless; validate via the
+## ClusterIP. externalTrafficPolicy: Local preserves the client source IP so
+## unbound's access-control sees real client subnets.
+apiVersion: v1
+kind: Service
+metadata:
+  name: unbound
+  namespace: split-horizon
+spec:
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.1
+  externalTrafficPolicy: Local
+  selector:
+    app: unbound
+  ports:
+  - name: dns-udp
+    port: 53
+    targetPort: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    targetPort: 53
+    protocol: TCP

@@ -1,0 +1,161 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unbound-config
+  namespace: split-horizon
+data:
+  unbound.conf: |
+    # Managed by Fleet -- fleet/split-horizon/
+    # In-cluster split-horizon resolver. Answers the override set below
+    # locally; forwards everything else to Technitium (192.168.1.54).
+    # The override list is a 1:1 migration of the BPI-R4 dnsmasq address=
+    # entries (2026-05-21), minus the decommissioned minio records.
+    server:
+        verbosity: 1
+        interface: 0.0.0.0
+        interface: ::0
+        port: 53
+        do-ip4: yes
+        do-ip6: yes
+        do-udp: yes
+        do-tcp: yes
+        num-threads: 2
+        so-reuseport: yes
+        edns-buffer-size: 1232
+        # container runtime: no setuid, no chroot, log to stderr
+        username: ""
+        chroot: ""
+        directory: "/etc/unbound"
+        use-syslog: no
+        logfile: ""
+        pidfile: ""
+        hide-identity: yes
+        hide-version: yes
+        prefetch: yes
+        cache-min-ttl: 0
+        cache-max-ttl: 86400
+        msg-cache-size: 64m
+        rrset-cache-size: 128m
+        # internal clients only (lan/dmz/adlan + cluster + internal v6)
+        access-control: 127.0.0.0/8 allow
+        access-control: 192.168.0.0/16 allow
+        access-control: 10.0.0.0/8 allow
+        access-control: 2a0d:d05:401::/48 allow
+        access-control: fdfd:dce5:df64::/48 allow
+        access-control: 0.0.0.0/0 refuse
+        access-control: ::/0 refuse
+        # No local DNSSEC validation -- Technitium is the validating
+        # recursive resolver upstream. Enable here later if desired.
+
+        # ---- split-horizon overrides ----
+        # transparent: listed names answered locally; all other names
+        # in these zones fall through to the forward-zone below.
+        local-zone: "coders.ch." transparent
+        local-zone: "coiffuredreams.ch." transparent
+        local-zone: "dellambrogio.ch." transparent
+        local-zone: "dellambrogio.com." transparent
+        local-zone: "dellambrogio.net." transparent
+        local-zone: "dellambrogio.org." transparent
+        local-zone: "envuassu.ch." transparent
+        local-zone: "ivodellambrogio.ch." transparent
+        local-zone: "lithia.eu." transparent
+        local-zone: "mdapi.ch." transparent
+        local-zone: "plex.direct." transparent
+        local-zone: "spider3.ch." transparent
+        local-zone: "textopolis.net." transparent
+        local-zone: "tillo.ch." transparent
+
+        local-data: "harvester.home.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "gitlab.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "harvester.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "registry.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "kas.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "gitjob.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "home.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "esphome.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "frigate.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "shop.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "auth.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "lam.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "autobrr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "bazarr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "overseerr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "prowlarr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "radarr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "sonarr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "tdarr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "transmission.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "windmill.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "dev.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "pages.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "test.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "cribl.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "rspamd.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "fio-tools.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "appdaemon.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "ingress.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "www.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.coiffuredreams.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.coders.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.dellambrogio.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.lithia.eu. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.textopolis.net. 300 IN A 192.168.1.191"
+        local-data: "webmail.coders.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.coiffuredreams.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.dellambrogio.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.lithia.eu. 300 IN A 192.168.1.191"
+        local-data: "webmail.textopolis.net. 300 IN A 192.168.1.191"
+        local-data: "suivi.envuassu.ch. 300 IN A 192.168.1.191"
+        local-data: "login.envuassu.ch. 300 IN A 192.168.1.191"
+        local-data: "plex.mdapi.ch. 300 IN A 192.168.1.46"
+        local-data: "31-3-128-62.5d0cc67044f0410fbaeefaf0a98c49de.plex.direct. 300 IN A 192.168.1.46"
+        local-data: "cloud.envuassu.ch. 300 IN A 192.168.1.40"
+        local-data: "ftth.mdapi.ch. 300 IN A 192.168.1.254"
+        local-data: "bpi-r4.home.tillo.ch. 300 IN A 192.168.1.254"
+        local-data: "vpnadmin.home.tillo.ch. 300 IN A 192.168.1.246"
+        local-data: "santillo.tillo.ch. 300 IN A 192.168.1.5"
+        local-data: "eclipse-mosquitto.home.tillo.ch. 300 IN A 192.168.1.43"
+        local-data: "rancher.home.tillo.ch. 300 IN A 192.168.1.246"
+        local-data: "cloud.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "dev.spider3.ch. 300 IN A 192.168.1.191"
+        local-data: "dns.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "docs.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "idp.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "k8s-mcp.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "mirror.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "notes-mcp.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "notes.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "nsadmin.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "pfsense.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "rancher.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "threadfin-bis.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "threadfin.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "www.coiffuredreams.ch. 300 IN A 192.168.1.191"
+        local-data: "www.dellambrogio.ch. 300 IN A 192.168.1.191"
+        local-data: "www.dellambrogio.com. 300 IN A 192.168.1.191"
+        local-data: "www.dellambrogio.net. 300 IN A 192.168.1.191"
+        local-data: "www.dellambrogio.org. 300 IN A 192.168.1.191"
+        local-data: "www.ivodellambrogio.ch. 300 IN A 192.168.1.191"
+        local-data: "www.textopolis.net. 300 IN A 192.168.1.191"
+        local-data: "zot.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "www.spider3.ch. 300 IN A 192.168.1.191"
+        local-data: "vpn.tillo.ch. 300 IN A 10.7.50.1"
+        local-data: "vpn.home.tillo.ch. 300 IN A 31.3.128.58"
+        local-data: "auth.test.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "cm.home.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "seerr.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "spider3.files.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "tv.files.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "logs.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "pushgateway.mdapi.ch. 300 IN A 192.168.1.190"
+
+    # Everything not overridden above -> Technitium: internal authority
+    # for home.tillo.ch, conditional-forwarder for mdapi.ch, recursive
+    # resolver for the public internet.
+    forward-zone:
+        name: "."
+        forward-addr: 192.168.1.54
