@@ -249,6 +249,109 @@ spec:
             requests: {cpu: 25m, memory: 64Mi}
             limits:   {cpu: 1,   memory: 256Mi}
 
+        ## archive-extractor: watches /consume for archives the consume-puller
+        ## drops in and extracts them in place so paperless can ingest the
+        ## contents (paperless-ngx has no native archive support). Handles
+        ## .zip and .tar(.gz/.bz2/.xz) via the Python stdlib, and .7z via
+        ## py7zr (pip-installed at startup; python:3.12-slim is glibc so the
+        ## C-extension wheels install with no build toolchain). RAR is NOT
+        ## supported — it needs a proprietary non-stdlib binary.
+        ## Charset-aware for zip: entries without the UTF-8 flag are recovered
+        ## from cp437 and re-decoded (utf-8 → cp850 → cp1252) so DOS/Windows
+        ## codepage filenames don't ingest as mojibake. Runs as uid 1000 so
+        ## everything it creates stays deletable by the worker (same reason
+        ## as consume-puller above). Each archive is extracted into a folder
+        ## named after it, then deleted; nested archives extract next pass.
+        - name: archive-extractor
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          env:
+            - name: HOME
+              value: /tmp
+          command: ["sh", "-c"]
+          args:
+            - |
+              pip install --user --quiet --disable-pip-version-check py7zr 2>&1 \
+                || echo "[archive-extractor] py7zr install failed - .7z disabled this run"
+              cat > /tmp/extract.py <<'PYEOF'
+              import zipfile, tarfile, os, time, shutil
+              try:
+                  import py7zr
+                  HAVE_7Z = True
+              except Exception:
+                  HAVE_7Z = False
+              CONSUME, SETTLE, POLL = "/consume", 30, 60
+              def zname(zi):
+                  if zi.flag_bits & 0x800:
+                      return zi.filename
+                  raw = zi.filename.encode("cp437")
+                  for enc in ("utf-8", "cp850", "cp1252"):
+                      try: return raw.decode(enc)
+                      except UnicodeDecodeError: continue
+                  return zi.filename
+              def safe(base, name):
+                  t = os.path.normpath(os.path.join(base, name.lstrip("/")))
+                  if t != base and not t.startswith(base + os.sep):
+                      raise ValueError("unsafe path %r" % name)
+                  return t
+              def do_zip(path, dest):
+                  with zipfile.ZipFile(path) as zf:
+                      if zf.testzip() is not None:
+                          raise zipfile.BadZipFile("CRC failed")
+                      for zi in zf.infolist():
+                          if zi.is_dir(): continue
+                          t = safe(dest, zname(zi))
+                          os.makedirs(os.path.dirname(t), exist_ok=True)
+                          with zf.open(zi) as s, open(t, "wb") as o:
+                              shutil.copyfileobj(s, o)
+              def do_tar(path, dest):
+                  with tarfile.open(path) as tf:
+                      for m in tf.getmembers():
+                          if not m.isfile(): continue
+                          t = safe(dest, m.name)
+                          os.makedirs(os.path.dirname(t), exist_ok=True)
+                          with tf.extractfile(m) as s, open(t, "wb") as o:
+                              shutil.copyfileobj(s, o)
+              def do_7z(path, dest):
+                  os.makedirs(dest, exist_ok=True)
+                  with py7zr.SevenZipFile(path, "r") as z:
+                      z.extractall(path=dest)
+              print("[archive-extractor] started (7z %s)" % ("on" if HAVE_7Z else "off"), flush=True)
+              while True:
+                  try:
+                      for root, _, files in os.walk(CONSUME):
+                          for f in files:
+                              lo = f.lower()
+                              if lo.endswith(".zip"): fn = do_zip
+                              elif lo.endswith((".tar",".tar.gz",".tgz",".tar.bz2",".tar.xz")): fn = do_tar
+                              elif lo.endswith(".7z") and HAVE_7Z: fn = do_7z
+                              else: continue
+                              p = os.path.join(root, f)
+                              try:
+                                  if time.time() - os.path.getmtime(p) < SETTLE: continue
+                              except OSError: continue
+                              try:
+                                  fn(p, os.path.splitext(p)[0])
+                                  os.remove(p)
+                                  print("[archive-extractor] extracted: " + p, flush=True)
+                              except Exception as e:
+                                  print("[archive-extractor] FAILED %s: %r" % (p, e), flush=True)
+                  except Exception as e:
+                      print("[archive-extractor] loop error: %r" % e, flush=True)
+                  time.sleep(POLL)
+              PYEOF
+              exec python3 -u /tmp/extract.py
+          volumeMounts:
+            - name: data
+              mountPath: /consume
+              subPath: consume
+          resources:
+            requests: {cpu: 10m,  memory: 64Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
+
       volumes:
         - name: data
           persistentVolumeClaim:
