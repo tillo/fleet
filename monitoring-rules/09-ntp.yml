@@ -1,16 +1,20 @@
-## chrony stratum-1 NTP server in ntppool ns. The router (BPI-R4) and
-## every other host that asks ntp.mdapi.ch for time goes here. Single
-## replica, RWO storage for the local refclock state.
+## chrony NTP server in the ntppool ns — the router (BPI-R4) and every
+## host that asks ntp.mdapi.ch for time syncs here. Stratum 1 when the
+## GPS refclock is healthy, stratum 2 from upstream NTP otherwise.
 ##
-## Wire-level UDP probe via blackbox is skipped: blackbox-exporter's
-## tcp prober doesn't reliably do UDP/NTP. Coverage here is:
-##   1. Deployment availability (kube-state-metrics)
-##   2. Crashloop detection
-##
-## For "is chrony actually serving and stratum-1?" — covered by the
-## BPI-R4 health flow (bpir4_health.py pushes uptime+load that depend
-## on chrony being reachable) and by host-side `chronyc tracking` on
-## the NAS / mbptillo (logged externally).
+## Coverage:
+##   1. Deployment availability (kube-state-metrics) — effective now
+##      that chrony has a readiness probe (chronyc tracking): a dead
+##      chronyd drops the pod out of Ready, replicas_available falls,
+##      and NtpChronyUnavailable fires.
+##   2. Crashloop detection.
+##   3. Functional NTP probe — f/infra_health/ntp_health sends a real
+##      NTP client request to the chrony LB IP every 5 min and pushes
+##      ntp_probe_* to Pushgateway. Catches "answers but unsynchronised"
+##      and "unreachable on the LB IP" — blackbox-exporter's tcp prober
+##      can't do UDP/NTP, hence the Windmill probe. This closed the gap
+##      that let chrony sit dead ~9h on 2026-05-21 while the pod still
+##      read 1/1 Running (no readiness probe at the time).
 
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -59,3 +63,46 @@ spec:
         team: mdapi
       annotations:
         summary: "ntppool/{{ $labels.pod }} crash-looping"
+
+    - alert: NtpChronyNotServing
+      expr: ntp_probe_success == 0
+      for: 10m
+      labels:
+        severity: critical
+        component: General
+        team: mdapi
+      annotations:
+        summary: "chrony NTP server not answering"
+        description: |
+          The ntppool chrony server (192.168.1.58) did not answer an
+          NTP client request from f/infra_health/ntp_health. Hosts
+          syncing against it will drift. Catches the "pod Running but
+          chronyd dead / unreachable on the LB IP" case the
+          deployment-availability alert above can miss.
+
+    - alert: NtpChronyUnsynced
+      expr: ntp_probe_stratum >= 16
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "chrony is unsynchronised (stratum {{ $value }})"
+        description: |
+          chrony answers NTP but reports stratum >= 16 — it has lost
+          all time sources (GPS refclock and upstream NTP). Clients
+          will reject it as unsynchronised.
+
+    - alert: NtpProbeStale
+      expr: time() - ntp_probe_last_run_timestamp_seconds > 1800
+      for: 5m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "NTP functional probe is stale"
+        description: |
+          f/infra_health/ntp_health has not reported to Pushgateway in
+          over 30 min — the NTP functional monitor itself may be down.
