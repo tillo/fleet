@@ -1,13 +1,18 @@
 ## external-dns talks RFC2136 to Technitium primary inside the cluster.
 ## TSIG key is loaded from secret 'external-dns-tsig' (synced from Akeyless).
-## Policy is upsert-only during burn-in so existing manual A-records in
-## home.tillo.ch are left untouched. TXT registry records ownership via
-## extdns- prefix.
+## Policy is sync: external-dns deletes the records it OWNS (those carrying an
+## extdns- registry TXT) once the source Ingress/Service is gone. Records
+## WITHOUT an extdns- TXT — manual entries and Technitium DHCP leases — are
+## never considered and never touched. Ownership scope is further narrowed by
+## the manage=mdapi annotation filter below. Verified 2026-05-22: only
+## Ingress/transit/garage carries the annotation, so the managed set is
+## api.garage + console.garage; sync additionally reaps the stale
+## api.minio/console.minio registry TXTs left orphaned by the MinIO decom.
 
 provider:
   name: rfc2136
 
-policy: upsert-only
+policy: sync
 
 sources:
   - service
