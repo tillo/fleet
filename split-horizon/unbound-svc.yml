@@ -1,11 +1,14 @@
-## LoadBalancer for the split-horizon resolver — takes over 192.168.1.1, the
-## per-segment DNS VIP every client already points at.
+## LoadBalancer for the split-horizon resolver. Holds the LAN DNS VIP
+## 192.168.1.1 via the dedicated single-address MetalLB pool in
+## metallb-pools/split-horizon.yml. LAN clients are handed this address
+## directly by DHCP; DMZ / ad-LAN clients reach it through the BPI-R4
+## dnsmasq forwarder.
 ##
-## CUTOVER: 192.168.1.1 must be removed from the BPI-R4 VIPs and added to a
-## MetalLB pool before it can be allocated here (see the cutover runbook).
-## Until then this Service stays Pending — harmless; validate via the
-## ClusterIP. externalTrafficPolicy: Local preserves the client source IP so
-## unbound's access-control sees real client subnets.
+## externalTrafficPolicy: Cluster -- the MetalLB L2 announcement stays on
+## one node and forwards to any Ready unbound pod cluster-wide, so a
+## Deployment rollout never has to move the VIP (no ARP churn). The
+## kube-proxy SNAT source still lands inside unbound's internal-subnet
+## access-control, so dropping the real client IP costs nothing here.
 apiVersion: v1
 kind: Service
 metadata:
@@ -15,7 +18,7 @@ spec:
   type: LoadBalancer
   loadBalancerClass: metallb
   loadBalancerIP: 192.168.1.1
-  externalTrafficPolicy: Local
+  externalTrafficPolicy: Cluster
   selector:
     app: unbound
   ports:
