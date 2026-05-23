@@ -29,8 +29,20 @@ OO_HOST = "127.0.0.1"
 OO_PORT = 15080
 ORG = "default"
 
-PUSHOVER_TOKEN = "aojg98ph5t2pkopumibdjyb74et3gy"
-PUSHOVER_USER = "ufvbi5k9xrfsvnazws31853anwcapx"
+
+def _akeyless(name):
+    """Fetch a secret from Akeyless via the akeyless CLI on mbptillo (this
+    machine doesn't carry akeyless credentials). All callers in this module
+    go through here, so there's a single point to change if the proxy moves."""
+    return subprocess.run(
+        ["ssh", "-i", os.path.expanduser("~/.ssh/tillo@exion.id_rsa"), "mbptillo",
+         f"akeyless get-secret-value --name {name}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+PUSHOVER_TOKEN = _akeyless("/mdapi/pushover/mdapi-alertmanager-token")
+PUSHOVER_USER = _akeyless("/mdapi/pushover/user-key")
 
 TEMPLATE_NAME = "pushover_mdapi"
 DESTINATION_NAME = "pushover_mdapi"
@@ -98,11 +110,7 @@ ALERTS = [
 
 
 def get_auth():
-    pw = subprocess.run(
-        ["ssh", "-i", os.path.expanduser("~/.ssh/tillo@exion.id_rsa"), "mbptillo",
-         "akeyless get-secret-value --name /mdapi/openobserve/o2/root-password"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+    pw = _akeyless("/mdapi/openobserve/o2/root-password")
     return base64.b64encode(f"tillo@tillo.ch:{pw}".encode()).decode()
 
 
