@@ -371,6 +371,62 @@ spec:
             requests: {cpu: 10m,  memory: 64Mi}
             limits:   {cpu: 500m, memory: 256Mi}
 
+        ## library-pusher: every 5 min, rclone-sync the paperless archive tree
+        ## (OCR'd searchable PDFs) into the OwnCloud `documents` user folder
+        ## /Paperless-Library. Shares 153/154 expose that folder read-only to
+        ## mdellambrogio (Tillo) and elisadellambrogio (Elisa), so they can
+        ## browse the {year}/{correspondent}/{title} document tree from
+        ## OwnCloud without granting any Paperless access.
+        ##
+        ## Direction is one-way: Paperless is source of truth, OwnCloud copy
+        ## mirrors deletions too. The read-only share keeps consumers from
+        ## modifying files only to have them reverted on the next sync.
+        ##
+        ## Mount is `media/documents` (subPath) at /library read-only so the
+        ## sidecar can't accidentally write back into the archive. Same rclone
+        ## env block as consume-puller (same OwnCloud creds via secretKeyRef).
+        - name: library-pusher
+          image: rclone/rclone:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "[$(date -Iseconds)] library-pusher started"
+              while true; do
+                rclone sync \
+                  --transfers 4 --checkers 8 \
+                  --retries 3 --low-level-retries 5 \
+                  --stats 0 \
+                  /library/archive/ owncloud:Paperless-Library/ \
+                  2>&1 | grep -vE '^$|^0 B / 0 B' || true
+                sleep 300
+              done
+          env:
+            - name: RCLONE_CONFIG_OWNCLOUD_TYPE
+              value: "webdav"
+            - name: RCLONE_CONFIG_OWNCLOUD_URL
+              value: "https://cloud.mdapi.ch/remote.php/dav/files/d1a8901f-7a33-46f1-a985-02e450a7a35a/"
+            - name: RCLONE_CONFIG_OWNCLOUD_VENDOR
+              value: "owncloud"
+            - name: RCLONE_CONFIG_OWNCLOUD_USER
+              value: "documents"
+            - name: RCLONE_CONFIG_OWNCLOUD_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: paperless-env-secret
+                  key: RCLONE_CONFIG_OWNCLOUD_PASS
+          volumeMounts:
+            - name: data
+              mountPath: /library
+              subPath: media/documents
+              readOnly: true
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits:   {cpu: 1,   memory: 256Mi}
+
       volumes:
         - name: data
           persistentVolumeClaim:
