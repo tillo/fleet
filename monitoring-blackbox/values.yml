@@ -143,7 +143,13 @@ config:
       dns:
         preferred_ip_protocol: ip4
         ip_protocol_fallback: false
-        transport_protocol: udp
+        # TCP rather than UDP — the mdapi.ch DNSKEY RRset (4096-bit KSK +
+        # 2048-bit ZSK + RRSIGs) exceeds the 1232-byte EDNS UDP bufsize
+        # blackbox-exporter uses, so UDP responses come back TC=1 with an
+        # empty answer section and the regex check fails. Switched on
+        # 2026-05-23 after the probe started failing once the response
+        # finally crossed the threshold.
+        transport_protocol: tcp
         query_name: "mdapi.ch"
         query_type: "DNSKEY"
         # Require the DNSKEY RRset itself (validates the signed origin and
