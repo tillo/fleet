@@ -18,7 +18,8 @@ data:
       "Files":    "74cp13q9xddn",
       "Notes":    "tpmgs9xk4nh2",
       "Websites": "hmpsfntgbtf7",
-      "DNS":      "rcn8wr2jf8fy"
+      "DNS":      "rcn8wr2jf8fy",
+      "Tools":    "3jwq6n0k63kk"
     }
 
   adapter.py: |
@@ -63,10 +64,14 @@ data:
     LAST_SENT_LOCK = threading.Lock()
 
     # severity -> statuspage status (firing case). Resolved always -> operational.
+    # Severity 'none' is used by Prometheus meta-rules (InfoInhibitor etc.)
+    # that always fire as signal, not as actual problems — they should never
+    # degrade a component, even if the component label happens to be mapped.
     SEVERITY_STATUS = {
         "critical": "major_outage",
         "warning":  "degraded_performance",
         "info":     "degraded_performance",
+        "none":     "operational",
     }
     STATUS_RANK = {
         "operational":          0,
@@ -76,8 +81,25 @@ data:
         "major_outage":         4,
     }
 
+    # Throttle the "unknown component" warning so a steady-state of N firing
+    # alerts in an unmapped bucket (e.g. component=General catch-all) doesn't
+    # produce one log line per webhook per component.
+    UNKNOWN_COMP_LOG_INTERVAL_SEC = 600
+    _unknown_comp_last_log: dict[str, float] = {}
+    _unknown_comp_lock = threading.Lock()
+
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
+
+    def log_unknown_component(comp: str, n_alerts: int):
+        now = time.time()
+        with _unknown_comp_lock:
+            last = _unknown_comp_last_log.get(comp, 0)
+            if now - last < UNKNOWN_COMP_LOG_INTERVAL_SEC:
+                return
+            _unknown_comp_last_log[comp] = now
+        log(f"WARN: alert with unknown component '{comp}' (alerts: {n_alerts}) "
+            f"— throttled, next log in {UNKNOWN_COMP_LOG_INTERVAL_SEC}s")
 
     def patch_component(component_id: str, status: str):
         """Set a single component's status via PATCH. Suppress if unchanged."""
@@ -146,7 +168,7 @@ data:
             for comp, alerts in by_component.items():
                 cid = COMPONENTS.get(comp)
                 if not cid:
-                    log(f"WARN: alert with unknown component '{comp}' (alerts: {len(alerts)})")
+                    log_unknown_component(comp, len(alerts))
                     continue
                 target_status = derive_status(alerts)
                 code = patch_component(cid, target_status)
