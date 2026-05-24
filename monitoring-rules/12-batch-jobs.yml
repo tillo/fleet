@@ -357,6 +357,29 @@ spec:
           Inspect the latest Windmill run of f/infra_health/gitlab_image_builder_health
           for the `schedule_collisions` field listing the offenders.
 
+    - alert: GitlabCIBulkFailure
+      ## When a single root cause cascades to many CI pipelines (e.g. the
+      ## 2026-05-23 'secret-scan untagged -> stuck_or_timeout_failure' that
+      ## broke 25 unrelated mdapi/* projects), surface it as ONE alert keyed
+      ## on (job_name, failure_reason) instead of N look-alike per-project
+      ## warnings. Routed to General -> Pushover only; deliberately NOT
+      ## component=GitLab to avoid the statuspage-degrade trap (CI failures
+      ## don't always mean the GitLab service is degraded).
+      expr: gitlab_ci_failures_grouped{job="gitlab_ci_failure_groupby"} >= 5
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "GitLab CI: {{ $value }} mdapi/* projects failing at {{ $labels.job_name }} / {{ $labels.failure_reason }}"
+        description: |
+          A single root cause is cascading across multiple mdapi/* projects:
+          {{ $value }} projects failed in the last 24h at the same job
+          ({{ $labels.job_name }}) for the same reason ({{ $labels.failure_reason }}).
+          Inspect the latest Windmill run of f/infra_health/gitlab_ci_failure_groupby
+          for the full project list + a sample pipeline URL.
+
   - name: app-batch-jobs.waf-audit
     rules:
     - alert: WafCarveoutRegression
