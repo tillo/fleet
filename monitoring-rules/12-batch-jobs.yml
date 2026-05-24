@@ -123,6 +123,50 @@ spec:
         summary: "Config backup of {{ $labels.target }} failed"
         description: "The daily config_backup job could not capture or upload config for {{ $labels.target }}. Check Windmill run logs."
 
+  - name: app-batch-jobs.garage-offsite-backup
+    rules:
+    - alert: GarageOffsiteBackupFailing
+      ## The job pushes success=0 when any (bucket × destination) pair
+      ## fails. 30h dampening so a single missed nightly doesn't alert
+      ## but two consecutive nights do.
+      expr: garage_offsite_backup_success == 0
+      for: 30h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Garage offsite backup: {{ with query \"garage_offsite_backup_pairs_failed\" }}{{ . | first | value }}{{ end }} of {{ with query \"garage_offsite_backup_pairs_ok + garage_offsite_backup_pairs_failed\" }}{{ . | first | value }}{{ end }} pairs failing for >30h"
+        description: |
+          One or more bucket -> destination pairs are failing on the nightly
+          f/config_backup/garage_offsite_backup job (Windmill). Inspect the
+          latest run for the failed-pair list and root cause; the typical
+          culprit is harvester-backup -> b2 hitting the per-rclone timeout.
+
+    - alert: GarageOffsiteBackupStale
+      ## Catches the case where the script itself doesn't reach the
+      ## Pushgateway push at all (e.g. worker OOMKilled mid-loop, or
+      ## subprocess.TimeoutExpired propagating before the never-raise
+      ## helper landed). Without this, the success/pairs gauges look
+      ## fine because Pushgateway holds the last value forever.
+      ## Nightly schedule is 02:00 UTC; 30h covers any single missed run
+      ## plus normal clock drift without flapping.
+      expr: time() - garage_offsite_backup_last_run_timestamp_seconds > 30 * 3600
+      for: 1h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "Garage offsite backup hasn't pushed metrics in >30h"
+        description: |
+          The garage_offsite_backup_last_run_timestamp_seconds gauge is older
+          than 30 hours. Either the Windmill job is no longer being scheduled,
+          or it's aborting before the Pushgateway PUT (worker OOM, unhandled
+          exception, network failure to pushgateway). The Pushgateway holds
+          stale gauges indefinitely, so the success/pairs gauges may LIE about
+          recent state — trust this alert, not them.
+
   - name: app-batch-jobs.rackspace-spend
     rules:
     - alert: RackspaceSpendOverCap
