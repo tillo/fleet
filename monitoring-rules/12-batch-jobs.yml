@@ -357,6 +357,27 @@ spec:
           Inspect the latest Windmill run of f/infra_health/gitlab_image_builder_health
           for the `schedule_collisions` field listing the offenders.
 
+    - alert: GitlabImageBuilderDescriptionDrift
+      ## A pipeline schedule's human-readable description has drifted from
+      ## its cron (e.g. cron moved to minute 25 but description still says
+      ## "minute 0"). The probe pushes the canonical-template comparison
+      ## per project; this aggregates and waits 1 day before alerting --
+      ## a same-day fix shouldn't trip it.
+      expr: gitlab_image_builder_description_drift_total{job="gitlab_image_builder_health"} > 0
+      for: 24h
+      labels:
+        severity: warning
+        component: General
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab image-builder schedule(s) have stale descriptions"
+        description: |
+          One or more mdapi/* pipeline schedules have descriptions that no
+          longer match their cron expression. The canonical template is
+          'Every 4h at minute X hour-base Y'. Inspect the latest Windmill
+          run of f/infra_health/gitlab_image_builder_health for the full
+          drift list (project, current desc, expected desc).
+
     - alert: GitlabCIBulkFailure
       ## When a single root cause cascades to many CI pipelines (e.g. the
       ## 2026-05-23 'secret-scan untagged -> stuck_or_timeout_failure' that
