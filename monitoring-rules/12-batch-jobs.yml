@@ -357,6 +357,66 @@ spec:
           Inspect the latest Windmill run of f/infra_health/gitlab_image_builder_health
           for the `schedule_collisions` field listing the offenders.
 
+  - name: app-batch-jobs.waf-audit
+    rules:
+    - alert: WafCarveoutRegression
+      ## A WAF rule that was carved out by a Fleet ingress
+      ## modsecurity-snippet (921250/932160 on idp OIDC, 934110 on oauth2,
+      ## 942290 on Graph API) registered a 403 in the last 24h.  Either
+      ## the carveout regex no longer covers a new path variant, the
+      ## Fleet ingress drifted, or a novel attack matches the same rule
+      ## outside the carveout scope.  All three are worth a look.
+      expr: waf_carveout_blocks{job="waf_novelty_audit"} > 0
+      for: 0m
+      labels:
+        severity: warning
+        component: General
+        subsystem: waf
+        team: mdapi
+      annotations:
+        summary: "WAF carveout-protected rule {{ $labels.rule }} fired {{ $value }}x in 24h"
+        description: |
+          Run `/waf-audit` and check the live Ingress annotation against
+          the relevant fleet file (e.g. ~/fleet/keycloak/keycloak-ing.yml
+          for rules 921250/932160). Steady-state count is 0.
+
+    - alert: WafNoveltyDetected
+      ## Novelty surfaced by f/infra_health/waf_novelty_audit: a new
+      ## (host, matched_rules) combination, a new host in the WAF
+      ## top-20, or >=10x deviation on an existing combination.  Most
+      ## days this is zero; when it fires, a human needs to classify
+      ## the rows.
+      expr: waf_novelty_signals{job="waf_novelty_audit"} > 0
+      for: 0m
+      labels:
+        severity: info
+        component: General
+        subsystem: waf
+        team: mdapi
+      annotations:
+        summary: "WAF novelty audit surfaced {{ $value }} new signal(s)"
+        description: |
+          Run `/waf-audit` to classify each row as scanner / attack /
+          false positive. The novelty list is in the latest Windmill
+          run output of f/infra_health/waf_novelty_audit.
+
+    - alert: WafNoveltyAuditStale
+      ## The cron is scheduled daily 06:00 UTC; 25h with no fresh
+      ## timestamp means the run silently failed or the schedule was
+      ## disabled.
+      expr: time() - waf_audit_last_run_timestamp_seconds{job="waf_novelty_audit"} > 90000
+      for: 30m
+      labels:
+        severity: warning
+        component: General
+        subsystem: waf
+        team: mdapi
+      annotations:
+        summary: "WAF novelty audit has not run in {{ $value | humanizeDuration }}"
+        description: |
+          Check the Windmill schedule f/infra_health/waf_novelty_audit
+          and the last job status.
+
   - name: app-batch-jobs.upgrade
     rules:
     - alert: ComponentUpgradeAvailable
