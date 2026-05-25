@@ -15,12 +15,26 @@ spec:
     groupInterval: 5m
     repeatInterval: 4h
     routes:
-    ## 1) Our own alerts (team=mdapi) — full statuspage + Pushover path
+    ## 1) Our own alerts (team=mdapi) — full statuspage + Pushover path.
+    ##
+    ## Explicit InfoInhibitor/Watchdog exclusion: the kube-prometheus-stack
+    ## InfoInhibitor rule groups by namespace and inherits source labels,
+    ## so when an info-severity team=mdapi alert is active (e.g.
+    ## NamespaceWithCriticalCves) the synthetic InfoInhibitor entry picks
+    ## up team=mdapi and would otherwise match here, producing one silent
+    ## Pushover priority-0 notification every 4h plus a "Truncated message"
+    ## warning in alertmanager logs (its message body always exceeds the
+    ## 1024-rune Pushover cap). Drop them so they fall through to
+    ## black-hole. Watchdog is also routed separately by the upstream
+    ## watchdog-deadman AlertmanagerConfig.
     - receiver: statuspage-and-pushover
       matchers:
       - name: team
         value: mdapi
         matchType: "="
+      - name: alertname
+        value: InfoInhibitor|Watchdog
+        matchType: "!~"
 
     ## 2) Chart-bundled alerts that DON'T carry team=mdapi (so wouldn't
     ## match #1) but ARE real signals worth knowing about. Routes to
