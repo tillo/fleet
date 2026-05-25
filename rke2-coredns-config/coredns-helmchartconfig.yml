@@ -1,0 +1,85 @@
+## Override the rke2-coredns chart values to:
+##
+##   1. Stop forwarding everything blindly to /etc/resolv.conf (which on the
+##      RKE2 nodes points at 192.168.1.1 = the BPI-R4 dnsmasq). That made
+##      external DNS for the whole cluster a SPOF on the router: a single
+##      ~10-min router DNS hiccup on 2026-05-25 (08:51–10:01 UTC) cascaded
+##      into cribl image-pull failures (docker.io), statuspage-adapter
+##      URLErrors (api.statuspage.io), and gitlab-runner clone failures
+##      (gitlab.mdapi.ch is also forwarded upstream via this path).
+##
+##   2. Preserve mdapi.ch resolution through the router's dnsmasq — the
+##      router holds the authoritative-cache hints for our owned zones
+##      (gitlab.mdapi.ch → 192.168.1.191, etc.). Routing mdapi.ch direct
+##      to public DNS would only return the public record set.
+##
+##   3. Use NextDNS first for everything else, with public DNS as fallback.
+##      NextDNS (paid plan) applies the filtering profile keyed on our WAN
+##      IP block (Linked-IP feature; SNAT'd cluster egress lands on
+##      31.3.128.48/28 so the profile matches). 1.1.1.1 and 9.9.9.9 are
+##      fallbacks for when NextDNS itself is unreachable or rate-limiting.
+##
+##   `policy sequential` walks the upstream list in order until one answers,
+##   so NextDNS gets priority — fallback only on its failure. `health_check`
+##   pulls a healthcheck every 5s and stops sending queries to upstreams
+##   that fail twice in a row.
+##
+##   See [[SESSION_REVIEW_20260517_DNSSEC_ROOT_CAUSE_CF_DESIGN_NEXTDNS.md]]
+##   for the prior NextDNS-vs-DNSSEC analysis. CoreDNS here is a non-
+##   validating stub (no `dnssec` plugin), so NextDNS's lack of DNSSEC
+##   chain doesn't matter at this layer; Technitium remains the only
+##   would-be-validator, and it's already on UDP / dnssecValidation=false
+##   per that session's decision.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-coredns
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    servers:
+    ## mdapi.ch — keep going through the router so internal-only records
+    ## (cluster IPs, LAN DHCP names, technitium split-horizon answers)
+    ## stay reachable.
+    - port: 53
+      zones:
+      - zone: mdapi.ch
+      plugins:
+      - name: errors
+      - name: cache
+        parameters: 30
+      - name: forward
+        parameters: . 192.168.1.1
+        configBlock: |-
+          health_check 5s
+          max_fails 2
+    ## Default zone — cluster.local handling (unchanged) + NextDNS-first
+    ## upstream chain for everything else.
+    - port: 53
+      zones:
+      - use_tcp: true
+        zone: .
+      plugins:
+      - name: errors
+      - name: health
+        configBlock: lameduck 10s
+      - name: ready
+      - name: kubernetes
+        parameters: cluster.local in-addr.arpa ip6.arpa
+        configBlock: |-
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+          ttl 30
+      - name: prometheus
+        parameters: 0.0.0.0:9153
+      - name: forward
+        parameters: . 45.90.28.16 45.90.30.16 1.1.1.1 9.9.9.9
+        configBlock: |-
+          policy sequential
+          health_check 5s
+          max_fails 2
+      - name: cache
+        parameters: 30
+      - name: loop
+      - name: reload
+      - name: loadbalance
