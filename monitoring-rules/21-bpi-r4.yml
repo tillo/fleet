@@ -398,12 +398,18 @@ spec:
     - alert: BpiR4PppoeSessionThrashing
       ## Counter increments only on session-id transitions (LCP up after
       ## a real re-auth or BRAS-side reset). > 2 per hour = thrashing.
-      ## Reset-safe via max-min trick (router reboot resets the counter).
+      ##
+      ## Use increase() rather than max-min: increase() is reset-aware (it
+      ## extrapolates from the post-reset slope and ignores the pre-reset
+      ## peak), so a router reboot — which IS one legitimate session
+      ## change — counts as exactly 1, not as `pre_reboot_counter`.
+      ## Observed 2026-05-25: pre-reboot counter was 5 (5 changes over
+      ## the prior 4-day uptime, ~1.25/day, normal); reboot reset it to
+      ## 0; the old max-min interpretation read that as a 5-flap thrash
+      ## and fired the alert for an hour while the pre-reboot peak aged
+      ## out of the [1h] window.
       expr: |
-        (
-          max_over_time(bpi_r4_pppoe_session_changes_total[1h])
-          - min_over_time(bpi_r4_pppoe_session_changes_total[1h])
-        ) > 2
+        increase(bpi_r4_pppoe_session_changes_total[1h]) > 2
       for: 5m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
@@ -598,12 +604,12 @@ spec:
     - alert: BpiR4NlbwmonEnobufs
       ## nlbwmon prints "Netlink receive failure: Out of memory" when the
       ## netlink recv buffer overflows — every event is a lost batch of
-      ## flow updates. Counter is reset-safe (max-min over 1h).
+      ## flow updates. Use increase() instead of max-min so a router
+      ## reboot (which resets the counter from N to 0) doesn't fire this
+      ## alert for an hour while N ages out of the window — see the
+      ## BpiR4PppoeSessionThrashing comment above for the full pattern.
       expr: |
-        (
-          max_over_time(bpi_r4_nlbwmon_enobufs_total[1h])
-          - min_over_time(bpi_r4_nlbwmon_enobufs_total[1h])
-        ) > 0
+        increase(bpi_r4_nlbwmon_enobufs_total[1h]) > 0
       for: 15m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
