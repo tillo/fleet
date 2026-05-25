@@ -114,7 +114,18 @@ data:
             f"— throttled, next log in {UNKNOWN_COMP_LOG_INTERVAL_SEC}s")
 
     def patch_component(component_id: str, status: str):
-        """Set a single component's status via PATCH. Suppress if unchanged."""
+        """Set a single component's status via PATCH. Suppress if unchanged.
+
+        Returns numeric HTTP code on completed PATCH, 0 on cached no-op, or
+        a negative sentinel on transport failure. CRITICAL: must never raise
+        — both call sites (webhook handler and reconcile loop) iterate over
+        multiple components, and a single transient DNS/network failure
+        should not abort the rest of the pass. Pre-2026-05-25 the only
+        caught exception was HTTPError; a URLError (Errno -3 EAGAIN from
+        glibc resolver during a router reboot) propagated up, killed the
+        reconcile thread silently, and the page stopped tracking reality
+        until the next pod restart.
+        """
         with LAST_SENT_LOCK:
             if LAST_SENT.get(component_id) == status:
                 return 0  # cached, no-op
@@ -133,6 +144,15 @@ data:
         except urllib.error.HTTPError as e:
             log(f"statuspage PATCH {component_id} -> {status}: HTTP {e.code} {e.read().decode()[:200]}")
             return e.code
+        except urllib.error.URLError as e:
+            # DNS failure (Errno -3 Try again), connection refused, TLS handshake
+            # timeout. Don't cache — next call will retry. Return -1 sentinel so
+            # the reconcile loop logs the drift but keeps going.
+            log(f"statuspage PATCH {component_id} -> {status}: URLError {e.reason}")
+            return -1
+        except Exception as e:
+            log(f"statuspage PATCH {component_id} -> {status}: {type(e).__name__}: {e}")
+            return -2
 
     def derive_status(alerts: list) -> str:
         """
@@ -228,7 +248,14 @@ data:
         for comp, comp_alerts in by_component.items():
             cid = COMPONENTS[comp]
             target = derive_status(comp_alerts)
-            code = patch_component(cid, target)
+            # Belt-and-braces: patch_component already swallows exceptions,
+            # but if a future refactor reintroduces one, don't let it abort
+            # the rest of this reconcile pass.
+            try:
+                code = patch_component(cid, target)
+            except Exception as e:
+                log(f"reconcile: {comp}({cid}) patch raised {type(e).__name__}: {e}")
+                continue
             if code and code != 0:
                 log(f"reconcile: {comp}({cid})={target} http={code}")
 
