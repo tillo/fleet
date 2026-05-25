@@ -1,0 +1,44 @@
+## Separate Service for the BitTorrent peer port (the existing transmission
+## ClusterIP svc on port 9091 keeps handling RPC + ingress; it is intentionally
+## untouched).
+##
+## - LoadBalancer with MetalLB IP 192.168.1.47 (next free in prod-pool 40-99).
+## - externalTrafficPolicy: Local so peer IPs are preserved (matters for BT).
+## - v4 only: BitTorrent announces its public IP based on its egress address.
+##   The default cluster egress SNATs to 31.3.128.62 (BPI-R4 "SNAT egress lan"
+##   rule), so the announced IP and the inbound DNAT target match if we put the
+##   inbound port forward on the same WAN IP. v6 is omitted on purpose.
+##
+## Static peer port 51413. PIA still drives the runtime peer-port when its
+## tunnel is up (port-forward API assigns a random one). The static path here
+## is the fallback used when PIA is down (planned port-manager sidecar — not
+## live yet); until then this Service just claims the LB slot so the router-
+## side DNAT and the kube-side endpoint stay coherent.
+##
+## Router-side DNAT (one-off, lives on BPI-R4 /etc/config/firewall):
+##   transmission_wan : 31.3.128.62:51413 -> 192.168.1.47:51413
+##   transmission_lan : same, src=lan, for hairpin reflection
+apiVersion: v1
+kind: Service
+metadata:
+  name: transmission-peer
+  namespace: tv
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.1.47
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ipFamilyPolicy: SingleStack
+  ipFamilies:
+  - IPv4
+  selector:
+    app: transmission-pia
+  ports:
+  - name: peer-tcp
+    port: 51413
+    protocol: TCP
+    targetPort: 51413
+  - name: peer-udp
+    port: 51413
+    protocol: UDP
+    targetPort: 51413
