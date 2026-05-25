@@ -5,10 +5,17 @@
 ##   pia-ok    : wg0 link up AND latest-handshake age < 180 s
 ##               → set peer-port = $(cat /pia-shared/port.dat)
 ##   pia-down  : NOT pia-ok for ≥3 cycles (~3 min hysteresis)
-##               → re-probe direct path every 5 cycles (~5 min) via SSH to
-##                 calc.o2switch.net (forced command tests WAN:51413 with nc -z)
-##                 → probe-ok : set peer-port = 51413
-##                 → probe-fail : set peer-port = 0 (transmission stops listening)
+##               → set peer-port = 51413  (commit immediately; the only thing
+##                 that has to be right is the router DNAT 31.3.128.62:51413
+##                 → 192.168.1.47:51413, which is set in /etc/config/firewall)
+##
+## Probe is monitoring, NOT precondition:
+##   Earlier draft (d2e9f1d) gated the switch on the probe — but transmission
+##   only listens on 51413 once we've already switched, so the probe always
+##   finds :51413 closed while PIA is still in use, and refused to ever fall
+##   back. The probe now runs every 5 cycles (after PIA-down is declared) as
+##   a healthcheck — failures are logged loudly so the operator notices if
+##   the router rule rotted, but they don't affect the decision.
 ##
 ## Why we don't touch routes:
 ##   wg-quick (inside the pia container) owns the routing table. When PIA is up,
@@ -33,7 +40,7 @@ data:
     PIA_PORT_FILE=/pia-shared/port.dat
     HANDSHAKE_STALE=180          # seconds
     PIA_DOWN_HYST=3              # cycles before declaring PIA down (3*60s)
-    PROBE_INTERVAL=5             # cycles between SSH probes when PIA-down
+    PROBE_INTERVAL=5             # cycles between SSH healthcheck probes
     PROBE_SSH_HOST=calc.o2switch.net
     PROBE_SSH_USER=xiva5435
     PROBE_SSH_KEY=/etc/probe-ssh/key
@@ -42,7 +49,7 @@ data:
     CYCLE=0
     PIA_DOWN_COUNT=0
     LAST_PORT=""
-    LAST_PROBE_OK=1
+    LAST_PROBE_OK=-1            # -1 = unknown, 0 = closed, 1 = open
     LAST_PROBE_CYCLE=-99
 
     log() { printf '%s port-manager: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -51,7 +58,7 @@ data:
       port="$1"
       [ "$port" = "$LAST_PORT" ] && return
       if transmission-remote "$TR_HOST:$TR_PORT" -p "$port" >/dev/null 2>&1; then
-        log "peer-port: $LAST_PORT -> $port"
+        log "peer-port: ${LAST_PORT:-<unset>} -> $port"
         LAST_PORT="$port"
       else
         log "WARN: transmission-remote -p $port failed (transmission not ready?)"
@@ -66,9 +73,10 @@ data:
       [ "$age" -le "$HANDSHAKE_STALE" ]
     }
 
-    probe_direct() {
-      # Forced command on the o2switch side runs `nc -z 31.3.128.62 51413` and
-      # exits with that result; the literal arg here is ignored by sshd.
+    # Healthcheck only — the result does NOT gate the fallback decision.
+    # Forced command on the o2switch side runs `timeout 5 bash -c '>/dev/tcp/...'`
+    # and exits with that result; whatever 'true' we pass here is ignored by sshd.
+    probe_static_path() {
       ssh -o BatchMode=yes -o ConnectTimeout=5 \
           -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes \
           -i "$PROBE_SSH_KEY" "$PROBE_SSH_USER@$PROBE_SSH_HOST" true 2>/dev/null
@@ -92,20 +100,20 @@ data:
       PIA_DOWN_COUNT=$((PIA_DOWN_COUNT + 1))
       [ "$PIA_DOWN_COUNT" -lt "$PIA_DOWN_HYST" ] && continue
 
+      # PIA has been down for ≥3 cycles. Commit to static port now.
+      set_port "$STATIC_PORT"
+
+      # Healthcheck the static path every PROBE_INTERVAL cycles. Logs only;
+      # does not change LAST_PORT. Run AFTER set_port so transmission is
+      # already listening — probe will reflect actual reachability.
       if [ $((CYCLE - LAST_PROBE_CYCLE)) -ge "$PROBE_INTERVAL" ]; then
-        if probe_direct; then
-          [ "$LAST_PROBE_OK" = 1 ] || log "probe: WAN:$STATIC_PORT open (was closed)"
+        if probe_static_path; then
+          [ "$LAST_PROBE_OK" = 1 ] || log "probe: WAN:$STATIC_PORT open (recovered or initial)"
           LAST_PROBE_OK=1
         else
-          [ "$LAST_PROBE_OK" = 0 ] || log "probe: WAN:$STATIC_PORT closed/filtered (was open)"
+          [ "$LAST_PROBE_OK" = 0 ] || log "ALERT: WAN:$STATIC_PORT closed/filtered while in fallback — check router DNAT for transmission_wan"
           LAST_PROBE_OK=0
         fi
         LAST_PROBE_CYCLE=$CYCLE
-      fi
-
-      if [ "$LAST_PROBE_OK" = 1 ]; then
-        set_port "$STATIC_PORT"
-      else
-        set_port "0"   # halt peer listening — no valid path
       fi
     done
