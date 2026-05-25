@@ -627,3 +627,44 @@ spec:
           Weekly speedtest cron isn't pushing. Likely speedtest.net
           CLI broken or lock-file stuck. Run `/usr/local/bin/speedtest-metrics.sh`
           on the router manually.
+
+  ## ─────────────────────────────────────────────────────────────────────
+  ## NAT64 (Jool) — translates IPv6-only client traffic to IPv4 so that
+  ## hosts on the BPI-R4's IPv6-only segments can reach IPv4-only sites.
+  ## When NAT64 breaks, those clients lose connectivity to most of the
+  ## v4 internet. Backing metrics are pushed minutely by
+  ## /usr/local/bin/nat64-watch.sh on the router (queries Jool inside the
+  ## dedicated 'jool' netns via `ip netns exec jool jool ...`).
+  ##
+  ## Note: a synthetic 64:ff9b::1.1.1.1 ping6 probe was considered but
+  ## doesn't work from the router shell — the well-known prefix is only
+  ## routed to Jool's translator inside the netns, so router-originated
+  ## packets bypass it. Instance-presence + watcher-freshness covers the
+  ## "Jool config wiped / module unloaded / init script broken" failure
+  ## modes which are the only ones we've actually seen.
+  ## ─────────────────────────────────────────────────────────────────────
+  - name: app-bpi-r4.nat64
+    rules:
+    - alert: BpiR4Nat64InstanceMissing
+      expr: bpi_r4_nat64_instance_present == 0
+      for: 5m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 NAT64: Jool instance missing"
+        description: |
+          The Jool stateful NAT64 instance is no longer registered. IPv6-only
+          clients lose v4 connectivity through this router. Check
+          `/etc/init.d/jool status`, `ip netns list` for the jool netns, and
+          dmesg for jool module load errors.
+
+    - alert: BpiR4Nat64WatcherStale
+      expr: time() - bpi_r4_nat64_last_run_timestamp_seconds > 300
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 NAT64 watcher hasn't pushed in >5m"
+        description: |
+          /usr/local/bin/nat64-watch.sh stopped pushing to Pushgateway.
+          Either the minute-cron is removed/disabled or the router can't
+          reach Pushgateway. BpiR4Nat64InstanceMissing is silently broken
+          until this resolves.

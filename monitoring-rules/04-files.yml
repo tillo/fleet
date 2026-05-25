@@ -10,12 +10,12 @@ spec:
     - alert: FilesDeploymentUnavailable
       expr: |
         ( kube_deployment_spec_replicas{
-            namespace=~"owncloud|spider3|tv",
-            deployment=~"owncloud|spider3|sftpgo"
+            namespace=~"owncloud|spider3|tv|paperless|mirror",
+            deployment=~"owncloud|spider3|sftpgo|paperless|mirror"
           }
           - kube_deployment_status_replicas_available{
-            namespace=~"owncloud|spider3|tv",
-            deployment=~"owncloud|spider3|sftpgo"
+            namespace=~"owncloud|spider3|tv|paperless|mirror",
+            deployment=~"owncloud|spider3|sftpgo|paperless|mirror"
           }
         ) > 0
       for: 5m
@@ -26,14 +26,18 @@ spec:
       annotations:
         summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replicas unavailable"
         description: |
-          File-storage component is degraded. cloud.mdapi.ch (ownCloud) and/or
-          *.files.mdapi.ch (SFTPGo) will be unreachable.
+          File-storage component is degraded. Affected services:
+            ownCloud   -> cloud.mdapi.ch
+            SFTPGo     -> *.files.mdapi.ch
+            Paperless  -> documents.mdapi.ch (DMS)
+            Mirror     -> mirror.mdapi.ch (Debian/Ubuntu mirror)
 
     - alert: FilesPodCrashLooping
       expr: |
         max by (namespace, pod, container) (
           rate(kube_pod_container_status_restarts_total{
-            namespace=~"owncloud|spider3|tv", pod=~"owncloud-.*|spider3-.*|sftpgo-.*"
+            namespace=~"owncloud|spider3|tv|paperless|mirror",
+            pod=~"owncloud-.*|spider3-.*|sftpgo-.*|paperless-.*|mirror-.*"
           }[15m]) * 60
         ) > 0.5
       for: 10m
@@ -46,8 +50,8 @@ spec:
 
     - alert: FilesPVCNearlyFull
       expr: |
-        kubelet_volume_stats_used_bytes{namespace=~"owncloud|spider3|tv"}
-          / kubelet_volume_stats_capacity_bytes{namespace=~"owncloud|spider3|tv"}
+        kubelet_volume_stats_used_bytes{namespace=~"owncloud|spider3|tv|paperless|mirror"}
+          / kubelet_volume_stats_capacity_bytes{namespace=~"owncloud|spider3|tv|paperless|mirror"}
           > 0.85
       for: 10m
       labels:

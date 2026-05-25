@@ -340,3 +340,107 @@ spec:
           working until expiry, then clients lose addresses.
           Single-active by design (Technitium has no DHCP failover protocol).
           Manual cutover: see fleet/technitium/DHCP-FAILOVER-RUNBOOK.md.
+
+  ## ─────────────────────────────────────────────────────────────────────
+  ## Adjacent DNS-stack components beyond Technitium. Each is independent
+  ## but a failure of any one degrades a DNS-related user surface:
+  ##   nameserver  -> ns.mdapi.ch (BIND9, public auth zone)
+  ##   external-dns -> RFC2136 sync into Technitium (new Ingresses + ACME)
+  ##   opennic     -> public OpenNIC tier-2 resolver
+  ##   unbound     -> split-horizon view (internal-vs-public resolution)
+  ## ─────────────────────────────────────────────────────────────────────
+
+  - name: app-dns.stack
+    rules:
+    - alert: NameserverBindUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="nameserver", deployment="nameserver"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="nameserver", deployment="nameserver"
+          }
+        ) > 0
+      for: 3m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "nameserver/nameserver (ns.mdapi.ch BIND9): {{ $value }} replicas unavailable"
+        description: |
+          Authoritative BIND9 for the public mdapi.ch zone is down. External
+          resolvers will get SERVFAIL once their cache expires. Inbound
+          mail/web/etc. for *.mdapi.ch breaks. The dns-public blackbox probe
+          (ns.mdapi.ch:53 UDP/TCP/DNSSEC) will already be reporting
+          probe_success=0 — this alert names the pod-side cause.
+
+    - alert: ExternalDnsUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="external-dns", deployment="external-dns"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="external-dns", deployment="external-dns"
+          }
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "external-dns: {{ $value }} replicas unavailable for >15m"
+        description: |
+          external-dns is the RFC2136 bridge that pushes Ingress/Service
+          hostnames into Technitium. While it is down, new ingress hostnames
+          (and any DNS-01 ACME challenges depending on freshly-published
+          TXT records) stop working. Existing records continue to resolve.
+
+    - alert: OpennicTier2Down
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="opennic", deployment="opennic-tier2"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="opennic", deployment="opennic-tier2"
+          }
+        ) > 0
+      for: 3m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "opennic/opennic-tier2: {{ $value }} replicas unavailable"
+        description: |
+          Public OpenNIC tier-2 resolver is down. End-users on the open
+          internet querying our advertised tier-2 IP for OpenNIC TLDs
+          (.geek, .libre, etc.) will fail over to other tier-2 operators.
+          Severity warning (not critical) because (a) we are one of many
+          tier-2 operators by design and (b) failover is automatic for
+          clients with multiple resolvers.
+
+    - alert: UnboundSplitHorizonDown
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="split-horizon", deployment="unbound"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="split-horizon", deployment="unbound"
+          }
+        ) > 0
+      for: 3m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "split-horizon/unbound: {{ $value }} replicas unavailable"
+        description: |
+          Unbound split-horizon resolver is degraded. With 2 replicas
+          desired (anti-affinity), a single-pod outage is tolerable;
+          this alert fires when both go down or one is unrecoverable.
+          Internal vs external split-view resolution will fall through
+          to the next resolver (Technitium primary) which serves the
+          internal view to everyone — typically benign but worth noting.
