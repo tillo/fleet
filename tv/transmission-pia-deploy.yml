@@ -114,7 +114,19 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
-          apk add --no-cache transmission-cli wireguard-tools openssh-client coreutils >/dev/null
+          # apk-add through the same netns as the pia container. As soon as
+          # pia runs `wg-quick up wg0` it installs an iptables drop for all
+          # untunnelled traffic, then sets wg0 as the default route — so the
+          # first ~10s after pod start the alpine CDN is unreachable, then
+          # it's reachable again via the tunnel. Retry until success.
+          i=0
+          while ! apk add --no-cache transmission-cli wireguard-tools openssh-client >/dev/null 2>&1; do
+            i=$((i + 1))
+            [ "$i" -ge 60 ] && { echo "FATAL: apk add did not succeed in 5 min"; exit 1; }
+            echo "apk add: try $i/60 failed, sleeping 5s (waiting for PIA tunnel)"
+            sleep 5
+          done
+          echo "apk add: tools installed"
           install -m 0600 /etc/probe-ssh-raw/key /tmp/probe.key
           install -m 0644 /etc/probe-ssh-raw/known_hosts /tmp/known_hosts
           # Manager reads its key/known_hosts from /etc/probe-ssh; symlink to /tmp copies.
