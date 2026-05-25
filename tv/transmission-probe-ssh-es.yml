@@ -1,0 +1,35 @@
+## SSH key for the port-manager's external port-open probe.
+##
+## The matching public key lives in xiva5435@calc.o2switch.net's
+## ~/.ssh/authorized_keys with a forced command:
+##   command="nc -z 31.3.128.62 51413",no-port-forwarding,no-X11-forwarding,no-pty,no-agent-forwarding ssh-ed25519 AAAA…
+## sshd ignores whatever the client sends and runs only that nc, returning its
+## exit code via SSH (0 = port open, 1 = port closed/filtered).
+##
+## known_hosts is pinned to the current calc.o2switch.net SSH host key
+## (port-manager runs with StrictHostKeyChecking=yes) so an MITM swap can't
+## silently turn the probe into a noop or leak the key.
+##
+## Akeyless layout (same convention as pia-es.yml):
+##   /mdapi/tv/transmission/probe-ssh-private-key  → the ed25519 private key
+##   /mdapi/tv/transmission/probe-ssh-known-hosts  → calc.o2switch.net host key
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: transmission-probe-ssh
+  namespace: tv
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: transmission-probe-ssh
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/tv/transmission/probe-ssh-private-key
+      secretKey: key
+    - remoteRef:
+        key: /mdapi/tv/transmission/probe-ssh-known-hosts
+      secretKey: known_hosts

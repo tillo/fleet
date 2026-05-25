@@ -1,0 +1,111 @@
+## Manager script — arbitrate transmission's peer-port between the PIA-assigned
+## port and the static router-forwarded port (51413).
+##
+## State (re-evaluated every 60s):
+##   pia-ok    : wg0 link up AND latest-handshake age < 180 s
+##               → set peer-port = $(cat /pia-shared/port.dat)
+##   pia-down  : NOT pia-ok for ≥3 cycles (~3 min hysteresis)
+##               → re-probe direct path every 5 cycles (~5 min) via SSH to
+##                 calc.o2switch.net (forced command tests WAN:51413 with nc -z)
+##                 → probe-ok : set peer-port = 51413
+##                 → probe-fail : set peer-port = 0 (transmission stops listening)
+##
+## Why we don't touch routes:
+##   wg-quick (inside the pia container) owns the routing table. When PIA is up,
+##   wg0 default route is active and transmission egresses through the tunnel.
+##   When PIA fails, wg0 goes away and the pod's default route reverts to the
+##   Cilium gateway → eth0 → SNAT'd to 31.3.128.62 by the BPI-R4 "egress" rule.
+##   So announce-IP and inbound-DNAT-IP both equal 31.3.128.62 — satisfies BT.
+##   The manager only needs to flip transmission's peer-port, never routes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transmission-port-manager
+  namespace: tv
+data:
+  manage.sh: |
+    #!/bin/sh
+    set -u
+
+    TR_HOST=127.0.0.1
+    TR_PORT=9091
+    STATIC_PORT=51413
+    PIA_PORT_FILE=/pia-shared/port.dat
+    HANDSHAKE_STALE=180          # seconds
+    PIA_DOWN_HYST=3              # cycles before declaring PIA down (3*60s)
+    PROBE_INTERVAL=5             # cycles between SSH probes when PIA-down
+    PROBE_SSH_HOST=calc.o2switch.net
+    PROBE_SSH_USER=xiva5435
+    PROBE_SSH_KEY=/etc/probe-ssh/key
+    KNOWN_HOSTS=/etc/probe-ssh/known_hosts
+
+    CYCLE=0
+    PIA_DOWN_COUNT=0
+    LAST_PORT=""
+    LAST_PROBE_OK=1
+    LAST_PROBE_CYCLE=-99
+
+    log() { printf '%s port-manager: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+    set_port() {
+      port="$1"
+      [ "$port" = "$LAST_PORT" ] && return
+      if transmission-remote "$TR_HOST:$TR_PORT" -p "$port" >/dev/null 2>&1; then
+        log "peer-port: $LAST_PORT -> $port"
+        LAST_PORT="$port"
+      else
+        log "WARN: transmission-remote -p $port failed (transmission not ready?)"
+      fi
+    }
+
+    pia_ok() {
+      ip link show wg0 >/dev/null 2>&1 || return 1
+      hs="$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}')"
+      [ -z "$hs" ] || [ "$hs" = "0" ] && return 1
+      age=$(( $(date +%s) - hs ))
+      [ "$age" -le "$HANDSHAKE_STALE" ]
+    }
+
+    probe_direct() {
+      # Forced command on the o2switch side runs `nc -z 31.3.128.62 51413` and
+      # exits with that result; the literal arg here is ignored by sshd.
+      ssh -o BatchMode=yes -o ConnectTimeout=5 \
+          -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes \
+          -i "$PROBE_SSH_KEY" "$PROBE_SSH_USER@$PROBE_SSH_HOST" true 2>/dev/null
+    }
+
+    log "starting (static_port=$STATIC_PORT, pia_port_file=$PIA_PORT_FILE)"
+
+    while sleep 60; do
+      CYCLE=$((CYCLE + 1))
+
+      if pia_ok; then
+        PIA_DOWN_COUNT=0
+        pia_port="$(cat "$PIA_PORT_FILE" 2>/dev/null)"
+        case "$pia_port" in
+          ''|*[!0-9]*) ;;                # not yet written / invalid
+          *) [ "$pia_port" -gt 0 ] && set_port "$pia_port" ;;
+        esac
+        continue
+      fi
+
+      PIA_DOWN_COUNT=$((PIA_DOWN_COUNT + 1))
+      [ "$PIA_DOWN_COUNT" -lt "$PIA_DOWN_HYST" ] && continue
+
+      if [ $((CYCLE - LAST_PROBE_CYCLE)) -ge "$PROBE_INTERVAL" ]; then
+        if probe_direct; then
+          [ "$LAST_PROBE_OK" = 1 ] || log "probe: WAN:$STATIC_PORT open (was closed)"
+          LAST_PROBE_OK=1
+        else
+          [ "$LAST_PROBE_OK" = 0 ] || log "probe: WAN:$STATIC_PORT closed/filtered (was open)"
+          LAST_PROBE_OK=0
+        fi
+        LAST_PROBE_CYCLE=$CYCLE
+      fi
+
+      if [ "$LAST_PROBE_OK" = 1 ]; then
+        set_port "$STATIC_PORT"
+      else
+        set_port "0"   # halt peer listening — no valid path
+      fi
+    done

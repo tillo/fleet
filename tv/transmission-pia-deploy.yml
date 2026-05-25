@@ -73,8 +73,14 @@ spec:
           value: '1'
         - name: PORT_FATAL
           value: '1'
+        ## EXIT_ON_FATAL=0 (was 1) — phase-2 change. Previously a single PIA
+        ## auth failure killed the container and looped the whole pod, taking
+        ## transmission offline. The port-manager sidecar now detects PIA
+        ## health (wg0 + recent handshake) and falls transmission over to the
+        ## static router-forwarded port. Let PIA keep retrying in-place instead
+        ## of bouncing the pod.
         - name: EXIT_ON_FATAL
-          value: '1'
+          value: '0'
         - name: ACTIVE_HEALTHCHECKS
           value: '1'
         - name: HEALTHCHECK_PING_TARGET
@@ -87,10 +93,10 @@ spec:
         # this, a restart locks DNS bootstrap behind a not-yet-up wg0.
         - name: PRE_UP
           value: 'printf "nameserver 10.53.0.10\n" > /etc/resolv.conf'
-        - name: POST_UP
-          value: 'sleep 10; apk add --no-cache transmission-remote && transmission-remote -p $(cat /pia-shared/port.dat)'
-        - name: POST_RECONNECT
-          value: 'sleep 10; apk add --no-cache transmission-remote && transmission-remote -p $(cat /pia-shared/port.dat)'
+        ## POST_UP/POST_RECONNECT used to call transmission-remote -p here.
+        ## That responsibility moved to the port-manager sidecar, which reads
+        ## /pia-shared/port.dat (PIA writes it itself) and sets the port via
+        ## the same RPC. Leaving these hooks in would race the manager.
         envFrom:
           - secretRef:
               name: pia-env-secret
@@ -98,6 +104,39 @@ spec:
           capabilities:
             add:
               - NET_ADMIN
+        volumeMounts:
+        - name: pia-shared
+          mountPath: /pia-shared
+      ## port-manager — arbitrates between PIA port and static fallback.
+      ## See ConfigMap transmission-port-manager for the script + state machine.
+      - name: port-manager
+        image: alpine:3.20
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          apk add --no-cache transmission-cli wireguard-tools openssh-client coreutils >/dev/null
+          install -m 0600 /etc/probe-ssh-raw/key /tmp/probe.key
+          install -m 0644 /etc/probe-ssh-raw/known_hosts /tmp/known_hosts
+          # Manager reads its key/known_hosts from /etc/probe-ssh; symlink to /tmp copies.
+          mkdir -p /etc/probe-ssh
+          ln -sf /tmp/probe.key /etc/probe-ssh/key
+          ln -sf /tmp/known_hosts /etc/probe-ssh/known_hosts
+          exec /bin/sh /script/manage.sh
+        securityContext:
+          # NET_ADMIN: `wg show` reads wireguard interface state via netlink.
+          capabilities:
+            add:
+              - NET_ADMIN
+        volumeMounts:
+        - name: pia-shared
+          mountPath: /pia-shared
+          readOnly: true
+        - name: port-manager-script
+          mountPath: /script
+          readOnly: true
+        - name: probe-ssh
+          mountPath: /etc/probe-ssh-raw
+          readOnly: true
       volumes:
       - name: transmission-config
         persistentVolumeClaim:
@@ -105,3 +144,15 @@ spec:
       - name: tv
         persistentVolumeClaim:
           claimName: tv
+      ## Shared IPC between pia (writer) and port-manager (reader). Holds
+      ## /pia-shared/port.dat — the PIA-forwarded port number.
+      - name: pia-shared
+        emptyDir: {}
+      - name: port-manager-script
+        configMap:
+          name: transmission-port-manager
+          defaultMode: 0755
+      - name: probe-ssh
+        secret:
+          secretName: transmission-probe-ssh
+          defaultMode: 0400
