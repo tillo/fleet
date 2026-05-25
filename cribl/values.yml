@@ -16,6 +16,37 @@ podAnnotations:
 
 config:
   scName: harvester-longhorn-2replicas
+  ## Liveness/readiness probe overrides — chart default is 60s delay, 10s
+  ## period, 1s timeout, 3 failures = 30s of unhealthy before kill. Under
+  ## sustained PQ-drain backpressure (httpraw source spiking 1–2.5 MB
+  ## chunks per worker), the /api/v1/health endpoint can't reply within
+  ## 1s, the pod gets killed mid-drain, restarts hot into the same load,
+  ## and crashloops. 2026-05-25 10:16–10:32 UTC: 17 restarts in 16 min
+  ## while the pod was using <12% of its CPU/RAM budget — the probe was
+  ## the killer, not resources.
+  ##
+  ## New budget: 60s delay (unchanged), 15s period × 6 failures × 5s
+  ## timeout = 90s of unhealthy before kill. Cribl PQ-drain bursts
+  ## typically settle in 5–10s; 90s leaves room for cold-cache reloads
+  ## without losing the liveness signal entirely.
+  livenessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: 9000
+      scheme: HTTP
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: 9000
+      scheme: HTTP
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
 persistence:
   size: 50Gi
 service:
