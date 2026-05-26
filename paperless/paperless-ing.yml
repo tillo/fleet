@@ -32,13 +32,21 @@ metadata:
       ## updates, PUT for replace, DELETE for removal. CRS default
       ## tx.allowed_methods is GET HEAD POST OPTIONS so anything else
       ## scores 5 on rule 911100 and trips the 949110 anomaly threshold.
-      ## Cannot override via setvar:tx.allowed_methods - the value needs
-      ## ModSec single quotes around the space-separated list, but the
-      ## entire modsecurity_rules block is wrapped in single quotes by
-      ## nginx-ingress, so inner single quotes are not possible. Use
-      ## ctl:ruleRemoveById=911100 scoped to /api/ instead.
-      SecRule REQUEST_URI "@beginsWith /api/" "id:1002,phase:1,pass,nolog,ctl:ruleRemoveById=911100"
-      SecRule REQUEST_URI "@beginsWith /api/documents/post_document" "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
+      ## The previous workaround used ctl:ruleRemoveById=911100 from a
+      ## phase-1 SecRule -- this is documented as ineffective: rule 911100
+      ## is itself phase 1 and loaded inside the CRS Include, so by the time
+      ## our ctl fires the score has already been incremented. Set the
+      ## allowed-methods variable directly instead. The value is a plain
+      ## space-separated token list; no inner quoting needed (owncloud uses
+      ## the same SecAction pattern with a longer WebDAV method list).
+      SecAction "id:1002,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      ## /api/documents/post_document accepts multipart PDF/image uploads.
+      ## CRS 920420 (disallowed Content-Type) and 920430 (HTTP version)
+      ## both fire on legitimate ingest. Same phase-1 ctl:ruleRemoveById
+      ## propagation issue as keycloak/owncloud -- switch to ruleRemoveByTag
+      ## scoped to the upload endpoint. See fleet/owncloud/owncloud-ing.yml
+      ## for the same fix and CRS CHANGES.md for upstream guidance.
+      SecRule REQUEST_URI "@beginsWith /api/documents/post_document" "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     flame.pawelmalak/type: app
     flame.pawelmalak/name: Documents
