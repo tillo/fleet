@@ -23,21 +23,31 @@ metadata:
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
       # Carveouts MUST precede the Include: phase:1 rules run in declaration
       # order, so a ctl placed after the Include fires too late.
+      # Note: we use ctl:ruleRemoveByTag=OWASP_CRS rather than ctl:ruleEngine=Off
+      # or ctl:ruleRemoveById=NNN here. In libmodsecurity-nginx v3, a phase-1
+      # ctl set before the CRS Include does not reliably propagate to phase-2
+      # rules loaded inside that Include; ruleRemoveByTag is processed at rule
+      # registration time and works regardless of phase. See CRS CHANGES.md
+      # (replace uses of ctl:ruleEngine=Off with ctl:ruleRemoveByTag=OWASP_CRS).
       # WebDAV file-sync paths carry arbitrary user file names and bytes, so
       # CRS request inspection there yields only false positives (LFI/XSS/SQLi
-      # rules tripping on file names and contents). Disable the rule engine
-      # for those paths outright; the web UI, OAuth2 and every other path on
-      # this host stay fully WAF-protected.
+      # rules tripping on file names and contents). Remove all CRS rules for
+      # those paths; the web UI, OAuth2 and every other path on this host
+      # stay fully WAF-protected.
       SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav|webdav))/" \
-        "id:1001,phase:1,pass,nolog,ctl:ruleEngine=Off"
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       # 934110 (SSRF: metadata URL in param) flags the RFC 8252 loopback
-      # redirect_uri of native OAuth2 clients; harmless across the oauth2 app.
+      # redirect_uri of native OAuth2 clients. The oauth2 app endpoint is a
+      # narrowly-scoped, server-implemented path where CRS request inspection
+      # has produced only false positives in practice; remove the full CRS
+      # ruleset for this path (same propagation reason as id:1001).
       SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/" \
-        "id:1008,phase:1,pass,nolog,ctl:ruleRemoveById=934110"
+        "id:1008,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       # 942290 (NoSQL/Mongo injection) flags the OData $expand query
-      # parameter name used by the OwnCloud Graph API; harmless on /graph/.
+      # parameter name used by the OwnCloud Graph API. Same propagation
+      # reason as id:1001; remove the full CRS ruleset on /graph/.
       SecRule REQUEST_URI "@beginsWith /graph/" \
-        "id:1009,phase:1,pass,nolog,ctl:ruleRemoveById=942290"
+        "id:1009,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
