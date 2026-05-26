@@ -4,6 +4,14 @@ metadata:
   name: nextcloud-aio-apache
   namespace: envuassu
 spec:
+  # Recreate (not RollingUpdate) so a new pod is never scheduled before the old
+  # one terminates and detaches the RWX volume — prevents transient cross-node
+  # mount of pvc nextcloud-aio-nextcloud, which wedges Longhorn (engine
+  # migration unsupported here, see envuassu/nextcloud/kustomize sibling
+  # patches on -nextcloud and -notify-push for the same reason).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   template:
     spec:
       affinity:
