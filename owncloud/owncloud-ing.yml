@@ -21,40 +21,32 @@ metadata:
       SecAuditLogFormat JSON
       SecAuditLog /dev/stdout
       SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
-      # Carveouts MUST precede the Include: phase:1 rules run in declaration
-      # order, so a ctl placed after the Include fires too late.
-      # Note: we use ctl:ruleRemoveByTag=OWASP_CRS rather than ctl:ruleEngine=Off
-      # or ctl:ruleRemoveById=NNN here. In libmodsecurity-nginx v3, a phase-1
-      # ctl set before the CRS Include does not reliably propagate to phase-2
-      # rules loaded inside that Include; ruleRemoveByTag is processed at rule
-      # registration time and works regardless of phase. See CRS CHANGES.md
-      # (replace uses of ctl:ruleEngine=Off with ctl:ruleRemoveByTag=OWASP_CRS).
-      # WebDAV file-sync paths carry arbitrary user file names and bytes, so
-      # CRS request inspection there yields only false positives (LFI/XSS/SQLi
-      # rules tripping on file names and contents). Remove all CRS rules for
-      # those paths; the web UI, OAuth2 and every other path on this host
-      # stay fully WAF-protected.
-      SecRule REQUEST_URI "@rx ^/(public\.php/webdav|remote\.php/(dav|webdav))/" \
-        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      # Upstream CRS rule-exclusions plugin for Nextcloud-family servers
+      # (OwnCloud shares the OCS API surface and most WebDAV semantics).
+      # File is mounted into the controller via the rke2-ingress-nginx
+      # HelmChartConfig extraVolume; ConfigMap source lives in fleet at
+      # ingress/nextcloud-rule-exclusions-plugin-cm.yml. The plugin must
+      # be Included BEFORE the CRS Include so its ctl:ruleRemoveTargetById
+      # actions are processed at rule registration time. Replaces the
+      # blanket carveouts that previously sat here:
+      #   - 1001 (WebDAV ruleRemoveByTag=OWASP_CRS) -> plugin rules
+      #     9508101 / 9508103 / 9508104 (and more) excise the specific
+      #     CRS rules that trip on file names / binary upload bodies.
+      #   - 1010 (files_sharing ruleRemoveByTag=OWASP_CRS) -> plugin
+      #     rule 9508135 strips rule 930120 from ARGS:path on the exact
+      #     /ocs/v*.php/apps/files_sharing/api/v*/shares URI.
+      Include /etc/nginx/modsec-plugins/nextcloud-rule-exclusions-before.conf
+      # OwnCloud-specific carveouts NOT covered by the Nextcloud plugin:
       # 934110 (SSRF: metadata URL in param) flags the RFC 8252 loopback
-      # redirect_uri of native OAuth2 clients. The oauth2 app endpoint is a
-      # narrowly-scoped, server-implemented path where CRS request inspection
-      # has produced only false positives in practice; remove the full CRS
-      # ruleset for this path (same propagation reason as id:1001).
+      # redirect_uri of native OAuth2 clients. Same blanket approach as
+      # before; phase:1 ctl placed before the CRS Include for propagation.
       SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/" \
         "id:1008,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       # 942290 (NoSQL/Mongo injection) flags the OData $expand query
-      # parameter name used by the OwnCloud Graph API. Same propagation
-      # reason as id:1001; remove the full CRS ruleset on /graph/.
+      # parameter name used by the OwnCloud Graph API (an OwnCloud-only
+      # endpoint with no Nextcloud equivalent, so no plugin coverage).
       SecRule REQUEST_URI "@beginsWith /graph/" \
         "id:1009,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
-      # OCS Sharing API echoes the account file path in ?path=. Any folder
-      # named /tmp, /etc, /proc, /var will trip CRS LFI rules
-      # (e.g. 930120 on /tmp). Symptom: Sharing tab in the Web UI spins
-      # forever. Scope strictly to the files_sharing API (other OCS endpoints
-      # remain fully WAF-protected). Same propagation reason as id:1001.
-      SecRule REQUEST_URI "@rx ^/ocs/v[12]\.php/apps/files_sharing/api/" \
-        "id:1010,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
