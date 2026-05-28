@@ -1,0 +1,36 @@
+## Phase 2 of the tv/tv split: Transmission downloadDir for movies (the
+## torrent "Finish" landing zone, read by Radarr to import into /tv/Film).
+##
+## Sized at 600 GiB:
+##   - Today /tv/Torrents/Finish/Film is ~340 GB.
+##   - The ~22 loose top-level "movie-like" torrents at /tv/Torrents/Finish/
+##     (Marriage Story, Logan, Send Help, etc.) get classified here during
+##     the migration sweep — another ~50 GB.
+##   - +200 GB headroom for future seeding + Tdarr transcode backlog.
+##
+## RWX because three consumers touch this path concurrently:
+##   - transmission-pia writes (downloadDir + seed reads)
+##   - radarr reads (import → /tv/Film)
+##   - sonarr (mounts /downloads/complete top-level; doesn't read /Film
+##     directly but the mount tree still has to be reachable)
+##
+## Storage class -notmigratable matches the precedent set by the original
+## tv/tv volume — long staleReplicaTimeout (2880 min) avoids rebuild
+## storms on transient node blips during Harvester upgrades.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tv-finish-film
+  namespace: tv
+  labels:
+    recurring-job-group.longhorn.io/default: enabled
+    recurring-job.longhorn.io/source: enabled
+    # No weekly snapshot — Finish is recoverable from torrents themselves.
+spec:
+  storageClassName: harvester-longhorn-2replicas-notmigratable
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 600Gi
