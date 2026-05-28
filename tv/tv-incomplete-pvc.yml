@@ -1,0 +1,32 @@
+## Transmission's incomplete-dir, carved off the big tv/tv volume.
+## Pilot for the staged tv/tv split (eventually: tv-film-library,
+## tv-serie-library, tv-finish-film, tv-finish-serie, tv-incomplete).
+##
+## Sized at 250 GiB — Transmission session config caps parallel downloads
+## via queue-stalled-enabled + speed-limit-* settings; biggest single torrent
+## seen so far is ~60 GiB. 250 GiB leaves room for 3-4 concurrent big ones.
+##
+## RWO is fine — only transmission-pia writes to /downloads/incomplete.
+## Sonarr/Radarr deliberately don't see it (they'd choke on .part files).
+##
+## Replicas 2 (via standard storage class) — incomplete is volatile but
+## losing it mid-download forces a re-grab on private trackers, so the
+## extra copy is worth it.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tv-incomplete
+  namespace: tv
+  labels:
+    recurring-job-group.longhorn.io/default: enabled
+    recurring-job.longhorn.io/source: enabled
+    # No weekly backup — this is volatile churn; let recurring-job/default
+    # take the daily snapshots only.
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 250Gi

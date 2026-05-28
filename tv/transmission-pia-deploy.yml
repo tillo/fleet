@@ -48,9 +48,12 @@ spec:
         - name: tv
           mountPath: /downloads/complete
           subPath: Torrents/Finish
-        - name: tv
+        ## Phase-1 of the tv/tv split: incomplete-dir moved off the shared
+        ## tv volume onto its own PVC. Keeps Transmission's high-churn
+        ## .part writes off the big RWX share + lets us snapshot it on a
+        ## different cadence (none, vs the library's daily).
+        - name: tv-incomplete
           mountPath: /downloads/incomplete
-          subPath: Torrents/Temp
         - name: tv
           mountPath: /watch
           subPath: Torrents/Start
@@ -156,6 +159,9 @@ spec:
       - name: tv
         persistentVolumeClaim:
           claimName: tv
+      - name: tv-incomplete
+        persistentVolumeClaim:
+          claimName: tv-incomplete
       ## Shared IPC between pia (writer) and port-manager (reader). Holds
       ## /pia-shared/port.dat — the PIA-forwarded port number.
       - name: pia-shared
