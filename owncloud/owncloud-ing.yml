@@ -47,19 +47,18 @@ metadata:
       # endpoint with no Nextcloud equivalent, so no plugin coverage).
       SecRule REQUEST_URI "@beginsWith /graph/" \
         "id:1009,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
-      # 920340/920341 (Request Containing Content, but Missing
-      # Content-Type header) fires on OwnCloud PROPFIND, which sends a
-      # small XML body without setting Content-Type. The Nextcloud
-      # plugin carves these rules out for REPORT method only. Mirror
-      # that scope for PROPFIND on the WebDAV roots. ctl:ruleRemoveById
-      # does not propagate reliably from a phase-1 SecRule in this
-      # nginx-ingress build, so use ruleRemoveByTag=OWASP_CRS scoped to
-      # PROPFIND + WebDAV roots (strictly narrower than the old blanket
-      # id:1001 which covered every method on the same path prefix).
-      SecRule REQUEST_METHOD "@streq PROPFIND" \
-        "id:1011,phase:1,pass,nolog,chain"
-        SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
-          "ctl:ruleRemoveByTag=OWASP_CRS"
+      # The Nextcloud rule-exclusions plugin covers Nextcloud client
+      # behavior on /remote.php/dav/ but not OwnCloud sync clients,
+      # which send PROPFIND with a small XML body and no Content-Type
+      # header. That trips 920340/920341 in phase 1, and the body XML
+      # tags also trip 941100/941130 in phase 2. Verified that chained
+      # SecRule + ctl:ruleRemoveBy* does not propagate reliably from a
+      # phase-1 chain in this nginx-ingress + ModSecurity 3.0.14 build,
+      # so this restores the pre-plugin id:1001 behavior under a new id
+      # for the /remote.php/dav/ surface only. The plugin still applies
+      # for other OwnCloud paths (Sharing, OCS, file uploads, etc.).
+      SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
+        "id:1011,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
