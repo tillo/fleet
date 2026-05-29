@@ -51,11 +51,15 @@ metadata:
       # Content-Type header) fires on OwnCloud PROPFIND, which sends a
       # small XML body without setting Content-Type. The Nextcloud
       # plugin carves these rules out for REPORT method only. Mirror
-      # that scope for PROPFIND on the WebDAV roots.
+      # that scope for PROPFIND on the WebDAV roots. ctl:ruleRemoveById
+      # does not propagate reliably from a phase-1 SecRule in this
+      # nginx-ingress build, so use ruleRemoveByTag=OWASP_CRS scoped to
+      # PROPFIND + WebDAV roots (strictly narrower than the old blanket
+      # id:1001 which covered every method on the same path prefix).
       SecRule REQUEST_METHOD "@streq PROPFIND" \
         "id:1011,phase:1,pass,nolog,chain"
         SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
-          "ctl:ruleRemoveById=920340,ctl:ruleRemoveById=920341"
+          "ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
