@@ -45,7 +45,7 @@ spec:
       labels:
         severity: warning
         team: mdapi
-        component: General
+        component: Platform
       annotations:
         summary: "Batch job {{ $labels.job }} hasn't pushed metrics in {{ $value | humanizeDuration }}"
         description: |
@@ -70,7 +70,7 @@ spec:
       labels:
         severity: warning
         team: mdapi
-        component: General
+        component: Platform
       annotations:
         summary: "Batch job {{ $labels.job }} reported a failed last run"
         description: "The script's `*_last_run_success` gauge is 0. Check its logs in Windmill."
@@ -174,7 +174,7 @@ spec:
       for: 30m
       labels:
         severity: warning
-        component: General
+        component: Platform
         team: mdapi
       annotations:
         summary: "Rackspace Spot p50 projection ${{ $value | printf \"%.0f\" }}/mo exceeds $100"
@@ -357,7 +357,7 @@ spec:
       expr: cluster_unknown_nodes_deleted_this_run > 0
       labels:
         severity: warning
-        component: General
+        component: Platform
         team: mdapi
       annotations:
         summary: "Auto-deleted {{ $value }} Unknown-state node(s)"
@@ -458,7 +458,7 @@ spec:
       for: 0m
       labels:
         severity: warning
-        component: General
+        component: Platform
         subsystem: waf
         team: mdapi
       annotations:
@@ -478,7 +478,7 @@ spec:
       for: 0m
       labels:
         severity: info
-        component: General
+        component: Platform
         subsystem: waf
         team: mdapi
       annotations:
@@ -496,7 +496,7 @@ spec:
       for: 30m
       labels:
         severity: warning
-        component: General
+        component: Platform
         subsystem: waf
         team: mdapi
       annotations:
@@ -515,7 +515,7 @@ spec:
       for: 30m
       labels:
         severity: info
-        component: General
+        component: Platform
         team: mdapi
       annotations:
         summary: "{{ $labels.component }} upgrade available"
@@ -528,7 +528,7 @@ spec:
       for: 30m
       labels:
         severity: info
-        component: General
+        component: Platform
         team: mdapi
       annotations:
         summary: "{{ $labels.host }} ({{ $labels.kind }}) has updates available"
@@ -543,7 +543,7 @@ spec:
       expr: longhorn_label_enforcer_pvcs_patched > 0
       labels:
         severity: info
-        component: General
+        component: Backups
         team: mdapi
       annotations:
         summary: "Longhorn label enforcer patched {{ $value }} PVC(s)"
@@ -553,7 +553,7 @@ spec:
       for: 10m
       labels:
         severity: warning
-        component: General
+        component: Backups
         team: mdapi
       annotations:
         summary: "Longhorn label enforcer had {{ $value }} error(s)"
@@ -566,7 +566,7 @@ spec:
       for: 30m
       labels:
         severity: warning
-        component: General
+        component: Platform
         team: mdapi
       annotations:
         summary: "{{ $value }} Fleet BundleDeployment(s) not Ready"
@@ -621,3 +621,83 @@ spec:
       annotations:
         summary: "{{ $labels.node }}:{{ $labels.mount }} is {{ $value }}% full"
         description: "Node filesystem usage > 80%. Investigate growth source."
+
+  - name: app-batch-jobs.chassis-health
+    ## Gauges pushed by f/infra_health/chassis_health every 15 min. Reads
+    ## ipmitool chassis status + sel info + sdr elist over SSH on the 5
+    ## bare-metal hosts (qui/quo/qua HPE + salt/pepper IBM TrueNAS).
+    ##
+    ## Component=Platform on purpose: per the statuspage adapter map, the
+    ## Platform component now explicitly covers physical server hardware
+    ## (chassis health, IPMI sensors). See memory:
+    ## ipmi_sel_clearing_bmc_reset_operational_pattern_2026_05_28.
+    rules:
+    - alert: ChassisFault
+      expr: chassis_fault == 1
+      for: 10m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "chassis fault asserted on {{ $labels.host }} ({{ $labels.type }})"
+        description: |
+          ipmitool chassis status reports {{ $labels.type }} fault asserted on
+          {{ $labels.host }}. Investigate immediately — drive/cooling/power
+          faults are real hardware events. Note: HPE qui/quo/qua Sys. Health
+          LED is permanently amber from non-HP-authenticated drive; that
+          cosmetic state does NOT trigger this alert.
+    - alert: ChassisSelNearFull
+      expr: chassis_sel_pct >= 80
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.host }} IPMI SEL is {{ $value }}% full"
+        description: |
+          The IPMI System Event Log on {{ $labels.host }} is filling up. On
+          IBM IMM-class boards (salt/pepper), the SEL is capped at 512
+          entries and stops accepting new events at 100% — masking future
+          hardware faults. Clear with sudo ipmitool sel clear.
+    - alert: ChassisSdrAnomaly
+      expr: chassis_sdr_not_ok > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.host }} has {{ $value }} non-OK SDR sensor(s)"
+        description: |
+          ipmitool sdr elist reports at least one sensor whose state is not
+          "ok" or "ns/Disabled" on {{ $labels.host }}. Run `sudo ipmitool sdr
+          elist | grep -Ev '\| ok '` on the host to identify the sensor and
+          its current reading.
+    - alert: ChassisHostUnreachable
+      expr: chassis_unreachable == 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "chassis_health cannot reach {{ $labels.host }}"
+        description: |
+          SSH or ipmitool failed for {{ $labels.host }} for over 30m. Could be
+          host down, BMC wedged, SSH key drift, or sudo permission change.
+          Cross-check with node Ready and blackbox probes before assuming
+          hardware fault.
+    - alert: ChassisHealthStale
+      expr: time() - chassis_health_last_run_timestamp_seconds > 3600
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "f/infra_health/chassis_health has not run in over an hour"
+        description: |
+          The Windmill chassis_health job (every 15m) has not pushed metrics
+          for more than an hour. Check Windmill schedule and worker pods.
