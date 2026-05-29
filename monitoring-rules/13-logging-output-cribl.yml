@@ -23,9 +23,18 @@ spec:
       type: memory
       flush_mode: interval
       flush_interval: 10s
+      ## flush_thread_count: parallelize HTTP POSTs to Cribl so chunk
+      ## drain rate keeps up with the new combined volume
+      ## (root pod logs + rke2-journald-aggregator + kube-audit forward).
+      flush_thread_count: 4
       retry_type: exponential_backoff
       retry_max_times: 5
       retry_max_interval: 30s
-      chunk_limit_size: 1m
-      total_limit_size: 32m
+      chunk_limit_size: 2m
+      ## Buffer raised 32m → 512m: chart 108.x migration added rke2
+      ## journald + kube-audit sources, the previous 32 MiB filled in
+      ## seconds, fluentd hit BufferOverflowError and started dropping
+      ## chunks. fluentd's parent memory limit is 2 GiB so 512 MiB of
+      ## in-memory output buffer is comfortable.
+      total_limit_size: 512m
       overflow_action: drop_oldest_chunk
