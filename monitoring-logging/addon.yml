@@ -1,0 +1,131 @@
+## Harvester Addon CR for rancher-logging.
+##
+## Owned by Fleet so the customizations in `valuesContent` survive Harvester
+## upgrades (which otherwise re-seed this CR with stock defaults).
+##
+## When upgrading Harvester to a new minor (e.g. 1.8 → 1.9):
+##   1. Read the new defaults from the Harvester installer
+##      (harvester/deploy/charts/harvester/templates/addon-rancher-logging.yaml
+##       or `kubectl get addon … -o yaml` on a freshly-installed cluster of
+##       the target version)
+##   2. Bump `spec.version` to the chart version Harvester ships
+##   3. Bump the eventTailer image tag (rancher/harvester-eventrouter:vX.Y.Z)
+##      to match the Harvester minor
+##   4. Merge in any new top-level keys Harvester added under valuesContent
+##      (do NOT lose our fluentbit/fluentd resources or bufferStorageVolume)
+##   5. Commit + push; Fleet reconciles; addon-controller does helm upgrade
+##
+## Diff against Harvester 1.8.0 stock defaults — KEEP THESE INTACT:
+##   * fluentbit.resources                 (bumped from 200m/200Mi limits)
+##   * fluentd.resources                   (bumped from 1000m/800Mi limits)
+##   * fluentd.disablePvc: false           (was true → log loss on restart)
+##   * fluentd.bufferStorageVolume         (10 Gi Longhorn PVC for buffer)
+##   * disablePspGeneration: true          (cluster has no PSP)
+##   * crds.enabled: false                 (rancher-logging-crd handles them)
+
+apiVersion: harvesterhci.io/v1beta1
+kind: Addon
+metadata:
+  name: rancher-logging
+  namespace: cattle-logging-system
+spec:
+  enabled: true
+  repo: http://harvester-cluster-repo.cattle-system.svc/charts
+  chart: rancher-logging
+  version: "108.0.2+up4.10.0-rancher.18"
+  valuesContent: |
+    ## ── Harvester defaults (kept verbatim) ───────────────────────────────
+
+    systemdLogPath: /var/log/journal
+
+    additionalLoggingSources:
+      rke2:
+        enabled: true
+      kubeAudit:
+        enabled: true
+        auditFilename: "audit.log"
+        pathPrefix: "/var/lib/rancher/rke2/server/logs/"
+        loggingRef: "harvester-kube-audit-log-ref"
+        fluentbit:
+          logTag: kube-audit
+          tolerations:
+            - key: node-role.kubernetes.io/controlplane
+              value: "true"
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/etcd
+              value: "true"
+              effect: NoExecute
+
+    eventTailer:
+      name: harvester-default
+      namespace: cattle-logging-system
+      controlNamespace: cattle-logging-system
+      workloadOverrides:
+        containers:
+          - image: rancher/harvester-eventrouter:v1.8.0
+            name: event-tailer
+            resources:
+              limits:
+                cpu: 100m
+                memory: 100Mi
+              requests:
+                cpu: 20m
+                memory: 20Mi
+
+    ## ── Our overrides on top of the defaults ──────────────────────────────
+
+    ## Don't reinstall CRDs (rancher-logging-crd chart already manages them).
+    crds:
+      enabled: false
+
+    ## Cluster has no PodSecurityPolicy.
+    disablePspGeneration: true
+
+    ## Operator pod (the logging-operator controller).
+    ## 256Mi OOMKilled during initial CRD cache sync on first install (exit 137,
+    ## CrashLoopBackOff); 512Mi is the smallest safe ceiling we've found.
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+
+    ## fluent-bit (DaemonSet — one per node).
+    ## Harvester ships 200m / 200Mi limits; observed steady-state memory was
+    ## 55–68 MiB across 3 nodes already, leaving almost no headroom for log
+    ## bursts (ingress-nginx tracebacks, crash-looping containers). New limit
+    ## gives ~4× the observed peak.
+    fluentbit:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 300m
+          memory: 256Mi
+
+    ## fluentd (StatefulSet — single aggregator).
+    ## Harvester ships 1000m / 800Mi limits; observed steady-state was 272 MiB.
+    ## 800Mi is workable but the disablePvc:true default uses emptyDir for the
+    ## buffer, which means a fluentd restart (image update, node drain, OOM)
+    ## drops in-flight events. Switching to a 10 Gi Longhorn PVC buys hours of
+    ## downstream (Cribl / am-relay / OpenObserve) unreachability tolerance.
+    fluentd:
+      resources:
+        requests:
+          cpu: 200m
+          memory: 384Mi
+        limits:
+          cpu: 1500m
+          memory: 768Mi
+      disablePvc: false
+      bufferStorageVolume:
+        pvc:
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 10Gi
+            storageClassName: harvester-longhorn-2replicas
