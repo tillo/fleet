@@ -47,6 +47,15 @@ metadata:
       # endpoint with no Nextcloud equivalent, so no plugin coverage).
       SecRule REQUEST_URI "@beginsWith /graph/" \
         "id:1009,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      # 920340/920341 (Request Containing Content, but Missing
+      # Content-Type header) fires on OwnCloud PROPFIND, which sends a
+      # small XML body without setting Content-Type. The Nextcloud
+      # plugin carves these rules out for REPORT method only. Mirror
+      # that scope for PROPFIND on the WebDAV roots.
+      SecRule REQUEST_METHOD "@streq PROPFIND" \
+        "id:1011,phase:1,pass,nolog,chain"
+        SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
+          "ctl:ruleRemoveById=920340,ctl:ruleRemoveById=920341"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
     nginx.ingress.kubernetes.io/server-snippet: |
       location = /.well-known/caldav  { return 301 https://cloud.mdapi.ch/remote.php/dav/; }
