@@ -37,10 +37,14 @@ fluentbit:
 ## Previous defaults (500m / 100Mi req, 1000m / 400Mi limit) had actual
 ## steady-state at 272 MiB — already at 68% of the limit. A burst would OOM
 ## and drop the in-memory buffer.
-## bufferStorageVolume: persistent disk buffer so a fluentd restart (image
-## update, node drain, OOM) doesn't lose whatever was in flight. 10 Gi on
-## the standard 2-replica Longhorn class is sized for several hours of
-## downstream (Cribl / am-relay / OpenObserve) unreachability.
+##
+## bufferStorageVolume / disablePvc are deliberately NOT set: rancher-logging
+## chart 107.x hardcodes disablePvc: true in its Logging-CR template and
+## ignores `fluentd.disablePvc: false` from values, but it DOES pass
+## `bufferStorageVolume` through. The two end up contradictory and the
+## operator produces an invalid StatefulSet (volume mount references a PVC
+## the operator was told not to create). Wait for the chart-108.x migration
+## via the Harvester addon path for a persistent buffer PVC.
 fluentd:
   resources:
     requests:
@@ -49,13 +53,3 @@ fluentd:
     limits:
       cpu: 1500m
       memory: 768Mi
-  disablePvc: false
-  bufferStorageVolume:
-    pvc:
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 10Gi
-        storageClassName: harvester-longhorn-2replicas
