@@ -15,7 +15,15 @@
 ## can't return. VACUUM (regular, not FULL) marks dead pages reusable
 ## without rewriting the file or locking it long.
 ##
-## Schedule: Sundays 03:30 Europe/Zurich. Cheap, low-traffic window.
+## Schedule: Sundays 02:30 UTC ≈ 03:30 CET / 04:30 CEST. Still in the cheap,
+## low-traffic window either side of DST. Originally set with
+## `timeZone: Europe/Zurich` (CronJob.spec.timeZone, k8s 1.27+) but
+## kube-state-metrics ships without tzdata in its container image and
+## panics with `unknown time zone Europe/Zurich` when it tries to render
+## the cron schedule metric — taking the whole kube_state_metrics scraper
+## down and silently breaking every kube_* alert. Set the schedule in
+## UTC to sidestep the issue. (Upstream tracking: a tzdata-loaded
+## kube-state-metrics image would let us go back to spec.timeZone.)
 ##
 ## Safety: DELETE is bounded to created_time < now - 30d. Joplin clients
 ## sync incrementally by `cursor`; events older than 30 days are well
@@ -27,8 +35,7 @@ metadata:
   name: postgres-events-cleanup
   namespace: joplin
 spec:
-  schedule: "30 3 * * 0"
-  timeZone: Europe/Zurich
+  schedule: "30 2 * * 0"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
