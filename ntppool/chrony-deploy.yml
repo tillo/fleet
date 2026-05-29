@@ -8,6 +8,9 @@ metadata:
     keel.sh/match-tag: "true"
     keel.sh/trigger: poll
     keel.sh/pollSchedule: "@every 4h"
+    # Roll the pod when the NTS-KE TLS Secret (mirror-mdapi-ch-tls) changes,
+    # so cert-manager's 60-day rotation propagates without a manual restart.
+    reloader.stakater.com/auto: "true"
 spec:
   # Recreate so the old pod releases /dev/ttyUSB0 before the new one
   # tries to claim it (GPS USB serial, single-writer).
@@ -36,13 +39,20 @@ spec:
         - name: ntp
           containerPort: 123
           protocol: UDP
+        - name: nts-ke
+          containerPort: 4460
+          protocol: TCP
         env:
         - name: TZ
           value: Europe/Zurich
         - name: NTP_SERVERS
           value: "81.94.123.16,81.94.123.17,194.242.34.149,193.5.68.2,192.33.96.101,192.33.96.102,84.16.73.33,84.16.67.12,193.134.29.11,193.134.29.12"
+        # NTS-KE server directives: cert + key paths point into the Secret
+        # volume mounted below; ntsport 4460 is the IANA-assigned default;
+        # ntsdumpdir persists the server-cookie keys across pod restarts so
+        # existing client cookies remain valid after a roll.
         - name: NTP_DIRECTIVES
-          value: "rtcsync\nclientloglimit 100000000\nleapsectz right/UTC"
+          value: "rtcsync\nclientloglimit 100000000\nleapsectz right/UTC\nntsserverkey /etc/chrony/tls/tls.key\nntsservercert /etc/chrony/tls/tls.crt\nntsport 4460\nntsdumpdir /var/lib/chrony"
         - name: NOCLIENTLOG
           value: "false"
         # GPS temporarily disabled: the FT232R USB-serial adapter on qui is
@@ -71,5 +81,17 @@ spec:
           periodSeconds: 20
           timeoutSeconds: 5
           failureThreshold: 3
+        volumeMounts:
+        - name: nts-tls
+          mountPath: /etc/chrony/tls
+          readOnly: true
+      volumes:
+      - name: nts-tls
+        secret:
+          secretName: mirror-mdapi-ch-tls
+          # tls.crt + tls.key are world-readable; chronyd drops to user
+          # `chrony` before reading them. Tightening to mode 0440 with
+          # fsGroup=chrony would require a SecurityContext change to a
+          # privileged pod, which is unnecessary inside the namespace.
       imagePullSecrets:
       - name: mdapi-registry
