@@ -1,21 +1,14 @@
-## monitoring-logging — Harvester-managed install of rancher-logging.
-##
-## This bundle no longer installs the Helm chart itself. Instead it owns the
-## Harvester Addon CR (cattle-logging-system/rancher-logging) and the
-## harvester-addon-controller installs the chart on top, using whatever
-## valuesContent the Addon CR carries.
-##
-## Why: the chart is "rancher-logging" managed by Harvester's addon system
-## (visible in the Harvester UI Logging tab). Two parallel installs (Fleet
-## helm + Harvester addon) of the same release name fight; this bundle keeps
-## Fleet authoritative for the Addon CR (so our customizations survive
-## Harvester upgrades that would otherwise reset valuesContent), and lets
-## the addon-controller drive the actual chart upgrade per Harvester version.
-##
-## ClusterFlow / ClusterOutput / Flow / Output CRs are kept in the separate
-## `monitoring-rules` bundle (they're upgrade-independent of the chart).
-
 defaultNamespace: cattle-logging-system
 namespaceLabels:
   cd.mdapi.ch: fleet
   cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  releaseName: rancher-logging
+  repo: https://charts.rancher.io
+  chart: rancher-logging
+  ## Match the rancher-logging-crd already installed (107.0.1+up4.10.0-rancher.10).
+  ## App version 4.10.0; rancher iteration .13 is the closest available app chart.
+  version: "107.0.1+up4.10.0-rancher.13"
+  valuesFiles:
+    - values.yml
