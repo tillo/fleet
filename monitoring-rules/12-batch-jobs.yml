@@ -622,6 +622,71 @@ spec:
         summary: "{{ $labels.node }}:{{ $labels.mount }} is {{ $value }}% full"
         description: "Node filesystem usage > 80%. Investigate growth source."
 
+  - name: app-batch-jobs.schedule-integrity
+    ## Gauges pushed by f/infra_health/schedule_integrity_check every hour
+    ## (cron 0 42 * * * * Europe/Zurich). The script holds an embedded
+    ## REQUIRED_SCHEDULES manifest; drift surfaces as schedule_integrity_*
+    ## gauges per offending schedule path.
+    ##
+    ## Built after the 2026-05-29 incident where `wmill sync push`
+    ## archived gitlab_ci_failure_groupby_schedule + waf_novelty_audit_schedule
+    ## silently — only discovered ~30h later via stale-data alerts firing on
+    ## the upstream metrics. See memory:
+    ## feedback-wmill-sync-push-deletes-orphans.
+    ##
+    ## Staleness of THIS check itself is already covered by the generic
+    ## BatchJobStale rule above (job=schedule_integrity_check joins with
+    ## windmill_schedule_interval_seconds).
+    rules:
+    - alert: WindmillRequiredScheduleMissing
+      expr: schedule_integrity_missing > 0
+      for: 10m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill required schedule {{ $labels.path }} is missing"
+        description: |
+          The schedule_integrity_check (f/infra_health/schedule_integrity_check)
+          asserts {{ $labels.path }} is required. It is absent from the
+          Windmill workspace — the classic `wmill sync push` orphan-archive
+          pattern.
+
+          Restore via Windmill UI or `mcp__windmill__createSchedule` using the
+          definition embedded in the script's REQUIRED_SCHEDULES list. Also
+          ensure `.schedule.yaml` exists locally under ~/windmill/ so the
+          next sync push does not re-orphan it.
+
+    - alert: WindmillRequiredScheduleDisabled
+      expr: schedule_integrity_disabled > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill required schedule {{ $labels.path }} is disabled"
+        description: |
+          The schedule exists but enabled=false. Either intentionally paused
+          (in which case remove from REQUIRED_SCHEDULES) or accidentally
+          toggled off in the UI.
+
+    - alert: WindmillRequiredScheduleDrifted
+      expr: schedule_integrity_drifted > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill required schedule {{ $labels.path }} drifted: {{ $labels.reason }}"
+        description: |
+          The schedule exists and is enabled, but its script_path / cron /
+          timezone no longer matches the embedded manifest. Either the
+          manifest is stale (intentional change — update REQUIRED_SCHEDULES
+          and redeploy) or someone edited the wrong field via the UI.
+
   - name: app-batch-jobs.chassis-health
     ## Gauges pushed by f/infra_health/chassis_health every 15 min. Reads
     ## ipmitool chassis status + sel info + sdr elist over SSH on the 5
