@@ -30,6 +30,12 @@ metadata:
       SecRule REQUEST_URI "@beginsWith /mcp" \
         "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # 921110 binds REQUEST_LINE (phase 1) plus REQUEST_BODY (phase 2) and the
+      # phase-1 ctl above does not catch it reliably. Probe verified 2026-05-31:
+      # SQLi + RCE patterns pass through to 401, the 921110 trigger phrase still
+      # 403d until removed by ID here. This ingress only serves /mcp so the
+      # unconditional removal is in scope.
+      SecRuleRemoveById 921110
     # SSE requires disabling proxy buffering
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
