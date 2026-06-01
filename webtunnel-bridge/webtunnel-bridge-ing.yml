@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webtunnel-bridge
+  namespace: webtunnel-bridge
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+# Intentionally no `tls:` section — flame's Ingress (flame ns) owns TLS for
+# mdapi.ch, and nginx-ingress merges per-host path rules across Ingresses.
+# Requests on https://mdapi.ch/api/v1/proxy/* hit our sidecar; everything
+# else falls through to flame.
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: webtunnel-bridge
+                port:
+                  number: 8443
+            path: /api/v1/proxy
+            pathType: Prefix
