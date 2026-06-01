@@ -25,6 +25,16 @@ metadata:
       SecAuditLogFormat JSON
       SecAuditLog /dev/stdout
       SecDebugLog /tmp/modsec_debug.log
+      # ESPHome dashboard write/WebSocket endpoints accept arbitrary YAML config,
+      # firmware binaries, and assorted JSON over text/html Content-Type. CRS
+      # 920420 (disallowed content type) trips on every POST. Endpoints below
+      # are the Handler-class-backed write paths from upstream web_server.py
+      # make_app(). The dashboard sits behind oauth2-proxy admin auth (see
+      # auth-url annotation above), so auth is the protection layer here.
+      # First trigger: 920420 on POST /wizard and POST /edit?configuration=
+      # secrets.yaml from internal users 2026-06-01.
+      SecRule REQUEST_URI "@rx ^/(wizard|edit|upload|compile|run|validate|delete|undo-delete|archive|unarchive|rename|import|ignore-device|update-all|clean|clean-all|clean-mqtt|vscode|ace|secret_keys|logs|events)(\?|/|$)" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
 spec:
   ingressClassName: nginx
