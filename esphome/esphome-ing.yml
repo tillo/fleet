@@ -36,6 +36,15 @@ metadata:
       SecRule REQUEST_URI "@rx ^/(wizard|edit|upload|compile|run|validate|delete|undo-delete|archive|unarchive|rename|import|ignore-device|update-all|clean|clean-all|clean-mqtt|vscode|ace|secret_keys|logs|events)(\?|/|$)" \
         "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # 920420 and 920430 are both phase 1, binding REQUEST_HEADERS:Content-Type
+      # and REQUEST_PROTOCOL respectively. The phase-1 ctl above does not catch
+      # them (probe verified 2026-06-01: text/html POST /wizard still 403d by
+      # 920420 with the ctl in place). Same gotcha pattern as 921110 on
+      # notes-mcp - phase-1 rules that bind early-populated variables need
+      # config-load-time removal via SecRuleRemoveById. This ingress only
+      # serves the esphome dashboard (internal-admin behind oauth2-proxy) so
+      # the unconditional removal is in scope.
+      SecRuleRemoveById 920420 920430
 spec:
   ingressClassName: nginx
   rules:
