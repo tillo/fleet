@@ -21,14 +21,6 @@ spec:
     spec:
       securityContext:
         fsGroup: 1000
-      # The agent explicitly dials tcp6 for api.ntppool.dev/monitor/api/registration
-      # (no Happy Eyeballs fallback), and the cluster pod network is IPv4-only,
-      # so AAAA lookups produce ENETUNREACH. Pinning to the current Fastly v4
-      # /etc/hosts entry sidesteps this. Refresh if Fastly rotates the IP.
-      hostAliases:
-      - ip: "146.75.53.55"
-        hostnames:
-        - "api.ntppool.dev"
       containers:
       - name: ntppool-agent
         image: registry.mdapi.ch/mdapi/ntppool-agent:latest
@@ -52,7 +44,9 @@ spec:
               sleep 60
             done
             echo "[wrapper] state present, starting monitor"
-            exec /usr/local/bin/ntppool-agent --env prod monitor
+            # --no-ipv6 because the pod network is IPv4-only; the agent
+            # explicitly dials tcp6 without fallback when this flag is unset.
+            exec /usr/local/bin/ntppool-agent --env prod --no-ipv6 monitor
         env:
         - name: TZ
           value: Europe/Zurich
