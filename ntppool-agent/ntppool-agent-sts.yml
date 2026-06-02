@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ntppool-agent
+  namespace: ntppool-agent
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  serviceName: ntppool-agent
+  selector:
+    matchLabels:
+      app: ntppool-agent
+  template:
+    metadata:
+      labels:
+        app: ntppool-agent
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: ntppool-agent
+        image: registry.mdapi.ch/mdapi/ntppool-agent:latest
+        # The agent has no creds on first deploy until `setup` has been
+        # run once (interactively, via kubectl exec — see below). This
+        # wrapper keeps the pod alive idling until state appears, then
+        # exec's into the monitor loop. Once state is in the PVC, the
+        # restart path goes straight to monitor.
+        #
+        # First-time setup (one-off):
+        #   kubectl -n ntppool-agent exec -it ntppool-agent-0 -- \
+        #     /usr/local/bin/ntppool-agent --env prod setup
+        # Follow the printed URL to claim the agent at manage.ntppool.org.
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            while [ -z "$(ls -A "$MONITOR_STATE_DIR" 2>/dev/null)" ]; do
+              echo "[wrapper] $MONITOR_STATE_DIR is empty — awaiting one-off setup."
+              echo "[wrapper] run: kubectl -n ntppool-agent exec -it ntppool-agent-0 -- /usr/local/bin/ntppool-agent --env prod setup"
+              sleep 60
+            done
+            echo "[wrapper] state present, starting monitor"
+            exec /usr/local/bin/ntppool-agent --env prod monitor
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: MONITOR_STATE_DIR
+          value: /var/lib/ntppool-agent
+        volumeMounts:
+        - name: state
+          mountPath: /var/lib/ntppool-agent
+        resources:
+          requests:
+            memory: 32Mi
+            cpu: 20m
+          limits:
+            memory: 256Mi
+            cpu: 500m
+      imagePullSecrets:
+      - name: mdapi-registry
+  volumeClaimTemplates:
+  - metadata:
+      name: state
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources:
+        requests:
+          storage: 1Gi
