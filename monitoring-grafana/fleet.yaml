@@ -1,0 +1,20 @@
+defaultNamespace: monitoring
+namespace: monitoring
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+# Drift sources: Keel auto-bumps the image tag (keel.sh/policy: minor); VPA may
+# rewrite resources at runtime. Strip both so Fleet stops flagging Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: grafana
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}

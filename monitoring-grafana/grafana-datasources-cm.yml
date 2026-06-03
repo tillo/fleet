@@ -1,0 +1,38 @@
+## Grafana datasource provisioning.
+## - HA-Postgres: read-only role grafana_ro on ha-recorder-pg; used for HA
+##   energy/battery long-term analysis from the recorder `statistics` table.
+## - Prometheus (transitional): the Rancher-bundled kube-prometheus in
+##   cattle-monitoring-system. Phase 3 switches this to VictoriaMetrics.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: HA-Postgres
+        uid: ha-postgres
+        type: postgres
+        access: proxy
+        url: ha-recorder-pg-rw.home-assistant.svc.cluster.local:5432
+        user: grafana_ro
+        database: homeassistant
+        editable: false
+        secureJsonData:
+          password: "$HA_PG_RO_PASSWORD"
+        jsonData:
+          sslmode: disable
+          postgresVersion: 1600
+          timescaledb: false
+      - name: Prometheus
+        uid: prometheus-rancher
+        type: prometheus
+        access: proxy
+        url: http://rancher-monitoring-prometheus.cattle-monitoring-system.svc.cluster.local:9090
+        editable: false
+        isDefault: true
+        jsonData:
+          httpMethod: POST
+          timeInterval: 30s
