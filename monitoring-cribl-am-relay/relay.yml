@@ -155,6 +155,14 @@ data:
         }
         return m.get(ns or "", "General")
 
+    ## Pods whose logs are routed through am-relay for other reasons
+    ## (ingress-nginx for ModSec, etc.) but proxy arbitrary user content
+    ## in their HTTP bodies. Skip pod_io_error detection for them — they
+    ## don't own PVCs, and a POST body containing "stale file handle" or
+    ## "Permission denied" is not a real I/O error. 2026-06-03: false
+    ## positive on rke2-ingress-nginx triggered by a webhook payload.
+    POD_IO_EXCLUDE_PODS = re.compile(r"^rke2-ingress-nginx-controller-")
+
     def detect_pod_io(ev):
         line = (ev.get("log") or ev.get("message") or "").strip()
         if not line or not POD_IO_RE.search(line):
@@ -163,6 +171,8 @@ data:
         ns  = k.get("namespace_name") or "?"
         pod = k.get("pod_name") or "?"
         cnt = k.get("container_name") or "?"
+        if POD_IO_EXCLUDE_PODS.match(pod):
+            return None
         return {
             "labels": {
                 "alertname": "PodIOError",
