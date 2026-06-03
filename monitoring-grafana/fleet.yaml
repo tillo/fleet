@@ -7,9 +7,11 @@ dependsOn:
   - name: mdapi-prod-cert-manager
 helm:
   maxHistory: 25
-# Drift source: VPA may rewrite resources at runtime. Image is on a rolling
-# tag (grafana/grafana:latest, pullPolicy Always) so no Keel watching it, no
-# tag drift. Strip resources from the diff so Fleet stops flagging Modified.
+# Two sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running pods.
+#   2. Keel (`keel.sh/policy: force`) rewrites the image field on its poll
+#      cadence as new digests publish for the rolling tag.
+# Strip both from the diff so Fleet stops flagging Modified.
 diff:
   comparePatches:
   - apiVersion: apps/v1
@@ -18,3 +20,4 @@ diff:
     namespace: monitoring
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}

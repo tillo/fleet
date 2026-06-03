@@ -5,3 +5,17 @@ namespaceLabels:
   cdenv.mdapi.ch: prod
 helm:
   maxHistory: 25
+# Two sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running pods.
+#   2. Keel (`keel.sh/policy: force`) rewrites the image field on its poll
+#      cadence as new digests publish for the rolling tag.
+# Strip both from the diff so Fleet stops flagging Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nut-server
+    namespace: ups
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
