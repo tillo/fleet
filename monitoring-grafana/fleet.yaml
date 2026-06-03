@@ -7,8 +7,9 @@ dependsOn:
   - name: mdapi-prod-cert-manager
 helm:
   maxHistory: 25
-# Drift sources: Keel auto-bumps the image tag (keel.sh/policy: minor); VPA may
-# rewrite resources at runtime. Strip both so Fleet stops flagging Modified.
+# Drift source: VPA may rewrite resources at runtime. Image is on a rolling
+# tag (grafana/grafana:latest, pullPolicy Always) so no Keel watching it, no
+# tag drift. Strip resources from the diff so Fleet stops flagging Modified.
 diff:
   comparePatches:
   - apiVersion: apps/v1
@@ -17,4 +18,3 @@ diff:
     namespace: monitoring
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
