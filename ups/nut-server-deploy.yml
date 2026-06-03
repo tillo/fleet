@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nut-server
+  labels:
+    app: nut-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nut-server
+  template:
+    metadata:
+      labels:
+        app: nut-server
+    spec:
+      nodeSelector:
+        mdapi.ch/has-ups: "true"
+      containers:
+        - name: nut
+          image: instantlinux/nut-upsd:2.8.2-r0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: SERIAL
+              value: "3C89382208"
+            - name: UPS_NAME
+              value: "hp-rt3000"
+            - name: UPS_DESC
+              value: "HP R/T3000 (3000VA, 2700W, 230V)"
+            - name: API_USER
+              value: "monuser"
+            - name: API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nut-creds
+                  key: mon_password
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nut-creds
+                  key: admin_password
+            - name: SHUTDOWN_TIMER
+              value: "180"
+            - name: NETMASK
+              value: "10.0.0.0/8"
+          ports:
+            - name: nut
+              containerPort: 3493
+              protocol: TCP
+          volumeMounts:
+            - name: dev-bus-usb
+              mountPath: /dev/bus/usb
+          readinessProbe:
+            tcpSocket:
+              port: 3493
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3493
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: dev-bus-usb
+          hostPath:
+            path: /dev/bus/usb
+            type: Directory
