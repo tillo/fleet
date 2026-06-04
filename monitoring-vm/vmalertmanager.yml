@@ -1,8 +1,9 @@
-## Dedicated Alertmanager for vmalert. During Phase 3 it ships with a null
-## route (swallow everything) so we don't duplicate-deliver alerts that the
-## bundled Alertmanager (in cattle-monitoring-system) is still firing.
-## Phase 4 migrates the AlertmanagerConfig CRs from the bundled AM here and
-## flips delivery.
+## Dedicated Alertmanager for vmalert. Phase 4: pulls its routes/receivers
+## from VMAlertmanagerConfig CRs labeled `monitoring-stack: mdapi`
+## (currently `monitoring/mdapi-team`, see fleet/monitoring-vmalertmanager-
+## config/). The inline `configRawYaml` is kept as a minimal scaffold that
+## the operator merges the selected CRs into — `global.resolve_timeout`
+## sticks because it's not surfaced via VMAlertmanagerConfig.
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMAlertmanager
 metadata:
@@ -26,13 +27,11 @@ spec:
       memory: 64Mi
     limits:
       memory: 256Mi
-  ## Inline placeholder config — null receiver swallows all alerts. Phase 4
-  ## migrates the real routes/receivers (currently in
-  ## fleet/monitoring-alertmanager-config/) into VMAlertmanagerConfig CRs.
+  selectAllByDefault: false
+  configSelector:
+    matchLabels:
+      monitoring-stack: mdapi
+  configNamespaceSelector: {}
   configRawYaml: |
     global:
       resolve_timeout: 5m
-    route:
-      receiver: 'null'
-    receivers:
-      - name: 'null'

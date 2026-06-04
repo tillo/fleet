@@ -1,22 +1,40 @@
 # monitoring-alertmanager-config
 
-Wires the existing rancher-monitoring Alertmanager to my receivers
-(statuspage adapter + Pushover) for alerts labelled `team=mdapi`.
+Post-Phase-4 this bundle is the minimal glue that still wires the
+bundled `rancher-monitoring-alertmanager` to *one* external endpoint:
+healthchecks.io for the `Watchdog` dead-man's switch.
 
-## How the routing composes
+The team=mdapi routing previously here moved to
+`fleet/monitoring-vmalertmanager-config/` (VMAlertmanagerConfig consumed
+by `vmalertmanager-mdapi`).
 
-The Prometheus Operator merges all `AlertmanagerConfig` CRDs into one
-Alertmanager config alongside the rancher-monitoring chart's hardcoded
-default config (a single Pushover receiver named `default`).
+## What still lives here
 
-For our routes to match alerts from any namespace (mail, joplin, …), the
-Alertmanager CR's `alertmanagerConfigMatcherStrategy` MUST be `None`. The
-default is `OnNamespace`, which would prepend `namespace=monitoring` to
-every route from this AC and exclude all real workload alerts.
+- **`watchdog-deadman` AlertmanagerConfig** — routes the always-firing
+  `Watchdog` alert from bundled Prom to a healthchecks.io HEAD ping.
+  Watchdog is a kube-prometheus-stack vendor rule (no `mdapi` label) so
+  it's evaluated by bundled Prometheus, not by vmalert. Keeping it here
+  means the dead-man path is wholly independent of the VM stack — if
+  vmalert / vmalertmanager are themselves dead, healthchecks.io still
+  catches it.
 
-Strategy was patched to `None` by hand on 2026-05-10. Rancher chart
-upgrades may revert it; if alerts mysteriously stop reaching statuspage
-after a Rancher upgrade, re-apply:
+- **`healthchecks-watchdog` ExternalSecret** — supplies the
+  `https://hc-ping.com/<uuid>` URL for the above (key
+  `/mdapi/pushover/healthchecks-watchdog-url` in akeyless).
+
+- **`pushover` ExternalSecret** — the shared Pushover user-key + token,
+  consumed by `vmalertmanager-mdapi`'s VMAlertmanagerConfig in the
+  sibling bundle. Left in this bundle for now because moving an ES
+  across bundles deletes the underlying Secret and triggers a brief
+  delivery gap; safer to leave it where it is.
+
+## Bundled-AM matcher strategy quirk
+
+`alertmanagerConfigMatcherStrategy=None` must stay on
+`rancher-monitoring-alertmanager`. The default `OnNamespace` would
+prepend `namespace=monitoring` to the `watchdog-deadman` route and
+prevent the Watchdog alert (no `namespace` label) from matching. Patched
+by hand on 2026-05-10; Rancher chart upgrades may revert it:
 
 ```
 kubectl --context mdapi-prod -n cattle-monitoring-system patch \
@@ -24,17 +42,8 @@ kubectl --context mdapi-prod -n cattle-monitoring-system patch \
   -p '{"spec":{"alertmanagerConfigMatcherStrategy":{"type":"None"}}}'
 ```
 
-## What this bundle does NOT replace
-
-The chart-managed default Pushover receiver still exists. We don't touch it
-because it sits inside a Secret owned by the rancher-monitoring helm release.
-For team=mdapi alerts we deliver the same Pushover notification ourselves
-(via this AC's pushoverConfig) so we don't depend on the chart's default —
-this way the rancher receiver can be retired in the future without breaking
-our mdapi alerts.
-
-## Receivers
+## Receivers (this bundle)
 
 | Receiver | Notifies | Purpose |
 |---|---|---|
-| `statuspage-and-pushover` | webhook (statuspage adapter) + Pushover | All team=mdapi alerts |
+| `healthchecks-watchdog` | webhook (hc-ping.com) | `Watchdog` dead-man heartbeat |
