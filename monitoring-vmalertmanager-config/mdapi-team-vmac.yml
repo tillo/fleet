@@ -1,0 +1,89 @@
+## VMAlertmanagerConfig for vmalertmanager-mdapi. After Phase 4 cutover
+## (vmalert ruleSelector narrowed to monitoring-stack=mdapi + vmAM
+## configSelector selecting this CR), the route below is the ONLY path
+## team=mdapi alerts take. Bundled Alertmanager will no longer see them.
+##
+## Format reference: https://docs.victoriametrics.com/operator/api/#vmalertmanagerconfigspec
+## Field names follow Go json tags from the VM operator (snake_case),
+## matching native alertmanager.yaml — not the camelCase used by
+## monitoring.coreos.com/AlertmanagerConfig.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: mdapi-team
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  route:
+    ## Parent route is a no-op black-hole. Anything not matching a child
+    ## route is silently dropped — symmetric with the prior
+    ## AlertmanagerConfig design.
+    receiver: black-hole
+    group_by: [component, alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+    ## team=mdapi alerts get the full statuspage + Pushover treatment.
+    ## InfoInhibitor / Watchdog are exclude-listed defensively — vmalert
+    ## won't evaluate them post-cutover (vendor rules, no mdapi label),
+    ## but if a misconfigured custom rule ever borrows the label, this
+    ## guarantees no surprise pages.
+    - receiver: statuspage-and-pushover
+      matchers:
+      - 'team="mdapi"'
+      - 'alertname!~"InfoInhibitor|Watchdog"'
+
+  inhibit_rules:
+  ## When LonghornVolumeDegraded fires for a given (pvc_namespace, pvc),
+  ## mute the chart-side LonghornVolumeStatusWarning on the same volume.
+  ## Same intent as the prior AC's inhibitRule; kept here so the rule
+  ## travels with the route.
+  - source_matchers:
+    - 'alertname="LonghornVolumeDegraded"'
+    target_matchers:
+    - 'alertname="LonghornVolumeStatusWarning"'
+    equal: [pvc_namespace, pvc]
+
+  receivers:
+  - name: black-hole
+
+  - name: statuspage-and-pushover
+    webhook_configs:
+    - url: http://statuspage-adapter.monitoring.svc.cluster.local:8080/webhook
+      send_resolved: true
+      max_alerts: 0
+    pushover_configs:
+    - user_key:
+        name: pushover
+        key: user-key
+      token:
+        name: pushover
+        key: api-token
+      send_resolved: true
+      priority: |-
+        {{- if eq .CommonLabels.severity "critical" -}}1
+        {{- else -}}0
+        {{- end -}}
+      title: |-
+        [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.component }}: {{ .CommonLabels.alertname }}
+      message: |-
+        {{ range .Alerts -}}
+        {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .Annotations.summary }}
+        {{ end }}
+        {{ if .CommonAnnotations.description -}}
+        ---
+        {{ .CommonAnnotations.description }}
+        {{- end }}
+      ## One-tap from notification to the live time-series view.
+      url: |-
+        {{- $c := .CommonLabels.component -}}
+        {{- if or (eq $c "Internet") (eq $c "Time") (eq $c "VPN") (eq $c "DNS") -}}
+        https://grafana.mdapi.ch/d/bpi-r4-overview
+        {{- else if eq $c "Home" -}}
+        https://grafana.mdapi.ch/d/home-assistant-overview
+        {{- else -}}
+        https://grafana.mdapi.ch
+        {{- end -}}
+      url_title: 📊 Open Grafana
