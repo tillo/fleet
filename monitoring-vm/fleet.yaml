@@ -1,0 +1,32 @@
+defaultNamespace: monitoring
+namespace: monitoring
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  takeOwnership: true
+  releaseName: vm-operator
+  repo: https://victoriametrics.github.io/helm-charts/
+  chart: victoria-metrics-operator
+  version: "0.63.1"
+  valuesFiles:
+    - values.yml
+# VMSingle / VMAgent reconciliation injects pod resources at runtime that
+# Fleet would otherwise flag as drift. Image tags too — those follow the
+# operator's app version (no separate Keel here, the operator handles
+# component upgrades when the chart bumps).
+diff:
+  comparePatches:
+  - apiVersion: operator.victoriametrics.com/v1beta1
+    kind: VMSingle
+    name: mdapi
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/resources"}
+  - apiVersion: operator.victoriametrics.com/v1beta1
+    kind: VMAgent
+    name: mdapi
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/resources"}

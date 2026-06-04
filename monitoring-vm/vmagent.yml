@@ -1,0 +1,38 @@
+## VMAgent scrapes everything the bundled Rancher Prometheus scrapes today.
+## Phase 3 will narrow this to label `monitoring-stack: mdapi` so the
+## Rancher Prometheus reverts to vendor-default scope (no double scrape).
+## remoteWrite points at the vmsingle Service above.
+##
+## scrapeInterval 30s matches kube-prometheus-stack default.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAgent
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  scrapeInterval: 30s
+
+  ## Empty selectors = scrape everything cluster-wide. Phase 3 will tighten.
+  serviceScrapeNamespaceSelector: {}
+  serviceScrapeSelector: {}
+  podScrapeNamespaceSelector: {}
+  podScrapeSelector: {}
+  probeNamespaceSelector: {}
+  probeSelector: {}
+  staticScrapeNamespaceSelector: {}
+  staticScrapeSelector: {}
+
+  remoteWrite:
+    - url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8429/api/v1/write"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+  ## ExtraArgs for buffering — survive vmsingle restarts without dropping data
+  extraArgs:
+    remoteWrite.tmpDataPath: "/tmp/vmagent-remotewrite-data"
+    remoteWrite.maxDiskUsagePerURL: "1GiB"

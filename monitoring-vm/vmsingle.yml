@@ -1,0 +1,27 @@
+## Single-node VictoriaMetrics instance. Long retention for multi-year energy
+## / solar analysis. PVC on Longhorn (3-replica default).
+## Operator naming: pod and Service get the prefix `vmsingle-mdapi`.
+## The Service exposes :8429 (HTTP API + remoteWrite endpoint).
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMSingle
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  retentionPeriod: "3y"
+  storage:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: longhorn
+    resources:
+      requests:
+        storage: 50Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  extraArgs:
+    ## Smooth out series-churn behaviour for the recorder's per-sensor cardinality
+    dedup.minScrapeInterval: "30s"

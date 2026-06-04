@@ -1,0 +1,28 @@
+## victoria-metrics-operator chart values.
+## - prometheus-converter: ON — operator auto-converts ServiceMonitor/Probe/
+##   PodMonitor CRDs into the equivalent VM* CRDs so vmagent picks up the
+##   existing kube-prometheus-stack-shaped CRs without rewriting any bundle.
+##   convertWithOwnerReferences=false so the VM* shadows survive even if the
+##   source Prometheus CR is later deleted by Phase 4 cleanup.
+## - crds.cleanup.enabled stays default false; we don't want a chart-removal
+##   to nuke the CRDs and orphan vmsingle/vmagent state.
+## - We set sensible resource requests; VPA mode=Off here, the operator is
+##   small and stable.
+
+crds:
+  create: true
+  cleanup:
+    enabled: false
+
+operator:
+  prometheus_converter:
+    enabled: true
+    convertWithOwnerReferences: false
+    resyncPeriod: "0"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
