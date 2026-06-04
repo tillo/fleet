@@ -1,0 +1,569 @@
+{
+  "title": "UPS \u2014 Power & runtime",
+  "uid": "mdapi-ups",
+  "tags": [
+    "mdapi",
+    "ha",
+    "ups"
+  ],
+  "schemaVersion": 40,
+  "timezone": "Europe/Zurich",
+  "refresh": "1m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "editable": true,
+  "annotations": {
+    "list": [
+      {
+        "name": "Mains out (OB)",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "ha-postgres"
+        },
+        "enable": true,
+        "iconColor": "rgba(217, 83, 79, 1)",
+        "rawQuery": "SELECT s.last_updated_ts * 1000 AS time, 'Mains out: ' || s.state AS text FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.ups_status_data' AND s.state LIKE '%OB%' AND $__unixEpochFilter(s.last_updated_ts)",
+        "target": {
+          "type": "dashboard"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Real Power",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1800
+              },
+              {
+                "color": "red",
+                "value": 2400
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.ups_real_power' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Battery",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 40
+              },
+              {
+                "color": "green",
+                "value": 75
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.ups_battery_charge' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Load",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.ups_load' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Status",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "Online": {
+                  "color": "green",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "On Battery": {
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "Low Battery": {
+                  "color": "red",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "Status"
+        },
+        "orientation": "auto",
+        "textMode": "value",
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state AS \"Status\" FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.ups_status' ORDER BY s.last_updated_ts DESC LIMIT 1",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Power (real vs apparent)",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watt",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Apparent (VA)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "voltampere"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5bc0de"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Real (W)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#5cb85c"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Real (W)\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.ups_real_power' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Apparent (VA)\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.ups_apparent_power' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Battery charge",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#d9534f"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15,
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Battery %\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.ups_battery_charge' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "UPS load %",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#f0ad4e"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15,
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Load %\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.ups_load' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Mains voltage (input vs output)",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ha-postgres"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "volt",
+          "min": 200,
+          "max": 250,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 0,
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Input V\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.ups_input_voltage' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Output V\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.ups_output_voltage' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ha-postgres"
+          }
+        }
+      ]
+    }
+  ]
+}

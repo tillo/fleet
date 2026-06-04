@@ -38,8 +38,16 @@ spec:
           value: https://grafana.mdapi.ch
         - name: GF_SERVER_DOMAIN
           value: grafana.mdapi.ch
+        # oauth2-proxy-admin + Keycloak `mdapi-admin` role is the real access
+        # gate. Inside Grafana, treat any authenticated visitor as anonymous
+        # Viewer so dashboards render without a separate Grafana login.
+        # /login still works for editing as admin.
         - name: GF_AUTH_ANONYMOUS_ENABLED
-          value: "false"
+          value: "true"
+        - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+          value: Viewer
+        - name: GF_AUTH_ANONYMOUS_ORG_NAME
+          value: "Main Org."
         - name: GF_USERS_ALLOW_SIGN_UP
           value: "false"
         - name: GF_INSTALL_PLUGINS
@@ -59,18 +67,28 @@ spec:
         - name: datasources
           mountPath: /etc/grafana/provisioning/datasources
           readOnly: true
+        - name: dashboards-provider
+          mountPath: /etc/grafana/provisioning/dashboards
+          readOnly: true
+        - name: dashboards-mdapi
+          mountPath: /var/lib/grafana/dashboards/mdapi
+          readOnly: true
         livenessProbe:
           httpGet:
             path: /api/health
             port: 3000
-          initialDelaySeconds: 30
+          initialDelaySeconds: 60
           periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 5
         readinessProbe:
           httpGet:
             path: /api/health
             port: 3000
-          initialDelaySeconds: 10
+          initialDelaySeconds: 15
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
       volumes:
       - name: data
         persistentVolumeClaim:
@@ -78,3 +96,9 @@ spec:
       - name: datasources
         configMap:
           name: grafana-datasources
+      - name: dashboards-provider
+        configMap:
+          name: grafana-dashboards-provider
+      - name: dashboards-mdapi
+        configMap:
+          name: grafana-dashboards-mdapi
