@@ -1,0 +1,33 @@
+## vmalert evaluates VMRules (auto-converted from PrometheusRule CRs by the
+## operator's prometheus_converter). Reads from vmsingle, alerts to the
+## dedicated VMAlertmanager (`mdapi`).
+##
+## During Phase 3 the dedicated AM has a null receiver — alerts evaluate
+## but go nowhere, while the bundled Rancher Prometheus+AM keep delivering
+## as today. Phase 4 narrows bundled Prom's ruleSelector and flips the AM
+## to deliver via a migrated VMAlertmanagerConfig set.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlert
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  evaluationInterval: 30s
+  datasource:
+    url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+  remoteRead:
+    url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+  remoteWrite:
+    url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+  notifier:
+    url: http://vmalertmanager-mdapi.monitoring.svc.cluster.local:9093
+  ## Empty selector = evaluate every VMRule cluster-wide. Phase 3 keeps it
+  ## permissive for parity testing against bundled Prom; Phase 4 narrows
+  ## to `monitoring-stack: mdapi`.
+  selectAllByDefault: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
