@@ -48,6 +48,15 @@ spec:
           value: Viewer
         - name: GF_AUTH_ANONYMOUS_ORG_NAME
           value: "Main Org."
+        ## Grafana 13 hammers SQLite with concurrent writes from unified-
+        ## storage, provisioning, alertmanager-sync and secure-values cleanup,
+        ## producing SQLITE_BUSY storms in the default rollback-journal mode.
+        ## WAL mode lets readers and writers run concurrently and raises the
+        ## practical concurrency ceiling roughly 10x for this workload.
+        - name: GF_DATABASE_WAL
+          value: "true"
+        - name: GF_DATABASE_QUERY_RETRIES
+          value: "10"
         - name: GF_USERS_ALLOW_SIGN_UP
           value: "false"
         - name: GF_INSTALL_PLUGINS
