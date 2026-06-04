@@ -32,6 +32,17 @@ spec:
     matchLabels:
       monitoring-stack: mdapi
   configNamespaceSelector: {}
+  ## Base config — the operator merges the selected VMAlertmanagerConfig
+  ## CRs on top of this. The admission webhook requires the base to be a
+  ## valid alertmanager.yaml (with at least one route + receiver), even
+  ## when configSelector is set. The fallback null receiver is the
+  ## inherited parent route in the merged config; the mdapi-team
+  ## VMAlertmanagerConfig's `route:` becomes a child sub-route that
+  ## intercepts everything before falling through.
   configRawYaml: |
     global:
       resolve_timeout: 5m
+    route:
+      receiver: fallback-null
+    receivers:
+      - name: fallback-null
