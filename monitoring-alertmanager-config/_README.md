@@ -42,6 +42,23 @@ kubectl --context mdapi-prod -n cattle-monitoring-system patch \
   -p '{"spec":{"alertmanagerConfigMatcherStrategy":{"type":"None"}}}'
 ```
 
+## Bundled-Prom ruleSelector exclusion (Phase 4)
+
+`rancher-monitoring-prometheus.spec.ruleSelector` must exclude
+`monitoring-stack=mdapi` so bundled Prometheus does NOT evaluate our
+mdapi PrometheusRule CRs (vmalert owns those now). Without this, both
+Prometheuses fire the same alerts and the bundled AM's chart-default
+Pushover receiver duplicates every notification.
+
+Patched by hand on 2026-06-04. Like the matcherStrategy patch above,
+Rancher chart upgrades may revert it:
+
+```
+kubectl --context mdapi-prod -n cattle-monitoring-system patch \
+  prometheus rancher-monitoring-prometheus --type=merge \
+  -p '{"spec":{"ruleSelector":{"matchExpressions":[{"key":"monitoring-stack","operator":"NotIn","values":["mdapi"]}]}}}'
+```
+
 ## Receivers (this bundle)
 
 | Receiver | Notifies | Purpose |
