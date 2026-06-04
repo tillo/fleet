@@ -28,11 +28,18 @@ spec:
   resources:
     requests:
       cpu: 100m
-      memory: 256Mi
-    limits:
       memory: 512Mi
+    limits:
+      ## 512Mi was OOMKilling vmagent ~once per hour (6 restarts in 4h).
+      ## Headroom for the apiserver + cadvisor scrapes — those are the
+      ## fattest targets and currently flirt with the 16 MiB scrape size.
+      memory: 1Gi
 
-  ## ExtraArgs for buffering — survive vmsingle restarts without dropping data
   extraArgs:
+    ## Survive vmsingle restarts without dropping data.
     remoteWrite.tmpDataPath: "/tmp/vmagent-remotewrite-data"
     remoteWrite.maxDiskUsagePerURL: "1GiB"
+    ## Default 16 MiB; multiple kubelet/cadvisor + apiserver scrapes
+    ## breach it on every scrape, silently dropping the response. 64 MiB
+    ## gives ~4x headroom for kubelet on the busier nodes.
+    promscrape.maxScrapeSize: "64MiB"
