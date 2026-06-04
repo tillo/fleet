@@ -21,10 +21,15 @@ spec:
     url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
   notifier:
     url: http://vmalertmanager-mdapi.monitoring.svc.cluster.local:9093
-  ## Empty selector = evaluate every VMRule cluster-wide. Phase 3 keeps it
-  ## permissive for parity testing against bundled Prom; Phase 4 narrows
-  ## to `monitoring-stack: mdapi`.
-  selectAllByDefault: true
+  ## Phase 4: only evaluate VMRules carrying `monitoring-stack: mdapi`.
+  ## Vendor / chart-bundled rules (Watchdog, InfoInhibitor, KubeNode*,
+  ## Longhorn vendor rules, …) are intentionally left to the bundled
+  ## Rancher Prometheus so the chart stays pristine.
+  selectAllByDefault: false
+  ruleSelector:
+    matchLabels:
+      monitoring-stack: mdapi
+  ruleNamespaceSelector: {}
   resources:
     requests:
       cpu: 50m
