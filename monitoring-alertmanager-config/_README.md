@@ -22,11 +22,10 @@ by `vmalertmanager-mdapi`).
   `https://hc-ping.com/<uuid>` URL for the above (key
   `/mdapi/pushover/healthchecks-watchdog-url` in akeyless).
 
-- **`pushover` ExternalSecret** — the shared Pushover user-key + token,
-  consumed by `vmalertmanager-mdapi`'s VMAlertmanagerConfig in the
-  sibling bundle. Left in this bundle for now because moving an ES
-  across bundles deletes the underlying Secret and triggers a brief
-  delivery gap; safer to leave it where it is.
+**Note**: the `pushover` ExternalSecret moved to
+`fleet/monitoring-vmalertmanager-config/` (2026-06-04). Bundled AM no
+longer routes any `team=mdapi` alert through Pushover; its only
+external sink is the healthchecks.io webhook above.
 
 ## Bundled-AM matcher strategy quirk
 

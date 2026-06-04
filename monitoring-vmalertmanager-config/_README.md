@@ -32,7 +32,8 @@ operator merges them into the generated `alertmanager.yaml`.
 
 ## Pushover secret
 
-References the `pushover` Secret (managed by ExternalSecret in
-`fleet/monitoring-alertmanager-config/`). Cross-bundle secret reference
-is intentional: one source of Pushover credentials for both
-Alertmanagers.
+The `pushover` ExternalSecret lives in this bundle (`pushover-es.yml`)
+since vmalertmanager-mdapi is now the only consumer. `creationPolicy:
+Merge` so accidental bundle removal doesn't drop the Secret out from
+under any race; the cost is an orphan Secret if the entire bundle is
+ever deleted, which is the correct trade-off here.
