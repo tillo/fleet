@@ -28,3 +28,23 @@ spec:
         limits:
           cpu: 2000m
           memory: 420Mi
+
+    ## Disable kube-prometheus-stack default rules that are noisy or
+    ## inappropriate for this homelab. Each entry is a one-line note on
+    ## why it goes; revisit if any of these turn out to mask a real fault.
+    ##
+    ##   CPUThrottlingHigh     -- duplicate of our own ContainerCpuThrottling
+    ##                            (monitoring-rules/18-cpu-throttling.yml) with
+    ##                            proper exclusions for Harvester-managed pods.
+    ##   NodeSystemSaturation  -- threshold (load1 / cores > 2 for 15m) is
+    ##                            too aggressive for Harvester hosts running
+    ##                            VMs; routinely fires without real impact.
+    ##   NodeBondingDegraded   -- we don't bond NICs in this cluster.
+    ##   NodeDiskIOSaturation  -- routinely fires on qua during background
+    ##                            Longhorn rebalance; known noise.
+    defaultRules:
+      disabled:
+        CPUThrottlingHigh: true
+        NodeSystemSaturation: true
+        NodeBondingDegraded: true
+        NodeDiskIOSaturation: true
