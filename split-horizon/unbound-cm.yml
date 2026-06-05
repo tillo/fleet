@@ -147,20 +147,25 @@ data:
         local-data: "logs.mdapi.ch. 300 IN A 192.168.1.191"
         local-data: "pushgateway.mdapi.ch. 300 IN A 192.168.1.191"
 
-    # Internal authoritative zones go to Technitium (192.168.1.54):
+    # Internal authoritative zones go to Technitium (192.168.1.54) only:
     #   home.tillo.ch.            -- LAN DHCP-generated records
     #   168.192.in-addr.arpa.     -- LAN reverse for every 192.168.0.0/16 subnet
-    # Everything else (mdapi.ch public records, external resolution) goes
-    # directly to NextDNS so external DNS does NOT depend on the Technitium
-    # DNS LoadBalancer being reachable. Same upstream Technitium itself uses,
-    # which keeps the policy/filter consistent across the chain.
+    # No fallback for these -- NextDNS does not know these zones, and a
+    # SERVFAIL is the correct behaviour if Technitium is down.
     forward-zone:
         name: "home.tillo.ch."
         forward-addr: 192.168.1.54
     forward-zone:
         name: "168.192.in-addr.arpa."
         forward-addr: 192.168.1.54
+    # Default recursion: Technitium first (DoT to NextDNS+Quad9, profile
+    # tagging via the technitium- client hostname, query graphs + cache
+    # visibility in the Technitium UI). NextDNS listed as failover so the
+    # LAN keeps resolving externals if the Technitium LB goes blackhole
+    # again -- Unbound picks the forwarder by RTT and falls over to the
+    # next on timeout/SERVFAIL.
     forward-zone:
         name: "."
+        forward-addr: 192.168.1.54
         forward-addr: 45.90.28.16
         forward-addr: 45.90.30.16
