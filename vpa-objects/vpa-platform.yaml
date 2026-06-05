@@ -496,17 +496,19 @@ spec:
     kind: StatefulSet
     name: zammad-postgresql
   # Switched from Off -> Auto on 2026-06-05 after 11% CFS throttle on
-  # query bursts. The chart-default 500m hardcap was clipping every
-  # non-trivial SELECT; Auto lets VPA scale request + limit proportionally
-  # so bursts stop being paused.
+  # query bursts. Note: VPA's steady-state recommendation is only 49m
+  # because postgres idles ~all the time -- but query bursts spike well
+  # above 500m. minAllowed.cpu bumped to 750m so VPA's request floor
+  # (and the proportional 2x limit derived from the Helm-chart defaults)
+  # leaves enough headroom for the bursts.
   updatePolicy:
     updateMode: Auto
   resourcePolicy:
     containerPolicies:
     - containerName: "*"
       minAllowed:
-        cpu: 10m
-        memory: 64Mi
+        cpu: 750m
+        memory: 256Mi
       maxAllowed:
         cpu: 2000m
         memory: 2Gi
