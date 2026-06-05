@@ -18,7 +18,10 @@ metadata:
     keel.sh/trigger: poll
     keel.sh/pollSchedule: "@every 4h"
 spec:
-  replicas: 2
+  ## 3 replicas, one per node (qui/quo/qua). Strict spread so a node
+  ## losing the LB-announcing node never leaves Unbound without a local
+  ## endpoint, regardless of externalTrafficPolicy.
+  replicas: 3
   selector:
     matchLabels:
       app: unbound
@@ -34,15 +37,13 @@ spec:
     spec:
       imagePullSecrets:
       - name: mdapi-registry
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchLabels:
-                  app: unbound
-              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: unbound
       containers:
       - name: unbound
         image: registry.mdapi.ch/mdapi/unbound:latest

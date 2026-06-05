@@ -25,7 +25,19 @@ spec:
       # drift detection doesn't flag the bundle Modified after admission
       # fills them in on the live state.
       restartPolicy: Always
-      dnsPolicy: ClusterFirst
+      # Pin this pod's resolver to NextDNS directly (same upstream as
+      # Technitium itself). Avoids the dependency loop where the secondary
+      # -- which IS part of the DNS chain -- relies on the DNS chain to
+      # resolve external names (zone-transfer source, update checks, etc.).
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+        - 45.90.28.16
+        - 45.90.30.16
+        searches:
+        - technitium.svc.cluster.local
+        - svc.cluster.local
+        - cluster.local
       schedulerName: default-scheduler
       terminationGracePeriodSeconds: 30
       securityContext: {}
