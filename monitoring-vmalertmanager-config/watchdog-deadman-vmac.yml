@@ -1,0 +1,66 @@
+## Dead-man's switch — vmAM side. Pairs with the always-firing
+## WatchdogMdapi alert in monitoring-rules/19-watchdog-mdapi.yml.
+##
+## Moved from the prior monitoring-alertmanager-config bundle on
+## 2026-06-05 (architectural cleanup: custom destinations don't belong
+## on the vendor Alertmanager).
+##
+## SETUP / SECRET STORE:
+## The hc-ping.com URL lives in akeyless at
+## /mdapi/pushover/healthchecks-watchdog-url. The folder is kept under
+## /mdapi/pushover/ because that path is in the ESO access-id's ACL.
+## (Original creation:
+##   akeyless create-secret \
+##     --name /mdapi/pushover/healthchecks-watchdog-url \
+##     --value 'https://hc-ping.com/<uuid>'
+##  — already done; this bundle just consumes it.)
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: healthchecks-watchdog-vm
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: healthchecks-watchdog-vm
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/pushover/healthchecks-watchdog-url
+      secretKey: url
+---
+## VMAlertmanagerConfig: match the WatchdogMdapi alert, send to
+## hc-ping.com webhook every 4 minutes (well inside hc.io's default
+## 5-min grace period).
+##
+## Field naming follows VMAlertmanagerConfig snake_case (matches native
+## alertmanager.yaml), per the convention established in
+## mdapi-team-vmac.yml.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: watchdog-deadman
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  route:
+    receiver: healthchecks-watchdog
+    matchers:
+      - 'alertname="WatchdogMdapi"'
+    group_wait: 0s
+    group_interval: 4m
+    repeat_interval: 4m
+  receivers:
+    - name: healthchecks-watchdog
+      webhook_configs:
+        - url_secret:
+            name: healthchecks-watchdog-vm
+            key: url
+          send_resolved: false
+          max_alerts: 1
