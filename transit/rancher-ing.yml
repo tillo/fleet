@@ -1,3 +1,11 @@
+## rancher.mdapi.ch -> transit/rancher Service -> 192.168.1.246:443
+## (rancher.home.tillo.ch, the Rancher UI of the mdapi-rancher cluster).
+##
+## upstream-vhost rewrites the HTTP Host header so the upstream Rancher
+## matches its `rancher.home.tillo.ch` vhost; proxy-ssl-server-name +
+## proxy-ssl-name set the matching SNI on the TLS handshake. Read/send
+## timeouts bumped to 3600s so kubectl-exec / shell / log-tail streams
+## from the Rancher UI don't get cut at the default 60s.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -6,6 +14,12 @@ metadata:
   annotations:
     cert-manager.io/issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    nginx.ingress.kubernetes.io/upstream-vhost: rancher.home.tillo.ch
+    nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: rancher.home.tillo.ch
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   ingressClassName: nginx
   rules:
