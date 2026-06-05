@@ -21,13 +21,27 @@ spec:
   - name: app-cpu-throttling.cfs
     rules:
     - alert: ContainerCpuThrottling
+      ## Scope: user-owned workloads only. Harvester/Rancher chart-installed
+      ## pods (harvester-system, cattle-*, kube-system core add-ons) are
+      ## managed by the upstream installer -- bumping their limits would
+      ## drift on the next Harvester upgrade, so the alert isn't actionable
+      ## for that class. The system pods that throttle most-frequently
+      ## (whereabouts, node-manager, harvester-network, virt-*, pcidevices)
+      ## are intermittent reconcilers; their throttling is upstream's
+      ## problem, not ours.
       expr: |
         sum by (namespace, pod, container) (
-          rate(container_cpu_cfs_throttled_periods_total{container!="",container!="POD"}[5m])
+          rate(container_cpu_cfs_throttled_periods_total{
+            container!="",container!="POD",
+            namespace!~"harvester-system|kube-system|cattle-.*"
+          }[5m])
         )
         /
         sum by (namespace, pod, container) (
-          rate(container_cpu_cfs_periods_total{container!="",container!="POD"}[5m])
+          rate(container_cpu_cfs_periods_total{
+            container!="",container!="POD",
+            namespace!~"harvester-system|kube-system|cattle-.*"
+          }[5m])
         ) > 0.05
       for: 15m
       labels:

@@ -26,13 +26,17 @@ spec:
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8265
+        # Tdarr is a transcoder: scales to all available CPU when a job
+        # runs. VPA was saturated at the old 8c lid (40% throttle observed
+        # 2026-06-05 mid-HEVC). Bumped to 12c + VPA maxAllowed raised to
+        # match. Memory grows with concurrent transcode threads.
         resources:
           requests:
             cpu: 4
             memory: 8Gi
           limits:
-            cpu: 8
-            memory: 12Gi
+            cpu: 12
+            memory: 16Gi
         env:
         - name: TZ
           value: Europe/Zurich
