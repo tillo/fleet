@@ -1,0 +1,30 @@
+## Override the rancher-monitoring chart values for resource limits.
+## Rancher Monitoring is installed via the helm-controller HelmChart CR
+## (see `kubectl -n cattle-monitoring-system get helmcharts`), which
+## reads merged values from any HelmChartConfig with the same name in
+## the same namespace. This file is that override.
+##
+## What we patch and why:
+##
+##   prometheus-node-exporter.resources -- the chart ships with
+##     req=200m / lim=200m (a Guaranteed-QoS hardcap). Under cluster-
+##     event bursts (large pod creates, heavy disk-I/O scrape periods)
+##     each node-exporter was throttling ~9% of CFS periods, which then
+##     makes the underlying metrics arrive late and dashboard rows go
+##     stale. Bumping the limit to 1c keeps it responsive; the request
+##     stays at 200m so scheduling overhead is unchanged.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rancher-monitoring
+  namespace: cattle-monitoring-system
+spec:
+  valuesContent: |-
+    prometheus-node-exporter:
+      resources:
+        requests:
+          cpu: 200m
+          memory: 150Mi
+        limits:
+          cpu: 2000m
+          memory: 420Mi
