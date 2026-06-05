@@ -411,3 +411,30 @@ spec:
       maxAllowed:
         cpu: 500m
         memory: 256Mi
+---
+# seerr (Overseerr fork) — Next.js SSR app. Was missed from the 2026-06-04
+# tv-app sweep; 32% of its CPU scheduling periods were being throttled
+# against the 500m hardcap, giving the user-visible 246-857ms TTFB swing
+# on /login. Same Auto profile as the other tv apps; max headroom set to
+# 1500m since the workload is largely idle but spiky on SSR render.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: seerr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: seerr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: seerr
+      minAllowed:
+        cpu: 25m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 1500m
+        memory: 1Gi
