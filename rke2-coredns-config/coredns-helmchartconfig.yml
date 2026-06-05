@@ -37,6 +37,18 @@ metadata:
   namespace: kube-system
 spec:
   valuesContent: |-
+    ## Override chart defaults of req==lim=100m (Guaranteed QoS, zero
+    ## headroom). CoreDNS spikes during cluster events (pod-create
+    ## flurries, ServiceMonitor scrape bursts) and was throttling ~5% of
+    ## CFS periods. Bumping the limit to 500m keeps the resolver
+    ## responsive without changing the request floor.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
     servers:
     ## mdapi.ch — keep going through the router so internal-only records
     ## (cluster IPs, LAN DHCP names, technitium split-horizon answers)
