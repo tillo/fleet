@@ -500,3 +500,100 @@ spec:
         component: DNS
         team: mdapi
         probe: technitium_secondary_pod
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Infrastructure / management plane — TLS cert-expiry coverage (added 2026-06-05
+# to close the gap that let rancher.home.tillo.ch silently expire 2026-06-02).
+# Probes are scraped purely for `probe_ssl_earliest_cert_expiry`; some endpoints
+# (oauth2-proxy gated, redirect to /sign_in) will fail probe_success but the
+# TLS handshake — and thus cert validity — is what we care about here.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-platform
+  namespace: monitoring
+spec:
+  jobName: infra-platform
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://rancher.home.tillo.ch
+        - https://rancher.mdapi.ch
+        - https://harvester.mdapi.ch
+        - https://auth.mdapi.ch
+      labels:
+        component: Platform
+        team: mdapi
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-observability
+  namespace: monitoring
+spec:
+  jobName: infra-observability
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://grafana.mdapi.ch
+        - https://logs.mdapi.ch
+        - https://vmalert.mdapi.ch
+        - https://vmalertmanager.mdapi.ch
+        - https://pushgateway.mdapi.ch
+        - https://cribl.mdapi.ch
+      labels:
+        component: Observability
+        team: mdapi
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-home
+  namespace: monitoring
+spec:
+  jobName: infra-home
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://home.mdapi.ch
+        - https://frigate.mdapi.ch
+        - https://esphome.mdapi.ch
+      labels:
+        component: Home Assistant
+        team: mdapi
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-media
+  namespace: monitoring
+spec:
+  jobName: infra-media
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://bazarr.mdapi.ch
+        - https://prowlarr.mdapi.ch
+        - https://radarr.mdapi.ch
+        - https://overseerr.mdapi.ch
+        - https://autobrr.mdapi.ch
+      labels:
+        component: Media
+        team: mdapi
