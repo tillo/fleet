@@ -1,12 +1,11 @@
-## ExternalSecret that pulls the 4 Garage S3 creds from Akeyless and
-## templates them into a Secret containing the full zot config.json
-## (with S3 storageDriver). Keeping creds out of the ConfigMap.
+## ExternalSecret templating the full zot config.json + sync credentials
+## file. Two keys produced in the target Secret:
+##   - config.json     -> mounted at /etc/zot/config.json
+##   - sync-creds.json -> mounted at /etc/zot/sync-creds.json
 ##
 ## Source secrets in Akeyless under /mdapi/zot/:
-##   - garage-s3-access-key
-##   - garage-s3-secret-key
-##   - garage-s3-bucket   (currently 'zot-images')
-##   - garage-s3-endpoint (currently 'https://api.garage.home.tillo.ch')
+##   - garage-s3-{access-key, secret-key, bucket, endpoint}
+##   - gitlab-sync-{username, token}  (group-level read_registry deploy token)
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -22,6 +21,28 @@ spec:
     template:
       engineVersion: v2
       data:
+        ## ─────────────────────────────────────────────────────────────
+        ## sync-creds.json: per-upstream-registry credentials, keyed by
+        ## the registry URL Zot uses (just host, no scheme). Anonymous
+        ## registries (ghcr.io / docker.io / lscr.io / quay.io) are
+        ## omitted — Zot falls back to anonymous pulls.
+        ## ─────────────────────────────────────────────────────────────
+        sync-creds.json: |
+          {
+            "registry.mdapi.ch": {
+              "username": "{{ .gitlabUser }}",
+              "password": "{{ .gitlabToken }}"
+            }
+          }
+        ## ─────────────────────────────────────────────────────────────
+        ## config.json
+        ## storage: S3 (Garage external) + emptyDir cache + GC, no dedupe
+        ##   (dedupe needs a shared metadata DB which we don't run)
+        ## extensions.sync: on-demand pull-through + periodic refresh per
+        ##   registry. Tag regex filters: latest/stable/main/master + any
+        ##   semver-ish tag (v1, v1.2, 1.2.3, 1.2.3-suffix). Prevents
+        ##   accidentally mirroring 1000+ tags from things like nginx.
+        ## ─────────────────────────────────────────────────────────────
         config.json: |
           {
             "storage": {
@@ -53,6 +74,122 @@ spec:
             },
             "log": {
               "level": "info"
+            },
+            "extensions": {
+              "sync": {
+                "enable": true,
+                "credentialsFile": "/etc/zot/sync-creds.json",
+                "registries": [
+                  {
+                    "urls": ["https://registry.mdapi.ch"],
+                    "onDemand": true,
+                    "pollInterval": "6h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "mdapi/**", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } }
+                    ]
+                  },
+                  {
+                    "urls": ["https://ghcr.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "anantis-security/trapeye" },
+                      { "prefix": "autobrr/autobrr" },
+                      { "prefix": "blakeblackshear/frigate" },
+                      { "prefix": "brioche-works/technitium-dns-prometheus-exporter" },
+                      { "prefix": "cloudnative-pg/cloudnative-pg" },
+                      { "prefix": "cloudnative-pg/postgresql" },
+                      { "prefix": "democratic-csi/csi-grpc-proxy" },
+                      { "prefix": "democratic-csi/democratic-csi" },
+                      { "prefix": "external-secrets/external-secrets" },
+                      { "prefix": "flaresolverr/flaresolverr" },
+                      { "prefix": "haveagitgat/tdarr" },
+                      { "prefix": "home-assistant/home-assistant" },
+                      { "prefix": "infomaniak/cert-manager-webhook-infomaniak" },
+                      { "prefix": "k8snetworkplumbingwg/whereabouts" },
+                      { "prefix": "ldapaccountmanager/lam" },
+                      { "prefix": "nextcloud-releases/**" },
+                      { "prefix": "paperless-ngx/paperless-ngx" },
+                      { "prefix": "project-zot/zot-linux-amd64" },
+                      { "prefix": "seerr-team/seerr" },
+                      { "prefix": "stakater/reloader" },
+                      { "prefix": "windmill-labs/windmill" }
+                    ]
+                  },
+                  {
+                    "urls": ["https://docker.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "library/alpine" },
+                      { "prefix": "library/busybox" },
+                      { "prefix": "library/caddy" },
+                      { "prefix": "library/debian" },
+                      { "prefix": "library/eclipse-mosquitto" },
+                      { "prefix": "library/mariadb" },
+                      { "prefix": "library/memcached" },
+                      { "prefix": "library/nginx" },
+                      { "prefix": "library/postgres" },
+                      { "prefix": "library/redis" },
+                      { "prefix": "acockburn/appdaemon" },
+                      { "prefix": "alpine/curl" },
+                      { "prefix": "alpine/socat" },
+                      { "prefix": "apache/tika" },
+                      { "prefix": "bitnamilegacy/elasticsearch" },
+                      { "prefix": "bitnamilegacy/os-shell" },
+                      { "prefix": "bitnamilegacy/postgresql" },
+                      { "prefix": "cribl/cribl" },
+                      { "prefix": "drakkan/sftpgo" },
+                      { "prefix": "dxflrs/garage" },
+                      { "prefix": "esphome/esphome" },
+                      { "prefix": "gotenberg/gotenberg" },
+                      { "prefix": "grafana/grafana" },
+                      { "prefix": "instantlinux/nut-upsd" },
+                      { "prefix": "joplin/server" },
+                      { "prefix": "keelhq/keel" },
+                      { "prefix": "koush/scrypted" },
+                      { "prefix": "longhornio/**" },
+                      { "prefix": "nfrastack/openldap" },
+                      { "prefix": "nicolaka/netshoot" },
+                      { "prefix": "owncloud/server" },
+                      { "prefix": "plexinc/pms-docker" },
+                      { "prefix": "rancher/**" },
+                      { "prefix": "rclone/rclone" }
+                    ]
+                  },
+                  {
+                    "urls": ["https://lscr.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "linuxserver/**" }
+                    ]
+                  },
+                  {
+                    "urls": ["https://quay.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "jetstack/cert-manager-cainjector" },
+                      { "prefix": "jetstack/cert-manager-controller" },
+                      { "prefix": "jetstack/cert-manager-webhook" },
+                      { "prefix": "keycloak/keycloak" },
+                      { "prefix": "metallb/controller" },
+                      { "prefix": "metallb/speaker" },
+                      { "prefix": "oauth2-proxy/oauth2-proxy" },
+                      { "prefix": "prometheus/blackbox-exporter" },
+                      { "prefix": "prometheus-operator/prometheus-config-reloader" },
+                      { "prefix": "prometheus/prometheus" },
+                      { "prefix": "prometheus/pushgateway" }
+                    ]
+                  }
+                ]
+              }
             }
           }
   data:
@@ -68,3 +205,9 @@ spec:
     - remoteRef:
         key: /mdapi/zot/garage-s3-endpoint
       secretKey: endpoint
+    - remoteRef:
+        key: /mdapi/zot/gitlab-sync-username
+      secretKey: gitlabUser
+    - remoteRef:
+        key: /mdapi/zot/gitlab-sync-token
+      secretKey: gitlabToken
