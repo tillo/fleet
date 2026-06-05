@@ -1,17 +1,21 @@
 ## Transit Service for harvester.mdapi.ch -> in-cluster Harvester UI.
-## ExternalName points at the harvester-system Service so the resolver
-## follows the namespace boundary without needing a hand-maintained
-## Endpoint. The old setup pointed at the ingress VIP (192.168.1.191)
-## which was circular and broke as of the cluster-VIP rework.
+##
+## Pointed at the harvester-system/harvester Service's ClusterIP (which
+## fronts the Rancher-derived Harvester UI on TCP/8443). nginx-ingress
+## cannot resolve ExternalName Services, so we keep the hand-maintained
+## Endpoint pattern (mirroring pfsense/santillo/test/rancher).
+##
+## ClusterIPs are stable for the lifetime of the Service; if the
+## harvester-system/harvester Service ever gets re-created, refresh the
+## Endpoint with: `kubectl -n harvester-system get svc harvester
+## -o jsonpath='{.spec.clusterIP}'`.
 apiVersion: v1
 kind: Service
 metadata:
   name: harvester
   namespace: transit
 spec:
-  type: ExternalName
-  externalName: harvester.harvester-system.svc.cluster.local
+  type: ClusterIP
   ports:
     - port: 8443
       targetPort: 8443
-      protocol: TCP
