@@ -8,9 +8,17 @@
 ## PrometheusRule (which would drift on every Harvester / Rancher
 ## Monitoring chart upgrade).
 ##
-## Pattern: each suppressed alert name gets its own match block that
-## routes to the no-op `drop` receiver. When something else needs the
-## same treatment, add another `match` line to the route below.
+## Pattern: each suppressed alert name gets an `inhibitRules` entry
+## that pairs against the always-firing `Watchdog` dead-man alert.
+## Since Watchdog always fires, the target alerts are *permanently*
+## inhibited -- they never reach a receiver, never count toward
+## delivery stats, and never trip the AM self-monitoring rules.
+##
+## (Earlier iteration routed matched alerts to a no-op webhook
+## receiver. That worked at the routing level but the webhook URL
+## couldn't resolve, AM retry-stormed, and the bundled
+## AlertmanagerFailedToSendAlerts self-rule fired against us. The
+## inhibit-rule pattern below has zero notification side-effects.)
 ##
 ## To replace a vendor alert with a custom-threshold version, the
 ## companion PrometheusRule lives in fleet/monitoring-rules/ with
@@ -22,30 +30,17 @@ metadata:
   name: mdapi-vendor-rule-suppress
   namespace: cattle-monitoring-system
 spec:
-  ## A receiver alone isn't enough -- AM rejects the config if any
-  ## referenced receiver is empty. `drop` has a webhook config that
-  ## never resolves; that's intentional. `send_resolved: false` keeps
-  ## the queue from filling with unsent retries.
-  receivers:
-  - name: drop
-    webhookConfigs:
-    - url: http://drop.cattle-monitoring-system.svc.cluster.local/never-used
-      sendResolved: false
-  route:
-    ## The Prometheus Operator wraps this whole block as a CHILD route
-    ## under the top-level route. With `continue: false` (default), once
-    ## an alert matches here the parent receiver is bypassed -- exactly
-    ## the suppression behaviour we want.
-    receiver: drop
-    groupBy: ['alertname']
-    groupWait: 10s
-    groupInterval: 5m
-    repeatInterval: 24h
-    matchers:
-    ## LonghornDiskStorageWarning: vendor threshold is 70% and noisy
-    ## while the quo mirror-srv resize work is in progress. Replaced
-    ## by our own LonghornDiskCapacityHigh at 85% via the bundled
-    ## monitoring-rules PR (sent through the new vmAM -> Pushover).
+  inhibitRules:
+  ## LonghornDiskStorageWarning: vendor threshold is 70% and noisy
+  ## while the quo mirror-srv resize work is in progress. Replaced
+  ## by our own LonghornDiskCapacityHigh at 85% via the bundled
+  ## monitoring-rules PR (sent through the new vmAM -> Pushover).
+  - sourceMatch:
+    - name: alertname
+      matchType: '='
+      value: Watchdog
+    targetMatch:
     - name: alertname
       matchType: '='
       value: LonghornDiskStorageWarning
+    equal: []
