@@ -40,15 +40,16 @@ spec:
         ports:
         - containerPort: 5055
         # Initial seed only -- VPA Auto (vpa-objects/vpa-auto.yaml) rewrites
-        # requests/limits per actual usage. Old seed was 500m CPU lid and
-        # SSR spikes hit it ~32% of the time; bumped to 1500m so the very
-        # first post-VPA-apply state isn't throttled.
+        # requests/limits per actual usage. Old 500m lid throttled 32% of
+        # SSR renders; 1500m was still hitting 13% throttle on bursts. 3c
+        # is plenty for the Next.js render path. Memory request matches
+        # observed steady-state (~230Mi); 1Gi limit caps any leak.
         resources:
           requests:
             cpu: 25m
             memory: 350Mi
           limits:
-            cpu: 1500m
+            cpu: 3000m
             memory: 1Gi
         env:
         - name: TZ

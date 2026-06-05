@@ -1,0 +1,44 @@
+## Catch silent CPU throttling.
+##
+## Background: the 2026-06-05 seerr-slowness investigation revealed both
+## seerr (1500m hardcap) and sonarr (1c hardcap) were being CFS-throttled
+## ~13-27% of scheduler periods despite low average CPU usage. The
+## throttling was invisible at the deployment level (status said Ready,
+## VPA target was below the limit, top showed single-digit CPU) but the
+## user experienced sustained latency on SSR renders. cAdvisor's
+## container_cpu_cfs_throttled_periods_total exposes it directly.
+##
+## Threshold: 5% sustained over 15 minutes. Anything less is noisy bursts.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cpu-throttling
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-cpu-throttling.cfs
+    rules:
+    - alert: ContainerCpuThrottling
+      expr: |
+        sum by (namespace, pod, container) (
+          rate(container_cpu_cfs_throttled_periods_total{container!="",container!="POD"}[5m])
+        )
+        /
+        sum by (namespace, pod, container) (
+          rate(container_cpu_cfs_periods_total{container!="",container!="POD"}[5m])
+        ) > 0.05
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }}:{{ $labels.container }} CPU-throttled {{ $value | humanizePercentage }}"
+        description: |
+          Container {{ $labels.namespace }}/{{ $labels.pod }}:{{ $labels.container }} has been CFS-throttled at {{ $value | humanizePercentage }} of scheduler periods for >15 minutes.
+          Either the CPU limit is too low for the workload's burst profile, or remove the limit entirely. Inspect with:
+            kubectl --context=mdapi-prod -n {{ $labels.namespace }} exec {{ $labels.pod }} -- cat /sys/fs/cgroup/cpu.stat
+          and the VPA recommendation (if any):
+            kubectl --context=mdapi-prod -n {{ $labels.namespace }} describe vpa {{ $labels.container }}
