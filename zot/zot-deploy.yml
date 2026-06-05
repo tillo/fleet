@@ -1,3 +1,7 @@
+## 2026-06-05: storage moved from 20 Gi Longhorn PVC to external Garage S3
+## (bucket `zot-images`, see zot-s3-config-es.yml). Deployment hardened for
+## IR-critical role: 2 replicas, anti-affinity, RollingUpdate, PDB.
+## The 4.3 GiB of existing images were rclone-synced to S3 prior to cutover.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,50 +10,72 @@ metadata:
   annotations:
     reloader.stakater.com/auto: "true"
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: zot
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       labels:
         app: zot
     spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: zot
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: zot
           image: ghcr.io/project-zot/zot-linux-amd64:latest
+          imagePullPolicy: Always
           args: ["serve", "/etc/zot/config.json"]
           ports:
             - containerPort: 5000
           resources:
             requests:
               cpu: 25m
-              memory: 1325Mi
+              memory: 256Mi
             limits:
-              memory: 2Gi
+              memory: 1Gi
           volumeMounts:
-            - name: data
+            - name: cache
               mountPath: /var/lib/registry
             - name: config
               mountPath: /etc/zot/config.json
               subPath: config.json
+              readOnly: true
             - name: auth
               mountPath: /etc/zot/htpasswd
               subPath: htpasswd
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: 5000
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: zot-data
+        ## Local cache + boltdb metadata. With S3 backend, the rootDirectory
+        ## is only a working area / metadata index — losing it on restart
+        ## just means the next push re-stages from S3. Per-replica.
+        - name: cache
+          emptyDir:
+            sizeLimit: 5Gi
         - name: config
-          configMap:
-            name: zot-config
+          secret:
+            secretName: zot-s3-config
         - name: auth
           secret:
             secretName: zot-auth

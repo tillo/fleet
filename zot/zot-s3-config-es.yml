@@ -1,0 +1,70 @@
+## ExternalSecret that pulls the 4 Garage S3 creds from Akeyless and
+## templates them into a Secret containing the full zot config.json
+## (with S3 storageDriver). Keeping creds out of the ConfigMap.
+##
+## Source secrets in Akeyless under /mdapi/zot/:
+##   - garage-s3-access-key
+##   - garage-s3-secret-key
+##   - garage-s3-bucket   (currently 'zot-images')
+##   - garage-s3-endpoint (currently 'https://api.garage.home.tillo.ch')
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-s3-config
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-s3-config
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        config.json: |
+          {
+            "storage": {
+              "rootDirectory": "/var/lib/registry",
+              "dedupe": true,
+              "gc": true,
+              "gcDelay": "1h",
+              "gcInterval": "24h",
+              "storageDriver": {
+                "name": "s3",
+                "bucket": "{{ .bucket }}",
+                "region": "garage",
+                "regionendpoint": "{{ .endpoint }}",
+                "accesskey": "{{ .accesskey }}",
+                "secretkey": "{{ .secretkey }}",
+                "secure": true,
+                "skipverify": false,
+                "forcepathstyle": true
+              }
+            },
+            "http": {
+              "address": "0.0.0.0",
+              "port": "5000",
+              "auth": {
+                "htpasswd": {
+                  "path": "/etc/zot/htpasswd"
+                }
+              }
+            },
+            "log": {
+              "level": "info"
+            }
+          }
+  data:
+    - remoteRef:
+        key: /mdapi/zot/garage-s3-access-key
+      secretKey: accesskey
+    - remoteRef:
+        key: /mdapi/zot/garage-s3-secret-key
+      secretKey: secretkey
+    - remoteRef:
+        key: /mdapi/zot/garage-s3-bucket
+      secretKey: bucket
+    - remoteRef:
+        key: /mdapi/zot/garage-s3-endpoint
+      secretKey: endpoint
