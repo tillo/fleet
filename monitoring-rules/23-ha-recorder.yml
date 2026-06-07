@@ -1,0 +1,54 @@
+## HA recorder write-freshness. The recorder write loop can wedge while HA
+## core stays up and serving (2026-06-06/07: silent ~32h stall, pod 2/2, no
+## errors in logs). HA's own hass_* metrics CANNOT detect this -- they reflect
+## the in-memory state machine, which keeps advancing during a stall. This
+## watches a DB-side CNPG custom metric: seconds since the last row was written
+## to the recorder `states` table. min() across instances = the freshest value
+## (the primary; a lagging replica only reads larger).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-home-recorder
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-home-recorder.freshness
+    rules:
+    - alert: HomeAssistantRecorderStalled
+      expr: |
+        min(cnpg_ha_recorder_last_write_age_seconds{namespace="home-assistant"}) > 900
+      for: 5m
+      labels:
+        severity: critical
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA recorder not writing for {{ $value | printf \"%.0f\" }}s"
+        description: |
+          No new rows in the recorder `states` table for >15m while the DB is
+          reachable. The recorder write loop has likely wedged -- HA core may
+          still be serving normally, so no other alert fires. History, logbook
+          and statistics are silently not being recorded.
+          Fix: restart HA Core (`homeassistant.restart` service, or
+          `kubectl -n home-assistant rollout restart deploy/home-assistant`) to
+          re-init the recorder. Ref: 2026-06-06/07 ~32h silent stall.
+
+    ## Companion: the metric itself going absent means the recorder Postgres
+    ## exporter / custom query broke or the DB is down (the StalledSilently
+    ## alert can't fire on a metric that isn't there).
+    - alert: HomeAssistantRecorderMetricMissing
+      expr: |
+        absent(cnpg_ha_recorder_last_write_age_seconds{namespace="home-assistant"})
+      for: 15m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA recorder freshness metric missing"
+        description: |
+          cnpg_ha_recorder_last_write_age_seconds absent for 15m. The
+          ha-recorder-pg exporter/custom query may be broken, or the CNPG
+          cluster is down. Check `kubectl -n home-assistant get cluster.postgresql.cnpg.io ha-recorder-pg`.

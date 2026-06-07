@@ -1,0 +1,27 @@
+## Custom CNPG metric for the HA recorder: seconds since the recorder last
+## wrote a row to the `states` table. Detects the "recorder write-loop wedged
+## while HA core stays up" failure mode (2026-06-06/07: ~32h silent stall, pod
+## 2/2, no errors) that HA's own hass_* metrics CANNOT see -- those reflect
+## the in-memory state machine, which keeps advancing during a recorder stall.
+##
+## The exporter runs this on each instance against the homeassistant DB; CNPG
+## exports it as cnpg_ha_recorder_last_write_age_seconds. vmagent scrapes the
+## PodMonitor automatically (empty scrape selectors). Consumed by the
+## HomeAssistantRecorderStalled alert in monitoring-rules/23-ha-recorder.yml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ha-recorder-pg-metrics
+  namespace: home-assistant
+data:
+  queries.yaml: |
+    ha_recorder:
+      query: >
+        SELECT EXTRACT(EPOCH FROM (now() - to_timestamp(max(last_updated_ts))))::bigint
+        AS last_write_age_seconds FROM states
+      target_databases:
+        - homeassistant
+      metrics:
+        - last_write_age_seconds:
+            usage: "GAUGE"
+            description: "Seconds since the HA recorder last wrote a row to states"
