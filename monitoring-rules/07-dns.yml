@@ -74,6 +74,24 @@ spec:
           Zones flagged notifyFailed=true on primary. Replication to secondary
           may be lagging up to SOA refresh interval.
 
+    - alert: TechnitiumLowSoaExpire
+      expr: technitium_min_soa_expire_seconds{instance="primary"} > 0 < 86400
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "A Technitium zone has SOA expire={{ $value }}s (< 1 day)"
+        description: |
+          The lowest SOA expire across authoritative zones is under 1 day.
+          Secondaries stop serving a zone once they cannot reach the primary for
+          'expire' seconds, so a low value means the domain goes dark shortly
+          after a primary/cluster outage — root cause of the 2026-06-06 tillo.ch
+          / mdapi.ch outage (expire was 300s; secondaries gave up in 5 min).
+          Raise the SOA expire to 1209600 (2 weeks) via nsupdate to match the
+          other zones.
+
     - alert: TechnitiumZoneCountMismatch
       expr: |
         abs(
