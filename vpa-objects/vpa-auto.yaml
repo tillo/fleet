@@ -364,7 +364,11 @@ spec:
     kind: Deployment
     name: threadfin
   updatePolicy:
-    updateMode: Auto
+    # Off (recommend-only): threadfin is bursty — idle most of the time, then
+    # ~6Gi spike during the XMLTV parse (15k channels + 40k programs). VPA Auto
+    # capped it at maxAllowed=1Gi (req 1Gi/limit 3Gi) -> OOMKilled crashloop
+    # (2026-06-07). Let the deploy's hand-sized 2Gi req / 6Gi limit stand.
+    updateMode: "Off"
   resourcePolicy:
     containerPolicies:
     - containerName: threadfin
@@ -373,7 +377,7 @@ spec:
         memory: 128Mi
       maxAllowed:
         cpu: 1000m
-        memory: 1Gi
+        memory: 6Gi
 ---
 # transmission-pia: 3 containers (transmission + PIA WireGuard + port-mgr).
 # Eviction breaks active torrent connections; recoverable within ~2 min
