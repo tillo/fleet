@@ -65,6 +65,23 @@ spec:
         configBlock: |-
           health_check 5s
           max_fails 2
+    ## home.tillo.ch — the internal split-horizon zone (api.garage, LAN DHCP
+    ## names, technitium answers). Must forward to the router/Unbound (.1) like
+    ## mdapi.ch; otherwise it falls through to the public forwarders and
+    ## SERVFAILs, which broke in-cluster api.garage.home.tillo.ch resolution
+    ## (zot -> Garage S3) during the 2026-06-07 recovery.
+    - port: 53
+      zones:
+      - zone: home.tillo.ch
+      plugins:
+      - name: errors
+      - name: cache
+        parameters: 30
+      - name: forward
+        parameters: . 192.168.1.1
+        configBlock: |-
+          health_check 5s
+          max_fails 2
     ## Default zone — cluster.local handling (unchanged) + NextDNS-first
     ## upstream chain for everything else.
     - port: 53
