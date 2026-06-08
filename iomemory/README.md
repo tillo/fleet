@@ -14,7 +14,10 @@ low-latency StorageClass backed by those disks.
 |------|---------|
 | `fleet.yaml` | prod-only target; namespace `iomemory-driver` (PSA=privileged) |
 | `iomemory-ds.yml` | gated privileged DaemonSet that insmods the module |
-| `mdapi-registry-es.yml` | zot pull secret (ExternalSecret → `cm-akeyless`) |
+
+The `zot-pull` image-pull secret for `iomemory-driver` is provided by the shared
+`../zot-pull-secrets/` bundle (ES `zot-pull` → secret `zot-pull`, host
+`zot.mdapi.ch`), per repo convention — not carried in this app bundle.
 
 The `longhorn-iomemory` StorageClass (disk tag `iomemory`, dataLocality
 best-effort) is **cluster-scoped**, so it lives in the sibling bundle
@@ -35,9 +38,10 @@ repo + CI, like the `gitlab-*-ee` images) and mirrored to
   the card is a **host disk**, so no passthrough and no ACS override needed.
 
 ## Prerequisites (do once, before any activation)
-1. **Akeyless key** `/mdapi/iomemory/mdapi-registry` = the zot pull creds
-   (`encodedUserPass`, same value as other bundles). Requires the cm/akeyless
-   gateway to be up.
+1. **Pull secret**: the `zot-pull` ExternalSecret for `iomemory-driver` lives in the
+   shared `../zot-pull-secrets/` bundle and uses the existing shared Akeyless key
+   `/mdapi/zot/zot-auth/password` — no new key needed. It syncs once cm/akeyless is
+   up; a `zot-pull` secret was created manually to bridge the cm outage.
 2. **Build + push the loader image** for the current node kernel
    (`6.12.0-160000.28-default`): see `~/iomemory-vsl-loader/README.md`. Result:
    `zot.mdapi.ch/mdapi/iomemory-vsl-loader:6.12.0-160000.28`.
