@@ -1,0 +1,116 @@
+# iomemory-vsl-loader — loads the RemixVSL iomemory-vsl module on nodes that
+# carry a FusionIO ioMemory card.
+#
+# *** SAFETY GATE ***
+# nodeSelector `mdapi.ch/iomemory: enabled` matches NO node today, so this
+# DaemonSet schedules ZERO pods. Activate one node at a time, only when ALL of:
+#   - card physically installed in the node
+#   - card released from vfio-pci (the loader also does this; remove any
+#     Harvester PCIDeviceClaim so it isn't re-bound on reboot)
+#   - `iommu=pt` on the node kernel cmdline (Intel) + node rebooted
+#   - loader image built for the node's EXACT kernel and pushed to zot
+#   - a one-node validation passed (see README.md)
+# then:  kubectl label node <node> mdapi.ch/iomemory=enabled
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: iomemory-vsl-loader
+  namespace: iomemory-driver
+  labels:
+    app: iomemory-vsl-loader
+spec:
+  selector:
+    matchLabels:
+      app: iomemory-vsl-loader
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: iomemory-vsl-loader
+    spec:
+      nodeSelector:
+        mdapi.ch/iomemory: enabled
+      tolerations:
+        - operator: Exists
+      hostPID: true
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: loader
+          # Built per-kernel by the ~/iomemory-vsl-loader repo; tag == target kernel.
+          # Bump the tag whenever Harvester's kernel changes (vermagic must match).
+          image: zot.mdapi.ch/mdapi/iomemory-vsl-loader:6.12.0-160000.28
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: BAKED_KVER
+              value: "6.12.0-160000.28-default"
+            # Empty for normal operation. Only set "sure_erase_mode=1" transiently
+            # to run fio-sure-erase (see RemixVSL README), then revert.
+            - name: MODULE_PARAMS
+              value: ""
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              RK=$(uname -r)
+              echo "[loader] node=$(hostname) running-kernel=$RK baked=$BAKED_KVER"
+
+              # 1) ioMemory card present on this node?
+              if [ -z "$(lspci -d 1aed: 2>/dev/null)" ]; then
+                echo "[loader] no ioMemory (vendor 1aed) device here; nothing to do."
+                exec sleep infinity
+              fi
+              lspci -nn -d 1aed: || true
+
+              # 2) Refuse to insmod a module built for a different kernel.
+              if [ "$RK" != "$BAKED_KVER" ]; then
+                echo "[loader] FATAL: baked module is for '$BAKED_KVER' but node runs '$RK'."
+                echo "[loader] Rebuild the loader image with TARGET_KVER=$RK and bump the DS tag."
+                exec sleep infinity
+              fi
+
+              # 3) Release the card from vfio-pci if Harvester bound it for passthrough.
+              for d in $(lspci -D -d 1aed: | awk '{print $1}'); do
+                drv=$(basename "$(readlink -f /sys/bus/pci/devices/$d/driver 2>/dev/null)" 2>/dev/null)
+                if [ "$drv" = "vfio-pci" ]; then
+                  echo "[loader] unbinding $d from vfio-pci"
+                  echo "$d" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+                fi
+              done
+
+              # 4) Advisory: iommu=pt recommended on Intel (non-fatal).
+              grep -qw "iommu=pt" /proc/cmdline || \
+                echo "[loader] WARN: 'iommu=pt' not in /proc/cmdline — set it on the node kernel cmdline + reboot for DMA stability."
+
+              # 5) Already loaded?
+              if lsmod | grep -q "^iomemory_vsl"; then
+                echo "[loader] iomemory_vsl already loaded:"; lsmod | grep iomemory
+                exec sleep infinity
+              fi
+
+              # 6) Load into the host kernel (kernel modules are global).
+              KO="/opt/iomemory/${BAKED_KVER}/iomemory-vsl.ko"
+              if [ ! -f "$KO" ]; then echo "[loader] FATAL: $KO missing in image"; exec sleep infinity; fi
+              echo "[loader] insmod $KO $MODULE_PARAMS"
+              if insmod "$KO" $MODULE_PARAMS; then
+                sleep 3
+                dmesg | grep -i fioinf | tail -8 || true
+                echo "[loader] block devices:"; ls -l /dev/fio* 2>/dev/null || echo "  (none yet — check 'fio-status -a')"
+                echo "[loader] loaded OK; holding."
+              else
+                echo "[loader] insmod FAILED (rc=$?). Check dmesg / vermagic / iommu=pt."
+              fi
+              exec sleep infinity
+          volumeMounts:
+            - { name: dev, mountPath: /dev }
+            - { name: sys, mountPath: /sys }
+            - { name: modules, mountPath: /lib/modules, readOnly: true }
+      volumes:
+        - { name: dev, hostPath: { path: /dev } }
+        - { name: sys, hostPath: { path: /sys } }
+        - { name: modules, hostPath: { path: /lib/modules } }
