@@ -56,7 +56,9 @@ spec:
     - alert: LonghornRebuildStuck
       ## A WO (write-only) replica's `progress%` is reported by the
       ## f/infra_health/longhorn_rebuild_stuck Windmill probe every 5 min.
-      ## If the gauge sits unchanged for ≥15 min while still 0 < progress < 100,
+      ## If the gauge sits unchanged for ≥15 min while progress < 100 — this
+      ## includes a rebuild frozen at 0% (a WO target that retries but never
+      ## starts transferring, e.g. pvc-e9bef15c after the 2026-06-06 outage) —
       ## the rebuild stalled. Longhorn does NOT auto-recover stalled WO
       ## rebuilds on its own — the manual fix is to delete the replica so
       ## auto-balance reschedules.
@@ -72,7 +74,6 @@ spec:
       ## Combined with `for: 5m` we get an effective 20-min stall window.
       expr: |
         changes(longhorn_replica_rebuild_progress[15m]) == 0
-          and longhorn_replica_rebuild_progress > 0
           and longhorn_replica_rebuild_progress < 100
       for: 5m
       labels:
