@@ -14,8 +14,12 @@ low-latency StorageClass backed by those disks.
 |------|---------|
 | `fleet.yaml` | prod-only target; namespace `iomemory-driver` (PSA=privileged) |
 | `iomemory-ds.yml` | gated privileged DaemonSet that insmods the module |
-| `iomemory-sc.yml` | `longhorn-iomemory` StorageClass (disk tag `iomemory`, dataLocality best-effort) |
 | `mdapi-registry-es.yml` | zot pull secret (ExternalSecret → `cm-akeyless`) |
+
+The `longhorn-iomemory` StorageClass (disk tag `iomemory`, dataLocality
+best-effort) is **cluster-scoped**, so it lives in the sibling bundle
+`../iomemory-storageclass/` (a `namespace:`-pinned bundle forbids cluster-scoped
+objects — Fleet rejects them).
 
 Loader **image** is built out-of-band from `~/iomemory-vsl-loader/` (its own
 repo + CI, like the `gitlab-*-ee` images) and mirrored to
