@@ -1,0 +1,100 @@
+## Owner-side Joplin client sync -- fans out API-created notes to share recipients.
+##
+## WHY: notes written through the Joplin Data API (the joplin-mcp account, e.g.
+## the /backlog-sync flow) are NOT stamped with jop_share_id by the server. Joplin
+## only assigns share membership CLIENT-side, during a sync. With no owner client
+## ever syncing, every API-created note stays outside the share, so recipients
+## (tillo@tillo.ch) never see it. On 2026-06-11 this had left 30 of 40 notes in the
+## shared "mdapi Infrastructure" notebook invisible to the recipient -- including
+## the daily-updated backlog note. (Proven: creating a folder share via POST
+## /api/shares does not stamp jop_share_id even on the folder; only a client sync
+## does.) See memory joplin_share_fanout_gap_jop_share_id_not_stamped_api_notes.
+##
+## WHAT: run the joplin CLI logged in as the OWNER account on a schedule. Each run:
+## pass 1 pulls any new API-created notes (unstamped); the client stamps them with
+## the parent folder's share_id locally; pass 2 uploads the stamped notes. Joplin
+## Server's "Process shared items" task (#11) then creates the recipient user_items
+## within ~10s. Idempotent -- a run with nothing new uploads nothing.
+##
+## IMAGE: reuse the cached joplin-mcp image only for its Node/npm runtime
+## (IfNotPresent -- no registry round-trip, survives registry outages); the joplin
+## CLI is npm-installed (pinned) into an emptyDir at runtime (~1-2 min). Stateless
+## on purpose: no PVC to corrupt or reattach, and a failed run simply retries next
+## tick. (If the per-run npm install ever becomes a concern, bake a small image
+## with joplin preinstalled and drop the install step.)
+##
+## SCHEDULE in UTC, NOT spec.timeZone: kube-state-metrics ships without tzdata and
+## panics on named zones, taking every kube_* alert down with it (same reason as
+## postgres-events-cleanup in this bundle).
+##
+## CREDENTIALS: owner email/password from joplin-mcp-env-secret (the same secret the
+## MCP uses). The password lives only in env + the ephemeral profile; never logged.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: joplin-owner-share-sync
+  namespace: joplin
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: joplin-owner-share-sync
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: zot-pull
+          containers:
+          - name: sync
+            image: zot.mdapi.ch/mdapi/joplin-mcp:latest
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: HOME
+              value: /work
+            - name: JOPLIN_SERVER_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: joplin-mcp-env-secret
+                  key: JOPLIN_SERVER_EMAIL
+            - name: JOPLIN_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: joplin-mcp-env-secret
+                  key: JOPLIN_SERVER_PASSWORD
+            command: ["sh", "-c"]
+            args:
+            - |
+              set -e
+              mkdir -p /work/npm
+              npm config set prefix /work/npm >/dev/null 2>&1
+              export PATH=/work/npm/bin:$PATH
+              npm install -g joplin@3.6.2 >/tmp/npm.log 2>&1 || { echo "npm install failed:"; tail -20 /tmp/npm.log; exit 1; }
+              joplin config keychain.supported 0 >/dev/null
+              joplin config sync.target 9 >/dev/null
+              joplin config sync.9.path https://notes.mdapi.ch >/dev/null
+              joplin config sync.9.username "$JOPLIN_SERVER_EMAIL" >/dev/null
+              joplin config sync.9.password "$JOPLIN_SERVER_PASSWORD" >/dev/null
+              for n in 1 2 3; do
+                echo "sync pass $n:"; joplin sync 2>&1 | grep -iE 'updat|upload|fetch|complet|error' | tail -3 || true
+              done
+              echo "done: $(joplin status 2>&1 | grep -iE 'Total' | head -1)"
+            volumeMounts:
+            - name: work
+              mountPath: /work
+            resources:
+              requests:
+                cpu: 50m
+                memory: 128Mi
+              limits:
+                memory: 512Mi
+          volumes:
+          - name: work
+            emptyDir: {}
