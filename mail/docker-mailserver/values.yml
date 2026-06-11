@@ -242,6 +242,31 @@ configMaps:
       \w+@\w+\.(?:tillo|mdapi)\.ch SENDER_FROM_REGEXP:-10:edgestuff
       EOF
 
+      # Blocklist DNS (RBL/URIBL/EMAILBL) from public providers is throttled/slow via the
+      # shared resolver; the default 5 DNS retransmits let one dead lookup stall a message to
+      # the 8s task_timeout, which soft-rejected our users outbound mail with
+      # "4.7.1 timeout processing message" (webmail unaffected). Fail slow lookups fast
+      # (rspamd resolves in parallel) so the task finishes well under task_timeout; spam
+      # checks still run. Verified 2026-06-11: heavy multi-blocklist scan 8s -> ~0.6s.
+      cat <<EOF >/etc/rspamd/local.d/options.inc
+      dns {
+        timeout = 1s;
+        retransmits = 2;
+      }
+      EOF
+
+      # Belt-and-suspenders: authenticated (outbound) senders skip the DNS-heavy blocklist
+      # groups entirely (DKIM signing, BAYES, SPF and local checks stay active).
+      cat <<EOF >/etc/rspamd/local.d/settings.conf
+      authenticated_outbound {
+        priority = high;
+        authenticated = true;
+        apply {
+          groups_disabled = ["rbl", "surbl", "dnswl", "emails", "asn"];
+        }
+      }
+      EOF
+
       # Removed by docker-mailserver Dockerfile
       curl -o /usr/lib/dovecot/decode2text.sh https://raw.githubusercontent.com/bdraco/dovecot/refs/heads/master/src/plugins/fts/decode2text.sh
       chmod +x /usr/lib/dovecot/decode2text.sh
