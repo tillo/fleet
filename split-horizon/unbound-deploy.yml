@@ -46,12 +46,12 @@ spec:
             app: unbound
       containers:
       - name: unbound
-        image: registry.mdapi.ch/mdapi/unbound:latest
-        ## IfNotPresent breaks the DNS->registry dependency loop: unbound is
-        ## itself the LAN resolver, so pulling its own image must not need
-        ## DNS. The cached image on each node is enough to restart the pod;
-        ## a Keel-detected update lands on the next cache miss or a manual
-        ## kubectl rollout restart.
+        image: registry.mdapi.ch/mdapi/unbound:1.25.1-mdapi.119
+        ## Lane B (boot-safe, pinned 2026-06-11): pinned tag + IfNotPresent so
+        ## unbound -- itself the LAN resolver -- restarts from each node's image
+        ## cache without needing DNS/registry. Renovate bumps this tag via MR
+        ## (mdapi/ci-templates .version-tag mints :<unbound-ver>-mdapi.<pipeline>).
+        ## Do NOT revert to :latest -- that re-breaks cold-boot + the lint.
         imagePullPolicy: IfNotPresent
         command: ["unbound"]
         args: ["-d", "-p", "-c", "/etc/unbound/unbound.conf"]
