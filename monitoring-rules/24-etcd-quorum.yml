@@ -1,0 +1,75 @@
+## etcd quorum / member-health alerts.
+##
+## Backed by RKE2 etcd's own metrics (etcd_server_has_leader, one series per
+## member), surfaced via the etcd-metrics-proxy DaemonSet (fleet/etcd-metrics/).
+##
+## Closes the detection gap from the 2026-06-10 outage: a member was removed
+## mid-maintenance, leaving a fragile 2-member etcd that then hit a ReadIndex
+## deadlock under load -> API down. Nothing alerted on "running on 2 members"
+## because all 3 nodes were still Ready (so node-readiness alerts miss it) and
+## etcd's own metrics weren't scraped. EtcdMemberMissing now fires on exactly
+## that state.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-etcd-quorum
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cluster-etcd-quorum.rules
+    rules:
+    - alert: EtcdMemberMissing
+      ## One etcd_server_has_leader series per reporting member. 3 expected.
+      ## If a member is down or was removed from the cluster, its series goes
+      ## absent and the count drops -> we are on a fragile 2-member quorum.
+      ## 10m `for` rides out a brief proxy/scrape blip or a planned member
+      ## reshuffle; never sit on 2 members (go to 1 via cluster-reset or back to 3).
+      expr: count(etcd_server_has_leader) < 3
+      for: 10m
+      labels:
+        severity: warning
+        component: etcd
+        team: mdapi
+      annotations:
+        summary: "etcd reporting {{ $value }} members (expected 3)"
+        description: |
+          Fewer than 3 etcd members are reporting. A member is down or was removed
+          -- etcd is on a fragile 2-member quorum (the exact 2026-06-10 failure mode:
+          a 2-member etcd ReadIndex-deadlocked under recovery I/O and took the API down).
+          Restore to 3 members BEFORE any node reboot. If a 2-member state is
+          unavoidable, drop to a single-member `rke2 server --cluster-reset` rather than
+          sitting on 2. (If all 3 nodes are Ready, also check the etcd-metrics-proxy
+          DaemonSet pod on the silent node -- a dead proxy looks like a missing member.)
+
+    - alert: EtcdQuorumLost
+      ## etcd_server_has_leader == 1 when a member can see a leader. If fewer
+      ## than 2 of 3 members see a leader, quorum is gone.
+      expr: sum(etcd_server_has_leader) < 2
+      for: 2m
+      labels:
+        severity: critical
+        component: etcd
+        team: mdapi
+      annotations:
+        summary: "etcd quorum at risk -- only {{ $value }} member(s) see a leader"
+        description: |
+          Fewer than 2 etcd members report a leader -- quorum is lost or about to be.
+          The Kubernetes API will be unstable/unavailable. Recover with a single-member
+          `rke2 server --cluster-reset` on the healthiest node, then sequentially rejoin
+          the others (see qui_etcd_member_removed_rejoin_pending).
+
+    - alert: EtcdNoLeader
+      expr: max(etcd_server_has_leader) == 0
+      for: 1m
+      labels:
+        severity: critical
+        component: etcd
+        team: mdapi
+      annotations:
+        summary: "etcd has no leader"
+        description: |
+          No etcd member reports a leader -- quorum is lost and the Kubernetes API
+          is down. Immediate recovery required (single-member cluster-reset + rejoin).
