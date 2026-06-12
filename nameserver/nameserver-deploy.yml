@@ -5,10 +5,6 @@ metadata:
   namespace: nameserver
   annotations:
     reloader.stakater.com/auto: "true"
-    keel.sh/policy: force
-    keel.sh/match-tag: "true"
-    keel.sh/trigger: poll
-    keel.sh/pollSchedule: "@every 4h"
 spec:
   selector:
     matchLabels:
@@ -32,7 +28,7 @@ spec:
               mountPath: /var/lib/bind
       containers:
         - name: nameserver
-          image: registry.mdapi.ch/mdapi/nameserver:latest
+          image: registry.mdapi.ch/mdapi/nameserver:9.20.21-mdapi.199
           ## Default Always means every pod restart waits on a fresh pull
           ## against registry.mdapi.ch → gitlab.mdapi.ch JWT auth. On
           ## 2026-05-18 a Valkey/Longhorn outage made GitLab JWT return
@@ -40,10 +36,9 @@ spec:
           ## restart took BIND9 (and therefore in-cluster DNS) down with
           ## it. IfNotPresent breaks that dependency loop — the cached
           ## image on each node is enough to restart the pod when GitLab
-          ## is unavailable. Trade-off: Keel detects new image SHAs but
-          ## the pull won't happen until the cache evicts; for nameserver
-          ## that's acceptable because image bumps are infrequent and a
-          ## manual `kubectl rollout restart` is fine.
+          ## is unavailable. Lane B (2026-06-12): the tag is now PINNED (was
+          ## :latest) and keel removed; Renovate bumps the pinned X.Y.Z-mdapi.N
+          ## tag via MR, so updates land through GitOps rather than a live pull.
           imagePullPolicy: IfNotPresent
           ports:
             - name: dns-tcp
