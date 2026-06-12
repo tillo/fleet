@@ -3,11 +3,6 @@ kind: Deployment
 metadata:
   name: technitium-primary
   namespace: technitium
-  annotations:
-    keel.sh/policy: force
-    keel.sh/match-tag: "true"
-    keel.sh/trigger: poll
-    keel.sh/pollSchedule: "@every 4h"
 spec:
   replicas: 1
   strategy:
@@ -32,8 +27,12 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: technitium
-        image: technitium/dns-server:latest
-        imagePullPolicy: Always
+        # Lane B (boot-safe, pinned 2026-06-12): in-cluster DNS must boot from
+        # each node's image cache without the registry. Pinned to its running
+        # release 15.2.0 (digest-matched, no content change). Renovate owns the
+        # bump; keel removed. Do NOT revert to :latest+Always.
+        image: technitium/dns-server:15.2.0
+        imagePullPolicy: IfNotPresent
         ports:
         - name: dns-tcp
           containerPort: 53
