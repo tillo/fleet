@@ -33,8 +33,12 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: zot
-          image: ghcr.io/project-zot/zot-linux-amd64:latest
-          imagePullPolicy: Always
+          # Lane B (boot-safe, pinned 2026-06-12): zot IS the in-cluster registry,
+          # so it must boot from each node's image cache without needing to pull
+          # itself. Pinned to the running version (v2.1.17) + IfNotPresent.
+          # Renovate bumps this tag via MR. Do NOT revert to :latest+Always.
+          image: ghcr.io/project-zot/zot-linux-amd64:v2.1.17
+          imagePullPolicy: IfNotPresent
           args: ["serve", "/etc/zot/config.json"]
           ports:
             - containerPort: 5000
