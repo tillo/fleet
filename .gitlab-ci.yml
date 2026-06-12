@@ -37,3 +37,28 @@ include:
 - template: Auto-DevOps.gitlab-ci.yml
 secret-scan:
   extends: .secret-scan
+
+# Renovate — Lane-B image bumps (config in renovate.json). Runs ONLY on a pipeline
+# schedule or a manual web run, never on normal pushes/MRs. Opens MRs (automerge
+# OFF). Token from the masked RENOVATE_TOKEN CI variable (Akeyless source of truth:
+# /mdapi/renovate/gitlab-token). Part of the 2026-06 image-policy work.
+renovate:
+  stage: lint
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  image:
+    name: ghcr.io/renovatebot/renovate:latest
+    entrypoint: [""]
+  tags:
+    - mdapi
+  variables:
+    RENOVATE_PLATFORM: gitlab
+    RENOVATE_ENDPOINT: https://gitlab.mdapi.ch/api/v4
+    RENOVATE_AUTODISCOVER: "false"
+    RENOVATE_REPOSITORIES: $CI_PROJECT_PATH
+    RENOVATE_GIT_AUTHOR: "Renovate Bot <renovate@mdapi.ch>"
+    RENOVATE_HOST_RULES: '[{"matchHost":"registry.mdapi.ch","hostType":"docker","username":"renovate-bot","password":"$RENOVATE_TOKEN"}]'
+    LOG_LEVEL: info
+  script:
+    - renovate

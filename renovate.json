@@ -1,0 +1,43 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "mdapi Renovate — Lane-B image bumps ONLY. Lane-A floating apps stay on Keel. See operator ~/imagepolicy-study/PROPOSAL.md.",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled"],
+  "automerge": false,
+  "prHourlyLimit": 2,
+  "kubernetes": {
+    "managerFilePatterns": ["/-deploy\\.ya?ml$/"]
+  },
+  "packageRules": [
+    {
+      "description": "Default OFF — do not touch Lane-A floating image refs (Keel owns them).",
+      "matchManagers": ["kubernetes"],
+      "enabled": false
+    },
+    {
+      "description": "Lane-B custom mdapi images — X.Y.Z-mdapi.N versioning (CI mints these).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "registry.mdapi.ch/mdapi/unbound",
+        "registry.mdapi.ch/mdapi/nameserver"
+      ],
+      "enabled": true,
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "Lane-B upstream criticals — default docker/semver versioning.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "ghcr.io/project-zot/zot-linux-amd64",
+        "technitium/dns-server"
+      ],
+      "enabled": true
+    }
+  ],
+  "hostRules": [
+    {
+      "description": "Read private mdapi registry tags. Credentials injected at runtime via RENOVATE_HOST_RULES (NOT committed).",
+      "matchHost": "registry.mdapi.ch",
+      "hostType": "docker"
+    }
+  ]
+}
