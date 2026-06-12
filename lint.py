@@ -42,18 +42,39 @@ def load_docs(path: pathlib.Path):
         return []
 
 
+def strip_yaml_comments(text: str) -> str:
+    """Drop YAML comments so prose that merely *mentions* an annotation (e.g. a
+    `# keel.sh/policy: force` explainer in a fleet.yaml header) doesn't trip the
+    raw-substring checks. Quote-aware, and per the YAML spec a `#` only starts a
+    comment at line start or after whitespace — so `path: /a#b` is preserved."""
+    out = []
+    for line in text.splitlines():
+        in_s = in_d = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == "'" and not in_d:
+                in_s = not in_s
+            elif ch == '"' and not in_s:
+                in_d = not in_d
+            elif ch == "#" and not in_s and not in_d and (i == 0 or line[i - 1] in " \t"):
+                cut = i
+                break
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Check A — Keel policy=force MUST have match-tag: "true"
 # ---------------------------------------------------------------------------
-# Grep-level on raw text: keel annotations may live inside Helm values
-# (arbitrary depth) so a full YAML walk would have to know the chart schema.
-# Substring grep is good enough — false positives here would require someone
-# to deliberately comment-write the strings without using them.
+# Grep-level on comment-stripped text: keel annotations may live inside Helm
+# values (arbitrary depth) so a full YAML walk would have to know the chart
+# schema. Substring grep is good enough; stripping comments first avoids the
+# known false positive of prose that documents the annotation without using it.
 RE_FORCE = re.compile(r"keel\.sh/policy:\s*[\"']?force[\"']?")
 RE_MATCH = re.compile(r"keel\.sh/match-tag:\s*[\"']?true[\"']?")
 
 for path in all_yaml_files():
-    text = path.read_text()
+    text = strip_yaml_comments(path.read_text())
     if RE_FORCE.search(text) and not RE_MATCH.search(text):
         errors.append(
             f"[KEEL-FORCE-NO-MATCH-TAG] {path.relative_to(REPO)}: "
