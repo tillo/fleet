@@ -3,11 +3,6 @@ kind: Deployment
 metadata:
   name: technitium-secondary
   namespace: technitium
-  annotations:
-    keel.sh/policy: force
-    keel.sh/match-tag: "true"
-    keel.sh/trigger: poll
-    keel.sh/pollSchedule: "@every 4h"
 spec:
   replicas: 1
   strategy:
@@ -52,8 +47,13 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: technitium
-        image: technitium/dns-server:latest
-        imagePullPolicy: Always
+        # Lane B (boot-safe, pinned 2026-06-12): in-cluster DNS must boot from
+        # each node's image cache without needing a registry. Pinned to the
+        # latest tagged release 15.2.0 (= primary's version; secondary had been
+        # force-polled to an untagged :latest). Renovate owns the bump; keel
+        # annotations removed. Do NOT revert to :latest+Always.
+        image: technitium/dns-server:15.2.0
+        imagePullPolicy: IfNotPresent
         terminationMessagePath: /dev/termination-log
         terminationMessagePolicy: File
         ports:
