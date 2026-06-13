@@ -4,6 +4,7 @@
   "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled"],
   "enabledManagers": ["kubernetes"],
   "automerge": false,
+  "platformAutomerge": true,
   "assignees": ["tillo"],
   "prHourlyLimit": 2,
   "kubernetes": {
@@ -16,7 +17,7 @@
       "enabled": false
     },
     {
-      "description": "Lane-B custom mdapi images — X.Y.Z-mdapi.N versioning (CI mints these).",
+      "description": "Lane-B custom mdapi images — X.Y.Z-mdapi.N versioning (CI mints these). Reviewed by default; minor/major upstream bumps need a human.",
       "matchManagers": ["kubernetes"],
       "matchPackageNames": [
         "registry.mdapi.ch/mdapi/unbound",
@@ -26,13 +27,32 @@
       "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
     },
     {
-      "description": "Lane-B upstream criticals — default docker/semver versioning.",
+      "description": "Lane-B custom mdapi images — auto-merge the contextless -mdapi.N rebuilds (classified as patch) + digests after CI green. 1-day soak guards against a torn push being auto-deployed.",
       "matchManagers": ["kubernetes"],
       "matchPackageNames": [
-        "ghcr.io/project-zot/zot-linux-amd64",
-        "technitium/dns-server"
+        "registry.mdapi.ch/mdapi/unbound",
+        "registry.mdapi.ch/mdapi/nameserver"
       ],
-      "enabled": true
+      "matchUpdateTypes": ["patch", "digest"],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$",
+      "automerge": true,
+      "minimumReleaseAge": "1 day"
+    },
+    {
+      "description": "Lane-B upstream critical: zot. Manual review with release notes + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/project-zot/zot-linux-amd64"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/project-zot/zot",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: Technitium DNS. Manual review with release notes + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["technitium/dns-server"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/TechnitiumSoftware/DnsServer",
+      "minimumReleaseAge": "3 days"
     }
   ],
   "hostRules": [
