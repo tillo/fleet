@@ -15,6 +15,16 @@ spec:
     endpoint: http://logstream-leader-internal.cribl.svc.cluster.local:8080
     content_type: application/json
     json_array: true
+    ## Fail-fast instead of hanging a flush thread forever on a wedged Cribl
+    ## source. On 2026-06-11 a torn write corrupted the Cribl httpraw source
+    ## persistent-queue; the source accepted connections but never processed
+    ## the POST bodies. With no read_timeout (fluentd default is unlimited),
+    ## the flush threads blocked indefinitely — no error, no retry — and the
+    ## WAF/modsec feed silently stalled for ~44h. read_timeout forces those
+    ## hung flushes to error and retry (and re-resolve to a healthy worker);
+    ## open_timeout bounds the TCP connect.
+    open_timeout: 5
+    read_timeout: 30
     ## Buffer locally for up to 10s then flush; on Cribl outage chunks
     ## get retried up to retry_max_times with exponential backoff.
     ## flush_mode: interval is required for flush_interval to take effect
