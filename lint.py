@@ -164,6 +164,91 @@ for fleet_yaml in REPO.rglob("fleet.y*ml"):
 
 
 # ---------------------------------------------------------------------------
+# Check C — image-policy 2-lane convention (postmortem A2 / image-policy P4)
+# ---------------------------------------------------------------------------
+# Static port of ~/imagepolicy-study/image-policy-lint.py (that one is kubectl-
+# based). This runs in fleet CI with no cluster access, so it can only see RAW
+# Deployment/StatefulSet/DaemonSet manifests in this repo — NOT workloads whose
+# imagePullPolicy lives in Helm values (longhorn, democratic-csi, any chart).
+# Audit those with the kubectl lint.
+#
+# Lanes (locked 2026-06-11, ~/imagepolicy-study/PROPOSAL.md):
+#   Lane A (apps):               floating tag + Always       (Keel-driven)
+#   Lane B (bootstrap-critical): pinned tag  + IfNotPresent  (Renovate-driven)
+# Bad combos: floating+IfNotPresent (never updates) and pinned+Always (re-pulls a
+# fixed tag every start; can't boot when the registry itself is down — the
+# 2026-06-06 deadlock). Bootstrap-critical MUST be Lane B => hard error. App-tier
+# drift is report-only (warning) until the P3 rollout lands; promote to error after.
+# Omitted imagePullPolicy is scored at the k8s default (floating->Always,
+# pinned->IfNotPresent), so manifests that simply leave it out are NOT flagged.
+
+C_FLOATING = re.compile(r"^(latest|stable|edge|main|master|develop|dev|nightly|"
+                        r"rolling|full|alpine|[0-9]+-alpine)$")
+C_PINNED = re.compile(r"^v?[0-9]+([._-].*)?$|^[0-9]{8}")
+C_CRIT_IMG = ("technitium/dns-server", "project-zot/zot", "longhornio/",
+              "democratic-csi", "/mdapi/nameserver", "/mdapi/unbound", "dxflrs/garage")
+C_CRIT_NAME = {"technitium-primary", "technitium-secondary", "nameserver",
+               "unbound", "zot", "garage"}
+C_WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet"}
+
+
+def c_tag_class(image: str) -> str:
+    image = str(image)
+    if "@sha256:" in image:
+        return "digest"
+    last = image.rsplit("/", 1)[-1]
+    if ":" not in last:
+        return "floating"            # no tag => :latest
+    tag = image.rsplit(":", 1)[-1]
+    if C_FLOATING.match(tag):
+        return "floating"
+    if C_PINNED.match(tag):
+        return "pinned"
+    return "other"
+
+
+for path in all_yaml_files():
+    for doc in load_docs(path):
+        if not isinstance(doc, dict) or doc.get("kind") not in C_WORKLOAD_KINDS:
+            continue
+        md = doc.get("metadata", {}) or {}
+        name = md.get("name", "?")
+        spec = (((doc.get("spec") or {}).get("template") or {}).get("spec") or {})
+        for c in spec.get("containers", []) or []:
+            if not isinstance(c, dict):
+                continue
+            img = c.get("image")
+            if not img or "${" in str(img) or "{{" in str(img):
+                continue                       # templated/var image, can't classify
+            pol = c.get("imagePullPolicy", "")
+            cls = c_tag_class(img)
+            # effective policy: score omitted pullPolicy at the k8s default
+            eff = pol or ("IfNotPresent" if cls in ("pinned", "digest") else "Always")
+            laneB = cls in ("pinned", "digest") and eff == "IfNotPresent"
+            crit = name in C_CRIT_NAME or any(s in str(img) for s in C_CRIT_IMG)
+            where = f"{path.relative_to(REPO)}: {name}/{c.get('name', '?')}"
+            if crit:
+                if not laneB:
+                    errors.append(
+                        f"[IMG-LANE-CRITICAL] {where}: bootstrap-critical workload "
+                        f"must be Lane B (pinned tag + IfNotPresent); got "
+                        f"{cls}+{eff}: {img}. A cold cluster can't pull this when "
+                        "the registry is down."
+                    )
+            elif cls == "floating" and eff == "IfNotPresent":
+                warnings.append(
+                    f"[IMG-LANE] {where}: floating tag + IfNotPresent never updates "
+                    f"(Lane A wants Always; Lane B wants a pinned tag): {img}"
+                )
+            elif cls in ("pinned", "digest") and eff == "Always":
+                warnings.append(
+                    f"[IMG-LANE] {where}: pinned tag + Always re-pulls a fixed tag "
+                    f"every start and can't boot if the registry is down "
+                    f"(-> IfNotPresent): {img}"
+                )
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 for w in warnings:
