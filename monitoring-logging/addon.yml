@@ -110,6 +110,16 @@ spec:
     ## because of the new sources Harvester defaults add (rke2 journald + the
     ## separate kube-audit fluentd's chunks all flow through this aggregator,
     ## OOMKilled at 768Mi within minutes — exit 137, BufferOverflowError).
+    ## 2Gi → 3Gi (2026-06-13): the cribl ClusterOutput keeps its buffer in
+    ## memory at total_limit_size 512m (deliberately NOT moved to disk), but
+    ## fluentd RSS runs ~2.7x nominal buffer (Ruby heap + fragmentation that is
+    ## never returned to the OS), so a full 512m buffer sits at ~1.4 GiB RSS —
+    ## 68% of a 2Gi limit, with no headroom for runtime growth, i.e. a full
+    ## buffer could drive an OOMKill. 3Gi puts a full-buffer peak (~1.6 GiB) at
+    ## ~53%, guaranteeing the in-memory buffer cannot exhaust the container.
+    ## (Root cause of the 2026-06-11 → 06-13 WAF/modsec log-feed stall: after a
+    ## restart during cluster instability the 512m buffer wedged in permanent
+    ## BufferOverflowError and dropped every chunk bound for Cribl for ~44h.)
     fluentd:
       resources:
         requests:
@@ -117,4 +127,4 @@ spec:
           memory: 512Mi
         limits:
           cpu: 2000m
-          memory: 2Gi
+          memory: 3Gi
