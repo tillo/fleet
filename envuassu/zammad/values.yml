@@ -62,6 +62,15 @@ elasticsearch:
   # stuck at 8.18.0 (no newer 8.x in legacy; 9.x is a major).
   sysctlImage:
     tag: 12-debian-12-r51
+  master:
+    # 2026-06-14: ES 8.18 JVM is slow to answer on :9200, esp. under cluster
+    # load. The default liveness (initialDelay 180s, failureThreshold 5 -> kill
+    # at ~230s) liveness-killed it during a reconcile-under-heavy-load, cascading
+    # into a zammad outage. Widen the startup grace so a slow start can't trigger
+    # a liveness-kill (now ~300 + 10*10 = 400s before liveness engages).
+    livenessProbe:
+      initialDelaySeconds: 300
+      failureThreshold: 10
 
 # Note: Elasticsearch runs in single-node mode and will show YELLOW status due to unassigned
 # replica shards. This is expected and harmless. To turn it GREEN, run once after ES is up:
