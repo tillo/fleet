@@ -63,11 +63,23 @@ elasticsearch:
   sysctlImage:
     tag: 12-debian-12-r51
   master:
-    # 2026-06-14: ES 8.18 JVM is slow to answer on :9200, esp. under cluster
-    # load. The default liveness (initialDelay 180s, failureThreshold 5 -> kill
-    # at ~230s) liveness-killed it during a reconcile-under-heavy-load, cascading
-    # into a zammad outage. Widen the startup grace so a slow start can't trigger
-    # a liveness-kill (now ~300 + 10*10 = 400s before liveness engages).
+    # 2026-06-14: ES 8.18 was tight at 1536Mi limit / 512m heap. Bump to 2Gi
+    # limit with heap = 50% (1024m) per ES best practice (other 50% for Lucene
+    # filesystem cache), to reduce slow starts + GC pressure.
+    heapSize: 1024m
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1536Mi
+        ephemeral-storage: 50Mi
+      limits:
+        cpu: 750m
+        memory: 2Gi
+        ephemeral-storage: 2Gi
+    # ES 8.18 JVM is slow to answer on :9200, esp. under cluster load. The default
+    # liveness (initialDelay 180s, failureThreshold 5 -> kill at ~230s) liveness-
+    # killed it during a reconcile-under-heavy-load, cascading into a zammad
+    # outage. Widen the startup grace (now ~300 + 10*10 = 400s before liveness).
     livenessProbe:
       initialDelaySeconds: 300
       failureThreshold: 10
