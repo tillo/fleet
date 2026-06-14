@@ -1,0 +1,67 @@
+# Build/load script for the CephFS kernel module (ceph.ko).
+# The SUSE Linux Micro 6.2 kernel ships CONFIG_CEPH_FS=n (only libceph+rbd built), so
+# the CephFS *kernel* client has no module. This builds ceph.ko from the matching SUSE
+# kernel source against the EXACT running kernel and loads it. Auto-rebuilds when the
+# kernel changes (vermagic check). Pattern mirrors the FusionIO iomemory loader.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cephfs-kmod-build-script
+  namespace: cephfs-kmod
+data:
+  build.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    KVER="$(uname -r)"                          # shared host kernel (e.g. 6.12.0-160000.28-default)
+    DEST=/host-usrlocal/lib/ceph-kmod           # persisted on COS_PERSISTENT (/usr/local)
+    KO="$DEST/ceph.ko"
+    HOSTRPM=/host/usr/lib/sysimage/rpm
+    LEAP=https://download.opensuse.org/distribution/leap/16.0/repo/oss/
+    log(){ echo "[cephfs-kmod $(date -u +%T)] $*"; }
+
+    ko_current(){ [ -f "$KO" ] && modinfo "$KO" 2>/dev/null | grep -qE "^vermagic: *${KVER}( |\$)"; }
+
+    build(){
+      local KPKG KSRC KOBJ
+      KPKG="$(rpm --dbpath "$HOSTRPM" -q --qf '%{VERSION}-%{RELEASE}' kernel-default 2>/dev/null | head -1)"
+      [ -n "$KPKG" ] || { log "FATAL: cannot read host kernel-default version"; return 1; }
+      log "building ceph.ko for kernel $KVER (source pkg $KPKG)"
+      # Only the GA OSS repo is needed (kernel-source/syms/devel @ .28.1 all live there).
+      zypper --non-interactive ar -fG "$LEAP" leap-oss 2>/dev/null || true
+      zypper --non-interactive --gpg-auto-import-keys refresh leap-oss >/dev/null 2>&1 || true
+      # zypper may exit non-zero on benign repo warnings even when packages install fine,
+      # so do NOT gate on its exit code — verify the build tree exists instead.
+      zypper --non-interactive in -y --no-recommends \
+        gcc make kmod tar xz zstd flex bison ncurses-devel libopenssl-devel bc perl libelf-devel \
+        "kernel-source=${KPKG}" "kernel-syms=${KPKG}" "kernel-default-devel=${KPKG}" || true
+      KSRC="/usr/src/linux-${KPKG%.*}"          # strip trailing .N -> /usr/src/linux-6.12.0-160000.28
+      KOBJ=/usr/src/linux-obj/x86_64/default
+      [ -d "$KSRC" ] || KSRC="$(ls -d /usr/src/linux-*-[0-9]* 2>/dev/null | grep -v obj | head -1)"
+      [ -d "$KSRC/fs/ceph" ] && [ -f "$KOBJ/.config" ] || { log "FATAL: kernel build tree not installed (pkg ${KPKG})"; return 1; }
+      "$KSRC/scripts/config" --file "$KOBJ/.config" -m CEPH_FS
+      make -s -C "$KOBJ" olddefconfig
+      make -s -C "$KOBJ" modules_prepare || true   # btf host-tool may fail; autoconf.h is what we need
+      make -j"$(nproc)" -C "$KOBJ" M="$KSRC/fs/ceph" CONFIG_DEBUG_INFO_BTF_MODULES=n modules || {
+          log "FATAL: module build failed"; return 1; }
+      [ -f "$KSRC/fs/ceph/ceph.ko" ] || { log "FATAL: ceph.ko not produced"; return 1; }
+      strip --strip-debug "$KSRC/fs/ceph/ceph.ko"
+      mkdir -p "$DEST"
+      install -m0644 "$KSRC/fs/ceph/ceph.ko" "$KO"
+      modinfo "$KO" | grep -qE "^vermagic: *${KVER}( |\$)" || { log "FATAL: built vermagic mismatch"; return 1; }
+      log "installed $KO ($(stat -c%s "$KO") bytes)"
+    }
+
+    # nsenter into PID1 namespaces so modprobe/insmod use the HOST modules + kernel
+    h(){ nsenter -t 1 -m -u -i -n -p -- "$@"; }
+    load(){
+      if h lsmod | awk '{print $1}' | grep -qx ceph; then log "ceph already loaded"; return 0; fi
+      h modprobe libceph 2>/dev/null || true
+      h modprobe netfs   2>/dev/null || true
+      if h insmod /usr/local/lib/ceph-kmod/ceph.ko; then log "ceph.ko loaded"; else log "ERROR: insmod failed"; return 1; fi
+    }
+
+    if ko_current; then log "ceph.ko already current for $KVER"; else build || exit 1; fi
+    load || exit 1
+    h grep -qw ceph /proc/filesystems && log "cephfs registered; OK"
+    log "done; idling (re-checks on pod restart / kernel change)"
+    sleep infinity

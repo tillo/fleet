@@ -1,0 +1,56 @@
+# Auto-builder DaemonSet: builds + loads ceph.ko (CephFS kernel client) on every node,
+# rebuilding automatically after a kernel upgrade (vermagic check). One pod per node;
+# after the one-time build it idles. Privileged + hostPID are required to load a module
+# into the host kernel (standard node module-loader pattern, cf. nvidia/wireguard).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cephfs-kmod-builder
+  namespace: cephfs-kmod
+  labels:
+    app: cephfs-kmod-builder
+spec:
+  selector:
+    matchLabels:
+      app: cephfs-kmod-builder
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: cephfs-kmod-builder
+    spec:
+      hostPID: true
+      # Run on the Ceph/storage nodes (all bare-metal nodes today). Tolerate any taint.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: builder
+          image: opensuse/leap:16.0
+          command: ["/bin/bash", "/scripts/build.sh"]
+          securityContext:
+            privileged: true
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits:   {memory: "4Gi"}          # peak during compile
+          volumeMounts:
+            - {name: script, mountPath: /scripts}
+            - {name: host-root, mountPath: /host, readOnly: true}      # rpm db (kernel version)
+            - {name: usr-local, mountPath: /host-usrlocal}             # persist + write ceph.ko
+          startupProbe:                          # mark ready once cephfs is registered
+            exec:
+              command: ["/bin/bash","-c","nsenter -t 1 -m -- grep -qw ceph /proc/filesystems"]
+            periodSeconds: 15
+            failureThreshold: 40                 # up to 10 min for first build
+          livenessProbe:
+            exec:
+              command: ["/bin/bash","-c","nsenter -t 1 -m -- grep -qw ceph /proc/filesystems"]
+            periodSeconds: 60
+            failureThreshold: 3
+      volumes:
+        - name: script
+          configMap: {name: cephfs-kmod-build-script, defaultMode: 0755}
+        - name: host-root
+          hostPath: {path: /, type: Directory}
+        - name: usr-local
+          hostPath: {path: /usr/local, type: Directory}

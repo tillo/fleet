@@ -1,10 +1,17 @@
 # RWX file driver (StorageClass ceph-filesystem). Name = rook-ceph.cephfs.csi.ceph.com,
 # the provisioner the rook-ceph-cluster chart set on the ceph-filesystem StorageClass.
-# Empty spec → inherits everything from the OperatorConfig driverSpecDefaults
-# (cephFsClientType defaults to the kernel client).
 apiVersion: csi.ceph.io/v1
 kind: Driver
 metadata:
   name: rook-ceph.cephfs.csi.ceph.com
   namespace: rook-ceph
-spec: {}
+spec:
+  # Use the in-kernel cephfs client (ceph.ko built+loaded by the cephfs-kmod DaemonSet).
+  # autodetect falls back to ceph-fuse if the module is ever absent.
+  cephFsClientType: autodetect
+  # The cluster requires msgr2 (network.connections.requireMsgr2=true); the mons listen
+  # msgr2-only on :3300. Without ms_mode the kernel client speaks msgr1 there and the mon
+  # drops it ("socket closed, con state V1_BANNER" -> mount fails "no mds is up").
+  # prefer-crc = use msgr2 (crc, no wire encryption since encryption is not enabled).
+  kernelMountOptions:
+    ms_mode: prefer-crc
