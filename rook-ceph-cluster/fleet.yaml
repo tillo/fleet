@@ -17,6 +17,30 @@ helm:
   version: v1.20.0
   valuesFiles:
     - values.yml
-# diff.comparePatches: Ceph/Rook mutate status, finalizers and default many spec
-# fields, which can show as Fleet drift. Add comparePatches REACTIVELY once the
-# bundle reports Modified (mirror the metallb/ pattern) — do not pre-invent paths.
+# The Rook operator/CRD defaults many CephCluster /spec fields that aren't in the
+# rendered manifest, which Fleet reports as drift (Modified). These are benign
+# defaults (live config is correct) — ignore them in the diff (metallb pattern,
+# observed 2026-06-14). Device list (/spec/storage/nodes) is intentionally NOT
+# ignored so real disk changes still surface.
+diff:
+  comparePatches:
+    - apiVersion: ceph.rook.io/v1
+      kind: CephCluster
+      namespace: rook-ceph
+      name: rook-ceph
+      operations:
+        - {op: remove, path: /spec/cleanupPolicy}
+        - {op: remove, path: /spec/healthCheck}
+        - {op: remove, path: /spec/livenessProbe}
+        - {op: remove, path: /spec/cephVersion/allowUnsupported}
+        - {op: remove, path: /spec/crashCollector/disable}
+        - {op: remove, path: /spec/dashboard/ssl}
+        - {op: remove, path: /spec/mgr/allowMultiplePerNode}
+        - {op: remove, path: /spec/mon/allowMultiplePerNode}
+        - {op: remove, path: /spec/storage/useAllNodes}
+        - {op: remove, path: /spec/network/connections/compression}
+        - {op: remove, path: /spec/network/connections/encryption}
+        - {op: remove, path: /spec/continueUpgradeAfterChecksEvenIfNotHealthy}
+        - {op: remove, path: /spec/skipUpgradeChecks}
+        - {op: remove, path: /spec/removeOSDsIfOutAndSafeToRemove}
+        - {op: remove, path: /spec/upgradeOSDRequiresHealthyPGs}
