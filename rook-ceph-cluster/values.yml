@@ -162,6 +162,19 @@ cephBlockPools:
         imageFormat: "2"
         imageFeatures: layering
         csi.storage.k8s.io/fstype: ext4
+        # CSI credential secrets (Rook auto-creates these in the operator ns). The
+        # chart default `parameters` carries these refs; since we override `parameters`,
+        # Helm replaces the whole map, so they MUST be repeated here or the provisioner
+        # fails with "provided secret is empty" (root-caused 2026-06-14). ns hardcoded
+        # rook-ceph (chart default uses "{{ .Release.Namespace }}" which it tpl-renders).
+        csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+        csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+        csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-publish-secret-name: rook-csi-rbd-provisioner
+        csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph
+        csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+        csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
 
 # ── RWX file (media tier): metadata rep3, data rep2/min_size1 ────────────────
 cephFileSystems:
@@ -195,6 +208,16 @@ cephFileSystems:
       volumeBindingMode: Immediate
       parameters:
         csi.storage.k8s.io/fstype: ext4
+        # See ceph-block note above — secret refs dropped by our `parameters` override
+        # must be restored or CephFS provisioning fails with "provided secret is empty".
+        csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+        csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+        csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-publish-secret-name: rook-csi-cephfs-provisioner
+        csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph
+        csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+        csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
 
 # ── S3 object (RGW) — PILOT for OpenObserve (see PLAN §11 S3-vs-Garage) ───────
 # NOTE: chart default uses an EC 2+1 data pool; on 3 nodes EC min_size pauses I/O
