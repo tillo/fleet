@@ -84,9 +84,15 @@ spec:
       minAllowed:
         cpu: 10m
         memory: 64Mi
+      # 2026-06-14: maxAllowed.memory was 1Gi -- a stale ceiling that predated
+      # the chart bumping the worker limit to 4Gi (windmill/values.yml). The cap
+      # hard-clamped the worker to 1Gi via the VPA admission webhook, so it
+      # OOMed on cold-cache python dep-setup + concurrent-job bursts (the
+      # f/infra_health/longhorn_rebuild_stuck OOM). Raise the ceiling to match
+      # the chart's burst headroom so VPA can size up to 4Gi (and react to OOMs).
       maxAllowed:
-        cpu: 500m
-        memory: 1Gi
+        cpu: "1"
+        memory: 4Gi
 ---
 apiVersion: autoscaling.k8s.io/v1
 kind: VerticalPodAutoscaler
@@ -106,9 +112,12 @@ spec:
       minAllowed:
         cpu: 10m
         memory: 32Mi
+      # 2026-06-14: align ceiling with the chart's 2Gi native-worker limit
+      # (was 512Mi; same stale-clamp pattern as the default group, not yet
+      # OOMing since native idles ~200Mi, but bump to prevent a burst clamp).
       maxAllowed:
         cpu: 500m
-        memory: 512Mi
+        memory: 2Gi
 ---
 apiVersion: autoscaling.k8s.io/v1
 kind: VerticalPodAutoscaler
