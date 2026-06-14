@@ -41,6 +41,43 @@ spec:
           cpu: 1000m
           memory: 500Mi
 
+    prometheus-adapter:
+      ## Chart ships NO resource requests/limits (BestEffort QoS) and a tight
+      ## liveness (/healthz HTTPS, timeout 5s, failureThreshold 3 -> kill after
+      ## ~30s of slow /healthz). Under custom-metrics query load the adapter
+      ## burns ~1.3c, its /healthz times out, and it gets liveness-killed in a
+      ## restart loop (~31 restarts, "http: Handler timeout"). Note: HPA CPU
+      ## metrics come from rke2-metrics-server, not this; only custom metrics
+      ## are affected. Give it resources (out of BestEffort) + a tolerant
+      ## liveness/readiness so a slow /healthz can't kill it.
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: 2000m
+          memory: 2Gi
+      livenessProbe:
+        httpGet:
+          path: /healthz
+          port: https
+          scheme: HTTPS
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 15
+        failureThreshold: 6
+        successThreshold: 1
+      readinessProbe:
+        httpGet:
+          path: /healthz
+          port: https
+          scheme: HTTPS
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 15
+        failureThreshold: 6
+        successThreshold: 1
+
     ## Disable kube-prometheus-stack default rules that are noisy or
     ## inappropriate for this homelab. Each entry is a one-line note on
     ## why it goes; revisit if any of these turn out to mask a real fault.
