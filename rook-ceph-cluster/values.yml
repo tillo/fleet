@@ -1,0 +1,194 @@
+# Rook Ceph CLUSTER values — bulk tier on the freed P420i. Lane B (pinned chart + image).
+# Tiering: fio Longhorn = fast/rep2 + VM images (unchanged); P420i Ceph = bulk.
+# Decision (2026-06-13): media = CephFS RWX, data rep2/min_size1 + metadata rep3.
+
+clusterName: rook-ceph
+operatorNamespace: rook-ceph
+
+# ── §7 flaky-P420i throttling (ceph.conf override) ───────────────────────────
+# Protects client I/O on a controller that resets under load. Some knobs are also
+# runtime-settable via `ceph config set`; LOAD-TEST (fail-OSD backfill + forced
+# deep-scrub under Plex load) before trusting these — that is the go/no-go gate.
+configOverride: |
+  [global]
+  osd_pool_default_size = 2
+  osd_pool_default_min_size = 1
+  mon_warn_on_pool_no_redundancy = false
+  [osd]
+  osd_mclock_profile = high_client_ops
+  osd_max_backfills = 1
+  osd_recovery_max_active = 1
+  osd_recovery_sleep_hdd = 0.1
+  osd_recovery_op_priority = 1
+  osd_max_scrubs = 1
+  osd_scrub_sleep = 0.1
+  osd_scrub_load_threshold = 0.3
+  osd_scrub_begin_hour = 1
+  osd_scrub_end_hour = 6
+  osd_deep_scrub_interval = 1209600
+  osd_scrub_during_recovery = false
+
+toolbox:
+  enabled: true            # `ceph -s` CLI; used by pre-reboot-guard Ceph gate
+
+monitoring:
+  enabled: true            # Ceph ServiceMonitor (needs ServiceMonitor CRD - present via rancher/VM)
+  createPrometheusRules: true
+
+cephClusterSpec:
+  cephVersion:
+    # renovate: datasource=docker depName=quay.io/ceph/ceph
+    image: quay.io/ceph/ceph:v20.2.1   # Tentacle. v20.2.0 has a read-affinity DATA-CORRUPTION bug -> keep >= v20.2.1. (Squid v19.2.x is the conservative alt.)
+    allowUnsupported: false
+  dataDirHostPath: /var/lib/rook       # persisted by /oem/98_rook_ceph.yaml (bind from /usr/local)
+  skipUpgradeChecks: false
+  continueUpgradeAfterChecksEvenIfNotHealthy: false
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+  mgr:
+    count: 2
+    allowMultiplePerNode: false
+    modules:
+      - name: rook
+        enabled: true
+  dashboard:
+    enabled: true
+    ssl: false             # front via ingress-nginx + cert-manager later if exposed
+  network:
+    connections:
+      requireMsgr2: true
+  crashCollector:
+    disable: false
+  logCollector:
+    enabled: true
+    periodicity: daily
+    maxLogSize: 500M
+  disruptionManagement:
+    managePodBudgets: true
+  resources:
+    mon:
+      requests: {cpu: "500m", memory: "1Gi"}
+      limits:   {memory: "2Gi"}
+    mgr:
+      requests: {cpu: "500m", memory: "512Mi"}
+      limits:   {memory: "1Gi"}
+    osd:
+      requests: {cpu: "1", memory: "2Gi"}
+      limits:   {memory: "4Gi"}
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    # Freed P420i SSDs by STABLE wwn (verified 2026-06-14; NEVER /dev/sdX — the
+    # blockdevice CRs' cached devPath is already stale, proving the re-enum trap).
+    # All 12 confirmed: 0 Longhorn replicas, excluded OS disk (sda) + HARV_LH_DEFAULT.
+    # Each must be released (blockdevice spec.provision=false) + wiped before Rook claims it.
+    nodes:
+      - name: qui   # 4 × 1.9T
+        devices:
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cc991a124a501b9d5cf9d  # was sdb
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c5bc908804aadc5f644ff  # was sdd
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c8ca34f6d3c380d351b39  # was sde
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cfc16df93311e0d258612  # was sdf
+      - name: quo   # 4 × 1.9T
+        devices:
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cd465f58928a9f278a3a0  # was sdb
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c5052ceee1feb8869f663  # was sdd
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c557ca8f9276a418c3b5f  # was sde
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2442949fc101a9ad2bd0  # was sdf
+      - name: qua   # 4 × 1.8T
+        devices:
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c32817960c4514eb0b8f8  # was sdb
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cb32c7e90d6266efe988b  # was sdd
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2bac499b979768746436  # was sde
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cbc1b7cec81c982c1e384  # was sdf
+
+# ── RWO block (bulk tier) ────────────────────────────────────────────────────
+cephBlockPools:
+  - name: ceph-blockpool
+    spec:
+      failureDomain: host
+      replicated:
+        size: 2
+      # min_size is not a first-class replicated field; applied as a pool parameter.
+      # VERIFY post-deploy: `ceph osd pool get ceph-blockpool min_size` == 1
+      parameters:
+        min_size: "1"
+    storageClass:
+      enabled: true
+      name: ceph-block
+      isDefault: false
+      reclaimPolicy: Delete
+      allowVolumeExpansion: true
+      volumeBindingMode: Immediate
+      parameters:
+        imageFormat: "2"
+        imageFeatures: layering
+        csi.storage.k8s.io/fstype: ext4
+
+# ── RWX file (media tier): metadata rep3, data rep2/min_size1 ────────────────
+cephFileSystems:
+  - name: ceph-filesystem
+    spec:
+      metadataPool:
+        replicated:
+          size: 3
+      dataPools:
+        - name: data0
+          failureDomain: host
+          replicated:
+            size: 2
+          parameters:
+            min_size: "1"
+            bulk: "true"
+      metadataServer:
+        activeCount: 1
+        activeStandby: true
+        resources:
+          requests: {cpu: "1", memory: "2Gi"}
+          limits:   {memory: "4Gi"}
+        priorityClassName: system-cluster-critical
+    storageClass:
+      enabled: true
+      isDefault: false
+      name: ceph-filesystem
+      pool: data0
+      reclaimPolicy: Delete
+      allowVolumeExpansion: true
+      volumeBindingMode: Immediate
+      parameters:
+        csi.storage.k8s.io/fstype: ext4
+
+# ── S3 object (RGW) — PILOT for OpenObserve (see PLAN §11 S3-vs-Garage) ───────
+# NOTE: chart default uses an EC 2+1 data pool; on 3 nodes EC min_size pauses I/O
+# when any node reboots (breaks upgrade-survivability) AND has no spare host to
+# re-create a lost chunk. Overridden to replicated size2/min_size1 for consistency
+# with the bulk tier. Switch to EC only once there are >3 OSD hosts.
+cephObjectStores:
+  - name: ceph-objectstore
+    spec:
+      metadataPool:
+        failureDomain: host
+        replicated:
+          size: 3
+      dataPool:
+        failureDomain: host
+        replicated:
+          size: 2
+        parameters:
+          min_size: "1"
+          bulk: "true"
+      preservePoolsOnDelete: true
+      gateway:
+        port: 80
+        instances: 2
+        resources:
+          requests: {cpu: "500m", memory: "1Gi"}
+          limits:   {memory: "2Gi"}
+    storageClass:
+      enabled: true
+      name: ceph-bucket          # ObjectBucketClaim provisioner (dynamic buckets + auto secret)
+      reclaimPolicy: Delete
+      volumeBindingMode: Immediate
+      parameters:
+        region: us-east-1
