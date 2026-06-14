@@ -77,19 +77,24 @@ spec:
     kind: Deployment
     name: windmill-workers-default
   updatePolicy:
-    updateMode: Auto
+    # 2026-06-14: recommend-only (NOT Auto). This is the bursty python worker
+    # (cold-cache `uv` dep installs, tarball stream + base64 buffers). The chart
+    # sets only a memory LIMIT (4Gi, no request) deliberately for burst headroom.
+    # Under updateMode:Auto, VPA pins request==limit==recommendation *target*
+    # (~1.5Gi, Guaranteed QoS) -- not maxAllowed -- so the limit sits at ~p90 of
+    # usage with zero burst headroom and bursts OOMKill (observed: a pod created
+    # at the new 1.48Gi limit still OOMed on its cold dep-install burst). "Off"
+    # lets VPA recommend for visibility while the chart's flat 4Gi limit stands.
+    # Precedent in this file: windmill-postgresql / keycloak / nextcloud are "Off".
+    updateMode: "Off"
   resourcePolicy:
     containerPolicies:
     - containerName: "*"
       minAllowed:
         cpu: 10m
         memory: 64Mi
-      # 2026-06-14: maxAllowed.memory was 1Gi -- a stale ceiling that predated
-      # the chart bumping the worker limit to 4Gi (windmill/values.yml). The cap
-      # hard-clamped the worker to 1Gi via the VPA admission webhook, so it
-      # OOMed on cold-cache python dep-setup + concurrent-job bursts (the
-      # f/infra_health/longhorn_rebuild_stuck OOM). Raise the ceiling to match
-      # the chart's burst headroom so VPA can size up to 4Gi (and react to OOMs).
+      # maxAllowed kept at the chart's 4Gi ceiling so the recommendation (now
+      # recommend-only) isn't artificially clamped in the VPA status/UI.
       maxAllowed:
         cpu: "1"
         memory: 4Gi
