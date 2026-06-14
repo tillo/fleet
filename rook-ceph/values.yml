@@ -1,0 +1,26 @@
+# Rook Ceph OPERATOR values — Lane B.
+# Image + CSI sidecars are pinned by the chart (rook/ceph:v1.20.0, cephcsi v3.17.0,
+# provisioner v6.2.0, snapshotter v8.5.0, attacher v4.12.0, resizer v2.1.0,
+# registrar v2.17.0, csiaddons v0.14.0). pullPolicy defaults to IfNotPresent.
+
+csi:
+  enableRbdDriver: true          # RWO block (StorageClass ceph-block)
+  enableCephfsDriver: true       # RWX file  (StorageClass ceph-filesystem)
+  enableNFSDriver: false         # not needed for k8s consumers; CephNFS export is separate
+  provisionerReplicas: 2         # 3-node cluster
+  # CSI plugin DaemonSet runs on every node; provisioners are HA at 2 replicas.
+
+# Operator-side ServiceMonitors (CSI metrics). Needs the Prometheus-operator CRDs
+# (ServiceMonitor) already present via the rancher/VM monitoring stack.
+monitoring:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# Keep the operator off any future non-storage/tainted nodes if the cluster grows.
+# (3 bare-metal nodes today all carry storage, so no nodeSelector needed yet.)
