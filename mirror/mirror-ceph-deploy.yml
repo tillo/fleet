@@ -1,0 +1,62 @@
+## mirror-ceph — single-Ceph-RBD replacement for the legacy mergerfs `mirror`
+## deployment. Same image (mirror-storage.service auto-detects: no /mnt/disk*
+## here, so /srv is the RBD mount, no mergerfs). Runs in parallel with the live
+## `mirror` (app=mirror) during the migration; the public Service is flipped to
+## app=mirror-ceph at cutover, then the legacy deployment + Longhorn PVCs are
+## deleted. keel owns :latest here (disabled on the legacy deployment).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mirror-ceph
+  namespace: mirror
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: mirror-ceph
+  replicas: 1
+  strategy:
+    type: Recreate          # RBD RWO: single-attach — old pod must release before new attaches
+  template:
+    metadata:
+      labels:
+        app: mirror-ceph
+    spec:
+      containers:
+      - name: mirror
+        image: registry.mdapi.ch/mdapi/mirror:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true   # bind mount /srv/ftp -> docroot in mirror-storage.sh
+        ports:
+        - {name: http,  containerPort: 80}
+        - {name: https, containerPort: 443}
+        - {name: rsync, containerPort: 873}
+        - {name: ftp,   containerPort: 21}
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        resources:
+          requests:
+            cpu: 50m
+            memory: 700Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /etc/ssl/private
+          name: mirror-cert
+        - mountPath: /srv
+          name: mirror-data
+      volumes:
+      - name: mirror-cert
+        secret:
+          secretName: mirror-cert
+      - name: mirror-data
+        persistentVolumeClaim:
+          claimName: mirror-data-ceph
+      imagePullSecrets:
+      - name: mdapi-registry
