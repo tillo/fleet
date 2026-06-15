@@ -7,3 +7,16 @@ dependsOn:
   - name: mdapi-prod-cert-manager
 helm:
   maxHistory: 25
+# The CNPG operator injects its default monitoring queries
+# ({key: queries, name: cnpg-default-monitoring}) into the ha-recorder-pg
+# Cluster's spec.monitoring.customQueriesConfigMap, alongside our own
+# ha-recorder-pg-metrics entry -> perpetual Modified. The operator co-owns this
+# list; ignore it in the diff.
+diff:
+  comparePatches:
+  - apiVersion: postgresql.cnpg.io/v1
+    kind: Cluster
+    name: ha-recorder-pg
+    namespace: home-assistant
+    operations:
+    - {"op": "remove", "path": "/spec/monitoring/customQueriesConfigMap"}

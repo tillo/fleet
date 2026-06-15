@@ -134,8 +134,13 @@ diff:
     - "/spec/template/metadata/annotations/keel.sh~1update-time"
     - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
 
-  ## transmission-pia has 3 containers (transmission + pia + port-manager)
-  ## and VPA Auto rewrites resources on all three.
+  ## transmission-pia has 3 containers (transmission + pia + port-manager).
+  ## VPA Auto only writes resources on container[0] (transmission); pia +
+  ## port-manager have NO `resources` in this manifest, so a `remove` op on
+  ## /containers/{1,2}/resources is a BOGUS PATH that fails the ENTIRE
+  ## comparePatch (Fleet discards all ops) -> drift never stripped, bundle
+  ## stuck Modified. Only strip resources where they exist (c0) + the images
+  ## on all three (Keel-tracked).
   - apiVersion: apps/v1
     kind: Deployment
     name: transmission-pia
@@ -143,9 +148,7 @@ diff:
     operations:
     - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
     - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/1/resources"}
     - {"op": "remove", "path": "/spec/template/spec/containers/1/image"}
-    - {"op": "remove", "path": "/spec/template/spec/containers/2/resources"}
     - {"op": "remove", "path": "/spec/template/spec/containers/2/image"}
     jsonPointers:
     - "/spec/template/metadata/annotations/keel.sh~1update-time"
