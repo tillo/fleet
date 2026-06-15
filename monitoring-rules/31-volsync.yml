@@ -1,0 +1,109 @@
+## VolSync backup alerting — scrapes the operator's controller-runtime "secure
+## metrics" (8443, TLS+authz, no rbac-proxy in 0.16) and alerts on failed/missed
+## Ceph-PVC backups to the external Garage ceph-backup bucket.
+##
+## SCOPE: catches VolSync-DETECTED failures (out-of-sync, missed schedules) +
+## the scrape being down. It does NOT catch the "mover exits 0 but writes no
+## objects" silent case (VolSync self-reports success) — that needs an
+## independent restic snapshot-freshness probe, built alongside the scheduled
+## ReplicationSources (the "solid system"). No ReplicationSources exist yet, so
+## the backup alerts below are forward-looking (series appear once sources do).
+---
+# vmagent's SA must be authorized to GET the /metrics nonResourceURL.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: volsync-metrics-reader
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volsync-metrics-reader-vmagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: volsync-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: vmagent-mdapi
+    namespace: monitoring
+---
+# VolSync's metrics server authenticates the scraper via TokenReview +
+# SubjectAccessReview, which requires its SA to have the auth-delegator role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volsync-metrics-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: volsync
+    namespace: volsync-system
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: volsync
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [volsync-system]
+  selector:
+    matchLabels:
+      control-plane: volsync-controller
+  endpoints:
+    - port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-volsync
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: volsync-backups
+      rules:
+        - alert: VolSyncBackupOutOfSync
+          expr: volsync_volume_out_of_sync == 1
+          for: 6h
+          labels:
+            severity: warning
+          annotations:
+            summary: "VolSync backup out of sync: {{ $labels.obj_namespace }}/{{ $labels.obj_name }}"
+            description: >-
+              VolSync {{ $labels.role }} {{ $labels.obj_namespace }}/{{ $labels.obj_name }}
+              has been out of sync for >6h (its last Ceph->Garage backup failed or is overdue).
+        - alert: VolSyncBackupMissedIntervals
+          expr: increase(volsync_missed_intervals_total[1d]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "VolSync missed a scheduled backup: {{ $labels.obj_namespace }}/{{ $labels.obj_name }}"
+            description: >-
+              VolSync {{ $labels.obj_namespace }}/{{ $labels.obj_name }} missed
+              {{ $value }} scheduled backup interval(s) in the last day.
+    - name: volsync-operator
+      rules:
+        - alert: VolSyncMetricsScrapeDown
+          expr: up{job="volsync"} == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "VolSync operator metrics unreachable"
+            description: >-
+              vmagent has been unable to scrape the VolSync operator metrics for >1h —
+              backup health alerting (out-of-sync / missed intervals) is blind.
