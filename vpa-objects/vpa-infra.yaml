@@ -156,19 +156,22 @@ spec:
         cpu: "4"
         memory: 2Gi
 ---
-# mirror: idle at 1m but holds 513Mi in memory — preserve that
+# mirror-ceph (Ceph-RBD mirror): recommend-only. The mirror does bursty full-tree
+# re-syncs whose rsync file lists + page-cache OOM if the limit is pinned to the
+# idle figure (it OOM-killed at 1Gi during the initial re-sync). Keep the static
+# 2Gi limit from the deployment; VPA only advises.
 apiVersion: autoscaling.k8s.io/v1
 kind: VerticalPodAutoscaler
 metadata:
-  name: mirror
+  name: mirror-ceph
   namespace: mirror
 spec:
   targetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: mirror
+    name: mirror-ceph
   updatePolicy:
-    updateMode: Auto
+    updateMode: "Off"
   resourcePolicy:
     containerPolicies:
     - containerName: "*"
