@@ -584,7 +584,14 @@ spec:
         summary: "Cert {{ $labels.namespace }}/{{ $labels.cert }} expires in {{ $value }}d"
         description: "cert-manager Certificate close to expiry; investigate renewal."
     - alert: LonghornBackupStale
-      expr: longhorn_backup_age_days > 70
+      # 40d (was 70d): the recurring `default` group backs up monthly (1st of
+      # month), so a healthy volume maxes ~31-35d before its next run. 70d only
+      # caught volumes that had already missed TWO cycles — when the May/June
+      # partial runs left ~37 volumes a full cycle behind, none of them alerted.
+      # 40d catches a single missed monthly cycle while leaving margin for a
+      # run that starts a few days late. (Weekly-group volumes are far tighter
+      # in practice; a per-group threshold needs the group label on the metric.)
+      expr: longhorn_backup_age_days > 40
       for: 1h
       labels:
         severity: warning
@@ -592,7 +599,7 @@ spec:
         team: mdapi
       annotations:
         summary: "Longhorn backup {{ $labels.namespace }}/{{ $labels.pvc }} is {{ $value }}d old"
-        description: "PVC backup older than the 70d staleness threshold."
+        description: "PVC backup older than the 40d staleness threshold (monthly policy)."
     - alert: LonghornBackupMissing
       expr: longhorn_backup_age_days == -1
       for: 1d
