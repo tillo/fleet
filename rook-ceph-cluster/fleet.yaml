@@ -31,13 +31,13 @@ diff:
       operations:
         - {op: remove, path: /spec/cleanupPolicy}
         - {op: remove, path: /spec/healthCheck}
-        # allowUnsupported: the chart RENDERS allowUnsupported:false while Rook
-        # omitempty-strips it from the live CR (live .spec.cephVersion = {image}
-        # only). comparePatches apply to the DESIRED manifest, so remove it there
-        # to match live. (An earlier `add value: false` used a bare bool, which
-        # Fleet — whose operations[].value is string-typed — fataled on, stalling
-        # the whole gitjob; quoting it injected the string "false" and still drifted.)
-        - {op: remove, path: /spec/cephVersion/allowUnsupported}
+        # allowUnsupported drift is ACCEPTED (no comparePatch op here): the chart
+        # renders allowUnsupported:false but Rook omitempty-strips it from the live
+        # CR, so it always shows as one cosmetic Modified field. No comparePatch
+        # form fixes it: `add value: false` (bool) fatals the gitjob (value is
+        # string-typed), `add value: "false"` injects a string that still differs,
+        # and `remove` errors on the agent ("remove nonexistent key" — comparePatches
+        # normalize the live obj too, which lacks the key). Leave it as benign drift.
         - {op: remove, path: /spec/crashCollector/disable}
         - {op: remove, path: /spec/dashboard/ssl}
         - {op: remove, path: /spec/mgr/allowMultiplePerNode}
