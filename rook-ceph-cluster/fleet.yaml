@@ -31,7 +31,15 @@ diff:
       operations:
         - {op: remove, path: /spec/cleanupPolicy}
         - {op: remove, path: /spec/healthCheck}
-        - {op: remove, path: /spec/cephVersion/allowUnsupported}
+        # allowUnsupported is the ODD ONE OUT: every other op removes an
+        # operator-ADDED default from live, but the chart RENDERS
+        # allowUnsupported:false while Rook omitempty-strips it from the live CR
+        # (live .spec.cephVersion = {image} only). A `remove` of a key absent
+        # from live errors ("Unable to remove nonexistent key") and voids the
+        # ENTIRE patch (all 14 ops), so the whole CephCluster shows as drift.
+        # Use `add` instead: inject allowUnsupported:false into live during
+        # normalization so it matches the rendered manifest. `add` never fails.
+        - {op: add, path: /spec/cephVersion/allowUnsupported, value: false}
         - {op: remove, path: /spec/crashCollector/disable}
         - {op: remove, path: /spec/dashboard/ssl}
         - {op: remove, path: /spec/mgr/allowMultiplePerNode}
