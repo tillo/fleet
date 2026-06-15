@@ -1,0 +1,38 @@
+## grafana-embed.mdapi.ch — UNGATED (no oauth2-proxy) Grafana endpoint, LAN-only,
+## used solely so the Ceph dashboard (ceph.mdapi.ch) can iframe-embed Grafana
+## d-solo panels. grafana.mdapi.ch is SSO-gated and SSO cookies aren't sent in
+## cross-site iframes, so the embed needs this gate-free path. Grafana itself
+## serves anonymous Viewer (read-only) — see GF_AUTH_ANONYMOUS_* in grafana-deploy.yml.
+## Locked to the home LAN + cluster ranges; ModSecurity in DetectionOnly so the
+## d-solo JS / query params aren't blocked. Set as ceph dashboard
+## grafana-frontend-api-url.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-embed
+  namespace: monitoring
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.0.0/16,10.0.0.0/8"
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine DetectionOnly
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana-embed.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: grafana
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - grafana-embed.mdapi.ch
+      secretName: grafana-embed-cert
