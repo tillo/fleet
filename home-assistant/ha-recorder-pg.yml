@@ -22,6 +22,17 @@ spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:16
   primaryUpdateStrategy: unsupervised
 
+  ## Keep the two instances on different nodes. CNPG defaults to a *soft*
+  ## (preferred) anti-affinity, which let both copies land on `qui` during a
+  ## 2026-06-15 rolling restart -- primary + replica + the HA app all
+  ## co-located, so the replica bought zero node-failure protection. `required`
+  ## is always satisfiable here (2 instances, 3 nodes) and guarantees the
+  ## replica schedules onto a different node than the primary.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
   ## Recorder write-freshness metric (cnpg_ha_recorder_last_write_age_seconds)
   ## feeding the HomeAssistantRecorderStalled alert. enablePodMonitor is
   ## auto-scraped by vmagent (empty scrape selectors). Non-disruptive: enabling
@@ -133,16 +144,22 @@ spec:
     - remoteRef: { key: /mdapi/home-assistant/garage-region }
       secretKey: REGION
 ---
-## Nightly base backup at 03:30 (WAL is streamed continuously). CNPG
+## Nightly base backup at 01:30 (WAL is streamed continuously). CNPG
 ## ScheduledBackup; retention managed by Garage bucket lifecycle / the
 ## offsite job, not barman here.
+##
+## Moved 03:30 -> 01:30 on 2026-06-16: the ~30Gi base backup takes ~90min to
+## upload and was overrunning into the 04:00 UTC garage_offsite_backup Windmill
+## job, which saturates the same salt/pepper Garage cluster. The contention
+## produced intermittent 504 Gateway Timeouts on CompleteMultipartUpload
+## (e.g. 2026-06-16 05:01Z). 01:30 gives a clear ~2.5h window before 04:00.
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:
   name: ha-recorder-pg-daily
   namespace: home-assistant
 spec:
-  schedule: "0 30 3 * * *"
+  schedule: "0 30 1 * * *"
   backupOwnerReference: self
   cluster:
     name: ha-recorder-pg

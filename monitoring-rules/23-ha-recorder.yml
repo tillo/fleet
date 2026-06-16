@@ -52,3 +52,47 @@ spec:
           cnpg_ha_recorder_last_write_age_seconds absent for 15m. The
           ha-recorder-pg exporter/custom query may be broken, or the CNPG
           cluster is down. Check `kubectl -n home-assistant get cluster.postgresql.cnpg.io ha-recorder-pg`.
+
+  - name: app-home-recorder.backup
+    rules:
+    ## Base backups to the salt/pepper Garage bucket flap (pod churn mid-backup,
+    ## or 504s from CompleteMultipartUpload colliding with the 04:00 offsite
+    ## job) and the cluster's LastBackupSucceeded condition went silent. WAL is
+    ## streamed continuously, so a single failed daily is WAL-recoverable -- the
+    ## real risk is base backups going *stale*, which leaves a longer WAL replay
+    ## as the only path. Warn (not critical) once no base backup has landed in
+    ## the object store for >26h (daily cadence + ~90min runtime + buffer).
+    - alert: HomeAssistantRecorderBackupStale
+      expr: |
+        time() - cnpg_collector_last_available_backup_timestamp{namespace="home-assistant"} > 93600
+      for: 1h
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA recorder base backup stale ({{ $value | humanizeDuration }} old)"
+        description: |
+          No successful ha-recorder-pg base backup has landed in
+          s3://homeassistant-pg-backup for >26h. Continuous WAL archiving still
+          protects PITR, but the base-backup anchor is aging. Check recent
+          backups: `kubectl -n home-assistant get backups.postgresql.cnpg.io`
+          and the cluster's LastBackupSucceeded condition. Common causes:
+          504 Gateway Timeout from Garage during CompleteMultipartUpload
+          (offsite-job contention), or instance-manager restart mid-backup.
+
+    ## Companion: if the catalog metric goes absent, the alert above can't fire.
+    - alert: HomeAssistantRecorderBackupMetricMissing
+      expr: |
+        absent(cnpg_collector_last_available_backup_timestamp{namespace="home-assistant"})
+      for: 1h
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA recorder backup-catalog metric missing"
+        description: |
+          cnpg_collector_last_available_backup_timestamp absent for 1h. The CNPG
+          collector or its barman cloud catalog read may be broken, masking
+          backup staleness. Check the ha-recorder-pg instance metrics endpoint.
