@@ -28,24 +28,22 @@ diff:
       kind: CephCluster
       namespace: rook-ceph
       name: rook-ceph
+      # IMPORTANT: comparePatches normalize the LIVE object too, and a JSON-patch
+      # `remove` of a key ABSENT from live fails ("Unable to remove nonexistent
+      # key"), which spams the Fleet agent + can void the obj's normalization.
+      # So ONLY list ops whose target key is actually present in the live CephCluster.
+      # Rook omitempty-strips most spec defaults from live, so a `remove` for them
+      # is a no-op-that-errors — list ONLY fields the operator actually persists.
+      # Verified present in live 2026-06-16: cleanupPolicy, healthCheck,
+      # network.connections.compression, network.connections.encryption.
+      # Dropped (absent from live -> errored, no-op): cephVersion.allowUnsupported,
+      # crashCollector.disable, dashboard.ssl, mgr/mon.allowMultiplePerNode,
+      # storage.useAllNodes, continueUpgradeAfterChecksEvenIfNotHealthy,
+      # skipUpgradeChecks, removeOSDsIfOutAndSafeToRemove, upgradeOSDRequiresHealthyPGs.
+      # (allowUnsupported is the only one the chart renders, so it remains one
+      # benign cosmetic Modified field — no comparePatch form suppresses it.)
       operations:
         - {op: remove, path: /spec/cleanupPolicy}
         - {op: remove, path: /spec/healthCheck}
-        # allowUnsupported drift is ACCEPTED (no comparePatch op here): the chart
-        # renders allowUnsupported:false but Rook omitempty-strips it from the live
-        # CR, so it always shows as one cosmetic Modified field. No comparePatch
-        # form fixes it: `add value: false` (bool) fatals the gitjob (value is
-        # string-typed), `add value: "false"` injects a string that still differs,
-        # and `remove` errors on the agent ("remove nonexistent key" — comparePatches
-        # normalize the live obj too, which lacks the key). Leave it as benign drift.
-        - {op: remove, path: /spec/crashCollector/disable}
-        - {op: remove, path: /spec/dashboard/ssl}
-        - {op: remove, path: /spec/mgr/allowMultiplePerNode}
-        - {op: remove, path: /spec/mon/allowMultiplePerNode}
-        - {op: remove, path: /spec/storage/useAllNodes}
         - {op: remove, path: /spec/network/connections/compression}
         - {op: remove, path: /spec/network/connections/encryption}
-        - {op: remove, path: /spec/continueUpgradeAfterChecksEvenIfNotHealthy}
-        - {op: remove, path: /spec/skipUpgradeChecks}
-        - {op: remove, path: /spec/removeOSDsIfOutAndSafeToRemove}
-        - {op: remove, path: /spec/upgradeOSDRequiresHealthyPGs}
