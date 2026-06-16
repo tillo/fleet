@@ -121,7 +121,16 @@ data:
         local-data: "docs.mdapi.ch. 300 IN A 192.168.1.191"
         local-data: "idp.mdapi.ch. 300 IN A 192.168.1.191"
         local-data: "k8s-mcp.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "mirror.mdapi.ch. 300 IN A 192.168.1.49"
+        # ---- EXCLUSIONS: do NOT add split-horizon overrides for these ----
+        # mirror.mdapi.ch is a SHARED public name fronting multiple ports on
+        # DIFFERENT LBs via bpi-r4 hairpin (HTTP/HTTPS -> mirror .49; NTS-KE 4460
+        # + NTP 123 -> chrony .58; ...). A single internal A record pins it to one
+        # box and silently breaks every other port — it killed NTS (2026-06-16,
+        # jauderho couldn't reach :4460). Leave it resolving to the public A/AAAA
+        # on-LAN too so hairpin NAT routes per-port. Apply the same rule to any
+        # future multi-service public FQDN. (This list is hand-maintained — joe +
+        # git — there is no auto-generator; verified 2026-06-16.)
+        # tails.mdapi.ch is single-service (the mirror box) so its override stays:
         local-data: "tails.mdapi.ch. 300 IN A 192.168.1.49"
         local-data: "notes-mcp.mdapi.ch. 300 IN A 192.168.1.191"
         local-data: "notes.mdapi.ch. 300 IN A 192.168.1.191"
