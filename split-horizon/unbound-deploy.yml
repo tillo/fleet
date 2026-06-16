@@ -5,7 +5,14 @@
 ##
 ## NOTE: subPath ConfigMap mounts do NOT auto-refresh on their own, but the
 ## reloader.stakater.com/auto annotation makes Stakater Reloader roll this
-## Deployment automatically whenever unbound-cm.yml changes.
+## Deployment automatically whenever unbound-cm.yml -- OR the external-dns
+## managed `unbound-generated` ConfigMap -- changes.
+##
+## Two config sources, both included by unbound.conf (server clause):
+##   - unbound-config   (this repo, unbound-cm.yml): static exceptions +
+##     non-mdapi.ch overrides + forward zones. Hand-maintained.
+##   - unbound-generated (external-dns, fleet/external-dns-mdapi): the mdapi.ch
+##     ingress-backed A records -> 192.168.1.191. Auto-generated; DO NOT edit.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -100,7 +107,18 @@ spec:
           mountPath: /etc/unbound/unbound.conf
           subPath: unbound.conf
           readOnly: true
+        - name: generated
+          mountPath: /etc/unbound/generated.conf
+          subPath: generated.conf
+          readOnly: true
       volumes:
       - name: config
         configMap:
           name: unbound-config
+      - name: generated
+        configMap:
+          ## Maintained by external-dns (fleet/external-dns-mdapi). Always
+          ## present + non-empty (the webhook never deletes it). optional:true
+          ## only guards the mount layer; unbound.conf `include:`s this path.
+          name: unbound-generated
+          optional: true

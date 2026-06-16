@@ -8,8 +8,12 @@ data:
     # Managed by Fleet -- fleet/split-horizon/
     # In-cluster split-horizon resolver. Answers the override set below
     # locally; forwards everything else to Technitium (192.168.1.54).
-    # The override list is a 1:1 migration of the BPI-R4 dnsmasq address=
-    # entries (2026-05-21), minus the decommissioned minio records.
+    #
+    # The mdapi.ch ingress records (-> 192.168.1.191) are NO LONGER listed
+    # here: they are generated from k8s Ingress objects by external-dns
+    # (fleet/external-dns-mdapi) into the `unbound-generated` ConfigMap and
+    # pulled in via `include:` below. This file now holds only the STATIC
+    # exceptions + non-mdapi.ch overrides + forward zones.
     server:
         verbosity: 1
         interface: 0.0.0.0
@@ -65,96 +69,68 @@ data:
         local-zone: "textopolis.net." transparent
         local-zone: "tillo.ch." transparent
 
-        local-data: "gitlab.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "harvester.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "registry.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "kas.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "gitjob.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "home.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "esphome.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "frigate.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "shop.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "auth.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "lam.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "autobrr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "bazarr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "overseerr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "prowlarr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "radarr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "sonarr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "tdarr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "transmission.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "windmill.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "dev.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "pages.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "test.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "cribl.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "rspamd.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "fio-tools.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "webmail.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "appdaemon.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "ingress.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "www.tillo.ch. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.tillo.ch. 300 IN A 192.168.1.191"
-        local-data: "webmail.tillo.ch. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.coiffuredreams.ch. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.coders.ch. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.dellambrogio.ch. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.lithia.eu. 300 IN A 192.168.1.191"
-        local-data: "autoconfig.textopolis.net. 300 IN A 192.168.1.191"
-        local-data: "webmail.coders.ch. 300 IN A 192.168.1.191"
-        local-data: "webmail.coiffuredreams.ch. 300 IN A 192.168.1.191"
-        local-data: "webmail.dellambrogio.ch. 300 IN A 192.168.1.191"
-        local-data: "webmail.lithia.eu. 300 IN A 192.168.1.191"
-        local-data: "webmail.textopolis.net. 300 IN A 192.168.1.191"
-        local-data: "suivi.envuassu.ch. 300 IN A 192.168.1.191"
-        local-data: "login.envuassu.ch. 300 IN A 192.168.1.191"
+        # ---- mdapi.ch ingress records: AUTO-GENERATED (external-dns) ----
+        # Every mdapi.ch name fronting the in-cluster nginx ingress VIP
+        # (192.168.1.191) is generated from its k8s Ingress by external-dns
+        # (fleet/external-dns-mdapi) into the `unbound-generated` ConfigMap and
+        # included here. Add/remove an Ingress and the record follows
+        # automatically; Stakater Reloader then rolls unbound. DO NOT hand-add
+        # mdapi.ch ingress records here -- put the host on the Ingress instead.
+        include: "/etc/unbound/generated.conf"
+
+        # ---- STATIC mdapi.ch exceptions (NOT ingress-backed / not .191) ----
+        # Deliberately kept out of external-dns. plex + ftth are covered by
+        # external-dns --exclude-domains (they resolve elsewhere); dev/fio-tools/
+        # ingress have no Ingress object; tails is windmill-pushed single-service.
         local-data: "plex.mdapi.ch. 300 IN A 192.168.1.46"
-        local-data: "31-3-128-62.5d0cc67044f0410fbaeefaf0a98c49de.plex.direct. 300 IN A 192.168.1.46"
-        local-data: "cloud.envuassu.ch. 300 IN A 192.168.1.40"
         local-data: "ftth.mdapi.ch. 300 IN A 192.168.1.254"
-        local-data: "santillo.tillo.ch. 300 IN A 192.168.1.5"
-        local-data: "cloud.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "dev.spider3.ch. 300 IN A 192.168.1.191"
-        local-data: "dns.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "docs.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "idp.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "k8s-mcp.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "dev.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "fio-tools.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "ingress.mdapi.ch. 300 IN A 192.168.1.191"
         # ---- EXCLUSIONS: do NOT add split-horizon overrides for these ----
         # mirror.mdapi.ch is a SHARED public name fronting multiple ports on
         # DIFFERENT LBs via bpi-r4 hairpin (HTTP/HTTPS -> mirror .49; NTS-KE 4460
         # + NTP 123 -> chrony .58; ...). A single internal A record pins it to one
-        # box and silently breaks every other port — it killed NTS (2026-06-16,
+        # box and silently breaks every other port -- it killed NTS (2026-06-16,
         # jauderho couldn't reach :4460). Leave it resolving to the public A/AAAA
-        # on-LAN too so hairpin NAT routes per-port. Apply the same rule to any
-        # future multi-service public FQDN. (This list is hand-maintained — joe +
-        # git — there is no auto-generator; verified 2026-06-16.)
+        # on-LAN too so hairpin NAT routes per-port. This is also why external-dns
+        # excludes mirror.mdapi.ch (--exclude-domains) -- an Ingress for it must
+        # NOT mint an internal A record. Apply the same rule to any future
+        # multi-service public FQDN. (Static list hand-maintained -- joe + git.)
         # tails.mdapi.ch is single-service (the mirror box) so its override stays:
         local-data: "tails.mdapi.ch. 300 IN A 192.168.1.49"
-        local-data: "notes-mcp.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "notes.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "nsadmin.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "pfsense.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "rancher.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "threadfin-bis.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "threadfin.mdapi.ch. 300 IN A 192.168.1.191"
+
+        # ---- STATIC non-mdapi.ch overrides (out of external-dns scope) ----
+        # external-dns is scoped to mdapi.ch (--domain-filter); these other
+        # public zones are hand-maintained here. Most front the same .191 ingress.
+        local-data: "www.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.tillo.ch. 300 IN A 192.168.1.191"
+        local-data: "santillo.tillo.ch. 300 IN A 192.168.1.5"
+        local-data: "vpn.tillo.ch. 300 IN A 10.7.50.1"
         local-data: "www.coiffuredreams.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.coiffuredreams.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.coiffuredreams.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.coders.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.coders.ch. 300 IN A 192.168.1.191"
         local-data: "www.dellambrogio.ch. 300 IN A 192.168.1.191"
         local-data: "www.dellambrogio.com. 300 IN A 192.168.1.191"
         local-data: "www.dellambrogio.net. 300 IN A 192.168.1.191"
         local-data: "www.dellambrogio.org. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.dellambrogio.ch. 300 IN A 192.168.1.191"
+        local-data: "webmail.dellambrogio.ch. 300 IN A 192.168.1.191"
         local-data: "www.ivodellambrogio.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.lithia.eu. 300 IN A 192.168.1.191"
+        local-data: "webmail.lithia.eu. 300 IN A 192.168.1.191"
         local-data: "www.textopolis.net. 300 IN A 192.168.1.191"
-        local-data: "zot.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "autoconfig.textopolis.net. 300 IN A 192.168.1.191"
+        local-data: "webmail.textopolis.net. 300 IN A 192.168.1.191"
+        local-data: "suivi.envuassu.ch. 300 IN A 192.168.1.191"
+        local-data: "login.envuassu.ch. 300 IN A 192.168.1.191"
+        local-data: "cloud.envuassu.ch. 300 IN A 192.168.1.40"
+        local-data: "dev.spider3.ch. 300 IN A 192.168.1.191"
         local-data: "www.spider3.ch. 300 IN A 192.168.1.191"
-        local-data: "vpn.tillo.ch. 300 IN A 10.7.50.1"
-        local-data: "auth.test.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "seerr.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "spider3.files.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "tv.files.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "logs.mdapi.ch. 300 IN A 192.168.1.191"
-        local-data: "pushgateway.mdapi.ch. 300 IN A 192.168.1.191"
+        local-data: "31-3-128-62.5d0cc67044f0410fbaeefaf0a98c49de.plex.direct. 300 IN A 192.168.1.46"
 
     # Internal authoritative zones go to Technitium (192.168.1.54) only:
     #   home.tillo.ch.            -- LAN DHCP-generated records
