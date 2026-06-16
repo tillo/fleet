@@ -364,6 +364,25 @@ spec:
       annotations:
         summary: "Auto-deleted {{ $value }} Unknown-state node(s)"
         description: "resource_waste.py removed nodes stuck in NotReady > 15min. New nodes should re-join automatically."
+    - alert: ClusterReleasedPVsOrphaned
+      ## A PVC was deleted but its PV stayed Released because
+      ## reclaimPolicy=Retain — the PV (and, for Longhorn, the backing
+      ## volume) keeps consuming disk. 1h `for:` rides out normal PVC churn.
+      expr: cluster_released_pvs_count > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} PV(s) orphaned in Released state"
+        description: |
+          PersistentVolume(s) left in Released phase — the bound PVC was
+          deleted but reclaimPolicy=Retain kept the PV, and for Longhorn the
+          backing volume too, which keeps consuming disk. See the
+          f/infra_health/resource_waste Windmill run log for the PV names.
+          Clean up: `kubectl delete pv <name>` and, for Longhorn,
+          `kubectl -n longhorn-system delete volumes.longhorn.io <name>`.
 
   - name: app-batch-jobs.image-builder-health
     rules:
