@@ -82,6 +82,13 @@ spec:
         - name: home-assistant-secrets
           mountPath: /config/secrets.yaml
           subPath: secrets.yaml
+        # /dev/ttyUSB* re-enumerate across reboots (a node reboot moved the Zigbee
+        # ZBT-1 from ttyUSB1->ttyUSB0, breaking ZHA which was pinned to ttyUSB1).
+        # Mount the udev /dev/serial/by-id symlinks so ZHA can use the stable
+        # by-id path (privileged already exposes the underlying ttyUSB* nodes).
+        - name: dev-serial
+          mountPath: /dev/serial
+          readOnly: true
         resources: {}
       # Sidecar: hourly off-site sync of /config/backups → Garage S3.
       # Local retention is unchanged (auto_backup keeps the rolling window).
@@ -121,3 +128,7 @@ spec:
       - name: home-assistant-secrets
         secret:
           secretName: home-assistant-secrets
+      - name: dev-serial
+        hostPath:
+          path: /dev/serial
+          type: Directory      # exists while the ZBT-1 (permanently installed) is present on qui
