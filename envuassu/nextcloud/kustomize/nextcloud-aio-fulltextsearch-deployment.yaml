@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-fulltextsearch
+  namespace: envuassu
+spec:
+  # Single replica over an RWO Elasticsearch PVC — Recreate avoids a
+  # multi-attach deadlock when the deployment rolls.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: nextcloud-aio-fulltextsearch
+          # The chart derives ELASTIC_PASSWORD from the FULLTEXTSEARCH_PASSWORD
+          # value, which we intentionally leave unset (no secrets in git) — so it
+          # renders EMPTY and the ES `elastic` user ends up with no usable
+          # password (HTTP 401, healthcheck fails, crashloop). Wire it from the
+          # same external-secret the nextcloud container already consumes; the
+          # `value: null` clears the empty chart value so only valueFrom remains.
+          env:
+            - name: ELASTIC_PASSWORD
+              value: null
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-aio-env-secret
+                  key: FULLTEXTSEARCH_PASSWORD
