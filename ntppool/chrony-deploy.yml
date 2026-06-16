@@ -12,8 +12,8 @@ metadata:
     # so cert-manager's 60-day rotation propagates without a manual restart.
     reloader.stakater.com/auto: "true"
 spec:
-  # Recreate so the old pod releases /dev/ttyUSB0 before the new one
-  # tries to claim it (GPS USB serial, single-writer).
+  # Recreate so the old pod releases the GPS USB serial (FT232R, single-writer;
+  # the image auto-detects it by ftdi_sio driver) before the new one claims it.
   strategy:
     type: Recreate
   selector:
@@ -55,14 +55,15 @@ spec:
           value: "rtcsync\nclientloglimit 100000000\nleapsectz right/UTC\nntsserverkey /etc/chrony/tls/tls.key\nntsservercert /etc/chrony/tls/tls.crt\nntsport 4460\nntsdumpdir /var/lib/chrony"
         - name: NOCLIENTLOG
           value: "false"
-        # GPS temporarily disabled: the FT232R USB-serial adapter on qui is
-        # faulty (2026-05-21) and the current image's startup hangs on the
-        # wedged device. chrony serves as a stratum-2 NTP server from
-        # NTP_SERVERS meanwhile. Re-enable (value "true") once the adapter is
-        # replaced AND the rebuilt image is live — chrony@60fe16f makes the
-        # startup degrade gracefully, so ENABLE_GPS=true is safe again then.
+        # GPS re-enabled 2026-06-16. The image auto-detects the GPS by DRIVER
+        # (ftdi_sio = the FT232R) in startup.sh — re-enumeration-proof, no hard
+        # ttyUSBn path. Verified the FT232R streams clean multi-constellation
+        # NMEA @115200 (GNGGA fix, 23 sats) — it IS the working GPS. The earlier
+        # "FT232R faulty" call (2026-05-21) blamed the wrong adapter: the
+        # Prolific PL2303 (ttyUSB1) is the dead one (no NMEA at any baud, no PPS).
+        # Startup degrades gracefully (timeout-guarded) if the GPS is ever absent.
         - name: ENABLE_GPS
-          value: "false"
+          value: "true"
         resources: {}
         # chronyc exits non-zero ("Cannot talk to daemon") if chronyd is not
         # running — so a wedged startup can no longer hide behind a false
