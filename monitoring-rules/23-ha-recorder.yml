@@ -63,8 +63,12 @@ spec:
     ## as the only path. Warn (not critical) once no base backup has landed in
     ## the object store for >26h (daily cadence + ~90min runtime + buffer).
     - alert: HomeAssistantRecorderBackupStale
+      ## max() across instances: only the primary reads the barman object-store
+      ## catalog, so replicas report this metric as 0. Without the aggregation
+      ## the replica's 0-series satisfies the threshold and false-fires. max()
+      ## takes the freshest available-backup timestamp, which is the real signal.
       expr: |
-        time() - cnpg_collector_last_available_backup_timestamp{namespace="home-assistant"} > 93600
+        time() - max(cnpg_collector_last_available_backup_timestamp{namespace="home-assistant"}) > 93600
       for: 1h
       labels:
         severity: warning
