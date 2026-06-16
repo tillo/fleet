@@ -82,6 +82,29 @@ spec:
           chronyd dead / unreachable on the LB IP" case the
           deployment-availability alert above can miss.
 
+    - alert: NtsKeNotServing
+      # warning (not critical): NTS down degrades the time service but plain
+      # NTP keeps working, so the NTP statuspage component shows degraded, not
+      # major outage. component: NTP reuses the existing statuspage component so
+      # users see it at mdapi.statuspage.io via the alertmanager adapter.
+      expr: nts_ke_probe_success == 0
+      for: 10m
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "chrony NTS-KE not serving (TCP 4460)"
+        description: |
+          The NTS-KE TLS handshake to the chrony server
+          (192.168.1.58:4460, ALPN ntske/1, SNI mirror.mdapi.ch) failed —
+          NTS clients (e.g. the nts-servers monitor) cannot establish keys,
+          though plain NTP may still work. Most likely the chrony image was
+          built without NTS (the Alpine pkg drops it; mdapi/chrony now compiles
+          chronyd +NTS from source and guards it) or the TLS cert broke.
+          Verify: `chronyc serverstats | grep NTS-KE` and
+          `openssl s_client -connect 192.168.1.58:4460 -alpn ntske/1`.
+
     - alert: NtpChronyUnsynced
       expr: ntp_probe_stratum >= 16
       for: 30m
