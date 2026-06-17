@@ -102,6 +102,15 @@ ingress:
       # firing on legitimate authenticated API traffic. Same pattern as
       # joplin/joplin-ing.yml cf3e8c3.
       SecAction "id:900201,phase:1,nolog,pass,t:none,setvar:tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/reports+json| |application/csp-report| |application/octet-stream|"
+      # Windmill resource paths (scripts/flows/apps) are user-named and can
+      # legitimately end in a CRS restricted-file token, e.g.
+      # f/gitlab/upgrade_bump_dockerfile -> 930130 matches "dockerfile" in
+      # restricted-files.data and blocks the authenticated API call. Drop
+      # 930130 only on the authenticated workspace API surface; root-level
+      # scanner probes (/.env, /.git/config) are not under /api/w/ and stay
+      # blocked. Two-line continuation is required or the ctl silently no-ops.
+      SecRule REQUEST_URI "@beginsWith /api/w/mdapi/" \
+        "id:1002,phase:1,pass,nolog,ctl:ruleRemoveById=930130"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
   tls:
     - secretName: windmill-cert
