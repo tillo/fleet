@@ -105,12 +105,18 @@ ingress:
       # Windmill resource paths (scripts/flows/apps) are user-named and can
       # legitimately end in a CRS restricted-file token, e.g.
       # f/gitlab/upgrade_bump_dockerfile -> 930130 matches "dockerfile" in
-      # restricted-files.data and blocks the authenticated API call. Drop
-      # 930130 only on the authenticated workspace API surface; root-level
-      # scanner probes (/.env, /.git/config) are not under /api/w/ and stay
-      # blocked. Two-line continuation is required or the ctl silently no-ops.
+      # restricted-files.data and blocks the authenticated API call. Drop the
+      # attack-lfi group only on the authenticated workspace API surface;
+      # root-level scanner probes (/.env, /.git/config) are not under /api/w/
+      # and stay blocked. ruleRemoveByTag (not ruleRemoveById) is required:
+      # 930130 is phase:2, and a ctl:ruleRemoveById from this phase:1 rule does
+      # not propagate to the phase:2 chain (verified 2026-06-17 by probe), but
+      # ruleRemoveByTag is applied at rule-registration time. LFI rules add no
+      # real protection on /api/w/mdapi/ since an authenticated Windmill user
+      # can run arbitrary scripts anyway. Two-line continuation is mandatory or
+      # the ctl silently no-ops.
       SecRule REQUEST_URI "@beginsWith /api/w/mdapi/" \
-        "id:1002,phase:1,pass,nolog,ctl:ruleRemoveById=930130"
+        "id:1002,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-lfi"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
   tls:
     - secretName: windmill-cert
