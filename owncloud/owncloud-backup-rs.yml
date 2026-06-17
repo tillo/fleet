@@ -1,0 +1,26 @@
+## VolSync backup of owncloud-data-ceph (Ceph RBD, ~172 GiB user files).
+## copyMethod Snapshot -> crash-consistent CSI snapshot via the ceph-block
+## VolumeSnapshotClass, then restic to the external Garage ceph-backup bucket
+## (off-site replicated to B2/SFTP by garage_offsite_backup). Daily 02:30 UTC,
+## finishing well before the 04:00 offsite sync. Retain 7 daily / 4 weekly /
+## 3 monthly; prune weekly. owncloud's Postgres lives on Longhorn and is
+## covered by the Longhorn recurring backups, so only the file data is here.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: owncloud-data-ceph
+spec:
+  sourcePVC: owncloud-data-ceph
+  trigger:
+    schedule: "30 2 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    cacheCapacity: 8Gi
+    cacheStorageClassName: ceph-block
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

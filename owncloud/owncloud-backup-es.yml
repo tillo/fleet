@@ -1,0 +1,34 @@
+## Restic repository secret for the VolSync ReplicationSource that backs up
+## owncloud-data-ceph (Ceph RBD) to the external Garage `ceph-backup` bucket.
+## Creds rendered from Akeyless /mdapi/volsync/ceph-backup/*; RESTIC_REPOSITORY
+## is composed in-template (not secret). The daily garage_offsite_backup job
+## then replicates ceph-backup -> B2 + SFTP, same as the Longhorn off-site path.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        RESTIC_REPOSITORY: "s3:https://api.garage.home.tillo.ch/ceph-backup/owncloud-data-ceph"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
