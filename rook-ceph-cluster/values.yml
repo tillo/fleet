@@ -216,6 +216,18 @@ cephFileSystems:
           requests: {cpu: "1", memory: "2Gi"}
           limits:   {memory: "4Gi"}
         priorityClassName: system-cluster-critical
+        # Spread the active + standby-replay MDS across nodes so losing one node
+        # (e.g. a reboot) never takes CephFS offline. Required is always
+        # schedulable with 3 nodes / 2 MDS. (2026-06-17: both were on qua.)
+        placement:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["rook-ceph-mds"]
+                topologyKey: kubernetes.io/hostname
     storageClass:
       enabled: true
       isDefault: false
