@@ -1,2 +1,12 @@
 namespace: 'cert-manager'
 installCRDs: true
+
+# DNS-01 zone detection + self-check must use the authoritative BIND nameserver.
+# The cluster recursive resolver (kube-dns) returns an empty SOA for mdapi.ch
+# (split-horizon/CoreDNS regression), which made cert-manager walk up to the
+# `ch` apex and send TSIG UPDATEs for zone `ch` -> NOTAUTH ("bad authentication").
+# BIND (192.168.1.53) is authoritative for mdapi.ch and returns the apex SOA
+# directly, so zone detection resolves correctly. (2026-06-18)
+extraArgs:
+  - --dns01-recursive-nameservers-only
+  - --dns01-recursive-nameservers=192.168.1.53:53
