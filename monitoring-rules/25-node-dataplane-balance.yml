@@ -1,0 +1,77 @@
+## Node data-plane balance observability.
+##
+## Background: the 2026-06-18 "qui under load" investigation found that qui's
+## elevated load average was NOT visible in the usual CPU/mem/disk-pressure
+## signals the kube-scheduler (and our existing alerts) watch. The real driver
+## class is *data-plane churn* -- network packet processing (NET_RX softirq),
+## context-switch rate, and storage-replication traffic -- which is invisible
+## to request-based scheduling. These recording rules surface that load per
+## node so it is queryable/graphable, and the imbalance alert flags when one
+## node carries a disproportionate share.
+##
+## Metric notes (verified on this cluster):
+##   - node-exporter has NO node-name label, only instance(IP:9796); we join
+##     node_uname_info on(instance) group_left(nodename) to label by node.
+##   - node_interrupts_total is NOT collected here (interrupts collector off),
+##     so we use node_softnet_times_squeezed_total instead -- it increments
+##     every time the NET_RX softirq exhausts its budget and yields, which is
+##     the truest "this node can't keep up with packet processing" signal.
+##   - net_bytes/net_packets are scoped to the physical uplink device=eno1 to
+##     avoid double-counting the same bytes across the bond (mgmt-bo), bridge
+##     (mgmt-br) and overlay (flannel.1).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-node-dataplane-balance
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-node-dataplane-balance.records
+    interval: 30s
+    rules:
+    - record: node:net_bytes:rate5m
+      expr: |
+        sum by (instance) (
+          rate(node_network_receive_bytes_total{device="eno1"}[5m])
+          + rate(node_network_transmit_bytes_total{device="eno1"}[5m])
+        ) * on (instance) group_left(nodename) node_uname_info
+    - record: node:net_packets:rate5m
+      expr: |
+        sum by (instance) (
+          rate(node_network_receive_packets_total{device="eno1"}[5m])
+          + rate(node_network_transmit_packets_total{device="eno1"}[5m])
+        ) * on (instance) group_left(nodename) node_uname_info
+    - record: node:softnet_squeezed:rate5m
+      expr: |
+        sum by (instance) (rate(node_softnet_times_squeezed_total[5m]))
+        * on (instance) group_left(nodename) node_uname_info
+    - record: node:ctxsw:rate5m
+      expr: |
+        sum by (instance) (rate(node_context_switches_total[5m]))
+        * on (instance) group_left(nodename) node_uname_info
+
+  - name: app-node-dataplane-balance.alerts
+    rules:
+    ## Relative imbalance: a node carrying >2.5x the cluster-average physical
+    ## uplink throughput, sustained 1h, AND above a 40 MB/s floor (current
+    ## per-node baseline is ~14-26 MB/s, so this only fires on real escalation
+    ## -- e.g. a storage-replication hotspot piling onto one node). Thresholds
+    ## are deliberately conservative initial values; tune once we have a few
+    ## days of the recorded series to look at.
+    - alert: NodeDataPlaneImbalance
+      expr: |
+        node:net_bytes:rate5m > 2.5 * scalar(avg(node:net_bytes:rate5m))
+        and node:net_bytes:rate5m > 40e6
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Node {{ $labels.nodename }} carrying disproportionate data-plane traffic ({{ $value | humanize1024 }}B/s uplink, >2.5x cluster avg)"
+        description: |
+          Node {{ $labels.nodename }} has sustained physical-uplink (eno1) throughput above 2.5x the cluster average for >1h (currently {{ $value | humanize1024 }}B/s). This is the data-plane-churn class of load (storage replication / packet processing) that does NOT show up in CPU/mem/disk-pressure scheduling signals. Cross-check the recorded series:
+            node:net_bytes:rate5m, node:net_packets:rate5m, node:softnet_squeezed:rate5m, node:ctxsw:rate5m
+          and the Longhorn engine/replica spread before rebalancing. Do NOT churn Longhorn replicas while task #144 recovery is in progress.
