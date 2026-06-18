@@ -38,18 +38,14 @@ spec:
       containers:
         # stdio MCP (npx) bridged to streamable-HTTP on :9090 by supergateway.
         - name: bridge
-          image: node:20-alpine
-          command: ["npx"]
+          image: node:24-alpine
+          # Install once at startup so per-session child spawns run the installed
+          # binary (fast), not npx (~38s each + node-engine warnings on node 20).
+          command: ["sh", "-c"]
           args:
-            - "-y"
-            - "supergateway"
-            - "--stdio"
-            - "npx -y @evertrust/horizon-mcp@1.2.0"
-            - "--outputTransport"
-            - "streamableHttp"
-            - "--stateful"
-            - "--port"
-            - "9090"
+            - |
+              npm install -g supergateway @evertrust/horizon-mcp@1.2.0 1>&2 &&
+              exec supergateway --stdio horizon-mcp --outputTransport streamableHttp --stateful --port 9090
           env:
             - name: HOME
               value: /tmp
