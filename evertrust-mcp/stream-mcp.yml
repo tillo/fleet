@@ -1,0 +1,137 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: stream-mcp-secrets
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: stream-mcp-secrets
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/evertrust-mcp/stream-mcp-token
+      secretKey: AUTH_TOKEN
+    - remoteRef:
+        key: /mdapi/stream/admin/password
+      secretKey: STREAM_API_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-mcp
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stream-mcp
+  template:
+    metadata:
+      labels:
+        app: stream-mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: bridge
+          image: node:20-alpine
+          command: ["npx"]
+          args:
+            - "-y"
+            - "supergateway"
+            - "--stdio"
+            - "npx -y @evertrust/stream-mcp@1.0.1"
+            - "--outputTransport"
+            - "streamableHttp"
+            - "--port"
+            - "9090"
+          env:
+            - name: HOME
+              value: /tmp
+            - name: npm_config_cache
+              value: /tmp/.npm
+            - name: STREAM_URL
+              value: http://stream.stream.svc.cluster.local:9000
+            - name: STREAM_API_ID
+              value: administrator
+            - name: STREAM_API_IDPROV
+              value: local
+            - name: STREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stream-mcp-secrets
+                  key: STREAM_API_KEY
+          ports:
+            - containerPort: 9090
+          startupProbe:
+            tcpSocket: { port: 9090 }
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket: { port: 9090 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 512Mi }
+        - name: caddy
+          image: caddy:2-alpine
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: stream-mcp-secrets
+                  key: AUTH_TOKEN
+          volumeMounts:
+            - name: caddy-config
+              mountPath: /etc/caddy
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 5m, memory: 32Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - name: caddy-config
+          configMap:
+            name: mcp-caddy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-mcp
+spec:
+  selector:
+    app: stream-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stream-mcp
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [stream-mcp.mdapi.ch]
+      secretName: stream-mcp-tls
+  rules:
+    - host: stream-mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stream-mcp
+                port:
+                  number: 8080

@@ -1,0 +1,138 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: horizon-mcp-secrets
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: horizon-mcp-secrets
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/evertrust-mcp/horizon-mcp-token
+      secretKey: AUTH_TOKEN
+    - remoteRef:
+        key: /mdapi/horizon/admin/password
+      secretKey: HORIZON_API_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: horizon-mcp
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: horizon-mcp
+  template:
+    metadata:
+      labels:
+        app: horizon-mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        # stdio MCP (npx) bridged to streamable-HTTP on :9090 by supergateway.
+        - name: bridge
+          image: node:20-alpine
+          command: ["npx"]
+          args:
+            - "-y"
+            - "supergateway"
+            - "--stdio"
+            - "npx -y @evertrust/horizon-mcp@1.2.0"
+            - "--outputTransport"
+            - "streamableHttp"
+            - "--port"
+            - "9090"
+          env:
+            - name: HOME
+              value: /tmp
+            - name: npm_config_cache
+              value: /tmp/.npm
+            - name: HORIZON_URL
+              value: http://horizon.horizon.svc.cluster.local:9000
+            - name: HORIZON_API_ID
+              value: administrator
+            - name: HORIZON_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: horizon-mcp-secrets
+                  key: HORIZON_API_KEY
+          ports:
+            - containerPort: 9090
+          startupProbe:
+            tcpSocket: { port: 9090 }
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket: { port: 9090 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 512Mi }
+        # Caddy token gate -> bridge.
+        - name: caddy
+          image: caddy:2-alpine
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: horizon-mcp-secrets
+                  key: AUTH_TOKEN
+          volumeMounts:
+            - name: caddy-config
+              mountPath: /etc/caddy
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 5m, memory: 32Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - name: caddy-config
+          configMap:
+            name: mcp-caddy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: horizon-mcp
+spec:
+  selector:
+    app: horizon-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: horizon-mcp
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # ModSec OFF — MCP JSON-RPC traffic trips CRS false positives (per k8s-mcp).
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [horizon-mcp.mdapi.ch]
+      secretName: horizon-mcp-tls
+  rules:
+    - host: horizon-mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: horizon-mcp
+                port:
+                  number: 8080
