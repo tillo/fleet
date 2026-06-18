@@ -34,6 +34,17 @@ spec:
       ## non-harvester-system namespaces (harvester-whereabouts in
       ## kube-system, harvester-default-event-tailer in cattle-logging-
       ## system, kube-vip / cloud-controller-manager in kube-system, etc.).
+      ##
+      ## Per-workload opt-out: workloads that are CPU-capped on purpose and
+      ## burst to their lid by design (transcoders, scanners, software-decode
+      ## NVRs) carry the pod-template label
+      ##   monitoring.mdapi.ch/cpu-throttle-exempt: "true"
+      ## and are subtracted by the trailing `unless ... kube_pod_labels{...}`.
+      ## This is per-pod, not per-namespace, so e.g. tdarr in tv/ is exempt
+      ## while seerr/sonarr in the same namespace still alert. The label is
+      ## surfaced into kube_pod_labels via the KSM metricLabelsAllowlist set
+      ## in rancher-monitoring-config/. A missing/typo'd label fails safe
+      ## (the pod simply keeps alerting).
       expr: |
         sum by (namespace, pod, container) (
           rate(container_cpu_cfs_throttled_periods_total{
@@ -50,6 +61,8 @@ spec:
             pod!~"harvester-.*|virt-.*|kube-vip-.*|cloud-controller-manager-.*"
           }[5m])
         ) > 0.05
+        unless on (namespace, pod)
+        kube_pod_labels{label_monitoring_mdapi_ch_cpu_throttle_exempt="true"}
       for: 15m
       labels:
         severity: warning

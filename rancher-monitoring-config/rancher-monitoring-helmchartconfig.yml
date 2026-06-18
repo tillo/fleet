@@ -80,6 +80,20 @@ spec:
         failureThreshold: 6
         successThreshold: 1
 
+    ## Expose the cpu-throttle-exempt pod label through kube-state-metrics so
+    ## the ContainerCpuThrottling rule (monitoring-rules/18-cpu-throttling.yml)
+    ## can subtract intentionally CPU-capped, burst-to-lid workloads (frigate,
+    ## tdarr, certspotter, ...) via `unless on(namespace,pod) kube_pod_labels`.
+    ## A workload opts out by setting on its POD TEMPLATE the label
+    ##   monitoring.mdapi.ch/cpu-throttle-exempt: "true"
+    ## Scoped to that single key (not pods=[*]) to keep cardinality minimal.
+    ## NOTE: this list REPLACES the base value (helm-controller overwrites list
+    ## values from a HelmChartConfig), so nodes=[*] must be restated to keep it.
+    kube-state-metrics:
+      metricLabelsAllowlist:
+        - nodes=[*]
+        - pods=[monitoring.mdapi.ch/cpu-throttle-exempt]
+
     ## Disable kube-prometheus-stack default rules that are noisy or
     ## inappropriate for this homelab. Each entry is a one-line note on
     ## why it goes; revisit if any of these turn out to mask a real fault.
