@@ -1,0 +1,251 @@
+# EverTrust Stream — PKI/CA backend, eval on mdapi-prod. Mirrors the horizon bundle.
+global:
+  imagePullSecrets:
+    - evertrust-registry
+
+replicas: 1
+
+# --- Hard-required secrets (chart fails to render without these) ---
+license:
+  secretName: stream-license
+  secretKey: license
+# Tink keyset is TOP-LEVEL in Stream (vs defaultVault.keyset in Horizon).
+keyset:
+  secretName: stream-vault-keyset
+  secretKey: keyset
+
+# --- Datastore: self-managed single-node MongoDB replica set (rs0) ---
+# Stream is fresh, so the RS is built clean from the start (no in-place convert).
+# temporaryDatabase off; MONGODB_URI comes from the stream-mongo-uri secret below.
+temporaryDatabase:
+  enabled: false
+externalDatabase:
+  secretName: stream-mongo-uri
+  secretKey: mongoUri
+
+# --- Ingress: mdapi conventions (rke2 nginx + ModSec, namespaced LE issuer) ---
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  hostname: stream.mdapi.ch
+  tls: true
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    # PKI REST API uses PUT/PATCH/DELETE -> raise CRS allowed methods before the include.
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAction "id:900200,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+
+# --- Supporting resources (chart tpl-renders each; keep free of `{{ }}`) ---
+extraObjects:
+  # Image pull secret for registry.evertrust.io (full dockerconfigjson in Akeyless,
+  # mapped directly; mergePolicy: Merge keeps the key + overlays the type).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: evertrust-registry
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: evertrust-registry
+        creationPolicy: Owner
+        template:
+          type: kubernetes.io/dockerconfigjson
+          mergePolicy: Merge
+      data:
+        - remoteRef:
+            key: /kyos/evertrust/registry/dockerconfigjson
+          secretKey: .dockerconfigjson
+
+  # Stream license (reuses the training license; has stream-ca/va/tsa/ssh entitlements).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: stream-license
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: stream-license
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /kyos/stream/license/license
+          secretKey: license
+
+  # Tink vault keyset (raw JSON; Stream reads KEYSET as JSON, not base64).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: stream-vault-keyset
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: stream-vault-keyset
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /mdapi/stream/vault-keyset/keyset
+          secretKey: keyset
+
+  # TSIG key for cert-manager DNS-01.
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: tsig-secret
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: tsig-secret
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /mdapi/stream/tsig-secret/tsig-secret-key
+          secretKey: tsig-secret-key
+
+  # Namespaced ACME issuer (DNS-01 via BIND RFC2136), same as horizon/joplin.
+  - apiVersion: cert-manager.io/v1
+    kind: Issuer
+    metadata:
+      name: letsencrypt-prod
+    spec:
+      acme:
+        email: tillo@tillo.ch
+        privateKeySecretRef:
+          name: letsencrypt-prod
+        server: https://acme-v02.api.letsencrypt.org/directory
+        solvers:
+          - dns01:
+              rfc2136:
+                nameserver: 31.3.128.59:53
+                tsigKeyName: mdapi
+                tsigAlgorithm: HMACSHA256
+                tsigSecretSecretRef:
+                  name: tsig-secret
+                  key: tsig-secret-key
+            selector:
+              dnsZones:
+                - 'mdapi.ch'
+          - http01:
+              ingress:
+                class: nginx
+
+  # External MongoDB URI for Stream (not sensitive; plain Secret the chart references
+  # via externalDatabase.secretName/secretKey). Points at the single-node RS below.
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: stream-mongo-uri
+    stringData:
+      mongoUri: "mongodb://stream-mongodb.stream.svc.cluster.local:27017/stream?replicaSet=rs0"
+
+  # --- Single-node MongoDB replica set (rs0) ---
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: stream-mongodb
+    spec:
+      storageClassName: harvester-longhorn-2replicas
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 5Gi
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: stream-mongodb
+    spec:
+      type: ClusterIP
+      ports:
+        - name: mongo
+          port: 27017
+          targetPort: mongo
+      selector:
+        app: stream-mongodb
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: stream-mongodb
+    spec:
+      replicas: 1
+      strategy:
+        type: Recreate
+      selector:
+        matchLabels:
+          app: stream-mongodb
+      template:
+        metadata:
+          labels:
+            app: stream-mongodb
+        spec:
+          securityContext:
+            fsGroup: 1001
+          containers:
+            - name: mongo
+              image: mongo:7
+              args: ["--replSet", "rs0", "--bind_ip_all"]
+              securityContext:
+                runAsUser: 1001
+                runAsNonRoot: true
+              ports:
+                - name: mongo
+                  containerPort: 27017
+              volumeMounts:
+                - name: data
+                  mountPath: /data/db
+              startupProbe:
+                tcpSocket: { port: mongo }
+                failureThreshold: 30
+                periodSeconds: 5
+              readinessProbe:
+                tcpSocket: { port: mongo }
+                periodSeconds: 10
+              livenessProbe:
+                tcpSocket: { port: mongo }
+                initialDelaySeconds: 30
+                periodSeconds: 10
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: stream-mongodb
+  # One-shot idempotent rs.initiate (single member).
+  - apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: stream-mongodb-rs-init
+    spec:
+      backoffLimit: 30
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: rs-init
+              image: mongo:7
+              command: ["bash", "-c"]
+              args:
+                - |
+                  host=stream-mongodb.stream.svc.cluster.local:27017
+                  for i in $(seq 1 80); do
+                    mongosh --host "$host" --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break
+                    echo "waiting for mongod ($i)..."; sleep 3
+                  done
+                  mongosh --host "$host" --quiet --eval '
+                    try { rs.status(); print("rs already initiated"); }
+                    catch (e) {
+                      rs.initiate({_id:"rs0", members:[{_id:0, host:"stream-mongodb.stream.svc.cluster.local:27017"}]});
+                      print("rs initiated");
+                    }'
