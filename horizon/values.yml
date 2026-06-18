@@ -19,12 +19,29 @@ defaultVault:
     secretName: horizon-vault-keyset
     secretKey: keyset
 
-# --- Datastore: chart's bundled "temporary" MongoDB (fine for an eval) ---
+# --- Datastore: self-managed single-node MongoDB REPLICASET (rs0) ---
+# Horizon config import/export needs multi-document transactions, which MongoDB
+# only supports on a replica set (even a 1-member one). The chart's bundled
+# temporaryDatabase is standalone-only, so disable it and run our own single-node
+# RS below in extraObjects, reusing the `horizon-mongodb` name/Service/PVC so the
+# existing data converts in place. One member, no anti-affinity — purely the
+# Horizon transactions technicality.
 temporaryDatabase:
-  enabled: true
-  persistence:
-    storageClass: harvester-longhorn-2replicas
-    size: 5Gi
+  enabled: false
+externalDatabase:
+  # rendered verbatim as the MONGODB_URI env value spec, so it must be value/valueFrom.
+  uri:
+    value: "mongodb://horizon-mongodb.horizon.svc.cluster.local:27017/horizon?replicaSet=rs0"
+
+# The migration + compatibility-check jobs run as helm pre/post-upgrade hooks and
+# connect to MONGODB_URI (?replicaSet=rs0). During this standalone->RS swap the RS
+# isn't initiated when the pre-upgrade hook fires, so it would fail the release.
+# Schema is unchanged (same Horizon appVersion), so they're not needed here.
+# RE-ENABLE both before any Horizon *version* upgrade.
+upgrade:
+  enabled: false
+upgradeCompatibilityCheck:
+  enabled: false
 
 # --- Ingress: mdapi conventions (rke2 nginx + ModSec, namespaced LE issuer) ---
 ingress:
@@ -150,3 +167,105 @@ extraObjects:
           - http01:
               ingress:
                 class: nginx
+
+  # --- Single-node MongoDB replica set (rs0) for Horizon transactions ---
+  # Reuse the chart's `horizon-mongodb` PVC + Service name (data + saved admin
+  # password preserved; standalone->RS is an in-place conversion). The Deployment
+  # uses a distinct name (horizon-mongodb-rs) to avoid Helm's immutable-selector
+  # clash when superseding the chart's deployment. uid/fsGroup 1001 matches the
+  # chart so the existing /data/db is readable. One member, no anti-affinity.
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: horizon-mongodb
+    spec:
+      storageClassName: harvester-longhorn-2replicas
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 5Gi
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: horizon-mongodb
+    spec:
+      type: ClusterIP
+      ports:
+        - name: mongo
+          port: 27017
+          targetPort: mongo
+      selector:
+        app: horizon-mongodb-rs
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: horizon-mongodb-rs
+    spec:
+      replicas: 1
+      strategy:
+        type: Recreate
+      selector:
+        matchLabels:
+          app: horizon-mongodb-rs
+      template:
+        metadata:
+          labels:
+            app: horizon-mongodb-rs
+        spec:
+          securityContext:
+            fsGroup: 1001
+          containers:
+            - name: mongo
+              image: mongo:7
+              args: ["--replSet", "rs0", "--bind_ip_all"]
+              securityContext:
+                runAsUser: 1001
+                runAsNonRoot: true
+              ports:
+                - name: mongo
+                  containerPort: 27017
+              volumeMounts:
+                - name: data
+                  mountPath: /data/db
+              startupProbe:
+                tcpSocket: { port: mongo }
+                failureThreshold: 30
+                periodSeconds: 5
+              readinessProbe:
+                tcpSocket: { port: mongo }
+                periodSeconds: 10
+              livenessProbe:
+                tcpSocket: { port: mongo }
+                initialDelaySeconds: 30
+                periodSeconds: 10
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: horizon-mongodb
+  # One-shot, idempotent rs.initiate (single member). Plain Job (runs on create).
+  - apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: horizon-mongodb-rs-init
+    spec:
+      backoffLimit: 30
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: rs-init
+              image: mongo:7
+              command: ["bash", "-c"]
+              args:
+                - |
+                  host=horizon-mongodb.horizon.svc.cluster.local:27017
+                  for i in $(seq 1 80); do
+                    mongosh --host "$host" --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break
+                    echo "waiting for mongod ($i)..."; sleep 3
+                  done
+                  mongosh --host "$host" --quiet --eval '
+                    try { rs.status(); print("rs already initiated"); }
+                    catch (e) {
+                      rs.initiate({_id:"rs0", members:[{_id:0, host:"horizon-mongodb.horizon.svc.cluster.local:27017"}]});
+                      print("rs initiated");
+                    }'
