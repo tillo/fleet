@@ -14,12 +14,26 @@ keyset:
   secretName: stream-vault-keyset
   secretKey: keyset
 
+# Play app secret + event-seal secret: externalize to an ESO-managed secret instead
+# of letting the chart self-generate them. The chart's eventSealSecret uses Bitnami's
+# common.secrets.passwords.manage, whose Helm `lookup` returns empty under Fleet's
+# render on UPGRADE -> the "provide current passwords" guard fails the bundle
+# (appSecret's lookup-or-default would also silently rotate). Pointing both at a
+# stable secret (seeded with the current values) makes every future upgrade idempotent.
+appSecret:
+  secretName: stream-secrets
+  secretKey: appSecret
+events:
+  secretName: stream-secrets
+  secretKey: eventSealSecret
+
 # Allow the in-cluster MCP bridge (evertrust-mcp ns) to reach the REST API by its
 # Service FQDN. Play's AllowedHostsFilter otherwise rejects it ("Host not allowed").
-# This list REPLACES the chart default, so keep localhost:9000. The ingress hostname
-# (stream.mdapi.ch) is added automatically by the chart helper.
+# This list REPLACES the chart default, so keep localhost:9000/9443. The ingress
+# hostname (stream.mdapi.ch) is added automatically by the chart helper.
 allowedHosts:
   - localhost:9000
+  - localhost:9443
   - stream.stream.svc.cluster.local:9000
 
 # --- Datastore: self-managed single-node MongoDB replica set (rs0) ---
@@ -106,6 +120,29 @@ extraObjects:
         - remoteRef:
             key: /mdapi/stream/vault-keyset/keyset
           secretKey: keyset
+
+  # Play app secret + event-seal secret (seeded from the chart's original self-generated
+  # values, see /mdapi/stream/{app-secret,event-seal-secret}). Referenced by appSecret.*
+  # and events.* above so the chart no longer self-manages them (Fleet lookup is flaky).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: stream-secrets
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: stream-secrets
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /mdapi/stream/app-secret
+          secretKey: appSecret
+        - remoteRef:
+            key: /mdapi/stream/event-seal-secret
+          secretKey: eventSealSecret
 
   # TSIG key for cert-manager DNS-01.
   - apiVersion: external-secrets.io/v1
