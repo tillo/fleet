@@ -38,11 +38,13 @@ spec:
       containers:
         - name: bridge
           image: node:24-alpine
+          # NOT --stateful: stateful mode leaked sessions to the 512Mi limit and
+          # OOMKilled (exit 137) every ~9-11h. Stateless keeps memory flat. (2026-06-19)
           command: ["sh", "-c"]
           args:
             - |
               npm install -g supergateway @evertrust/stream-mcp@1.0.1 1>&2 &&
-              exec supergateway --stdio stream-mcp --outputTransport streamableHttp --stateful --port 9090
+              exec supergateway --stdio stream-mcp --outputTransport streamableHttp --port 9090
           env:
             - name: HOME
               value: /tmp
@@ -70,7 +72,8 @@ spec:
             periodSeconds: 10
           resources:
             requests: { cpu: 50m, memory: 256Mi }
-            limits: { memory: 512Mi }
+            # 512Mi -> 1Gi headroom (was OOMKilled at 512Mi). (2026-06-19)
+            limits: { memory: 1Gi }
         - name: caddy
           image: caddy:2-alpine
           ports:

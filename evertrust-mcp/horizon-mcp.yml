@@ -41,11 +41,16 @@ spec:
           image: node:24-alpine
           # Install once at startup so per-session child spawns run the installed
           # binary (fast), not npx (~38s each + node-engine warnings on node 20).
+          # NOTE: NOT --stateful. Stateful mode keeps a per-HTTP-session MCP child
+          # with no session timeout -> sessions accumulate on every Claude reconnect
+          # -> the node process leaked to the 512Mi limit and OOMKilled (exit 137)
+          # every ~9-11h, with a ~39s reinstall outage on each restart. Stateless
+          # holds no per-session state, so memory stays flat. (2026-06-19)
           command: ["sh", "-c"]
           args:
             - |
               npm install -g supergateway @evertrust/horizon-mcp@1.2.0 1>&2 &&
-              exec supergateway --stdio horizon-mcp --outputTransport streamableHttp --stateful --port 9090
+              exec supergateway --stdio horizon-mcp --outputTransport streamableHttp --port 9090
           env:
             - name: HOME
               value: /tmp
@@ -71,7 +76,9 @@ spec:
             periodSeconds: 10
           resources:
             requests: { cpu: 50m, memory: 256Mi }
-            limits: { memory: 512Mi }
+            # 512Mi -> 1Gi headroom (the stateful leak OOMKilled at 512Mi; 1Gi is a
+            # safety margin now that stateless keeps usage flat). (2026-06-19)
+            limits: { memory: 1Gi }
         # Caddy token gate -> bridge.
         - name: caddy
           image: caddy:2-alpine
