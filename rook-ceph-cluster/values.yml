@@ -79,18 +79,27 @@ ingress:
 
 cephClusterSpec:
   # ── Health-alert tolerance (central config DB, managed by Rook) ──────────────
-  # The BlueStore stalled-read DB alert (DB_DEVICE_STALLED_READ_ALERT) fired on
-  # the flaky P420i bulk tier (#154) at its hair-trigger default: warn on a
-  # SINGLE stalled read within 24h, per OSD. Raised to ">=50 stalled reads in a
-  # 10-min window" so the chronic low-rate P420i noise is filtered while a
-  # genuinely failing device (continuous stalls) still trips it. Deferred real
-  # fix = move bulk-OSD block.db to fio once more cards arrive (no free fio
-  # space today; bulk OSDs are single-device BlueStore on the P420i). Mirrors
-  # the bluestore_slow_ops_warn tuning applied at runtime earlier (osd
-  # threshold 75 / lifetime 300s) — that one is still mon-DB drift, capture here
-  # on next touch.
+  # Tolerances for the flaky P420i bulk tier (#154): stop chronic low-rate
+  # controller noise sitting as a permanent HEALTH_WARN while still tripping on a
+  # genuinely failing device. All were applied at runtime earlier (ceph config
+  # set, mon-DB) and are folded here so the CR is the single source of truth —
+  # no more untracked drift.
+  #   bdev_stalled_read_warn  : default fired on 1 stalled read / 24h / OSD (a
+  #     hair-trigger); raised to ">=50 stalled reads within a 10-min window".
+  #   bluestore_slow_ops_warn : default warns on the 1st slow op; raised to
+  #     75 ops / 300s window.
+  # Deferred real fix = move bulk-OSD block.db to fio once more cards arrive
+  # (no free fio space today; bulk OSDs are single-device BlueStore on the P420i).
   cephConfig:
+    global:
+      # Redundant with the osd-scope value below (osd scope wins for all OSDs,
+      # the only BlueStore daemons). Replicated to match live runtime state;
+      # safe to drop on a later cleanup.
+      bluestore_slow_ops_warn_threshold: "10"
+      bluestore_slow_ops_warn_lifetime: "300"
     osd:
+      bluestore_slow_ops_warn_threshold: "75"
+      bluestore_slow_ops_warn_lifetime: "300"
       bdev_stalled_read_warn_threshold: "50"
       bdev_stalled_read_warn_lifetime: "600"
   cephVersion:
