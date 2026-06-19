@@ -1,0 +1,102 @@
+# Horizon network discovery: a node-pinned, hostNetwork CronJob that runs
+# `horizon-cli netscan` over the node's connected subnets (LAN 192.168.1.0/24)
+# and feeds the `network` discovery campaign in Horizon.
+#
+# Why this shape:
+#  - horizon-cli ships only as a Nexus binary (no container image) -> fetch the
+#    1.17.0 RPM at start and extract the static binary (download-at-start pattern).
+#  - netscan has no target flags; it scans the host's directly-connected subnets,
+#    so hostNetwork:true + nodeName pins it to a LAN-attached node to see 192.168.1.x.
+#  - dnsPolicy ClusterFirstWithHostNet so it resolves both horizon.*.svc and repo.evertrust.io.
+#  - auth = dedicated `horizon-discovery` Horizon identity (role discovery:*); the
+#    `network` campaign's feed authz is `authenticated`, which this identity satisfies.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: horizon-discovery
+  namespace: horizon-discovery
+automountServiceAccountToken: false
+---
+# Creds: Horizon discovery identity (feed) + kyos Nexus creds (download the RPM).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: horizon-discovery-creds
+  namespace: horizon-discovery
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: horizon-discovery-creds
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        ENDPOINT: "http://horizon.horizon.svc.cluster.local:9000"
+        APIID: "horizon-discovery"
+        APIKEY: "{{ .apikey }}"
+        REPO_USER: "kyos"
+        REPO_PW: "{{ .repopw }}"
+  data:
+    - secretKey: apikey
+      remoteRef:
+        key: /mdapi/horizon/discovery/password
+    - secretKey: repopw
+      remoteRef:
+        key: /kyos/evertrust/repo/password
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: horizon-netscan
+  namespace: horizon-discovery
+spec:
+  schedule: "30 3 * * *"            # daily 03:30
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          serviceAccountName: horizon-discovery
+          automountServiceAccountToken: false
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeName: qui                # LAN-attached node (192.168.1.190)
+          restartPolicy: Never
+          containers:
+            - name: netscan
+              image: alpine:3
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -e
+                  apk add --no-cache ca-certificates curl libarchive-tools >/dev/null
+                  cd /tmp
+                  echo "Fetching horizon-cli 1.17.0..."
+                  curl -fsSL -u "$REPO_USER:$REPO_PW" -o hzn.rpm \
+                    "https://repo.evertrust.io/repository/horizon-cli-rpm/horizon-cli-1.17.0-1.x86_64.rpm"
+                  bsdtar -xf hzn.rpm -C /tmp
+                  chmod +x /tmp/opt/horizon/bin/horizon-cli
+                  export HOME=/tmp
+                  mkdir -p /tmp/.horizon-cli/etc
+                  printf 'endpoint: %s\napi_id: %s\napi_key: %s\ntimeout: 10\n' \
+                    "$ENDPOINT" "$APIID" "$APIKEY" > /tmp/.horizon-cli/etc/horizon-cli.conf
+                  echo "Starting netscan -> campaign=network ..."
+                  exec /tmp/opt/horizon/bin/horizon-cli netscan --campaign=network
+              envFrom:
+                - secretRef:
+                    name: horizon-discovery-creds
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
