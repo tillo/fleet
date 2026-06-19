@@ -310,3 +310,31 @@ extraObjects:
                       rs.initiate({_id:"rs0", members:[{_id:0, host:"horizon-mongodb.horizon.svc.cluster.local:27017"}]});
                       print("rs initiated");
                     }'
+
+  # ModSec carve-out for the ACME protocol path. The main `horizon` ingress runs
+  # ModSec (WAF), which 403s ACME's JWS POSTs (new-acct/new-order). This second
+  # Ingress for the same host serves only /acme with ModSec OFF -> the ACME server
+  # (Horizon, profile acme-tls -> stream-mdapi -> Issuing CA 01) works while the
+  # rest of horizon.mdapi.ch keeps the WAF. nginx merges per-path locations.
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: horizon-acme
+      annotations:
+        nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    spec:
+      ingressClassName: nginx
+      tls:
+        - hosts: [horizon.mdapi.ch]
+          secretName: horizon.mdapi.ch-tls
+      rules:
+        - host: horizon.mdapi.ch
+          http:
+            paths:
+              - path: /acme
+                pathType: Prefix
+                backend:
+                  service:
+                    name: horizon
+                    port:
+                      name: http
