@@ -867,3 +867,36 @@ spec:
           ({{ with query "horizon_certificate_count{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }}/{{ with query "horizon_license_certificate_limit{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }}).
           Issuance/import is blocked at 100% — install a larger license (clm.N) or
           prune certificates now.
+
+  - name: app-batch-jobs.stream-license
+    ## f/infra_health/stream_license_usage (hourly) publishes Stream's total X509
+    ## certificate count vs the stream-ca.<N> license cap (decoded live from the
+    ## stream-license secret). Mirrors the Horizon CLM alert. Staleness covered by
+    ## the generic BatchJobStale rule (job label stream_license_usage).
+    rules:
+    - alert: StreamCertCountApproachingLicense
+      expr: stream_license_certificate_used_ratio{job="stream_license_usage"} > 0.8
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Stream CA license {{ $value | humanizePercentage }} used"
+        description: |
+          Stream holds {{ with query "stream_certificate_count{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }} of {{ with query "stream_license_certificate_limit{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }} licensed certificates (stream-ca, >80%).
+          At 100% the CAs refuse new issuance. Raise the Stream license (stream-ca.N)
+          or revoke/prune certs. Source: f/infra_health/stream_license_usage.
+    - alert: StreamCertCountNearLicenseLimit
+      expr: stream_license_certificate_used_ratio{job="stream_license_usage"} > 0.95
+      for: 30m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Stream CA license {{ $value | humanizePercentage }} used — near cap"
+        description: |
+          Stream is within 5% of its stream-ca certificate cap
+          ({{ with query "stream_certificate_count{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }}/{{ with query "stream_license_certificate_limit{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }}).
+          CA issuance is blocked at 100% — install a larger Stream license now.
