@@ -78,6 +78,21 @@ ingress:
         secretName: ceph-dashboard-cert
 
 cephClusterSpec:
+  # ── Health-alert tolerance (central config DB, managed by Rook) ──────────────
+  # The BlueStore stalled-read DB alert (DB_DEVICE_STALLED_READ_ALERT) fired on
+  # the flaky P420i bulk tier (#154) at its hair-trigger default: warn on a
+  # SINGLE stalled read within 24h, per OSD. Raised to ">=50 stalled reads in a
+  # 10-min window" so the chronic low-rate P420i noise is filtered while a
+  # genuinely failing device (continuous stalls) still trips it. Deferred real
+  # fix = move bulk-OSD block.db to fio once more cards arrive (no free fio
+  # space today; bulk OSDs are single-device BlueStore on the P420i). Mirrors
+  # the bluestore_slow_ops_warn tuning applied at runtime earlier (osd
+  # threshold 75 / lifetime 300s) — that one is still mon-DB drift, capture here
+  # on next touch.
+  cephConfig:
+    osd:
+      bdev_stalled_read_warn_threshold: "50"
+      bdev_stalled_read_warn_lifetime: "600"
   cephVersion:
     # renovate: datasource=docker depName=quay.io/ceph/ceph
     image: quay.io/ceph/ceph:v19.2.2   # Squid (pinned). Tentacle v20.2.x ceph-bluestore-tool ASSERTS (is_valid_io) on tiny foreign partitions (e.g. a Longhorn iSCSI VM-disk's 1K extended part), which crashes `ceph-volume raw list` and breaks OSD enumeration on hyperconverged nodes. Squid v19.2.2 skips them gracefully (proven 2026-06-14). Do NOT bump to v20 until that is fixed upstream.
