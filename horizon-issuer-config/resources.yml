@@ -25,9 +25,10 @@ spec:
 ---
 # Auth for the ClusterIssuer -> Horizon. horizon-issuer reads an Opaque secret with
 # username + password (mapped to X-API-Id / X-API-Key = password auth on the Horizon
-# local IdP). Using the `administrator` principal for now (it is authorized to enroll
-# on every profile). HARDENING TODO: swap to a dedicated, enroll-scoped Horizon
-# identity once one is provisioned — only this secret + the source path change.
+# local IdP). Dedicated, least-privilege service identity `cert-manager-issuer`: a
+# Horizon local identity bound to the `cert-manager-issuer` role (permission
+# `lifecycle:*` only — certificate enroll/revoke/search, NO configuration/discovery).
+# Provisioned imperatively via the Horizon REST API (no MCP create); password in Akeyless.
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -44,12 +45,12 @@ spec:
     template:
       type: Opaque
       data:
-        username: "administrator"
+        username: "cert-manager-issuer"
         password: "{{ .password }}"
   data:
     - secretKey: password
       remoteRef:
-        key: /mdapi/horizon/admin/password
+        key: /mdapi/horizon/issuer/password
 ---
 # Cluster-wide issuer: any namespace can request PRIVATE certs from Horizon, routed
 # through the `private-tls` WebRA profile -> stream-mdapi connector -> MDAPI Issuing CA 01.
