@@ -1,0 +1,65 @@
+# Supporting objects for the horizon-issuer controller (sibling `horizon-issuer`
+# bundle holds the chart). Kept separate because that chart has no extraObjects hook.
+
+# Image pull secret for the private registry.evertrust.io controller image.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: evertrust-registry
+  namespace: horizon-issuer
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: evertrust-registry
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      mergePolicy: Merge
+  data:
+    - remoteRef:
+        key: /kyos/evertrust/registry/dockerconfigjson
+      secretKey: .dockerconfigjson
+---
+# Auth for the ClusterIssuer -> Horizon. horizon-issuer reads an Opaque secret with
+# username + password (mapped to X-API-Id / X-API-Key = password auth on the Horizon
+# local IdP). Using the `administrator` principal for now (it is authorized to enroll
+# on every profile). HARDENING TODO: swap to a dedicated, enroll-scoped Horizon
+# identity once one is provisioned — only this secret + the source path change.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: horizon-issuer-auth
+  namespace: horizon-issuer
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: horizon-issuer-auth
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        username: "administrator"
+        password: "{{ .password }}"
+  data:
+    - secretKey: password
+      remoteRef:
+        key: /mdapi/horizon/admin/password
+---
+# Cluster-wide issuer: any namespace can request PRIVATE certs from Horizon, routed
+# through the `private-tls` WebRA profile -> stream-mdapi connector -> MDAPI Issuing CA 01.
+# url uses the in-cluster Horizon API (plain HTTP, no WAF/TLS hop); the Service FQDN is
+# already in Horizon's allowedHosts. authSecretName resolves in the controller namespace.
+apiVersion: horizon.evertrust.io/v1beta1
+kind: ClusterIssuer
+metadata:
+  name: horizon-private
+spec:
+  url: http://horizon.horizon.svc.cluster.local:9000
+  profile: private-tls
+  authSecretName: horizon-issuer-auth
