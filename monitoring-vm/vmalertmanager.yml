@@ -17,6 +17,18 @@ spec:
     - name: zot-pull
   replicaCount: 1
   retention: 120h
+  ## The alertmanager image runs as uid/gid 65534 (nobody); without an
+  ## fsGroup the Longhorn PVC mounts root-owned, so the nflog + silences
+  ## maintenance writes fail every 15m ("open /alertmanager/...: permission
+  ## denied"). That doesn't block live notifications (the Notify path is
+  ## in-memory) but silences and dedup state are lost on every restart.
+  ## fsGroup makes the kubelet group-own the data dir to 65534 on mount.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+    fsGroupChangePolicy: OnRootMismatch
   storage:
     volumeClaimTemplate:
       spec:
