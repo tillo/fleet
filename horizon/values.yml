@@ -321,7 +321,13 @@ extraObjects:
     metadata:
       name: horizon-acme
       annotations:
-        nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+        # enable-modsecurity:false only OMITS `modsecurity on;` for this location,
+        # so /acme still inherits the server-level `modsecurity on;` and 403s the
+        # ACME POSTs. Enable the modsec block in this location but turn the engine
+        # OFF (SecRuleEngine Off) — the reliable per-path ModSec disable.
+        nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+        nginx.ingress.kubernetes.io/modsecurity-snippet: |
+          SecRuleEngine Off
     spec:
       ingressClassName: nginx
       tls:
