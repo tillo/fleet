@@ -794,3 +794,39 @@ spec:
         description: |
           The Windmill chassis_health job (every 15m) has not pushed metrics
           for more than an hour. Check Windmill schedule and worker pods.
+
+  - name: app-batch-jobs.cert-discovery
+    ## f/infra_health/k8s_cert_discovery (hourly, 0 23 * * * * UTC) enumerates
+    ## every kubernetes.io/tls secret across local/prod/test (via the Rancher
+    ## proxy) and feeds each cert into Horizon's `kubernetes` discovery campaign
+    ## (POST /api/v1/discovery/feed; 201=new cert, 204=already known — both are
+    ## success, so steady-state errors=0). Complements the netscan network
+    ## CronJob (which sees served endpoints, not in-cluster Secrets).
+    ##
+    ## Staleness is already covered by the generic BatchJobStale rule above:
+    ## the pushed `k8s_cert_discovery_last_run_timestamp_seconds` (job label
+    ## `k8s_cert_discovery`, = basename of the script path) joins
+    ## `windmill_schedule_interval_seconds` (published daily by
+    ## schedule_cadence_map) and fires at 2× the interval (hourly → ~2h).
+    rules:
+    - alert: K8sCertDiscoveryFeedErrors
+      ## >0 only when feeds get non-2xx / exceptions (auth broken, cert
+      ## unparseable, or Horizon unreachable). 2h `for:` = two consecutive
+      ## hourly runs must fail, so a single transient run self-clears (the
+      ## next run overwrites the gauge to 0) without alerting.
+      expr: k8s_cert_discovery_errors{job="k8s_cert_discovery"} > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "k8s cert discovery: {{ $value }} cert(s) failed to feed into Horizon"
+        description: |
+          The hourly f/infra_health/k8s_cert_discovery job got non-2xx responses
+          (or exceptions) feeding certs into Horizon's `kubernetes` discovery
+          campaign for >2h (two runs). 201/204 are both success, so this is a
+          real fault — Horizon down/unreachable from the worker, the
+          horizon-discovery key rotated, or unparseable certs. Check the latest
+          run log at https://windmill.mdapi.ch (it prints the first 15 failing
+          cluster/namespace/secret + HTTP status).
