@@ -25,15 +25,28 @@ spec:
     group_interval: 5m
     repeat_interval: 4h
     routes:
-    ## team=mdapi alerts get the full statuspage + Pushover treatment.
-    ## InfoInhibitor / Watchdog are exclude-listed defensively — vmalert
-    ## won't evaluate them post-cutover (vendor rules, no mdapi label),
-    ## but if a misconfigured custom rule ever borrows the label, this
-    ## guarantees no surprise pages.
+    ## Severity-tiered notification to fight alarm fatigue. Same receiver
+    ## (statuspage-and-pushover) but the Pushover `priority` template keys
+    ## off severity, and repeat_interval is split per route:
+    ##   critical -> priority 1 (interrupts), repeat 4h
+    ##   warning  -> priority -1 (in-app, NO sound/vibration), repeat 24h
+    ##   info/etc -> priority -2 (silent, badge only), repeat 24h
+    ## First-match-wins: criticals take the first route; everything else
+    ## team=mdapi falls to the catch-all second route. You keep full
+    ## visibility in the Pushover app; only criticals buzz.
+    ## InfoInhibitor / Watchdog stay exclude-listed defensively (vendor
+    ## rules, no mdapi label post-cutover) so a stray label can't page.
     - receiver: statuspage-and-pushover
       matchers:
       - 'team="mdapi"'
       - 'alertname!~"InfoInhibitor|Watchdog"'
+      - 'severity="critical"'
+      repeat_interval: 4h
+    - receiver: statuspage-and-pushover
+      matchers:
+      - 'team="mdapi"'
+      - 'alertname!~"InfoInhibitor|Watchdog"'
+      repeat_interval: 24h
 
   inhibit_rules:
   ## When LonghornVolumeDegraded fires for a given (pvc_namespace, pvc),
@@ -62,9 +75,14 @@ spec:
         name: pushover
         key: api-token
       send_resolved: true
+      ## Severity -> Pushover priority. critical interrupts (1); warning is
+      ## delivered silently (-1, no sound/vibration); info and anything else
+      ## is badge-only (-2). CommonLabels.severity is stable because the
+      ## group_by includes alertname (one severity per rule).
       priority: |-
         {{- if eq .CommonLabels.severity "critical" -}}1
-        {{- else -}}0
+        {{- else if eq .CommonLabels.severity "warning" -}}-1
+        {{- else -}}-2
         {{- end -}}
       title: |-
         [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.component }}: {{ .CommonLabels.alertname }}
