@@ -27,6 +27,36 @@ allowedHosts:
   - localhost:9000
   - horizon.horizon.svc.cluster.local:9000
 
+# --- Analytics: embedded DuckDB read-model for search + dashboards ---
+# Offloads certificate/event/discovery-event search & dashboard queries off MongoDB
+# (Mongo stays the system of record; DuckDB is a rebuildable read replica).
+# Sets ANALYTICS=true + ANALYTICS_URL=jdbc:duckdb:/opt/horizon/var/analytics.db.
+analytics:
+  enabled: true
+
+# persistence.enabled=true makes the chart deploy Horizon as a StatefulSet and mount
+# a PVC at /opt/horizon/var so the DuckDB store survives restarts (otherwise it
+# re-syncs from Mongo on every pod start). One claim: `analytics`.
+persistence:
+  enabled: true
+  volumeClaimTemplates:
+    analytics:
+      storageClass: harvester-longhorn-2replicas
+      accessModes:
+        - ReadWriteOnce
+      size: "10Gi"
+      mountPath: "/opt/horizon/var"
+
+# Analytics adds RAM/CPU (DuckDB + initial sync). Chart default is 512Mi/300m, no
+# limits; raise headroom for the read-model.
+resources:
+  requests:
+    cpu: 300m
+    memory: 1Gi
+  limits:
+    cpu: "1500m"
+    memory: 2Gi
+
 # --- Datastore: self-managed single-node MongoDB REPLICASET (rs0) ---
 # Horizon config import/export needs multi-document transactions, which MongoDB
 # only supports on a replica set (even a 1-member one). The chart's bundled
