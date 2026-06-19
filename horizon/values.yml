@@ -47,15 +47,24 @@ persistence:
       size: "10Gi"
       mountPath: "/opt/horizon/var"
 
-# Analytics adds RAM/CPU (DuckDB + initial sync). Chart default is 512Mi/300m, no
-# limits; raise headroom for the read-model.
+# Analytics adds RAM/CPU (DuckDB + initial sync). Raise the memory request/limit
+# for the read-model, but DO NOT set a CPU limit: a CPU limit throttles JVM
+# startup + the analytics sync (CFS throttling), which starves the 1s internal
+# liveness check and crash-loops the pod. The chart default sets no limits.
 resources:
   requests:
-    cpu: 300m
+    cpu: 500m
     memory: 1Gi
   limits:
-    cpu: "1500m"
     memory: 2Gi
+
+# The first analytics sync (certs + events + discovery events into DuckDB) is
+# slow; widen the startup grace to 200×3s = 10min so a slow initial sync doesn't
+# trip the startup probe into a restart loop.
+startupProbe:
+  enabled: true
+  failureThreshold: 200
+  periodSeconds: 3
 
 # --- Datastore: self-managed single-node MongoDB REPLICASET (rs0) ---
 # Horizon config import/export needs multi-document transactions, which MongoDB
