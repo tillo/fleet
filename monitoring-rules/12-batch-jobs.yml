@@ -830,3 +830,40 @@ spec:
           horizon-discovery key rotated, or unparseable certs. Check the latest
           run log at https://windmill.mdapi.ch (it prints the first 15 failing
           cluster/namespace/secret + HTTP status).
+
+  - name: app-batch-jobs.horizon-license
+    ## f/infra_health/horizon_license_usage (hourly) publishes the total Horizon
+    ## certificate count vs the clm.<N> license cap (decoded live from the
+    ## horizon-license secret). The discovery jobs (netscan + k8s_cert_discovery)
+    ## keep growing the count, so warn BEFORE the cap blocks issuance/import.
+    ## Staleness is covered by the generic BatchJobStale rule (job label
+    ## horizon_license_usage = script basename).
+    rules:
+    - alert: HorizonCertCountApproachingLicense
+      expr: horizon_license_certificate_used_ratio{job="horizon_license_usage"} > 0.8
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon CLM license {{ $value | humanizePercentage }} used"
+        description: |
+          Horizon holds {{ with query "horizon_certificate_count{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }} of {{ with query "horizon_license_certificate_limit{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }} licensed CLM certificates (>80%).
+          The discovery jobs (netscan, k8s_cert_discovery) keep adding certs; at
+          100% Horizon refuses new issuance/import. Raise the license (clm.N) or
+          prune discovered certs. Source: f/infra_health/horizon_license_usage.
+    - alert: HorizonCertCountNearLicenseLimit
+      expr: horizon_license_certificate_used_ratio{job="horizon_license_usage"} > 0.95
+      for: 30m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon CLM license {{ $value | humanizePercentage }} used — near cap"
+        description: |
+          Horizon is within 5% of its CLM certificate cap
+          ({{ with query "horizon_certificate_count{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }}/{{ with query "horizon_license_certificate_limit{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }}).
+          Issuance/import is blocked at 100% — install a larger license (clm.N) or
+          prune certificates now.
