@@ -313,9 +313,12 @@ extraObjects:
         nginx.ingress.kubernetes.io/ssl-redirect: "false"
         nginx.ingress.kubernetes.io/enable-modsecurity: "true"
         nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+        # crl.mdapi.ch serves only public read-only artifacts (CRL + root CA download).
+        # WAF off: CRS rule 920440 blocks restricted extensions (.cer/.crt) -> 403 on the
+        # cert download, and there's no injection surface here (the Stream mgmt API stays
+        # on stream.mdapi.ch with WAF on). Per-path disable = enable + SecRuleEngine Off.
         nginx.ingress.kubernetes.io/modsecurity-snippet: |
-          SecRuleEngine On
-          Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+          SecRuleEngine Off
     spec:
       ingressClassName: nginx
       tls:
