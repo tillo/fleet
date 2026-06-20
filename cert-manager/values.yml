@@ -1,12 +1,21 @@
 namespace: 'cert-manager'
 installCRDs: true
 
-# DNS-01 zone detection + self-check must use the authoritative BIND nameserver.
-# The cluster recursive resolver (kube-dns) returns an empty SOA for mdapi.ch
-# (split-horizon/CoreDNS regression), which made cert-manager walk up to the
-# `ch` apex and send TSIG UPDATEs for zone `ch` -> NOTAUTH ("bad authentication").
-# BIND (192.168.1.53) is authoritative for mdapi.ch and returns the apex SOA
-# directly, so zone detection resolves correctly. (2026-06-18)
+# DNS-01 zone detection + self-check resolvers = the NextDNS anycast forwarders
+# (standing policy: never Cloudflare/Google/Quad9; use NextDNS — same upstream as
+# Technitium/Unbound/BPI-R4).
+#
+# History: this was pinned to BIND 192.168.1.53 on 2026-06-18 to fix a CoreDNS
+# regression (kube-dns returned an empty SOA for mdapi.ch -> cert-manager walked
+# to the `ch` apex -> TSIG UPDATE NOTAUTH). But .53 is authoritative-only
+# (recursion off) and REFUSES external zones, which permanently stalled the
+# Infomaniak-webhook DNS-01 for suivi.envuassu.ch (self-check SOA -> REFUSED).
+# With `recursive-nameservers-only`, .53 also can't be a *fallback* (cert-manager
+# treats REFUSED as a hard error, no failover). NextDNS resolves BOTH: the
+# internal RFC2136 zones (correct public apex SOA, so the CoreDNS regression does
+# NOT recur, + the _acme-challenge TXT which is publicly propagated — confirmed by
+# dellambrogio.* validating at LE over public DNS) AND external webhook zones.
+# (2026-06-20)
 extraArgs:
   - --dns01-recursive-nameservers-only
-  - --dns01-recursive-nameservers=192.168.1.53:53
+  - --dns01-recursive-nameservers=45.90.28.16:53,45.90.30.16:53
