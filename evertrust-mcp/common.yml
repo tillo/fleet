@@ -1,4 +1,5 @@
-# Shared: namespaced ACME issuer (DNS-01 via BIND), tsig, and the Caddy token-gate config.
+# Shared: namespaced ACME issuer (DNS-01 via BIND) + tsig for the *-mcp.mdapi.ch certs.
+# (The token gate is now baked into each MCP image's nginx, so the Caddy ConfigMap is gone.)
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -42,30 +43,3 @@ spec:
     - remoteRef:
         key: /mdapi/evertrust-mcp/tsig-secret-key
       secretKey: tsig-secret-key
----
-# Caddy token gate (shared config; AUTH_TOKEN injected per-deployment via env).
-# Mirrors the k8s-mcp pattern: gate on ?token=, rewrite Host/Origin to localhost
-# (MCP servers validate Origin), strip Sec-Fetch-* , proxy to the local bridge.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mcp-caddy
-data:
-  Caddyfile: |
-    {
-      admin off
-      auto_https off
-    }
-    :8080 {
-      @authed query token={$AUTH_TOKEN}
-      handle @authed {
-        reverse_proxy localhost:9090 {
-          header_up Host "localhost"
-          header_up Origin "http://localhost"
-          header_up -Sec-Fetch-Site
-          header_up -Sec-Fetch-Mode
-          header_up -Sec-Fetch-Dest
-        }
-      }
-      respond "Unauthorized" 401
-    }

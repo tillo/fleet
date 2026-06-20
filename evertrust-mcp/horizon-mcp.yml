@@ -22,7 +22,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: horizon-mcp
+  # Floating :latest tracked by Keel (poll every 4h); reloader restarts on secret rotation.
   annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
     reloader.stakater.com/auto: "true"
 spec:
   replicas: 1
@@ -35,31 +40,23 @@ spec:
         app: horizon-mcp
     spec:
       automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
       containers:
-        # stdio MCP (npx) bridged to streamable-HTTP on :9090 by supergateway.
-        - name: bridge
-          image: node:24-alpine
-          # Install once at startup so per-session child spawns run the installed
-          # binary (fast), not npx (~38s each + node-engine warnings on node 20).
-          # horizon-mcp REQUIRES --stateful: in stateless mode tools/list fails
-          # ("tools fetch failed") because it caches per-session API auth and the
-          # initialize handshake must precede tools/list on the SAME stdio child.
-          # The OOM cause was that --stateful spawns one stdio child per HTTP
-          # session and they were NEVER reaped (session timeout disabled) -> grew
-          # to the 512Mi limit and OOMKilled (exit 137) every ~9-11h. Fix: keep
-          # --stateful but add --sessionTimeout so idle sessions (+ their children)
-          # are reaped, bounding memory. Claude re-initializes if its session
-          # expires. 600000ms = 10min idle. (2026-06-19)
-          command: ["sh", "-c"]
-          args:
-            - |
-              npm install -g supergateway @evertrust/horizon-mcp@1.2.0 1>&2 &&
-              exec supergateway --stdio horizon-mcp --outputTransport streamableHttp --stateful --sessionTimeout 600000 --port 9090
+        # Self-contained image: supergateway + @evertrust/horizon-mcp baked in, behind an
+        # nginx bearer-token gate (accepts Authorization: Bearer OR ?token=). The
+        # --stateful/--sessionTimeout flags, MCP_BIN and ports are baked into the image ENV.
+        - name: horizon-mcp
+          image: zot.mdapi.ch/mdapi/horizon-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
           env:
-            - name: HOME
-              value: /tmp
-            - name: npm_config_cache
-              value: /tmp/.npm
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: horizon-mcp-secrets
+                  key: AUTH_TOKEN
             - name: HORIZON_URL
               value: http://horizon.horizon.svc.cluster.local:9000
             - name: HORIZON_API_ID
@@ -69,44 +66,16 @@ spec:
                 secretKeyRef:
                   name: horizon-mcp-secrets
                   key: HORIZON_API_KEY
-          ports:
-            - containerPort: 9090
           startupProbe:
-            tcpSocket: { port: 9090 }
+            tcpSocket: { port: 8080 }
             failureThreshold: 40
             periodSeconds: 5
-          readinessProbe:
-            tcpSocket: { port: 9090 }
-            periodSeconds: 10
-          resources:
-            requests: { cpu: 50m, memory: 256Mi }
-            # 512Mi -> 1Gi headroom (the stateful leak OOMKilled at 512Mi; 1Gi is a
-            # safety margin now that stateless keeps usage flat). (2026-06-19)
-            limits: { memory: 1Gi }
-        # Caddy token gate -> bridge.
-        - name: caddy
-          image: caddy:2-alpine
-          ports:
-            - containerPort: 8080
-          env:
-            - name: AUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: horizon-mcp-secrets
-                  key: AUTH_TOKEN
-          volumeMounts:
-            - name: caddy-config
-              mountPath: /etc/caddy
           readinessProbe:
             tcpSocket: { port: 8080 }
             periodSeconds: 10
           resources:
-            requests: { cpu: 5m, memory: 32Mi }
-            limits: { memory: 64Mi }
-      volumes:
-        - name: caddy-config
-          configMap:
-            name: mcp-caddy
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 1Gi }
 ---
 apiVersion: v1
 kind: Service

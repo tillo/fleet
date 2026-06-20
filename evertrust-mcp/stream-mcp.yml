@@ -22,7 +22,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: stream-mcp
+  # Floating :latest tracked by Keel (poll every 4h); reloader restarts on secret rotation.
   annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
     reloader.stakater.com/auto: "true"
 spec:
   replicas: 1
@@ -35,21 +40,23 @@ spec:
         app: stream-mcp
     spec:
       automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
       containers:
-        - name: bridge
-          image: node:24-alpine
-          # NOT --stateful: stateful mode leaked sessions to the 512Mi limit and
-          # OOMKilled (exit 137) every ~9-11h. Stateless keeps memory flat. (2026-06-19)
-          command: ["sh", "-c"]
-          args:
-            - |
-              npm install -g supergateway @evertrust/stream-mcp@1.0.1 1>&2 &&
-              exec supergateway --stdio stream-mcp --outputTransport streamableHttp --port 9090
+        # Self-contained image: supergateway + @evertrust/stream-mcp baked in, behind an
+        # nginx bearer-token gate (accepts Authorization: Bearer OR ?token=). stream-mcp
+        # runs stateless (no --stateful); MCP_BIN and ports are baked into the image ENV.
+        - name: stream-mcp
+          image: zot.mdapi.ch/mdapi/stream-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
           env:
-            - name: HOME
-              value: /tmp
-            - name: npm_config_cache
-              value: /tmp/.npm
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: stream-mcp-secrets
+                  key: AUTH_TOKEN
             - name: STREAM_URL
               value: http://stream.stream.svc.cluster.local:9000
             - name: STREAM_API_ID
@@ -61,42 +68,16 @@ spec:
                 secretKeyRef:
                   name: stream-mcp-secrets
                   key: STREAM_API_KEY
-          ports:
-            - containerPort: 9090
           startupProbe:
-            tcpSocket: { port: 9090 }
+            tcpSocket: { port: 8080 }
             failureThreshold: 40
             periodSeconds: 5
-          readinessProbe:
-            tcpSocket: { port: 9090 }
-            periodSeconds: 10
-          resources:
-            requests: { cpu: 50m, memory: 256Mi }
-            # 512Mi -> 1Gi headroom (was OOMKilled at 512Mi). (2026-06-19)
-            limits: { memory: 1Gi }
-        - name: caddy
-          image: caddy:2-alpine
-          ports:
-            - containerPort: 8080
-          env:
-            - name: AUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: stream-mcp-secrets
-                  key: AUTH_TOKEN
-          volumeMounts:
-            - name: caddy-config
-              mountPath: /etc/caddy
           readinessProbe:
             tcpSocket: { port: 8080 }
             periodSeconds: 10
           resources:
-            requests: { cpu: 5m, memory: 32Mi }
-            limits: { memory: 64Mi }
-      volumes:
-        - name: caddy-config
-          configMap:
-            name: mcp-caddy
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 1Gi }
 ---
 apiVersion: v1
 kind: Service
