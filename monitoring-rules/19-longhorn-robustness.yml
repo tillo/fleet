@@ -90,6 +90,56 @@ spec:
             kubectl --context=mdapi-prod -n longhorn-system delete replica {{ $labels.replica }}
           Auto-balance (best-effort) will re-schedule on a healthier node.
 
+    - alert: LonghornGhostSlotStuck
+      ## The OTHER stall mode, complementary to LonghornRebuildStuck above.
+      ## After a hard node reboot, replicas can return `stopped` with both
+      ## healthyAt AND failedAt empty; Longhorn keeps the dead replica
+      ## occupying the slot and NEVER starts a rebuild, so the volume sits
+      ## degraded on a single replica forever. There is no WO replica, so
+      ## LonghornRebuildStuck is blind to it (it watches rebuild progress).
+      ## The f/infra_health/longhorn_degraded_stuck probe (every 5 min)
+      ## counts these and auto-deletes the ghost (cap 8/run) so Longhorn
+      ## replenishes — a healed volume gets a WO rebuild and drops out of the
+      ## count within 1-2 runs. So a non-zero count sustained for 30 min means
+      ## the auto-delete is FAILING (Rancher API/permissions) or ghosts are
+      ## regenerating faster than the cap — needs a human.
+      expr: longhorn_ghost_slot_stuck_volume_count > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn ghost-slot autoheal not clearing: {{ $value }} volume(s) stuck degraded"
+        description: |
+          {{ $value }} rep>=2 Longhorn volume(s) have been degraded for >20 min on a
+          single replica with an inert stopped/failedAt-empty replica and no rebuild
+          in progress, and the f/infra_health/longhorn_degraded_stuck probe has not
+          cleared them in 30 min. The auto-delete is likely failing. Check the probe's
+          Windmill run logs, then clear manually:
+            kubectl --context=mdapi-prod -n longhorn-system get replica \
+              -o json | jq -r '.items[]|select(.status.currentState=="stopped" and .spec.healthyAt==null and .spec.failedAt==null)|.metadata.name'
+          Verify each volume keeps >=1 running healthy replica before deleting.
+
+    - alert: LonghornGhostSlotAutohealStale
+      ## Safety-net-for-the-safety-net: the ghost-slot autoheal only protects
+      ## redundancy if it actually runs. The schedule_integrity_check catches
+      ## the schedule being deleted/disabled; THIS catches the probe present +
+      ## enabled but erroring every run (no metric pushed). Pushgateway retains
+      ## the last timestamp, so a frozen value means the probe stopped pushing.
+      expr: time() - longhorn_degraded_stuck_last_run_timestamp_seconds > 1800
+      for: 5m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn ghost-slot autoheal probe stale (no run in >30 min)"
+        description: |
+          f/infra_health/longhorn_degraded_stuck has not pushed metrics in >30 min
+          (it runs every 5 min). The ghost-slot stall is now undetected. Check the
+          Windmill job run history for errors (Rancher token, API reachability).
+
     - alert: LonghornVolumeReadOnlyRemount
       ## Catches the silent-degraded failure mode that bit cribl + 4 *arr/Plex pods
       ## on 2026-05-19: the engine returned EIO long enough for the consumer's
