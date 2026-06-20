@@ -70,10 +70,14 @@ helm:
           command: ["/bin/sh", "-c"]
           args:
             - |
+              # Drive off `bao status` EXIT CODE (2 = sealed) — robust vs JSON parsing.
               while true; do
-                S=$(bao status -format=json 2>/dev/null)
-                echo "$S" | grep -q '"initialized":true' && echo "$S" | grep -q '"sealed":true' && [ -f /unseal/key1 ] && \
-                  for f in /unseal/key1 /unseal/key2 /unseal/key3; do [ -f "$f" ] && bao operator unseal "$(cat $f)" >/dev/null 2>&1; done
+                bao status >/dev/null 2>&1; rc=$?
+                if [ "$rc" = "2" ] && [ -f /unseal/key1 ]; then
+                  for f in /unseal/key1 /unseal/key2 /unseal/key3; do
+                    [ -f "$f" ] && bao operator unseal "$(cat $f)" >/dev/null 2>&1
+                  done
+                fi
                 sleep 10
               done
           volumeMounts:
