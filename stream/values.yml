@@ -3,7 +3,10 @@ global:
   imagePullSecrets:
     - evertrust-registry
 
-replicas: 1
+# 2 replicas: ONE Pekko cluster (same release) -> leader-elected singletons (CRL
+# generation, triggers run once), the 2nd pod adds HA for serving + the public CRL
+# distribution point (crl.mdapi.ch ingress below). Light: 300m/512Mi each.
+replicas: 2
 
 # --- Hard-required secrets (chart fails to render without these) ---
 license:
@@ -188,6 +191,38 @@ extraObjects:
           - http01:
               ingress:
                 class: nginx
+
+  # Public CRL distribution point. Stream serves CRLs UNAUTHENTICATED at /crls/<ca>
+  # (GET, DER/PEM). This dedicated host is the CRL VA endpoint: the CA's CRL-DP is set
+  # to https://crl.mdapi.ch/crls/mdapi-issuing-ca-01, and Horizon's imported CA points
+  # its crl_url here so revocation is actually checkable. Served HA by the 2 Stream pods.
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: stream-crl
+      annotations:
+        cert-manager.io/issuer: letsencrypt-prod
+        nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+        nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+        nginx.ingress.kubernetes.io/modsecurity-snippet: |
+          SecRuleEngine On
+          Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    spec:
+      ingressClassName: nginx
+      tls:
+        - hosts: [crl.mdapi.ch]
+          secretName: crl.mdapi.ch-tls
+      rules:
+        - host: crl.mdapi.ch
+          http:
+            paths:
+              - path: /crls
+                pathType: Prefix
+                backend:
+                  service:
+                    name: stream
+                    port:
+                      name: http
 
   # External MongoDB URI for Stream (not sensitive; plain Secret the chart references
   # via externalDatabase.secretName/secretKey). Points at the single-node RS below.
