@@ -196,6 +196,107 @@ extraObjects:
               ingress:
                 class: nginx
 
+  # --- Public PKI-artifact server (root CA download at crl.mdapi.ch/) ---
+  # Tiny unprivileged nginx serving the MDAPI Root CA so phones/devices fetch it at
+  # https://crl.mdapi.ch/MDAPI-Root-CA.crt (DER; nginx maps .crt -> application/x-x509-ca-cert,
+  # which triggers the Android CA installer). The CA cert is PUBLIC, not secret. ~10m/24Mi, 1 replica.
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: mdapi-ca-pub
+    binaryData:
+      MDAPI-Root-CA.crt: MIICDDCCAZGgAwIBAgIQc7+JgwH+dvxbrq/xr/l6KjAKBggqhkjOPQQDAzA1MQswCQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwHhcNMjYwNjE5MDQ1OTAxWhcNMzYwNjE2MDQ1OTAxWjA1MQswCQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAR1xDazV3lhbxfV8ihouX9s7jekFCEzFGL9gTV1gOQ6n97AfwjfIjTyz13KvyQv6mdmQDacQPciOBZcaeA2vztfE83MFXeZbXnyFsMqvld2Mzsue+vEYF5I6b+68CAMMoajZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwHQYDVR0OBBYEFJWzdaiI1rxzo/W1sHyTKrykHLSqMB8GA1UdIwQYMBaAFJWzdaiI1rxzo/W1sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNpADBmAjEAqnm2InKpu+JijKJjgegwgP97tqMyJtqBtQ7XiO5gLrAYBbF5ODvLmqvCfrOYDOYJAjEAt5nFrJb4nFUefDRZ4GybHOSb6GO0PpjFoF/xrwlX4t6kTjuLOZxz9CpgdjzHlriJ # gitleaks:allow (public CA cert, not a secret)
+    data:
+      MDAPI-Root-CA.pem: |
+        -----BEGIN CERTIFICATE-----
+        MIICDDCCAZGgAwIBAgIQc7+JgwH+dvxbrq/xr/l6KjAKBggqhkjOPQQDAzA1MQsw
+        CQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3Qg
+        Q0EwHhcNMjYwNjE5MDQ1OTAxWhcNMzYwNjE2MDQ1OTAxWjA1MQswCQYDVQQGEwJD
+        SDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwdjAQBgcq
+        hkjOPQIBBgUrgQQAIgNiAAR1xDazV3lhbxfV8ihouX9s7jekFCEzFGL9gTV1gOQ6
+        n97AfwjfIjTyz13KvyQv6mdmQDacQPciOBZcaeA2vztfE83MFXeZbXnyFsMqvld2
+        Mzsue+vEYF5I6b+68CAMMoajZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwHQYDVR0O
+        BBYEFJWzdaiI1rxzo/W1sHyTKrykHLSqMB8GA1UdIwQYMBaAFJWzdaiI1rxzo/W1
+        sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNpADBmAjEAqnm2
+        InKpu+JijKJjgegwgP97tqMyJtqBtQ7XiO5gLrAYBbF5ODvLmqvCfrOYDOYJAjEA
+        t5nFrJb4nFUefDRZ4GybHOSb6GO0PpjFoF/xrwlX4t6kTjuLOZxz9CpgdjzHlriJ
+        -----END CERTIFICATE-----
+      index.html: |
+        <!doctype html><html lang=en><head><meta charset=utf-8>
+        <meta name=viewport content="width=device-width,initial-scale=1">
+        <title>MDAPI Root CA</title>
+        <style>body{font-family:system-ui,sans-serif;max-width:40em;margin:2em auto;padding:0 1em;line-height:1.5}
+        code{background:#eee;padding:2px 4px;border-radius:4px;word-break:break-all;font-size:.85em}
+        a.btn{display:inline-block;background:#0a5;color:#fff;padding:.7em 1.1em;border-radius:8px;text-decoration:none;margin:.4em 0;font-weight:600}</style>
+        </head><body>
+        <h1>MDAPI Root CA</h1>
+        <p><a class=btn href="/MDAPI-Root-CA.crt">Download root CA (.crt)</a> &nbsp; <a href="/MDAPI-Root-CA.pem">PEM</a></p>
+        <p><b>Verify this SHA-256 on the device before trusting:</b><br>
+        <code>B9:64:99:EF:2F:FB:CA:78:8D:99:6C:52:FE:5E:8B:6F:81:49:57:FE:36:31:43:2D:45:39:4E:0E:9F:53:61:FA</code></p>
+        <p><b>Android:</b> Settings &rarr; Security &amp; privacy &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.
+        Note: only browsers/opt-in apps use user-installed CAs on Android 7+.</p>
+        </body></html>
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ca-pub
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: ca-pub
+      template:
+        metadata:
+          labels:
+            app: ca-pub
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: nginx
+              image: nginxinc/nginx-unprivileged:1.27-alpine
+              ports:
+                - name: http
+                  containerPort: 8080
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 24Mi
+                limits:
+                  memory: 64Mi
+              readinessProbe:
+                httpGet:
+                  path: /MDAPI-Root-CA.crt
+                  port: http
+                periodSeconds: 10
+              volumeMounts:
+                - name: web
+                  mountPath: /usr/share/nginx/html
+                  readOnly: true
+          volumes:
+            - name: web
+              configMap:
+                name: mdapi-ca-pub
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ca-pub
+    spec:
+      selector:
+        app: ca-pub
+      ports:
+        - name: http
+          port: 80
+          targetPort: http
+
   # Public CRL distribution point. Stream serves CRLs UNAUTHENTICATED at /crls/<ca>
   # (GET, DER/PEM). This dedicated host is the CRL VA endpoint: the CA's CRL-DP is set
   # to https://crl.mdapi.ch/crls/mdapi-issuing-ca-01, and Horizon's imported CA points
@@ -229,6 +330,15 @@ extraObjects:
                 backend:
                   service:
                     name: stream
+                    port:
+                      name: http
+              # Everything else on crl.mdapi.ch -> the static PKI-artifact server
+              # (root CA download + a landing page). /crls is more specific so it wins.
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: ca-pub
                     port:
                       name: http
 
