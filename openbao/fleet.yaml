@@ -1,0 +1,79 @@
+# OpenBao — self-hosted secrets STANDBY (Akeyless failover, Option B).
+# Design/ADR: Joplin note "OpenBao secrets failover & backup — design / ADR".
+# P1 PoC: deploy alongside the live Akeyless path, zero impact. Akeyless stays
+# PRIMARY; this is a warm, continuously-mirrored standby (mirror job = P2).
+#
+# Auto-unseal = Option α: the `unsealer` sidecar reads Shamir keys from the
+# (optional) Secret `openbao-unseal-keys` and unseals on boot. That Secret is
+# created out-of-band at init time from `bao operator init` output (NEVER in git).
+#
+# TODO before this is a real failover target (post-P1):
+#   - internal-CA TLS (currently global.tlsDisable=true, in-cluster http only)
+#   - mirror image -> zot.mdapi.ch (Lane B: pinned + IfNotPresent)
+#   - scale ha.replicas 1 -> 3 if HA wanted
+namespace: openbao
+helm:
+  releaseName: openbao
+  repo: https://openbao.github.io/openbao-helm
+  chart: openbao
+  version: 0.28.4            # appVersion v2.5.5
+  values:
+    global:
+      tlsDisable: true        # P1 PoC only — add internal-CA TLS before production failover use
+    injector:
+      enabled: false
+    csi:
+      enabled: false
+    ui:
+      enabled: true
+    server:
+      image:
+        repository: openbao/openbao
+        tag: "2.5.5"
+        pullPolicy: IfNotPresent
+      dataStorage:
+        enabled: true
+        size: 5Gi
+        storageClass: ceph-block
+        accessMode: ReadWriteOnce
+      ha:
+        enabled: true
+        replicas: 1
+        raft:
+          enabled: true
+          setNodeId: true
+          config: |
+            ui = true
+            listener "tcp" {
+              address = "[::]:8200"
+              cluster_address = "[::]:8201"
+              tls_disable = 1
+            }
+            storage "raft" {
+              path = "/openbao/data"
+            }
+      # Auto-unseal Option α: sidecar unseals from the optional Secret openbao-unseal-keys.
+      volumes:
+        - name: unseal-keys
+          secret:
+            secretName: openbao-unseal-keys
+            optional: true
+      extraContainers:
+        - name: unsealer
+          image: openbao/openbao:2.5.5
+          env:
+            - name: BAO_ADDR
+              value: http://127.0.0.1:8200
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              while true; do
+                S=$(bao status -format=json 2>/dev/null)
+                echo "$S" | grep -q '"initialized":true' && echo "$S" | grep -q '"sealed":true' && [ -f /unseal/key1 ] && \
+                  for f in /unseal/key1 /unseal/key2 /unseal/key3; do [ -f "$f" ] && bao operator unseal "$(cat $f)" >/dev/null 2>&1; done
+                sleep 10
+              done
+          volumeMounts:
+            - name: unseal-keys
+              mountPath: /unseal
+              readOnly: true
