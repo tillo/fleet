@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openbao-mirror-script
+  namespace: openbao
+data:
+  mirror.py: |
+    # Akeyless -> OpenBao mirror. Reads every /mdapi item (api-key auth), writes
+    # each to OpenBao KV v2 mdapi/<relpath> {"value": <raw>}. k8s-auth role `mirror`.
+    # Secret VALUES are NEVER printed (only counts + error key names).
+    import json, ssl, urllib.request
+    AK = "https://cm.mdapi.ch/akeyless-api/v2"
+    BAO = "http://openbao.openbao.svc:8200"
+    akid = open("/creds/access-id").read().strip()
+    akkey = open("/creds/access-key").read().strip()
+    sa = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+    ctx = ssl.create_default_context()
+
+    def post(url, body, tok_hdr=None):
+        h = {"Content-Type": "application/json"}
+        if tok_hdr:
+            h["X-Vault-Token"] = tok_hdr
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h, method="POST")
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+            b = r.read()
+            return json.loads(b) if b else {}
+
+    aktok = post(f"{AK}/auth", {"access-id": akid, "access-type": "api_key", "access-key": akkey})["token"]
+    baotok = post(f"{BAO}/v1/auth/kubernetes/login", {"role": "mirror", "jwt": sa})["auth"]["client_token"]
+
+    def fname(f):
+        return f if isinstance(f, str) else (f.get("path") or f.get("folder_name") or f.get("name"))
+
+    def list_items(path):
+        names, folders, pag = [], [], ""
+        while True:
+            body = {"token": aktok, "path": path}
+            if pag:
+                body["pagination-token"] = pag
+            r = post(f"{AK}/list-items", body)
+            names += [it["item_name"] for it in (r.get("items") or [])]
+            folders += [fname(f) for f in (r.get("folders") or [])]
+            pag = r.get("next_page") or ""
+            if not pag:
+                break
+        for f in folders:
+            if f:
+                names += list_items(f)
+        return names
+
+    items = sorted(set(list_items("/mdapi")))
+    print(f"akeyless_items={len(items)}", flush=True)
+    ok = err = 0
+    errs = []
+    for name in items:
+        try:
+            v = post(f"{AK}/get-secret-value", {"token": aktok, "names": [name]})
+            val = v.get(name)
+            if val is None:
+                err += 1; errs.append(name + ":noval"); continue
+            if not isinstance(val, str):
+                val = json.dumps(val)
+            rel = name[len("/mdapi/"):] if name.startswith("/mdapi/") else name.lstrip("/")
+            post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": val}}, tok_hdr=baotok)
+            ok += 1
+        except Exception as e:
+            err += 1; errs.append(f"{name}:{type(e).__name__}")
+    print(f"mirrored={ok} errors={err}", flush=True)
+    for e in errs[:25]:
+        print("ERR", e)
+    raise SystemExit(1 if err else 0)

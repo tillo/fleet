@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openbao-mirror
+  namespace: openbao
+spec:
+  schedule: "7 * * * *"          # hourly at :07
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          serviceAccountName: openbao-mirror
+          restartPolicy: Never
+          containers:
+          - name: mirror
+            image: python:3.12-alpine
+            imagePullPolicy: IfNotPresent
+            command: ["python3","/script/mirror.py"]
+            resources:
+              requests: {cpu: 100m, memory: 64Mi}
+              limits: {memory: 256Mi}
+            volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: creds, mountPath: /creds, readOnly: true}
+          volumes:
+          - {name: script, configMap: {name: openbao-mirror-script}}
+          - {name: creds, secret: {secretName: akeyless-mirror-creds}}
