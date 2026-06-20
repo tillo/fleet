@@ -23,17 +23,20 @@ spec:
     repository: volsync-ceph-backup-restic
     copyMethod: Snapshot
     volumeSnapshotClassName: ceph-block
-    # Run the restic mover as root so it can read owncloud's www-data-owned
-    # files (incl. transient PHP session files, mode 600). Without this the
-    # mover hits "permission denied" on /data/sessions/* -> restic exit 3 ->
-    # VolSync marks the sync Failed even though the snapshot actually saved.
-    # owncloud ns has no PSA enforcement so root is permitted; no fsGroup (root
-    # reads regardless of group, and fsGroup would force a slow recursive chown
-    # of the ~159 GiB snapshot clone).
+    # Run the restic mover as www-data (uid/gid 33) — the user that OWNS
+    # owncloud's data, incl. the transient PHP session files (mode 600) under
+    # /data/sessions/*. Running as root does NOT work here: VolSync's restic
+    # container hardcodes `capabilities: { drop: [ALL] }`, which strips
+    # CAP_DAC_OVERRIDE, so root-without-dac-override still gets "permission
+    # denied" on mode-600 files owned by 33 -> restic exit 3 -> VolSync marks
+    # the sync Failed (loops every retry) even though the snapshot saved.
+    # Reading as the owning uid (33) sidesteps the cap entirely. No fsGroup —
+    # 33 reads its own files directly, avoiding a slow recursive chown of the
+    # ~159 GiB snapshot clone.
     moverSecurityContext:
-      runAsUser: 0
-      runAsGroup: 0
-      runAsNonRoot: false
+      runAsUser: 33
+      runAsGroup: 33
+      runAsNonRoot: true
     cacheCapacity: 8Gi
     # restic cache (index) on fast Longhorn/fio, not the P420i Ceph tier we back up.
     cacheStorageClassName: harvester-longhorn-1replica

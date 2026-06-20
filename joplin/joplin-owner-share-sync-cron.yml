@@ -76,7 +76,25 @@ spec:
               mkdir -p /work/npm
               npm config set prefix /work/npm >/dev/null 2>&1
               export PATH=/work/npm/bin:$PATH
-              npm install -g joplin@3.6.2 >/tmp/npm.log 2>&1 || { echo "npm install failed:"; tail -20 /tmp/npm.log; exit 1; }
+              # joplin pulls in sqlite3, whose node-pre-gyp step DOWNLOADS a
+              # prebuilt napi-v6 binary. That download is flaky; when it misses,
+              # node-pre-gyp falls back to compiling from source, which fails
+              # because this runtime image has no C toolchain -> the whole run
+              # fails (~half of them). The prebuilt is the only viable path, so
+              # just retry the install: a retry re-attempts the download and a
+              # successful one finishes in ~110s with no compile. Wipe the
+              # partial tree between attempts so a half-install can't poison it.
+              installed=0
+              for attempt in 1 2 3 4 5; do
+                if npm install -g joplin@3.6.2 >/tmp/npm.log 2>&1; then
+                  echo "npm install ok (attempt $attempt)"; installed=1; break
+                fi
+                echo "npm install attempt $attempt failed (node-pre-gyp prebuilt miss); retrying after backoff"
+                tail -3 /tmp/npm.log || true
+                rm -rf /work/npm/lib/node_modules/joplin 2>/dev/null || true
+                sleep $((attempt * 10))
+              done
+              if [ "$installed" != 1 ]; then echo "npm install failed after 5 attempts:"; tail -30 /tmp/npm.log; exit 1; fi
               joplin config keychain.supported 0 >/dev/null
               joplin config sync.target 9 >/dev/null
               joplin config sync.9.path https://notes.mdapi.ch >/dev/null
