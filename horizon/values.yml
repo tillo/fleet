@@ -7,6 +7,14 @@ global:
 # Single replica for the eval.
 replicas: 1
 
+# EST simplereenroll (unattended auto-renewal) authenticates via mTLS. The horizon-acme
+# carve-out ingress requests the client cert and passes it upstream in the `ssl-client-cert`
+# header (auth-tls-pass-certificate-to-upstream). This sets Horizon's HTTP_CERTIFICATE_HEADER
+# env so it reads the client cert from that header and accepts the X509 reenroll.
+# (Standalone form — mutually exclusive with ingress.clientCertificateAuth, which would target
+# the chart's MAIN ingress; the EST paths live on the separate horizon-acme ingress.)
+clientCertificateHeader: "ssl-client-cert"
+
 # --- Hard-required secrets (chart fails to render without these) ---
 license:
   secretName: horizon-license
@@ -314,6 +322,44 @@ extraObjects:
                       print("rs initiated");
                     }'
 
+  # Client-CA bundle the horizon-acme ingress uses to verify EST client certs for mTLS
+  # reenroll (auth-tls-secret). ca.crt = MDAPI Issuing CA 01 + MDAPI Root CA — public CA
+  # certs (not secret), inlined so the trust anchor is Fleet-managed.
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: est-client-ca
+    type: Opaque
+    stringData:
+      ca.crt: |
+        -----BEGIN CERTIFICATE-----
+        MIICETCCAZegAwIBAgIQJWLvVrFzdklVpPqeC4qvYDAKBggqhkjOPQQDAzA1MQsw
+        CQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3Qg
+        Q0EwHhcNMjYwNjE5MDQ1OTI1WhcNMzEwNjE4MDQ1OTI1WjA7MQswCQYDVQQGEwJD
+        SDEOMAwGA1UECgwFbWRhcGkxHDAaBgNVBAMME01EQVBJIElzc3VpbmcgQ0EgMDEw
+        djAQBgcqhkjOPQIBBgUrgQQAIgNiAARFXWes3TPhHOXNibWS38lRScGnjAdA1NvJ
+        m21taiFGVudRc+y2geWgER3o1wPfEvA+S7xYaL3COlS5QP0VUHMbbjDzcryzSlTT
+        RfRYcQ9HHdXi7Kyqr0P8J/tSIux2cYejZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQAw
+        HQYDVR0OBBYEFOzQOTnCJbvJJ1t9uVJvDut3CZ56MB8GA1UdIwQYMBaAFJWzdaiI
+        1rxzo/W1sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNoADBl
+        AjACZQeOtpTxpyJTlir1cvlxGjRm75ACHJX84d9O4YKX04INQ6U3R9l6HeEku468
+        MIsCMQD6Fbcn8aDEout53w03HipxjGnrmh35dKYbvAa8+dVvk2mCq+fTU6FZgxfA
+        RW7FY04=
+        -----END CERTIFICATE-----
+        -----BEGIN CERTIFICATE-----
+        MIICDDCCAZGgAwIBAgIQc7+JgwH+dvxbrq/xr/l6KjAKBggqhkjOPQQDAzA1MQsw
+        CQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3Qg
+        Q0EwHhcNMjYwNjE5MDQ1OTAxWhcNMzYwNjE2MDQ1OTAxWjA1MQswCQYDVQQGEwJD
+        SDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwdjAQBgcq
+        hkjOPQIBBgUrgQQAIgNiAAR1xDazV3lhbxfV8ihouX9s7jekFCEzFGL9gTV1gOQ6
+        n97AfwjfIjTyz13KvyQv6mdmQDacQPciOBZcaeA2vztfE83MFXeZbXnyFsMqvld2
+        Mzsue+vEYF5I6b+68CAMMoajZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwHQYDVR0O
+        BBYEFJWzdaiI1rxzo/W1sHyTKrykHLSqMB8GA1UdIwQYMBaAFJWzdaiI1rxzo/W1
+        sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNpADBmAjEAqnm2
+        InKpu+JijKJjgegwgP97tqMyJtqBtQ7XiO5gLrAYBbF5ODvLmqvCfrOYDOYJAjEA
+        t5nFrJb4nFUefDRZ4GybHOSb6GO0PpjFoF/xrwlX4t6kTjuLOZxz9CpgdjzHlriJ
+        -----END CERTIFICATE-----
+
   # ModSec carve-out for the ACME protocol path. The main `horizon` ingress runs
   # ModSec (WAF), which 403s ACME's JWS POSTs (new-acct/new-order). This second
   # Ingress for the same host serves only /acme with ModSec OFF -> the ACME server
@@ -331,6 +377,13 @@ extraObjects:
         nginx.ingress.kubernetes.io/enable-modsecurity: "true"
         nginx.ingress.kubernetes.io/modsecurity-snippet: |
           SecRuleEngine Off
+        # mTLS for EST simplereenroll (auto-renewal): request the client cert but make it
+        # OPTIONAL so /acme and the challenge-based simpleenroll (no client cert) still work;
+        # pass the presented cert upstream as `ssl-client-cert` for Horizon's X509 reenroll.
+        nginx.ingress.kubernetes.io/auth-tls-verify-client: "optional"
+        nginx.ingress.kubernetes.io/auth-tls-secret: "horizon/est-client-ca"
+        nginx.ingress.kubernetes.io/auth-tls-verify-depth: "2"
+        nginx.ingress.kubernetes.io/auth-tls-pass-certificate-to-upstream: "true"
     spec:
       ingressClassName: nginx
       tls:
