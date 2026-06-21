@@ -54,13 +54,14 @@ metadata:
   name: horizon-netscan
   namespace: horizon-discovery
 spec:
-  schedule: "30 3 * * *"            # daily 03:30
+  schedule: "30 */6 * * *"          # every 6h at :30 (00:30/06:30/12:30/18:30) — was daily; a single
+                                    # transient failure now self-heals within 6h, not 24h.
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      backoffLimit: 1
+      backoffLimit: 3
       activeDeadlineSeconds: 3600
       template:
         spec:
@@ -76,11 +77,15 @@ spec:
               command: ["sh", "-c"]
               args:
                 - |
-                  set -e
-                  apk add --no-cache ca-certificates curl libarchive-tools >/dev/null
+                  set -eu
+                  # The runtime apk + RPM fetch depend on external DNS/CDN (alpine CDN, repo.evertrust.io).
+                  # A single transient DNS error used to fail the whole scan; retry to survive blips.
+                  # (Proper fix = bake an image with the deps + horizon-cli — tracked as a follow-up.)
+                  retry() { i=0; until "$@"; do i=$((i+1)); [ "$i" -ge 5 ] && echo "FAILED after $i tries: $*" && return 1; echo "retry $i: $*"; sleep 10; done; }
+                  retry apk add --no-cache ca-certificates curl libarchive-tools
                   cd /tmp
                   echo "Fetching horizon-cli 1.17.0..."
-                  curl -fsSL -u "$REPO_USER:$REPO_PW" -o hzn.rpm \
+                  retry curl -fsSL -u "$REPO_USER:$REPO_PW" -o hzn.rpm \
                     "https://repo.evertrust.io/repository/horizon-cli-rpm/horizon-cli-1.17.0-1.x86_64.rpm"
                   bsdtar -xf hzn.rpm -C /tmp
                   chmod +x /tmp/opt/horizon/bin/horizon-cli
