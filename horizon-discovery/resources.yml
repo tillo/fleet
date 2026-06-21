@@ -4,7 +4,7 @@
 #
 # Why this shape:
 #  - horizon-cli ships only as a Nexus binary (no upstream image) -> we bake it into
-#    our own image (registry.gitlab.mdapi.ch/mdapi/horizon-cli); the pod just runs it.
+#    our own image (registry.mdapi.ch/mdapi/horizon-cli); the pod just runs it.
 #  - netscan has no target flags; it scans the host's directly-connected subnets,
 #    so hostNetwork:true + nodeName pins it to a LAN-attached node to see 192.168.1.x.
 #  - dnsPolicy ClusterFirstWithHostNet so it resolves horizon.*.svc and the LAN.
@@ -63,7 +63,7 @@ spec:
       type: kubernetes.io/dockerconfigjson
       data:
         .dockerconfigjson: |
-          {"auths":{"registry.gitlab.mdapi.ch":{"username":"{{ .user }}","password":"{{ .token }}","auth":"{{ printf "%s:%s" .user .token | b64enc }}"}}}
+          {"auths":{"registry.mdapi.ch":{"username":"{{ .user }}","password":"{{ .token }}","auth":"{{ printf "%s:%s" .user .token | b64enc }}"}}}
   data:
     - secretKey: user
       remoteRef:
@@ -99,10 +99,10 @@ spec:
           restartPolicy: Never
           containers:
             - name: netscan
-              # Purpose-built image baking the horizon-cli static binary (registry.gitlab.mdapi.ch/mdapi/horizon-cli);
+              # Purpose-built image baking the horizon-cli static binary (registry.mdapi.ch/mdapi/horizon-cli);
               # ENTRYPOINT is horizon-cli, so args are just its subcommand. No runtime apk/RPM fetch, no kyos creds
               # in the pod. The binary reads ENDPOINT/APIID/APIKEY from the env (no config file needed).
-              image: registry.gitlab.mdapi.ch/mdapi/horizon-cli:latest
+              image: registry.mdapi.ch/mdapi/horizon-cli:latest
               imagePullPolicy: Always
               args: ["netscan", "--campaign=network"]
               envFrom:
