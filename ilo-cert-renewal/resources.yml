@@ -1,0 +1,236 @@
+# iLO BMC certificate renewal — a node-pinned, hostNetwork CronJob that renews the
+# HPE iLO HTTPS certs (qui/quo/qua) from Horizon before they expire.
+#
+# Why this shape:
+#  - iLO 4 can't run an agent and has no ACME/EST/SCEP, so a central job drives the
+#    Redfish CSR -> sign -> import flow. iLOs live on the LAN (192.168.1.x), so the pod
+#    is hostNetwork + nodeName-pinned to a LAN-attached node (same as horizon-netscan).
+#  - dnsPolicy ClusterFirstWithHostNet so it resolves horizon.*.svc AND reaches the LAN.
+#  - Enrolls via Horizon WebRA profile `private-tls-bmc` (CLM-managed) as the dedicated
+#    least-privilege identity `bmc-renewal` -> connector stream-mdapi-bmc -> CA01 /
+#    mdapi-tls-bmc (90-day). Certs are tracked + revocable in Horizon, not just discovered.
+#  - Each successful renewal IMPORTS via Redfish, which resets that BMC (~60s; host OS
+#    unaffected). Gated: only renews when < RENEW_DAYS to expiry (or FORCE=true), so at
+#    a daily cadence each iLO resets ~4x/year, never on a healthy cert.
+#  - Pure stdlib Python (urllib) on a stock python image -> no runtime pip/apk fetch.
+---
+# Creds: per-iLO Administrator passwords + the bmc-renewal Horizon API key.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ilo-renewal-creds
+  namespace: ilo-cert-renewal
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ilo-renewal-creds
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        HORIZON_URL: "http://horizon.horizon.svc.cluster.local:9000"
+        HORIZON_APIID: "bmc-renewal"
+        HORIZON_APIKEY: "{{ .horizonKey }}"
+        ILO_QUI_PW: "{{ .quiPw }}"
+        ILO_QUO_PW: "{{ .quoPw }}"
+        ILO_QUA_PW: "{{ .quaPw }}"
+  data:
+    - secretKey: horizonKey
+      remoteRef:
+        key: /mdapi/horizon/bmc-renewal/password
+    - secretKey: quiPw
+      remoteRef:
+        key: /mdapi/ilo/qui/password
+    - secretKey: quoPw
+      remoteRef:
+        key: /mdapi/ilo/quo/password
+    - secretKey: quaPw
+      remoteRef:
+        key: /mdapi/ilo/qua/password
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ilo-renewal-script
+  namespace: ilo-cert-renewal
+data:
+  renew.py: |
+    #!/usr/bin/env python3
+    # Renew HPE iLO HTTPS certs via Horizon WebRA (private-tls-bmc). Stdlib only.
+    import os, ssl, json, time, base64, urllib.request, urllib.error
+    from datetime import datetime, timezone
+
+    ILOS       = {"qui": "192.168.1.170", "quo": "192.168.1.181", "qua": "192.168.1.182"}
+    HORIZON    = os.environ.get("HORIZON_URL", "http://horizon.horizon.svc.cluster.local:9000")
+    PROFILE    = os.environ.get("PROFILE", "private-tls-bmc")
+    APIID      = os.environ["HORIZON_APIID"]
+    APIKEY     = os.environ["HORIZON_APIKEY"]
+    ILO_USER   = os.environ.get("ILO_USER", "Administrator")
+    RENEW_DAYS = int(os.environ.get("RENEW_DAYS", "30"))
+    DRY_RUN    = os.environ.get("DRY_RUN", "false").lower() == "true"
+    FORCE      = os.environ.get("FORCE", "false").lower() == "true"
+    PUSHGW     = os.environ.get("PUSHGATEWAY", "http://pushgateway.monitoring.svc.cluster.local:9091")
+    JOB        = "ilo_cert_renewal"
+    HC         = "/redfish/v1/Managers/1/SecurityService/HttpsCert/"
+    GEN_CSR    = HC + "Actions/HpHttpsCert.GenerateCSR/"
+    IMPORT     = HC + "Actions/HpHttpsCert.ImportCertificate/"
+
+    ILO_CTX = ssl.create_default_context()          # iLO presents an IP/self or new cert
+    ILO_CTX.check_hostname = False                   # -> don't verify (BMC on the LAN)
+    ILO_CTX.verify_mode = ssl.CERT_NONE
+
+    def http(url, method="GET", headers=None, body=None, ctx=None, timeout=60):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(url, method=method, data=data)
+        for k, v in (headers or {}).items():
+            r.add_header(k, v)
+        if data is not None:
+            r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, context=ctx, timeout=timeout) as resp:
+                return resp.status, resp.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "ignore")
+
+    def ilo(ip, pw, path, method="GET", body=None):
+        auth = base64.b64encode(f"{ILO_USER}:{pw}".encode()).decode()
+        return http(f"https://{ip}{path}", method, {"Authorization": "Basic " + auth}, body, ILO_CTX, 90)
+
+    def horizon_enroll(csr, cn, ip):
+        body = {"workflow": "enroll", "profile": PROFILE, "module": "webra",
+                "template": {"csr": csr,
+                             "subject": [{"element": "cn.1", "type": "CN", "value": cn}],
+                             "sans": [{"type": "DNSNAME", "value": [cn]},
+                                      {"type": "IPADDRESS", "value": [ip]}]}}
+        code, txt = http(HORIZON + "/api/v1/requests/submit", "POST",
+                         {"X-API-Id": APIID, "X-API-Key": APIKEY}, body, None, 90)
+        pem = None
+        if code < 300:
+            d = json.loads(txt)
+            cert = d.get("certificate")
+            if isinstance(cert, str) and "BEGIN CERT" in cert:
+                pem = cert
+            elif isinstance(cert, dict):
+                pem = cert.get("pem") or cert.get("certificate") or cert.get("value")
+            if not pem:
+                import re
+                m = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+                              txt.replace("\\n", "\n"), re.S)
+                pem = m.group(0) if m else None
+        return code, pem, txt
+
+    def renew_one(name, ip):
+        pw = os.environ["ILO_%s_PW" % name.upper()]
+        code, txt = ilo(ip, pw, HC)
+        if code >= 300:
+            print("%s: cannot read HttpsCert (HTTP %s)" % (name, code)); return "error"
+        info = json.loads(txt).get("X509CertificateInformation", {})
+        na = info.get("ValidNotAfter")
+        days = None
+        if na:
+            try:
+                days = (datetime.fromisoformat(na.replace("Z", "+00:00")) - datetime.now(timezone.utc)).days
+            except Exception:
+                pass
+        if not FORCE and days is not None and days > RENEW_DAYS:
+            print("%s: %sd to expiry (subj=%s) -> skip" % (name, days, info.get("Subject", "")[:40])); return "skip"
+        if DRY_RUN:
+            print("%s: %sd to expiry -> WOULD renew (dry-run)" % (name, days)); return "would"
+        cn = "%s-ilo.home.tillo.ch" % name
+        print("%s: %sd to expiry -> renewing (CN=%s)" % (name, days, cn))
+        c, _ = ilo(ip, pw, GEN_CSR, "POST", {"Country": "CH", "State": "Ticino", "City": "Lugano",
+                                             "OrgName": "mdapi", "OrgUnit": "homelab", "CommonName": cn})
+        if c >= 300:
+            print("%s: GenerateCSR failed (HTTP %s)" % (name, c)); return "error"
+        csr = None
+        for _ in range(40):                          # iLO 4 CSR gen is slow (up to ~10 min)
+            time.sleep(15)
+            cc, body = ilo(ip, pw, HC)
+            req = json.loads(body).get("CertificateSigningRequest") if cc < 300 else None
+            if req and "BEGIN CERTIFICATE REQUEST" in req:
+                csr = req; break
+        if not csr:
+            print("%s: CSR generation timed out" % name); return "error"
+        ec, pem, etxt = horizon_enroll(csr, cn, ip)
+        if not pem:
+            print("%s: Horizon enroll failed (HTTP %s) %s" % (name, ec, etxt[:200])); return "error"
+        ic, itxt = ilo(ip, pw, IMPORT, "POST", {"Certificate": pem})
+        if ic >= 300:
+            print("%s: ImportCertificate failed (HTTP %s) %s" % (name, ic, itxt[:160])); return "error"
+        print("%s: renewed + imported (BMC resetting)" % name); return "renewed"
+
+    def main():
+        counts = {"renewed": 0, "skip": 0, "would": 0, "error": 0}
+        for name, ip in ILOS.items():
+            try:
+                counts[renew_one(name, ip)] += 1
+            except Exception as e:
+                print("%s: exception %s" % (name, str(e)[:160])); counts["error"] += 1
+        print("summary:", counts)
+        try:
+            lines = ["# TYPE ilo_cert_renewal_renewed gauge", "ilo_cert_renewal_renewed %d" % counts["renewed"],
+                     "# TYPE ilo_cert_renewal_errors gauge", "ilo_cert_renewal_errors %d" % counts["error"],
+                     "# TYPE ilo_cert_renewal_due gauge", "ilo_cert_renewal_due %d" % (counts["renewed"] + counts["would"]),
+                     "# TYPE ilo_cert_renewal_last_run_timestamp_seconds gauge",
+                     "ilo_cert_renewal_last_run_timestamp_seconds %d" % datetime.now(timezone.utc).timestamp()]
+            req = urllib.request.Request("%s/metrics/job/%s" % (PUSHGW, JOB), method="PUT",
+                                         data=("\n".join(lines) + "\n").encode())
+            req.add_header("Content-Type", "text/plain")
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print("pushgateway error:", str(e)[:120])
+        if counts["error"]:
+            raise SystemExit(1)
+
+    main()
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ilo-cert-renewal
+  namespace: ilo-cert-renewal
+spec:
+  schedule: "0 4 * * *"               # daily 04:00 UTC; gated on expiry so it no-ops until due
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 2400      # 3 iLOs x slow CSR gen
+      template:
+        spec:
+          automountServiceAccountToken: false
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeName: qui                # LAN-attached node (192.168.1.190)
+          restartPolicy: Never
+          containers:
+            - name: renew
+              image: python:3.12-slim
+              command: ["python3", "/script/renew.py"]
+              env:
+                - name: DRY_RUN
+                  value: "false"       # safe: the expiry gate means no resets until < RENEW_DAYS
+                - name: RENEW_DAYS
+                  value: "30"
+              envFrom:
+                - secretRef:
+                    name: ilo-renewal-creds
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: "500m"
+                  memory: 256Mi
+          volumes:
+            - name: script
+              configMap:
+                name: ilo-renewal-script
