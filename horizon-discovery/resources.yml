@@ -3,11 +3,11 @@
 # and feeds the `network` discovery campaign in Horizon.
 #
 # Why this shape:
-#  - horizon-cli ships only as a Nexus binary (no container image) -> fetch the
-#    1.17.0 RPM at start and extract the static binary (download-at-start pattern).
+#  - horizon-cli ships only as a Nexus binary (no upstream image) -> we bake it into
+#    our own image (registry.gitlab.mdapi.ch/mdapi/horizon-cli); the pod just runs it.
 #  - netscan has no target flags; it scans the host's directly-connected subnets,
 #    so hostNetwork:true + nodeName pins it to a LAN-attached node to see 192.168.1.x.
-#  - dnsPolicy ClusterFirstWithHostNet so it resolves both horizon.*.svc and repo.evertrust.io.
+#  - dnsPolicy ClusterFirstWithHostNet so it resolves horizon.*.svc and the LAN.
 #  - auth = dedicated `horizon-discovery` Horizon identity (role discovery:*); the
 #    `network` campaign's feed authz is `authenticated`, which this identity satisfies.
 ---
@@ -18,7 +18,8 @@ metadata:
   namespace: horizon-discovery
 automountServiceAccountToken: false
 ---
-# Creds: Horizon discovery identity (feed) + kyos Nexus creds (download the RPM).
+# Creds: Horizon discovery identity (feed API). The horizon-cli binary is now baked into
+# the image, so the kyos Nexus creds are no longer present in the pod.
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -38,15 +39,38 @@ spec:
         ENDPOINT: "http://horizon.horizon.svc.cluster.local:9000"
         APIID: "horizon-discovery"
         APIKEY: "{{ .apikey }}"
-        REPO_USER: "kyos"
-        REPO_PW: "{{ .repopw }}"
   data:
     - secretKey: apikey
       remoteRef:
         key: /mdapi/horizon/discovery/password
-    - secretKey: repopw
+---
+# Pull secret for the private horizon-cli image (GitLab registry), via a group
+# read_registry deploy token stored in Akeyless.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gitlab-registry
+  namespace: horizon-discovery
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: gitlab-registry
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: |
+          {"auths":{"registry.gitlab.mdapi.ch":{"username":"{{ .user }}","password":"{{ .token }}","auth":"{{ printf "%s:%s" .user .token | b64enc }}"}}}
+  data:
+    - secretKey: user
       remoteRef:
-        key: /kyos/evertrust/repo/password
+        key: /mdapi/gitlab/registry-pull-token/username
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/gitlab/registry-pull-token/token
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -66,6 +90,8 @@ spec:
       template:
         spec:
           serviceAccountName: horizon-discovery
+          imagePullSecrets:
+            - name: gitlab-registry
           automountServiceAccountToken: false
           hostNetwork: true
           dnsPolicy: ClusterFirstWithHostNet
@@ -73,28 +99,12 @@ spec:
           restartPolicy: Never
           containers:
             - name: netscan
-              image: alpine:3
-              command: ["sh", "-c"]
-              args:
-                - |
-                  set -eu
-                  # The runtime apk + RPM fetch depend on external DNS/CDN (alpine CDN, repo.evertrust.io).
-                  # A single transient DNS error used to fail the whole scan; retry to survive blips.
-                  # (Proper fix = bake an image with the deps + horizon-cli — tracked as a follow-up.)
-                  retry() { i=0; until "$@"; do i=$((i+1)); [ "$i" -ge 5 ] && echo "FAILED after $i tries: $*" && return 1; echo "retry $i: $*"; sleep 10; done; }
-                  retry apk add --no-cache ca-certificates curl libarchive-tools
-                  cd /tmp
-                  echo "Fetching horizon-cli 1.17.0..."
-                  retry curl -fsSL -u "$REPO_USER:$REPO_PW" -o hzn.rpm \
-                    "https://repo.evertrust.io/repository/horizon-cli-rpm/horizon-cli-1.17.0-1.x86_64.rpm"
-                  bsdtar -xf hzn.rpm -C /tmp
-                  chmod +x /tmp/opt/horizon/bin/horizon-cli
-                  export HOME=/tmp
-                  mkdir -p /tmp/.horizon-cli/etc
-                  printf 'endpoint: %s\napi_id: %s\napi_key: %s\ntimeout: 10\n' \
-                    "$ENDPOINT" "$APIID" "$APIKEY" > /tmp/.horizon-cli/etc/horizon-cli.conf
-                  echo "Starting netscan -> campaign=network ..."
-                  exec /tmp/opt/horizon/bin/horizon-cli netscan --campaign=network
+              # Purpose-built image baking the horizon-cli static binary (registry.gitlab.mdapi.ch/mdapi/horizon-cli);
+              # ENTRYPOINT is horizon-cli, so args are just its subcommand. No runtime apk/RPM fetch, no kyos creds
+              # in the pod. The binary reads ENDPOINT/APIID/APIKEY from the env (no config file needed).
+              image: registry.gitlab.mdapi.ch/mdapi/horizon-cli:latest
+              imagePullPolicy: Always
+              args: ["netscan", "--campaign=network"]
               envFrom:
                 - secretRef:
                     name: horizon-discovery-creds
