@@ -1,0 +1,179 @@
+# CA01 cert for the Harvester VIP :8443 backend (replaces the change.me default).
+#
+# The front door (harvester.mdapi.ch:443 ingress) is already Let's Encrypt; this only
+# covers the raw VIP/node :8443 backend, reached on direct-IP access. Harvester's
+# ssl-certificates Setting is an INLINE cert (no native cert-manager reload), so:
+#   cert-manager Certificate (CA01, DNS+IP SANs, auto-renew) -> Secret -> a daily sync
+#   CronJob copies it into the Setting when it changes.
+# Bad Setting input flips the Setting's `configured` condition False (no silent break).
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: harvester-backend
+  namespace: harvester-system
+spec:
+  secretName: harvester-backend-cert
+  issuerRef:
+    group: horizon.evertrust.io
+    kind: ClusterIssuer
+    name: horizon-private-bmc        # private-tls-bmc -> CA01, 90d, DNS+IP SANs
+  commonName: harvester.mdapi.ch
+  dnsNames:
+    - harvester.mdapi.ch
+  ipAddresses:
+    - 192.168.1.191                  # Harvester management VIP
+    - 192.168.1.190                  # qui
+    - 192.168.1.192                  # quo
+    - 192.168.1.193                  # qua
+  renewBefore: 720h                  # 30d before expiry (90d cert)
+  privateKey:
+    algorithm: RSA
+    size: 2048
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: harvester-cert-sync
+  namespace: harvester-system
+---
+# Read just the cert-manager Secret.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: harvester-cert-sync
+  namespace: harvester-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["harvester-backend-cert"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: harvester-cert-sync
+  namespace: harvester-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: harvester-cert-sync
+subjects:
+  - kind: ServiceAccount
+    name: harvester-cert-sync
+    namespace: harvester-system
+---
+# Settings are cluster-scoped; grant get/update/patch on only ssl-certificates.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: harvester-cert-sync-ssl-setting
+rules:
+  - apiGroups: ["harvesterhci.io"]
+    resources: ["settings"]
+    resourceNames: ["ssl-certificates"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: harvester-cert-sync-ssl-setting
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: harvester-cert-sync-ssl-setting
+subjects:
+  - kind: ServiceAccount
+    name: harvester-cert-sync
+    namespace: harvester-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harvester-cert-sync-script
+  namespace: harvester-system
+data:
+  sync.py: |
+    #!/usr/bin/env python3
+    # Mirror the cert-manager Secret harvester-backend-cert into the Harvester
+    # ssl-certificates Setting. Stdlib only; talks to the in-cluster k8s API.
+    import ssl, json, base64, urllib.request, urllib.error
+
+    NS, SECRET, SETTING = "harvester-system", "harvester-backend-cert", "ssl-certificates"
+    API = "https://kubernetes.default.svc"
+    TOKEN = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+    CTX = ssl.create_default_context(cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+
+    def k8s(path, method="GET", body=None, ctype="application/json"):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(API + path, method=method, data=data)
+        r.add_header("Authorization", "Bearer " + TOKEN)
+        if data is not None:
+            r.add_header("Content-Type", ctype)
+        try:
+            with urllib.request.urlopen(r, context=CTX, timeout=30) as resp:
+                return resp.status, json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+
+    def main():
+        code, sec = k8s("/api/v1/namespaces/%s/secrets/%s" % (NS, SECRET))
+        if code != 200:
+            print("secret %s not readable (HTTP %s) — cert not issued yet?" % (SECRET, code)); raise SystemExit(1)
+        d = sec["data"]
+        crt = base64.b64decode(d["tls.crt"]).decode()
+        key = base64.b64decode(d["tls.key"]).decode()
+        ca = base64.b64decode(d["ca.crt"]).decode() if d.get("ca.crt") else ""
+        desired = {"publicCertificate": crt, "privateKey": key}
+        if ca:
+            desired["ca"] = ca
+        desired_str = json.dumps(desired)
+        code, st = k8s("/apis/harvesterhci.io/v1beta1/settings/%s" % SETTING)
+        if code != 200:
+            print("setting %s read failed (HTTP %s)" % (SETTING, code)); raise SystemExit(1)
+        if st.get("value", "") == desired_str:
+            print("ssl-certificates already current — no change"); return
+        code, resp = k8s("/apis/harvesterhci.io/v1beta1/settings/%s" % SETTING, "PATCH",
+                         {"value": desired_str}, "application/merge-patch+json")
+        if code not in (200, 201):
+            print("PATCH failed (HTTP %s): %s" % (code, json.dumps(resp)[:300])); raise SystemExit(1)
+        print("ssl-certificates updated from %s (cert %d bytes, ca=%s)" % (SECRET, len(crt), bool(ca)))
+
+    main()
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: harvester-cert-sync
+  namespace: harvester-system
+spec:
+  schedule: "30 4 * * *"             # daily; cert-manager renews ~30d out, sync applies within a day
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: harvester-cert-sync
+          restartPolicy: Never
+          containers:
+            - name: sync
+              image: python:3.12-slim
+              command: ["python3", "/script/sync.py"]
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 48Mi
+                limits:
+                  cpu: "250m"
+                  memory: 128Mi
+          volumes:
+            - name: script
+              configMap:
+                name: harvester-cert-sync-script
