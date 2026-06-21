@@ -421,6 +421,45 @@ spec:
           tear-downs, LCP keepalive failures, or local pppd respawn loop.
           Check `logread | grep -i pppd` on the router.
 
+    - alert: BpiR4WanDropCaptured
+      ## Fires on EACH WAN/PPPoE drop (lower bar than the >2/1h thrashing
+      ## alert) so the event recorder gets consulted promptly. On every drop
+      ## /etc/hotplug.d/iface/90-wandrop writes a full forensic record (optics,
+      ## both SFP carriers, PLOAM/LODS/BIP, session-id) to
+      ## /etc/last_wandrop.jsonl and the disconnect reason (LCP/PADT/link-down)
+      ## to /etc/last_wandrop.context. Investigation: ~/bpi-r4-wan-drop-report-2026-06-21.md
+      expr: |
+        increase(bpi_r4_pppoe_session_changes_total[15m]) >= 1
+      for: 0m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 WAN dropped (netconnect) — {{ $value }} PPPoE reset(s)/15m"
+        description: |
+          The netconnect PPPoE line dropped and re-established. Read the
+          captured context (sub-minute optics + disconnect reason):
+            ssh root@bpi-r4 'tail -4 /etc/last_wandrop.jsonl; cat /etc/last_wandrop.context'
+          If BpiR4OnuDownstreamLoss is ALSO firing -> PON/line-side (provider).
+          If NOT -> higher-layer (BNG/LCP) or router; check the recorder for
+          sfp_lan_carrier also down (router-side) vs only sfp_wan (PON-side).
+
+    - alert: BpiR4OnuDownstreamLoss
+      ## ONU Loss-Of-Downstream-Sync counter incremented = a brief downstream
+      ## PON-signal interruption. With healthy optics + PLOAM staying O5, this
+      ## is the provider/OLT-side micro-interruption signature behind the
+      ## 2026-06 netconnect drops (see ~/bpi-r4-wan-drop-report-2026-06-21.md).
+      expr: |
+        increase(bpi_r4_onu_lods_events_total[15m]) >= 1
+      for: 0m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 ONU downstream-sync loss (LODS +{{ $value }}) — PON/line-side"
+        description: |
+          The ONU briefly lost downstream sync. Optics are healthy and PLOAM
+          stays O5, so this is a line/OLT-side interruption, not local fibre
+          degradation (and not the freshly-swapped ONU). Ticket netconnect with
+          ONU serial AVMG7B4114F1 + the timestamp. Full context on the router:
+          /etc/last_wandrop.jsonl.
+
   - name: app-bpi-r4.pppoe-rtt
     rules:
     - alert: BpiR4PppoePeerLoss
