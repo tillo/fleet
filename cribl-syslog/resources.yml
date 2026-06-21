@@ -1,0 +1,25 @@
+# LAN-facing syslog ingress for the Cribl leader's in_syslog source (UDP/TCP 9514).
+# Aruba APs (and other LAN gear) send RFC3164 syslog to UDP/514 here; Cribl routes
+# syslog -> openobserve (index aruba_aps). External 514 -> Cribl 9514.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cribl-syslog
+  namespace: cribl
+  annotations:
+    metallb.universe.tf/allow-shared-ip: cribl-syslog
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/instance: logstream-leader
+    app.kubernetes.io/name: leader
+  ports:
+    - name: syslog-udp
+      protocol: UDP
+      port: 514
+      targetPort: 9514
+    - name: syslog-tcp
+      protocol: TCP
+      port: 514
+      targetPort: 9514
