@@ -45,6 +45,13 @@ include:
 
 secret-scan:
   extends: .secret-scan
+  # Pull gitleaks via the GitLab dependency proxy (in-cluster pull-through cache)
+  # instead of docker.io directly. secret-scan is a .pre job that GATES every
+  # pipeline (incl. the scheduled renovate run); a transient docker.io DNS/ratelimit
+  # blip on the image pull skips renovate+fleet-lint (observed 2026-06-22 12:03).
+  # The dependency proxy removes the runner->docker.io dependency at pull time.
+  # Local override to validate before promoting to the shared mdapi/ci-templates.
+  image: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/zricethezav/gitleaks:latest
 
 # Renovate — Lane-B image bumps (config in renovate.json). Runs ONLY on a pipeline
 # schedule or a manual web run, never on normal pushes/MRs. Opens MRs (automerge
