@@ -112,22 +112,25 @@ spec:
   ports:
     - {name: http, port: 9116, targetPort: 9116}
 ---
+# VMStaticScrape (not VMScrapeConfig): the VMAgent selects staticScrapes (staticScrapeSelector:{})
+# but has no scrapeConfigSelector, so this is the one that gets discovered without touching the
+# shared VMAgent. Scrapes the snmp_exporter once per AP target (snmp multi-target pattern).
 apiVersion: operator.victoriametrics.com/v1beta1
-kind: VMScrapeConfig
+kind: VMStaticScrape
 metadata:
   name: aruba-snmp
   namespace: monitoring
 spec:
   jobName: aruba-snmp
-  metricsPath: /snmp
-  scrapeInterval: 60s
-  params:
-    auth: [aruba_v3]
-    module: [aruba]
-  staticConfigs:
+  targetEndpoints:
     - targets: ["192.168.1.211", "192.168.1.212", "192.168.1.217"]
       labels: {job: aruba_snmp}
-  relabelConfigs:
-    - {sourceLabels: [__address__], targetLabel: __param_target}
-    - {sourceLabels: [__param_target], targetLabel: instance}
-    - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+      path: /snmp
+      scrapeInterval: 60s
+      params:
+        auth: [aruba_v3]
+        module: [aruba]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
