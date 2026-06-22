@@ -112,6 +112,15 @@ ingress:
       SecAction "id:900200,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
 
+# --- Metrics: Horizon exposes Kamon/Pekko metrics on the `kamon` port (9095).
+# The chart's own ServiceMonitor sends a blank Content-Type, which Prometheus 3.x
+# (rancher-monitoring runs v3.5.0) rejects: "non-compliant scrape target sending
+# blank Content-Type and no fallback_scrape_protocol specified". The 2.4.1 chart
+# can't set ServiceMonitor.spec.fallbackScrapeProtocol, so disable the chart SM and
+# ship our own (in extraObjects below) with that field set. (2026-06-22)
+monitoring:
+  enabled: false
+
 # --- Supporting resources (rendered via the chart's extraObjects/tpl pass).
 #     NOTE: keep these free of `{{ }}` — the chart runs `tpl` over each entry,
 #     so any Go-template braces would be evaluated by Helm, not ESO. ---
@@ -409,3 +418,27 @@ extraObjects:
                     name: horizon
                     port:
                       name: http
+
+  # ServiceMonitor for Horizon's Kamon metrics (port `kamon`/9095). Replaces the
+  # chart's built-in SM (disabled via monitoring.enabled=false above) solely to add
+  # fallbackScrapeProtocol, which Prometheus 3.x needs because Kamon's exposition
+  # response carries a blank Content-Type. Spec is otherwise identical to the chart's.
+  - apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: horizon
+      labels:
+        app.kubernetes.io/instance: horizon
+        app.kubernetes.io/name: horizon
+    spec:
+      fallbackScrapeProtocol: PrometheusText0.0.4
+      namespaceSelector:
+        matchNames:
+          - horizon
+      selector:
+        matchLabels:
+          app.kubernetes.io/instance: horizon
+          app.kubernetes.io/name: horizon
+      endpoints:
+        - path: /metrics
+          port: kamon
