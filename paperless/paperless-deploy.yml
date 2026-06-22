@@ -26,6 +26,11 @@ kind: Deployment
 metadata:
   name: paperless
   namespace: paperless
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
 spec:
   selector:
     matchLabels:
@@ -174,7 +179,7 @@ spec:
 
         - name: tika
           image: apache/tika:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 9998
           resources:
@@ -219,7 +224,7 @@ spec:
         ## reliably). See paperless-es.yml for the password-rotation note.
         - name: consume-puller
           image: rclone/rclone:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ## Run as paperless's uid/gid (1000) — NOT root. rclone creates the
           ## /consume subdirectories as it mirrors the OwnCloud folder tree;
           ## if it runs as root those dirs are root:root 0755 and paperless's
@@ -401,7 +406,7 @@ spec:
         ## env block as consume-puller (same OwnCloud creds via secretKeyRef).
         - name: library-pusher
           image: rclone/rclone:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
