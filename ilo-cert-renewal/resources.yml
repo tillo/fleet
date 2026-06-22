@@ -141,8 +141,10 @@ data:
             print("%s: %sd to expiry -> WOULD renew (dry-run)" % (name, days)); return "would"
         cn = "%s-ilo.home.tillo.ch" % name
         print("%s: %sd to expiry -> renewing (CN=%s)" % (name, days, cn))
-        c, _ = ilo(ip, pw, GEN_CSR, "POST", {"Country": "CH", "State": "Ticino", "City": "Lugano",
-                                             "OrgName": "mdapi", "OrgUnit": "homelab", "CommonName": cn})
+        # iLO 4 GenerateCSR requires Country/State/City/OrgName/CN (OrgUnit optional → omitted).
+        # Keep to CN/O/C + the iLO-required L/ST; use the CORRECT location (do NOT invent these).
+        c, _ = ilo(ip, pw, GEN_CSR, "POST", {"Country": "CH", "State": "Vaud", "City": "Echallens",
+                                             "OrgName": "mdapi", "CommonName": cn})
         if c >= 300:
             print("%s: GenerateCSR failed (HTTP %s)" % (name, c)); return "error"
         csr = None
