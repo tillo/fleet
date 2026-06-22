@@ -39,14 +39,20 @@ data:
             return 0, str(e).encode()[:200]
 
     def host_to_component(host):
+        # Component names track the 2026-05-25 statuspage restructure
+        # (adapter components.json: Mail / Sign-in (SSO) / Platform /
+        # Files & Documents / Backups / Websites / DNS / Smart Home /
+        # Internet / NTP). Legacy labels (GitLab/Identity/Files/Notes/
+        # Home/General) are no longer in the adapter map.
         h = (host or "").lower()
-        if any(s in h for s in ("gitlab", "registry")): return "GitLab"
+        if any(s in h for s in ("gitlab", "registry")): return "Platform"
         if any(s in h for s in ("mail", "rspamd", "roundcube")): return "Mail"
-        if any(s in h for s in ("idp", "auth", "keycloak", "lam")): return "Identity"
-        if any(s in h for s in ("files", "sftp", "cloud", "spider3", "owncloud")): return "Files"
-        if any(s in h for s in ("notes", "joplin")): return "Notes"
-        if any(s in h for s in ("home", "frigate", "appdaemon")): return "Home"
-        return "General"
+        if any(s in h for s in ("idp", "auth", "keycloak", "lam")): return "Sign-in (SSO)"
+        if any(s in h for s in ("spider3", "dellambrogio", "coiffuredreams")): return "Websites"
+        if any(s in h for s in ("files", "sftp", "cloud", "owncloud")): return "Files & Documents"
+        if any(s in h for s in ("notes", "joplin")): return "Files & Documents"
+        if any(s in h for s in ("home", "frigate", "appdaemon")): return "Smart Home"
+        return "Platform"
 
     TRUSTED_IP_RE = re.compile(
         r"^(?:192\.168\.|10\.|100\.(?:6[4-9]|[7-9]\d|1[0-2]\d)\.)"
@@ -143,21 +149,27 @@ data:
     )
 
     def ns_to_component(ns):
+        # Component names track the 2026-05-25 statuspage restructure;
+        # see host_to_component() above. Mechanical rename of the prior
+        # map onto the current adapter component set.
         m = {
             "mail":      "Mail",
-            "bootstrap": "GitLab",
-            "envuassu":  "Files",
-            "owncloud":  "Files",
-            "spider3":   "Files",
-            "tv":        "Files",
-            "joplin":    "Notes",
-            "home-assistant": "Home",
-            "frigate":   "Home",
-            "appdaemon": "Home",
-            "windmill":  "General",
-            "keycloak":  "Identity",
+            "bootstrap": "Platform",
+            "envuassu":  "Files & Documents",
+            "owncloud":  "Files & Documents",
+            "joplin":    "Files & Documents",
+            "tv":        "Files & Documents",
+            "spider3":         "Websites",
+            "dellambrogio":    "Websites",
+            "ivodellambrogio": "Websites",
+            "coiffuredreams":  "Websites",
+            "home-assistant": "Smart Home",
+            "frigate":   "Smart Home",
+            "appdaemon": "Smart Home",
+            "windmill":  "Platform",
+            "keycloak":  "Sign-in (SSO)",
         }
-        return m.get(ns or "", "General")
+        return m.get(ns or "", "Platform")
 
     ## Pods whose logs are routed through am-relay for other reasons
     ## (ingress-nginx for ModSec, etc.) but proxy arbitrary user content
