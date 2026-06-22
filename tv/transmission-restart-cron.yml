@@ -1,0 +1,104 @@
+# Scheduled clean restart for transmission to pre-empt its memory leak.
+#
+# transmission 4.1.2 (linuxserver image) leaks steadily: a fresh daemon with
+# the full torrent set sits at ~105 MiB, but RSS climbed to ~9-11 GiB over
+# ~2-3 days of uptime (2026-06-22) — pure leak, not torrents or cache (cache
+# is 4 MB, all piece hashes total 8 MiB). Rather than let it grow into the VPA
+# limit and get OOMKilled (an unclean kill that can interrupt mid-write and
+# loses the graceful settings.json save), restart it cleanly each night.
+#
+# A clean SIGTERM restart also re-saves settings.json (preserving peer-limit
+# 600/60) and lets VPA re-evaluate the request against the fresh low usage.
+# Torrents reconnect within ~2 min; 05:00 local is a low-demand window.
+# Cadence is tunable: daily keeps peak to ~1 day of leak (well under the cap).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: transmission-restarter
+  namespace: tv
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: transmission-restarter
+  namespace: tv
+rules:
+  # `kubectl rollout restart` GETs the deployment then PATCHes it with a
+  # restartedAt annotation. Least privilege: only the transmission-pia deploy.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["transmission-pia"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: transmission-restarter
+  namespace: tv
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: transmission-restarter
+subjects:
+  - kind: ServiceAccount
+    name: transmission-restarter
+    namespace: tv
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: transmission-leak-restart
+  namespace: tv
+spec:
+  schedule: "0 5 * * *"
+  timeZone: Europe/Zurich
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          serviceAccountName: transmission-restarter
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: kubectl
+              image: registry.k8s.io/kubectl:v1.35.2
+              command:
+                - kubectl
+                - rollout
+                - restart
+                - deployment/transmission-pia
+                - -n
+                - tv
+                - --cache-dir=/tmp/.kube-cache
+              env:
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { memory: 128Mi }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
