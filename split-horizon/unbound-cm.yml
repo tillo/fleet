@@ -51,6 +51,15 @@ data:
         # No local DNSSEC validation -- Technitium is the validating
         # recursive resolver upstream. Enable here later if desired.
 
+        # Unblock Unbound's built-in AS112 local-zones for RFC1918 (+ ULA v6)
+        # reverse space. local-zones are evaluated BEFORE forward-zones, so the
+        # default `local-zone: "168.192.in-addr.arpa." static` answers every LAN
+        # PTR query with NXDOMAIN *locally* and the 168.192.in-addr.arpa.
+        # forward-zone below never fires. This silently broke reverse DNS for
+        # all LAN hosts while the forward zones kept working (hence non-obvious).
+        # (2026-06-22)
+        unblock-lan-zones: yes
+
         # ---- split-horizon overrides ----
         # transparent: listed names answered locally; all other names
         # in these zones fall through to the forward-zone below.
