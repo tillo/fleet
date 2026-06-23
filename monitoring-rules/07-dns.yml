@@ -10,26 +10,54 @@ spec:
   - name: app-dns.workload
     rules:
     - alert: TechnitiumUnavailable
+      ## Fires only on TOTAL internal-DNS outage: neither technitium-primary nor
+      ## technitium-secondary has an available replica. Previously keyed on a
+      ## non-existent deployment="technitium" (the workloads are
+      ## technitium-primary / -secondary, both Recreate/1-replica behind the
+      ## role:dns LB at 192.168.1.54) so it never fired -- fixed 2026-06-23.
       expr: |
-        ( kube_deployment_spec_replicas{
-            namespace="technitium", deployment="technitium"
+        sum(
+          kube_deployment_status_replicas_available{
+            namespace="technitium", deployment=~"technitium-(primary|secondary)"
           }
-          - kube_deployment_status_replicas_available{
-            namespace="technitium", deployment="technitium"
-          }
-        ) > 0
-      for: 3m
+        ) == 0
+      for: 2m
       labels:
         severity: critical
         component: DNS
         team: mdapi
       annotations:
-        summary: "technitium/technitium: {{ $value }} replicas unavailable"
+        summary: "Technitium internal DNS fully down (no available primary or secondary)"
         description: |
-          DNS server is down. dns.mdapi.ch will not resolve. Recursive DNS
-          fallback applies for cluster-internal queries via coredns, but
-          public/external resolution from clients pointed at dns.mdapi.ch
-          breaks immediately.
+          Neither technitium-primary nor technitium-secondary has an available
+          replica. dns.mdapi.ch (192.168.1.54) will not resolve. Cluster-internal
+          queries fall back to coredns recursion, but LAN clients pointed at
+          192.168.1.54 and external resolution break immediately.
+
+    - alert: TechnitiumDeploymentDegraded
+      ## One of the two DNS pods is unavailable (the other still answers from its
+      ## AXFR copy). for:5m tolerates the Recreate-strategy gap during updates.
+      expr: |
+        (
+          kube_deployment_spec_replicas{
+            namespace="technitium", deployment=~"technitium-(primary|secondary)"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="technitium", deployment=~"technitium-(primary|secondary)"
+          }
+        ) > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.deployment }} unavailable (DNS degraded, one pod down)"
+        description: |
+          {{ $labels.deployment }} has no available replica for >5m. The other
+          Technitium pod still answers queries from its AXFR copy, but redundancy
+          is lost; if it is the primary, external-dns RFC2136 writes + DHCP-driven
+          record updates fail until it returns.
 
     - alert: TechnitiumPodCrashLooping
       expr: |
