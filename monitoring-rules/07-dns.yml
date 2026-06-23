@@ -143,6 +143,58 @@ spec:
           Windmill technitium_zone_diff hasn't successfully pushed in >48h.
           The zone-list drift alert is silently broken until this resolves.
 
+    - alert: TechnitiumPrimaryZonesWiped
+      ## The primary has lost ALL custom authoritative zones (home.tillo.ch +
+      ## the reverse zones) -- the 2026-06-14 rebuild-onto-empty-PVC failure
+      ## mode. The Windmill technitium_zone_restore_guard (every 5m) auto-
+      ## restores from the latest Garage backup; this fires only if the wipe
+      ## PERSISTS (restore errored, or the latest backup is >72h old and the
+      ## guard refused). Source: technitium_zone_restore_guard.
+      expr: technitium_restore_guard_primary_empty == 1
+      for: 5m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary lost all custom zones and auto-restore has not cleared it"
+        description: |
+          The primary is missing home.tillo.ch + the reverse zones and the
+          auto-restore guard has not recovered it within 5m. Internal DNS +
+          LAN PTRs are broken (the secondary serves AXFR copies but external-dns
+          RFC2136 writes go to the primary). Check the technitium_zone_restore_guard
+          job logs: likely the /api/settings/restore failed or the newest
+          config-backups/technitium backup is >72h old. Restore manually if so.
+
+    - alert: TechnitiumAutoRestoreFired
+      expr: technitium_restore_guard_restore_fired == 1
+      for: 0m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary was auto-restored from backup"
+        description: |
+          technitium_zone_restore_guard detected an empty primary and restored
+          it from the latest Garage backup. Expected after a primary rebuild,
+          but confirm: zones repopulated, the secondary re-synced, and any
+          dynamic DHCP/external-dns records added since the backup re-converged.
+
+    - alert: TechnitiumRestoreGuardStale
+      expr: time() - technitium_restore_guard_last_run_timestamp_seconds > 1800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium restore-guard probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill technitium_zone_restore_guard (every 5m) hasn't pushed in
+          >30m. Auto-restore protection for the primary is silently off until
+          this resolves.
+
     - alert: DNSSECRRSIGNearExpiry
       ## Earliest DNSKEY RRSIG signature expiry per signed zone. Source:
       ## Windmill dnssec_rrsig_expiry, scheduled 06:30 Zurich daily.
