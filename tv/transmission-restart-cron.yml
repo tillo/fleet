@@ -9,8 +9,13 @@
 #
 # A clean SIGTERM restart also re-saves settings.json (preserving peer-limit
 # 600/60) and lets VPA re-evaluate the request against the fresh low usage.
-# Torrents reconnect within ~2 min; 05:00 local is a low-demand window.
-# Cadence is tunable: daily keeps peak to ~1 day of leak (well under the cap).
+# Torrents reconnect within ~2 min; 03:00 UTC (~05:00 CEST / 04:00 CET) is a
+# low-demand window. Cadence is tunable: daily keeps peak to ~1 day of leak.
+#
+# NOTE: schedule is UTC and we deliberately do NOT set spec.timeZone. The
+# rancher kube-state-metrics image (appco 2.17.0) ships no tzdata, so a named
+# timeZone makes KSM panic in kube_cronjob_next_schedule_time and crashloop,
+# taking out ALL kube_* metrics. Bake the offset into the UTC cron instead.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -52,8 +57,7 @@ metadata:
   name: transmission-leak-restart
   namespace: tv
 spec:
-  schedule: "0 5 * * *"
-  timeZone: Europe/Zurich
+  schedule: "0 3 * * *"
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 3
