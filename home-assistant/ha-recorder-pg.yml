@@ -57,6 +57,23 @@ spec:
       ## room and keep WAL modest.
       maintenance_work_mem: 128MB
 
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the one standby to confirm each commit before it
+    ## returns. The default (async, maxSyncReplicas=0) drops the last
+    ## unreplicated writes on promotion; HA's in-memory recorder session then
+    ## references rows the new primary never received -> a sqlalchemy
+    ## StaleDataError loop ("expected to update N rows; M matched") that
+    ## freezes the recorder until HA is restarted. Root cause of the
+    ## 2026-06-22 22:04 UTC ~8h silent recorder freeze, and recurrent across
+    ## node-maintenance failovers. dataDurability: preferred falls back to
+    ## async when the standby is unavailable, so HA writes never stall on a
+    ## missing replica (availability favoured over strict RPO for a 2-node
+    ## cluster). Requires CNPG >= 1.25 (operator is 1.29.1).
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
   bootstrap:
     initdb:
       database: homeassistant
