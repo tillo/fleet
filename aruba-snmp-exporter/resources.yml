@@ -33,6 +33,9 @@ spec:
             msm430_v2c:
               version: 2
               community: "{{ .msm430ro }}"
+            public_v2c:
+              version: 2
+              community: public
           modules:
             aruba:
               walk:
@@ -381,6 +384,26 @@ spec:
       interval: 60s
       params:
         auth: [msm430_v2c]
+        module: [ifmib]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# Zyxel NWA130BE AP (.199) — v2c public read-only (enabled in GUI; SSH CLI = snmp-server enable); if_mib
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: zyxel-snmp
+  namespace: monitoring
+spec:
+  jobName: zyxel_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.199"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [public_v2c]
         module: [ifmib]
       relabelConfigs:
         - {sourceLabels: [__address__], targetLabel: __param_target}
