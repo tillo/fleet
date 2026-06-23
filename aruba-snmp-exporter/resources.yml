@@ -30,6 +30,9 @@ spec:
               auth_protocol: SHA
               priv_protocol: AES
               priv_password: "{{ .privpass }}"
+            msm430_v2c:
+              version: 2
+              community: "{{ .msm430ro }}"
           modules:
             aruba:
               walk:
@@ -210,6 +213,43 @@ spec:
                   oid: 1.3.6.1.4.1.232.6.2.9.3.1.7
                   type: gauge
                   indexes: [{labelname: chassis, type: gauge}, {labelname: bay, type: gauge}]
+            ifmib:
+              # generic interface stats (sysUpTime + if_mib, 32-bit + HC) for APs/switches
+              walk:
+                - 1.3.6.1.2.1.1.3.0
+                - 1.3.6.1.2.1.2.2.1.2
+                - 1.3.6.1.2.1.2.2.1.8
+                - 1.3.6.1.2.1.2.2.1.10
+                - 1.3.6.1.2.1.2.2.1.16
+                - 1.3.6.1.2.1.31.1.1.1.6
+                - 1.3.6.1.2.1.31.1.1.1.10
+              metrics:
+                - {name: sysUpTime, oid: 1.3.6.1.2.1.1.3, type: gauge}
+                - name: ifOperStatus
+                  oid: 1.3.6.1.2.1.2.2.1.8
+                  type: gauge
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+                - name: ifInOctets
+                  oid: 1.3.6.1.2.1.2.2.1.10
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+                - name: ifOutOctets
+                  oid: 1.3.6.1.2.1.2.2.1.16
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+                - name: ifHCInOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.6
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+                - name: ifHCOutOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.10
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
   data:
     - secretKey: authpass
       remoteRef:
@@ -217,6 +257,9 @@ spec:
     - secretKey: privpass
       remoteRef:
         key: /mdapi/aruba/snmp/priv-pass
+    - secretKey: msm430ro
+      remoteRef:
+        key: /mdapi/msm430/snmp-ro-community
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -319,6 +362,26 @@ spec:
       params:
         auth: [aruba_v3]
         module: [ilo]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# HP MSM430 AP (.15) — v2c read-only community (no v3 on this EOL AP); if_mib only
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: msm430-snmp
+  namespace: monitoring
+spec:
+  jobName: msm_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.15"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [msm430_v2c]
+        module: [ifmib]
       relabelConfigs:
         - {sourceLabels: [__address__], targetLabel: __param_target}
         - {sourceLabels: [__param_target], targetLabel: instance}
