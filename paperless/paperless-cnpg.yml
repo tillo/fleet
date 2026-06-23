@@ -1,4 +1,4 @@
-## Dedicated CNPG single-node Postgres for paperless-ngx.
+## Dedicated CNPG Postgres (HA, 2 instances) for paperless-ngx.
 ##
 ## Mirrors fleet/bootstrap/cnpg-cluster.yml. paperless's metadata sits
 ## here; documents themselves live on the Longhorn PVC mounted into the
@@ -15,6 +15,16 @@ spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:16
   primaryUpdateStrategy: unsupervised
 
+  ## Keep primary + replica on different nodes. CNPG defaults to *soft*
+  ## (preferred) anti-affinity, which can let both copies co-locate on one
+  ## node during a rolling restart -- then a node loss takes out both and the
+  ## replica buys zero protection (the trap ha-recorder-pg hit 2026-06-15).
+  ## required is always satisfiable here (2 instances, 3 nodes).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
   storage:
     storageClass: harvester-longhorn-2replicas
     size: 5Gi
@@ -24,6 +34,16 @@ spec:
       max_connections: "200"
       shared_buffers: 128MB
       effective_cache_size: 384MB
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the standby to confirm each commit. Default async
+    ## drops the last unreplicated writes on promotion. dataDurability:
+    ## preferred falls back to async if the standby is down so writes never
+    ## stall on a missing replica. (Mirrors ha-recorder-pg; CNPG >=1.25.)
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
 
   bootstrap:
     initdb:
