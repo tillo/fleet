@@ -62,11 +62,24 @@ spec:
           memory: 420Mi
 
     grafana:
-      ## Embedded Grafana retired (see header) — use grafana.mdapi.ch.
+      ## Embedded Grafana SERVER retired (see header) — use grafana.mdapi.ch.
       enabled: false
-      ## (kept-but-ignored while disabled) Chart ships req=100m / lim=200m.
-      ## Dashboard render + provisioning bursts exceed 200m and trip our
-      ## ContainerCpuThrottling rule. Memory left at chart default; CPU lim 1c.
+      ## ...but still SHIP its default dashboard ConfigMaps (Kubernetes / Node /
+      ## etcd / CoreDNS / apiserver / kubelet / Prometheus / ...). They land in
+      ## cattle-dashboards (grafana.defaultDashboards.namespace), which the custom
+      ## Grafana's dashboard sidecar watches, and the annotation routes them into
+      ## a "Kubernetes" Grafana folder (sidecar FOLDER_ANNOTATION=grafana_folder
+      ## + provider foldersFromFilesStructure). Chart-maintained across upgrades.
+      ## NOTE: the Rancher-specific dashboards gate on grafana.enabled (NOT
+      ## forceDeployDashboards) so they are NOT shipped here — they're added as
+      ## Fleet CMs in the grafana-extra-dashboards bundle instead.
+      forceDeployDashboards: true
+      sidecar:
+        dashboards:
+          annotations:
+            grafana_folder: Kubernetes
+      ## (resources kept-but-ignored while the server is disabled) Chart ships
+      ## req=100m / lim=200m; bursts trip ContainerCpuThrottling — CPU lim 1c.
       resources:
         requests:
           cpu: 100m

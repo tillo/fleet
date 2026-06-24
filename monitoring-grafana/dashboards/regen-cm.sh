@@ -41,8 +41,11 @@ data:
         options:
           path: /var/lib/grafana/dashboards/mdapi
       - name: harvester
-        ## Fed by the k8s dashboard sidecar (see grafana-deploy.yml): live-imports
-        ## the Harvester dashboards from cattle-dashboards CMs into this folder.
+        ## Fed by the k8s dashboard sidecar (see grafana-deploy.yml). The sidecar
+        ## writes each CM into a subfolder named by its grafana_folder annotation
+        ## (Kubernetes/Rancher/Longhorn); foldersFromFilesStructure turns those
+        ## subdirs into Grafana folders. Un-annotated CMs (the Harvester VM
+        ## dashboards) stay at the root.
         orgId: 1
         folder: 'Harvester'
         type: file
@@ -51,6 +54,7 @@ data:
         allowUiUpdates: false
         options:
           path: /var/lib/grafana/dashboards/harvester
+          foldersFromFilesStructure: true
 ---
 apiVersion: v1
 kind: ConfigMap
