@@ -43,3 +43,31 @@ spec:
                  kubectl -n openbao logs job/<latest openbao-mirror job>
           Akeyless remains primary (Option B), so this is a recovery-readiness gap,
           not a live outage.
+  - name: app-openbao.raft-snapshot-freshness
+    ## The Windmill job f/config_backup/openbao_raft_snapshot (daily 03:30 Zurich)
+    ## takes a full OpenBao raft snapshot (operational-restore artifact: KV mounts,
+    ## auth, policies, roles, barrier keyring), age-encrypts it, and ships it to the
+    ## off-site Garage config-backups/openbao-raft/ (replicated to B2+SFTP). It pushes
+    ## openbao_raft_snapshot_last_run_timestamp_seconds to Pushgateway on success.
+    ## A failed run raises before that push, so a stale timestamp covers both
+    ## "didn't run" and "ran but failed". 36h = one missed daily run of slack.
+    ## This is the P3a operational-restore backup for the OpenBao standby (TODO #25).
+    rules:
+    - alert: OpenBaoRaftSnapshotStale
+      expr: |
+        time() - openbao_raft_snapshot_last_run_timestamp_seconds > 36 * 3600
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "OpenBao raft snapshot off-site backup is {{ $value | humanizeDuration }} stale"
+        description: |
+          No successful OpenBao raft snapshot has shipped off-site in over 36h, so
+          the operational-restore artifact (the thing `bao operator raft snapshot
+          restore` needs to rebuild a destroyed OpenBao) is stale. The logical
+          secret-value archive (openbao_secrets_archive) is separate and may still
+          be current -- but a raft restore would roll back further than intended.
+          Check the Windmill schedule f/config_backup/openbao_raft_snapshot and its
+          last run at windmill.mdapi.ch. Akeyless remains primary (Option B), so
+          this is a recovery-readiness gap, not a live outage.
