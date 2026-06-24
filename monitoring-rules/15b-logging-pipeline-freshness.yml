@@ -1,0 +1,117 @@
+## Logging-pipeline freshness + fluentd->Cribl backlog alerting (TODO #27).
+##
+## The fluentd -> Cribl (httpraw) -> OpenObserve `modsec` WAF feed silently
+## stalled ~44h on 2026-06-11 (torn-write-corrupted Cribl persistent-queue;
+## hung flush threads, no error) with NO alert. 13-logging-output-cribl.yml
+## added read_timeout to PREVENT that specific hang; this file adds DETECTION
+## for a stall by any cause, in two layers:
+##
+##  1. End-to-end output freshness: the Windmill probe
+##     f/infra_health/logging_pipeline_freshness (every 5m) queries OpenObserve
+##     for the newest row in the `modsec` stream and pushes its age to
+##     Pushgateway (job logging_pipeline_freshness). ModsecFeedStale fires if no
+##     new row in >1h -- catches a break at ANY stage (ingress, fluentd, Cribl,
+##     OpenObserve ingest).
+##  2. Early warning at the source: scrape fluentd's own metrics (:24231) and
+##     alert when a Cribl output buffer is filling (draining slower than it
+##     fills) BEFORE it hits overflow_action drop_oldest_chunk and loses logs.
+---
+## fluentd exposes prometheus metrics on the (unauthenticated) http-metrics
+## port; the rancher-logging operator does not ship a ServiceMonitor for it.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fluentd-root-metrics
+  namespace: cattle-logging-system
+  labels:
+    monitoring-stack: mdapi
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fluentd
+      app.kubernetes.io/managed-by: rancher-logging-root
+  namespaceSelector:
+    matchNames:
+      - cattle-logging-system
+  endpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-logging-freshness
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-logging-freshness.modsec
+    rules:
+    - alert: ModsecFeedStale
+      ## Newest row in the OpenObserve modsec stream older than 1h. modsec gets
+      ## continuous scanner traffic (newest row is normally seconds old), so >1h
+      ## means the feed has stalled. ~70min detection latency vs the 44h that
+      ## went unnoticed on 2026-06-11.
+      expr: logging_stream_freshness_age_seconds{stream="modsec"} > 3600
+      for: 10m
+      labels:
+        severity: warning
+        component: Logging
+        team: mdapi
+      annotations:
+        summary: "modsec WAF log feed stale -- newest row {{ $value | humanizeDuration }} old"
+        description: |
+          No new row in the OpenObserve `modsec` stream for over 1h, so the
+          fluentd -> Cribl -> OpenObserve WAF feed has likely stalled (the
+          2026-06-11 torn-queue incident went ~44h undetected). Check:
+            kubectl -n cattle-logging-system logs sts/rancher-logging-root-fluentd -c fluentd | grep -i cribl
+            Cribl httpraw source persistent-queue health (cribl.mdapi.ch)
+          Source: Windmill f/infra_health/logging_pipeline_freshness.
+    - alert: LoggingFreshnessProbeStale
+      ## The freshness probe itself stopped reporting -> ModsecFeedStale is blind.
+      expr: time() - logging_pipeline_freshness_last_run_timestamp_seconds > 1800
+      for: 5m
+      labels:
+        severity: warning
+        component: Logging
+        team: mdapi
+      annotations:
+        summary: "logging-freshness probe silent for {{ $value | humanizeDuration }}"
+        description: |
+          The Windmill probe f/infra_health/logging_pipeline_freshness (5m
+          schedule) has not pushed metrics in >30m, so the ModsecFeedStale
+          detector is blind. Check the Windmill schedule + the probe's last run.
+  - name: app-logging-freshness.fluentd-buffer
+    rules:
+    - alert: FluentdCriblOutputBufferFilling
+      ## available_space_ratio is a percent (healthy ~99-100). Sustained <50%
+      ## means a Cribl output is draining slower than it fills -- a stall
+      ## building. Caught BEFORE drop_oldest_chunk loses data.
+      expr: fluentd_output_status_buffer_available_space_ratio{plugin_id=~".*:cribl"} < 50
+      for: 15m
+      labels:
+        severity: warning
+        component: Logging
+        team: mdapi
+      annotations:
+        summary: "fluentd->Cribl buffer {{ $labels.plugin_id }} >50% full for 15m"
+        description: |
+          A fluentd output buffer to Cribl is draining slower than it fills
+          (available space < 50% sustained). At 0% it hits overflow_action
+          drop_oldest_chunk and loses logs. Check the Cribl httpraw source +
+          fluentd flush threads. Source: scraped fluentd metrics (:24231).
+    - alert: FluentdCriblOutputBufferCritical
+      expr: fluentd_output_status_buffer_available_space_ratio{plugin_id=~".*:cribl"} < 10
+      for: 5m
+      labels:
+        severity: critical
+        component: Logging
+        team: mdapi
+      annotations:
+        summary: "fluentd->Cribl buffer {{ $labels.plugin_id }} nearly full -- log loss imminent"
+        description: |
+          A fluentd output buffer to Cribl is <10% free; drop_oldest_chunk log
+          loss is imminent. The Cribl httpraw source is likely wedged or slow.
