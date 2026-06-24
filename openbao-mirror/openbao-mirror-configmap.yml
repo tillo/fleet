@@ -8,7 +8,7 @@ data:
     # Akeyless -> OpenBao mirror. Reads every /mdapi item (api-key auth), writes
     # each to OpenBao KV v2 mdapi/<relpath> {"value": <raw>}. k8s-auth role `mirror`.
     # Secret VALUES are NEVER printed (only counts + error key names).
-    import json, ssl, urllib.request
+    import json, ssl, time, urllib.request, urllib.error
     AK = "https://cm.mdapi.ch/akeyless-api/v2"
     BAO = "http://openbao.openbao.svc:8200"
     akid = open("/creds/access-id").read().strip()
@@ -20,10 +20,22 @@ data:
         h = {"Content-Type": "application/json"}
         if tok_hdr:
             h["X-Vault-Token"] = tok_hdr
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=h, method="POST")
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
-            b = r.read()
-            return json.loads(b) if b else {}
+        data = json.dumps(body).encode()
+        # Retry transient network/DNS failures (e.g. EAI_AGAIN resolving
+        # cm.mdapi.ch) so a brief blip doesn't fail the whole hourly run.
+        # An HTTPError (4xx/5xx) is a real answer and is never retried.
+        for attempt in range(5):
+            try:
+                req = urllib.request.Request(url, data=data, headers=h, method="POST")
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+                    b = r.read()
+                    return json.loads(b) if b else {}
+            except urllib.error.HTTPError:
+                raise
+            except urllib.error.URLError:
+                if attempt == 4:
+                    raise
+                time.sleep(2 * (attempt + 1))
 
     aktok = post(f"{AK}/auth", {"access-id": akid, "access-type": "api_key", "access-key": akkey})["token"]
     baotok = post(f"{BAO}/v1/auth/kubernetes/login", {"role": "mirror", "jwt": sa})["auth"]["client_token"]

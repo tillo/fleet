@@ -1,0 +1,45 @@
+## OpenBao secrets-mirror freshness.
+##
+## The openbao-mirror CronJob (namespace openbao, schedule "7 * * * *") mirrors
+## all Akeyless /mdapi secrets into the OpenBao warm standby every hour. Single
+## runs occasionally fail on a transient DNS-resolution blip (EAI_AGAIN resolving
+## cm.mdapi.ch) and recover on the next run -- the script now also retries that
+## internally. This alert exists because there was previously NO signal if the
+## mirror silently stopped succeeding for hours: a multi-hour drift would leave
+## the standby stale and nobody would know (OpenBao failover item, Joplin TODO #26).
+##
+## Threshold 4h = 4 consecutive missed hourly runs: rides over the 1-2 run
+## transient flaps, fires on a genuinely sustained outage. Warning severity
+## because Akeyless stays primary (Option B) -- a stale standby is a recovery-
+## readiness gap, not a live outage.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-openbao
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-openbao.mirror-freshness
+    rules:
+    - alert: OpenBaoMirrorStale
+      expr: |
+        time() - kube_cronjob_status_last_successful_time{
+          namespace="openbao", cronjob="openbao-mirror"
+        } > 4 * 3600
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "OpenBao Akeyless mirror hasn't succeeded in {{ $value | humanizeDuration }}"
+        description: |
+          The openbao-mirror CronJob (hourly at :07, namespace openbao) has had no
+          successful run in over 4h, so the OpenBao warm standby is drifting from
+          Akeyless. Usual cause: repeated DNS-resolution failures (EAI_AGAIN)
+          reaching cm.mdapi.ch from the mirror pod.
+          Check: kubectl -n openbao get jobs --sort-by=.status.startTime | tail
+                 kubectl -n openbao logs job/<latest openbao-mirror job>
+          Akeyless remains primary (Option B), so this is a recovery-readiness gap,
+          not a live outage.
