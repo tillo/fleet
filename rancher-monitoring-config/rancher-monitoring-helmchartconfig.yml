@@ -20,6 +20,38 @@ metadata:
   namespace: cattle-monitoring-system
 spec:
   valuesContent: |-
+    ## ── Embedded server stack RETIRED 2026-06-24 — VictoriaMetrics is the
+    ## single source of truth ───────────────────────────────────────────────
+    ## VM (monitoring ns, vmagent) independently scrapes every
+    ## ServiceMonitor/PodMonitor this chart defines, so the bundled
+    ## Prometheus/Alertmanager/Grafana are pure duplication (proven: the
+    ## embedded Prometheus had 0 jobs that VM didn't already have). Disable the
+    ## SERVER components but KEEP the exporters + ServiceMonitors —
+    ## kube-state-metrics, node-exporter, and the kubeApiServer/kubelet/coreDns
+    ## SMs (via kubernetesServiceMonitors=true, untouched) — so VM keeps
+    ## scraping exactly as before. Harvester's own KubeVirt/CDI/Longhorn SMs
+    ## are operator-owned and unaffected.
+    ##
+    ## Why this survives Harvester upgrades: the Harvester Addon CR only manages
+    ## `enabled`/`version`; its valuesContent does NOT carry these component
+    ## flags, and HelmChartConfig values WIN over the Addon valuesContent on
+    ## conflict (verified live: node-exporter cpu-limit "2" from here beats the
+    ## Addon's "1"). So the Addon's alertmanager.enabled:true -> false here.
+    ##
+    ## prometheus-adapter off too: no HPA uses custom/external metrics (all 6
+    ## are Resource / rke2-metrics-server), so its v1beta1.custom.metrics.k8s.io
+    ## APIService is unused; disabling removes that aggregated API cleanly
+    ## instead of leaving it dangling against a dead Prometheus.
+    ##
+    ## TRADE-OFF: the Harvester dashboard's built-in host/VM graphs and the
+    ## Rancher-UI "Monitoring -> Grafana" link go dark (they read the embedded
+    ## Prometheus/Grafana). Use grafana.mdapi.ch (VM-backed) instead.
+    ## ROLLBACK: remove the four `enabled: false` lines; Fleet re-enables them.
+    prometheus:
+      enabled: false
+    alertmanager:
+      enabled: false
+
     prometheus-node-exporter:
       resources:
         requests:
@@ -30,9 +62,11 @@ spec:
           memory: 420Mi
 
     grafana:
-      ## Chart ships req=100m / lim=200m. Dashboard render + provisioning
-      ## bursts exceed 200m and trip our ContainerCpuThrottling rule.
-      ## Memory left at the chart default; CPU lim bumped to 1c.
+      ## Embedded Grafana retired (see header) — use grafana.mdapi.ch.
+      enabled: false
+      ## (kept-but-ignored while disabled) Chart ships req=100m / lim=200m.
+      ## Dashboard render + provisioning bursts exceed 200m and trip our
+      ## ContainerCpuThrottling rule. Memory left at chart default; CPU lim 1c.
       resources:
         requests:
           cpu: 100m
@@ -42,7 +76,10 @@ spec:
           memory: 500Mi
 
     prometheus-adapter:
-      ## Chart ships NO resource requests/limits (BestEffort QoS) and a tight
+      ## Retired (see header): no HPA consumes custom metrics, and it has no
+      ## Prometheus to query once the server is gone.
+      enabled: false
+      ## (kept-but-ignored while disabled) Chart ships NO resource requests/limits (BestEffort QoS) and a tight
       ## liveness (/healthz HTTPS, timeout 5s, failureThreshold 3 -> kill after
       ## ~30s of slow /healthz). Under custom-metrics query load the adapter
       ## burns ~1.3c, its /healthz times out, and it gets liveness-killed in a

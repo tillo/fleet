@@ -48,11 +48,11 @@ spec:
     - alert: MonitoringStatefulSetDown
       expr: |
         kube_statefulset_status_replicas_ready{
-          namespace=~"cribl|monitoring|cattle-monitoring-system|cattle-logging-system",
-          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager|rancher-logging-root-fluentd"
+          namespace=~"cribl|monitoring|cattle-logging-system",
+          statefulset=~"rancher-logging-root-fluentd"
         } < kube_statefulset_status_replicas{
-          namespace=~"cribl|monitoring|cattle-monitoring-system|cattle-logging-system",
-          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager|rancher-logging-root-fluentd"
+          namespace=~"cribl|monitoring|cattle-logging-system",
+          statefulset=~"rancher-logging-root-fluentd"
         }
       for: 5m
       labels:
@@ -111,3 +111,40 @@ spec:
       annotations:
         summary: "statuspage adapter /healthz failing"
         description: "Alertmanager webhooks to the adapter will 5xx; public statuspage components won't reflect actual outages."
+
+  - name: meta-monitoring.embedded-retired
+    rules:
+    - alert: EmbeddedMonitoringResurrected
+      ## The bundled rancher-monitoring SERVER stack (Prometheus / Alertmanager
+      ## / Grafana / prometheus-adapter) was intentionally retired 2026-06-24 in
+      ## favour of VictoriaMetrics — disabled via the rancher-monitoring-config
+      ## HelmChartConfig (`enabled: false`). If any of these workloads is running
+      ## again, a Harvester upgrade or a manual change re-rendered the chart and
+      ## overrode the Fleet disable: VM is now double-scraped and the dead-
+      ## datasource confusion is back. Re-assert the HelmChartConfig (Fleet
+      ## should self-heal within a reconcile; investigate if it doesn't).
+      ## `for: 30m` rides out the transient re-render during a Harvester upgrade.
+      expr: |
+        kube_statefulset_replicas{
+          namespace="cattle-monitoring-system",
+          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager"
+        } > 0
+        or
+        kube_deployment_spec_replicas{
+          namespace="cattle-monitoring-system",
+          deployment=~"rancher-monitoring-grafana|rancher-monitoring-prometheus-adapter"
+        } > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "embedded rancher-monitoring resurrected: {{ $labels.statefulset }}{{ $labels.deployment }}"
+        description: |
+          A retired embedded rancher-monitoring server component is running
+          again (VictoriaMetrics is meant to be the sole source). Most likely a
+          Harvester upgrade re-rendered the chart. Verify rancher-monitoring-config's
+          HelmChartConfig still carries the `enabled: false` flags and that Fleet
+          has reconciled it; then confirm the embedded Prometheus/AM/Grafana/adapter
+          are gone again.
