@@ -40,6 +40,17 @@ data:
         allowUiUpdates: false
         options:
           path: /var/lib/grafana/dashboards/mdapi
+      - name: harvester
+        ## Fed by the k8s dashboard sidecar (see grafana-deploy.yml): live-imports
+        ## the Harvester dashboards from cattle-dashboards CMs into this folder.
+        orgId: 1
+        folder: 'Harvester'
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards/harvester
 ---
 apiVersion: v1
 kind: ConfigMap

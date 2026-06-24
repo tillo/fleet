@@ -20,6 +20,7 @@ spec:
       labels:
         app: grafana
     spec:
+      serviceAccountName: grafana
       securityContext:
         fsGroup: 472
         runAsUser: 472
@@ -95,6 +96,9 @@ spec:
         - name: dashboards-mdapi
           mountPath: /var/lib/grafana/dashboards/mdapi
           readOnly: true
+        - name: dashboards-harvester
+          mountPath: /var/lib/grafana/dashboards/harvester
+          readOnly: true
         livenessProbe:
           httpGet:
             path: /api/health
@@ -114,6 +118,39 @@ spec:
           periodSeconds: 30
           timeoutSeconds: 10
           failureThreshold: 3
+      # Dashboard sidecar: live-imports the Harvester dashboards (cattle-dashboards
+      # ConfigMaps labelled grafana_dashboard=1) into the "Harvester" Grafana folder,
+      # replacing the embedded Grafana's sidecar after the rancher-monitoring server
+      # stack was retired (2026-06-24). RBAC (scoped read on cattle-dashboards CMs)
+      # is in the grafana-harvester-sidecar-rbac bundle. Image via zot pull-through
+      # (rancher/** is already allow-listed).
+      - name: dashboard-sidecar
+        image: zot.mdapi.ch/rancher/mirrored-kiwigrid-k8s-sidecar:1.30.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: LABEL
+          value: grafana_dashboard
+        - name: LABEL_VALUE
+          value: "1"
+        - name: FOLDER
+          value: /var/lib/grafana/dashboards/harvester
+        - name: RESOURCE
+          value: configmap
+        - name: NAMESPACE
+          value: cattle-dashboards
+        - name: METHOD
+          value: WATCH
+        - name: UNIQUE_FILENAMES
+          value: "true"
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+        volumeMounts:
+        - name: dashboards-harvester
+          mountPath: /var/lib/grafana/dashboards/harvester
       volumes:
       - name: data
         persistentVolumeClaim:
@@ -127,3 +164,5 @@ spec:
       - name: dashboards-mdapi
         configMap:
           name: grafana-dashboards-mdapi
+      - name: dashboards-harvester
+        emptyDir: {}
