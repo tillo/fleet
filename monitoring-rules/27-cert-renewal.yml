@@ -1,0 +1,94 @@
+## Certificate renewal safety net.
+##
+## Closes the gap that the event-driven renewal rollout exposed: renewals now run via
+## Horizon on_expire triggers (→ Windmill cert_renew_dispatch / ilo_cert_renew), with the
+## old crons kept only as backstop. Nothing alerted if BOTH a trigger and its cron silently
+## failed — the cert would surface only at expiry (an outage; several are mail/ingress/BMC
+## adjacent). Before this, only blackbox-probe served-cert checks existed; nothing watched the
+## per-device *_cert_days_to_expiry push metrics, the Horizon managed-cert portfolio, or a
+## renewal job erroring. Companion to memory event_driven_cert_renewal_horizon_onexpire_windmill.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cert-renewal
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cert-renewal.rules
+    rules:
+    # --- per-device push certs (cm / msm430 / nastillo / santillo / zyxel) ---
+    - alert: DeviceCertExpiringSoon
+      ## *_cert_days_to_expiry is pushed by each device renewal job. Gates renew ~15-30d and
+      ## the on_expire trigger fires at 30d, so <14d means a renewal has not landed. 6h `for`
+      ## rides out the renew+verify window + a metric-scrape blip.
+      expr: min by (__name__) ({__name__=~".+_cert_days_to_expiry"}) < 14
+      for: 6h
+      labels:
+        severity: warning
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: "Device cert {{ $labels.__name__ }} at {{ $value }}d to expiry — renewal not landing"
+        description: |
+          A device cert tracked by *_cert_days_to_expiry is under 14 days and has not renewed.
+          Check the event-driven path (Horizon on_expire → cert_renew_dispatch / ilo_cert_renew)
+          and the backstop cron/schedule for that device.
+
+    - alert: DeviceCertExpiringCritical
+      expr: min by (__name__) ({__name__=~".+_cert_days_to_expiry"}) < 7
+      for: 1h
+      labels:
+        severity: critical
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: "Device cert {{ $labels.__name__ }} at {{ $value }}d to expiry"
+        description: |
+          A device cert is under 7 days — both the trigger and the backstop cron have failed.
+          Renew now: `wmill script run` the device's renew script with force=true.
+
+    # --- Horizon managed-cert portfolio (catch-all: iLO BMC + any managed cert without a device metric) ---
+    - alert: ManagedCertExpiring
+      expr: horizon_certs_expiring{window="7d"} > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} Horizon-managed cert(s) within 7 days of expiry"
+        description: |
+          The Horizon CLM portfolio (horizon_cert_metrics, hourly) reports managed cert(s)
+          within 7 days. Covers iLO BMC + any managed cert lacking a per-device metric.
+          Identify via the CLM dashboard or Horizon search `status is valid and valid.until < <date>`.
+
+    # --- a renewal job returned an error ---
+    - alert: CertRenewalError
+      expr: cert_renew_dispatch_result{result="error"} > 0 or ilo_cert_renew_event_result{result="error"} > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: "Cert renewal errored (device {{ $labels.device }}{{ $labels.ilo }})"
+        description: |
+          An event-driven renewal returned status=error. Inspect the Windmill job
+          (cert_renew_dispatch or ilo_cert_renew) for that device and re-run.
+
+    # --- the inventory metric pipeline itself stopped (ManagedCertExpiring would go blind) ---
+    - alert: CertInventoryMetricsStale
+      expr: time() - max(horizon_cert_metrics_last_run_timestamp_seconds) > 10800
+      for: 15m
+      labels:
+        severity: warning
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: "Horizon cert-inventory metrics stale (>3h)"
+        description: |
+          horizon_cert_metrics (hourly) has not pushed in >3h, so ManagedCertExpiring is blind.
+          Check the f/infra_health/horizon_cert_metrics Windmill schedule.
