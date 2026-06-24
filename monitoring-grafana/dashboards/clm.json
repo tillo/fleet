@@ -33,30 +33,81 @@
   },
   "panels": [
     {
+      "id": 10,
+      "type": "stat",
+      "title": "Horizon-managed certificates",
+      "description": "Certificates Horizon actively manages (enroll + auto-renew). Discovered/external certs are tracked separately and not counted here.",
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "gridPos": { "x": 0, "y": 0, "w": 5, "h": 6 },
+      "targets": [ { "expr": "horizon_certs_managed_total", "instant": true, "refId": "A" } ],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "type": "piechart",
+      "title": "Managed by profile",
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "gridPos": { "x": 5, "y": 0, "w": 9, "h": 6 },
+      "targets": [ { "expr": "horizon_certs_profile", "legendFormat": "{{profile}}", "instant": true, "refId": "A" } ],
+      "options": { "pieType": "donut", "reduceOptions": { "calcs": ["lastNotNull"] }, "legend": { "displayMode": "list", "placement": "right", "values": ["value"] } },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 12,
+      "type": "bargauge",
+      "title": "Managed by status",
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "gridPos": { "x": 14, "y": 0, "w": 6, "h": 6 },
+      "targets": [ { "expr": "horizon_certs_status", "legendFormat": "{{status}}", "instant": true, "refId": "A" } ],
+      "options": { "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "revoked" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "expired" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Managed expiring soon",
+      "datasource": { "type": "prometheus", "uid": "$datasource" },
+      "gridPos": { "x": 20, "y": 0, "w": 4, "h": 6 },
+      "targets": [
+        { "expr": "horizon_certs_expiring{window=\"30d\"}", "legendFormat": "≤30d", "instant": true, "refId": "A" },
+        { "expr": "horizon_certs_expiring{window=\"7d\"}", "legendFormat": "≤7d", "instant": true, "refId": "B" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+
+    {
       "id": 1,
       "type": "bargauge",
       "title": "Device cert — days to expiry (auto-renewed)",
       "description": "Per-device web-UI cert days-to-expiry, pushed by the Windmill renewal jobs. Red <15d, amber <30d. Each renews inside 15d.",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
-      "targets": [
-        { "expr": "{__name__=~\".+_cert_days_to_expiry\"}", "legendFormat": "{{__name__}}", "instant": true, "refId": "A" }
-      ],
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 8 },
+      "targets": [ { "expr": "{__name__=~\".+_cert_days_to_expiry\"}", "legendFormat": "{{__name__}}", "instant": true, "refId": "A" } ],
       "options": { "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true },
       "fieldConfig": {
         "defaults": {
-          "unit": "d",
-          "min": 0,
-          "max": 60,
+          "unit": "d", "min": 0, "max": 60,
           "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "orange", "value": 15 },
-              { "color": "green", "value": 30 }
-            ]
-          }
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 15 }, { "color": "green", "value": 30 } ] }
         },
         "overrides": []
       }
@@ -66,23 +117,14 @@
       "type": "stat",
       "title": "Soonest device-cert expiry",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 8 },
-      "targets": [
-        { "expr": "min({__name__=~\".+_cert_days_to_expiry\"})", "instant": true, "refId": "A" }
-      ],
+      "gridPos": { "x": 12, "y": 6, "w": 6, "h": 8 },
+      "targets": [ { "expr": "min({__name__=~\".+_cert_days_to_expiry\"})", "instant": true, "refId": "A" } ],
       "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": {
         "defaults": {
           "unit": "d",
           "color": { "mode": "thresholds" },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "orange", "value": 15 },
-              { "color": "green", "value": 30 }
-            ]
-          }
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 15 }, { "color": "green", "value": 30 } ] }
         },
         "overrides": []
       }
@@ -92,10 +134,8 @@
       "type": "stat",
       "title": "Cert renewals (total)",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 8 },
-      "targets": [
-        { "expr": "sum({__name__=~\".+_cert_renewed_total\"})", "instant": true, "refId": "A" }
-      ],
+      "gridPos": { "x": 18, "y": 6, "w": 6, "h": 8 },
+      "targets": [ { "expr": "sum({__name__=~\".+_cert_renewed_total\"})", "instant": true, "refId": "A" } ],
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } }, "overrides": [] }
     },
@@ -105,7 +145,7 @@
       "title": "K8s TLS cert discovery → Horizon",
       "description": "Windmill k8s_cert_discovery feeder: certs fed to the CLM vs internal/self-signed skipped, plus feed errors.",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 0, "y": 8, "w": 16, "h": 8 },
+      "gridPos": { "x": 0, "y": 14, "w": 16, "h": 8 },
       "targets": [
         { "expr": "k8s_cert_discovery_certs_fed", "legendFormat": "fed", "refId": "A" },
         { "expr": "k8s_cert_discovery_skipped_internal", "legendFormat": "skipped internal", "refId": "B" },
@@ -114,9 +154,7 @@
       ],
       "fieldConfig": {
         "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } },
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "errors" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
-        ]
+        "overrides": [ { "matcher": { "id": "byName", "options": "errors" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] } ]
       }
     },
     {
@@ -124,7 +162,7 @@
       "type": "stat",
       "title": "Discovery snapshot",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 8 },
+      "gridPos": { "x": 16, "y": 14, "w": 8, "h": 8 },
       "targets": [
         { "expr": "k8s_cert_discovery_tls_secrets", "legendFormat": "TLS secrets scanned", "instant": true, "refId": "A" },
         { "expr": "k8s_cert_discovery_certs_fed", "legendFormat": "certs fed", "instant": true, "refId": "B" },
@@ -138,10 +176,8 @@
       "type": "stat",
       "title": "Horizon",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 0, "y": 16, "w": 4, "h": 6 },
-      "targets": [
-        { "expr": "up{job=\"horizon\"}", "instant": true, "refId": "A" }
-      ],
+      "gridPos": { "x": 0, "y": 22, "w": 4, "h": 6 },
+      "targets": [ { "expr": "up{job=\"horizon\"}", "instant": true, "refId": "A" } ],
       "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "fieldConfig": {
         "defaults": {
@@ -157,10 +193,8 @@
       "type": "timeseries",
       "title": "Horizon — HTTP request rate",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 4, "y": 16, "w": 10, "h": 6 },
-      "targets": [
-        { "expr": "sum(rate(http_server_requests_total{job=\"horizon\"}[5m]))", "legendFormat": "req/s", "refId": "A" }
-      ],
+      "gridPos": { "x": 4, "y": 22, "w": 10, "h": 6 },
+      "targets": [ { "expr": "sum(rate(http_server_requests_total{job=\"horizon\"}[5m]))", "legendFormat": "req/s", "refId": "A" } ],
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } }, "overrides": [] }
     },
     {
@@ -168,7 +202,7 @@
       "type": "timeseries",
       "title": "Horizon — JVM memory committed",
       "datasource": { "type": "prometheus", "uid": "$datasource" },
-      "gridPos": { "x": 14, "y": 16, "w": 10, "h": 6 },
+      "gridPos": { "x": 14, "y": 22, "w": 10, "h": 6 },
       "targets": [
         { "expr": "sum(jvm_memory_committed_bytes{job=\"horizon\"})", "legendFormat": "committed", "refId": "A" },
         { "expr": "sum(jvm_memory_max_bytes{job=\"horizon\"} > 0)", "legendFormat": "max", "refId": "B" }
