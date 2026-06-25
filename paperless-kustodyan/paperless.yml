@@ -15,9 +15,9 @@ spec:
       secretKey: PAPERLESS_SECRET_KEY
     - remoteRef: { key: /mdapi/paperless-kustodyan/admin-password }
       secretKey: PAPERLESS_ADMIN_PASSWORD
-    - remoteRef: { key: /kyos/kustodyan/showcase-client-id }
+    - remoteRef: { key: /kyos/kustodyan/searchable-client-id }
       secretKey: KUSTODYAN_CLIENT_ID
-    - remoteRef: { key: /kyos/kustodyan/showcase-client-secret }
+    - remoteRef: { key: /kyos/kustodyan/searchable-client-secret }
       secretKey: KUSTODYAN_CLIENT_SECRET
 ---
 # Pull secret for zot.mdapi.ch.
@@ -84,8 +84,8 @@ spec:
       containers:
         - name: paperless
           # Custom image: paperless-ngx 2.20.15 + the paperless_kustodyan add-on app.
-          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest
-          imagePullPolicy: Always
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan@sha256:d61e33e8fbd5331aa8c55e3a8396dbcbefd5c82c942d4f476027d9b511013a14
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
@@ -118,9 +118,13 @@ spec:
             - name: KUSTODYAN_ENGINE_URL
               value: https://dev.kustodyan.io/api/engine
             - name: KUSTODYAN_DEFAULT_CLASSNAME
-              value: ch.tillo.paperless.Document
-            # Protect full document content + these tag names (from-scratch PaperlessProtection config).
+              value: ch.tillo.paperless.SearchableDocument
+            # Protect full document content + these tag names (from-scratch PaperlessSearchable config).
             - name: KUSTODYAN_PROTECT_DOCUMENT_CONTENT
+              value: "true"
+            # Searchable mode: word-by-word deterministic tokenization → encrypted index is
+            # searchable by full word (AESDeterministicProtector), reversible only per role.
+            - name: KUSTODYAN_SEARCHABLE_CONTENT
               value: "true"
             - name: KUSTODYAN_SENSITIVE_TAGS
               value: "patient,salary,confidential,medical,legal,hr,nda"
