@@ -1,0 +1,184 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-kustodyan-secrets
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-kustodyan-secrets
+    creationPolicy: Owner
+  data:
+    - remoteRef: { key: /mdapi/paperless-kustodyan/secret-key }
+      secretKey: PAPERLESS_SECRET_KEY
+    - remoteRef: { key: /mdapi/paperless-kustodyan/admin-password }
+      secretKey: PAPERLESS_ADMIN_PASSWORD
+    - remoteRef: { key: /kyos/kustodyan/client-id }
+      secretKey: KUSTODYAN_CLIENT_ID
+    - remoteRef: { key: /kyos/kustodyan/client-secret }
+      secretKey: KUSTODYAN_CLIENT_SECRET
+---
+# Pull secret for zot.mdapi.ch.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-pull
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-pull
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: kubernetes.io/dockerconfigjson
+      engineVersion: v2
+      mergePolicy: Replace
+      data:
+        .dockerconfigjson: |
+          {"auths":{"zot.mdapi.ch":{"username":"zot","password":"{{ .password }}","auth":"{{ printf "zot:%s" .password | b64enc }}"}}}
+  data:
+    - remoteRef: { key: /mdapi/zot/zot-auth/password }
+      secretKey: password
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: paperless-kustodyan-data
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperless-kustodyan
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # single RWO PVC
+  selector:
+    matchLabels:
+      app: paperless-kustodyan
+  template:
+    metadata:
+      labels:
+        app: paperless-kustodyan
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: paperless
+          # Custom image: paperless-ngx 2.20.15 + the paperless_kustodyan add-on app.
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            # --- paperless core ---
+            - name: PAPERLESS_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: PAPERLESS_SECRET_KEY } }
+            - name: PAPERLESS_URL
+              value: https://paperless-kustodyan.mdapi.ch
+            - name: PAPERLESS_ALLOWED_HOSTS
+              value: paperless-kustodyan.mdapi.ch
+            - name: PAPERLESS_CSRF_TRUSTED_ORIGINS
+              value: https://paperless-kustodyan.mdapi.ch
+            - name: PAPERLESS_REDIS
+              value: redis://paperless-kustodyan-valkey:6379
+            - name: PAPERLESS_TIME_ZONE
+              value: Europe/Zurich
+            - name: PAPERLESS_OCR_LANGUAGE
+              value: eng
+            - name: PAPERLESS_ADMIN_USER
+              value: admin
+            - name: PAPERLESS_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: PAPERLESS_ADMIN_PASSWORD } }
+            # --- activate the Kustodyan add-on app ---
+            - name: PAPERLESS_APPS
+              value: paperless_kustodyan.apps.PaperlessKustodyanConfig
+            # --- Kustodyan engine ---
+            - name: KUSTODYAN_IDENTITY_URL
+              value: https://dev.kustodyan.io/api/identity
+            - name: KUSTODYAN_ENGINE_URL
+              value: https://dev.kustodyan.io/api/engine
+            - name: KUSTODYAN_DEFAULT_CLASSNAME
+              value: ch.kyos.Contact
+            - name: KUSTODYAN_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: KUSTODYAN_CLIENT_ID } }
+            - name: KUSTODYAN_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: KUSTODYAN_CLIENT_SECRET } }
+          volumeMounts:
+            - name: data
+              mountPath: /usr/src/paperless/data
+            - name: media
+              mountPath: /usr/src/paperless/media
+          startupProbe:
+            tcpSocket: { port: 8000 }
+            failureThreshold: 60
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: { path: /accounts/login/, port: 8000 }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits: { memory: 2Gi }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: paperless-kustodyan-data
+        - name: media
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperless-kustodyan
+spec:
+  selector:
+    app: paperless-kustodyan
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: paperless-kustodyan
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # Demo instance — ModSec off to avoid CRS false positives on the JSON reveal API.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [paperless-kustodyan.mdapi.ch]
+      secretName: paperless-kustodyan-tls
+  rules:
+    - host: paperless-kustodyan.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: paperless-kustodyan
+                port:
+                  number: 8000
