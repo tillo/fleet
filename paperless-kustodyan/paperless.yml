@@ -56,6 +56,17 @@ spec:
     requests:
       storage: 5Gi
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: paperless-kustodyan-media
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -84,8 +95,8 @@ spec:
       containers:
         - name: paperless
           # Custom image: paperless-ngx 2.20.15 + the paperless_kustodyan add-on app.
-          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest
-          imagePullPolicy: Always
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan@sha256:10fabeeb1d3c31b012d4ad6db67000a3c50ff9f4cedaaf6fa938ce64a6cf5f19
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
@@ -169,7 +180,8 @@ spec:
           persistentVolumeClaim:
             claimName: paperless-kustodyan-data
         - name: media
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: paperless-kustodyan-media
 ---
 apiVersion: v1
 kind: Service
