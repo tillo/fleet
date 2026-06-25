@@ -1,0 +1,155 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: kustodyan-mcp-secrets
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: kustodyan-mcp-secrets
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /kyos/kustodyan/gate-token
+      secretKey: MCP_BEARER_TOKEN
+    - remoteRef:
+        key: /kyos/kustodyan/client-id
+      secretKey: KUSTODYAN_CLIENT_ID
+    - remoteRef:
+        key: /kyos/kustodyan/client-secret
+      secretKey: KUSTODYAN_CLIENT_SECRET
+---
+# Pull secret for zot.mdapi.ch (the image registry), templated from the zot password.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-pull
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-pull
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: kubernetes.io/dockerconfigjson
+      engineVersion: v2
+      mergePolicy: Replace
+      data:
+        .dockerconfigjson: |
+          {"auths":{"zot.mdapi.ch":{"username":"zot","password":"{{ .password }}","auth":"{{ printf "zot:%s" .password | b64enc }}"}}}
+  data:
+    - remoteRef:
+        key: /mdapi/zot/zot-auth/password
+      secretKey: password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kustodyan-mcp
+  # Floating :latest tracked by Keel (poll every 4h); reloader restarts on secret rotation.
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kustodyan-mcp
+  template:
+    metadata:
+      labels:
+        app: kustodyan-mcp
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        # Self-contained image: the kustodyan-mcp server (streamable HTTP) behind an
+        # nginx bearer-token gate (Authorization: Bearer OR ?token=). Transport/ports
+        # are baked into the image ENV; only creds + the gate token are injected.
+        - name: kustodyan-mcp
+          image: zot.mdapi.ch/mdapi/kustodyan-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kustodyan-mcp-secrets
+                  key: MCP_BEARER_TOKEN
+            - name: KUSTODYAN_IDENTITY_URL
+              value: https://dev.kustodyan.io/api/identity
+            - name: KUSTODYAN_ENGINE_URL
+              value: https://dev.kustodyan.io/api/engine
+            - name: KUSTODYAN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kustodyan-mcp-secrets
+                  key: KUSTODYAN_CLIENT_ID
+            - name: KUSTODYAN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kustodyan-mcp-secrets
+                  key: KUSTODYAN_CLIENT_SECRET
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 30
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            # Stateless request/response (a fresh MCP server per HTTP request) — flat,
+            # low memory; no per-session caches to grow.
+            limits: { memory: 384Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kustodyan-mcp
+spec:
+  selector:
+    app: kustodyan-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kustodyan-mcp
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # ModSec OFF — MCP JSON-RPC traffic trips CRS false positives (per evertrust-mcp/k8s-mcp).
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    # streamable-HTTP/SSE needs no buffering + long timeouts.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [kustodyan-mcp.mdapi.ch]
+      secretName: kustodyan-mcp-tls
+  rules:
+    - host: kustodyan-mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kustodyan-mcp
+                port:
+                  number: 8080

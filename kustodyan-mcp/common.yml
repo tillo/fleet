@@ -1,0 +1,45 @@
+# Shared: namespaced ACME issuer (DNS-01 via BIND, HTTP-01 fallback) + tsig for the
+# kustodyan-mcp.mdapi.ch cert. The bearer-token gate is baked into the image's nginx.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+  namespace: kustodyan-mcp
+spec:
+  acme:
+    email: tillo@tillo.ch
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    server: https://acme-v02.api.letsencrypt.org/directory
+    solvers:
+      - dns01:
+          rfc2136:
+            nameserver: 31.3.128.59:53
+            tsigKeyName: mdapi
+            tsigAlgorithm: HMACSHA256
+            tsigSecretSecretRef:
+              name: tsig-secret
+              key: tsig-secret-key
+        selector:
+          dnsZones:
+            - 'mdapi.ch'
+      - http01:
+          ingress:
+            class: nginx
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: tsig-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: tsig-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/kustodyan-mcp/tsig-secret/tsig-secret-key
+      secretKey: tsig-secret-key
