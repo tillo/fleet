@@ -15,9 +15,9 @@ spec:
       secretKey: PAPERLESS_SECRET_KEY
     - remoteRef: { key: /mdapi/paperless-kustodyan/admin-password }
       secretKey: PAPERLESS_ADMIN_PASSWORD
-    - remoteRef: { key: /kyos/kustodyan/searchable-client-id }
+    - remoteRef: { key: /kyos/kustodyan/ope-client-id }
       secretKey: KUSTODYAN_CLIENT_ID
-    - remoteRef: { key: /kyos/kustodyan/searchable-client-secret }
+    - remoteRef: { key: /kyos/kustodyan/ope-client-secret }
       secretKey: KUSTODYAN_CLIENT_SECRET
 ---
 # Pull secret for zot.mdapi.ch.
@@ -84,8 +84,8 @@ spec:
       containers:
         - name: paperless
           # Custom image: paperless-ngx 2.20.15 + the paperless_kustodyan add-on app.
-          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest
-          imagePullPolicy: Always
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan@sha256:c5a91f47f2d68996439b9ff774d80f6c925a6c662eef2472058b0fee1aa1b229
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
@@ -118,14 +118,17 @@ spec:
             - name: KUSTODYAN_ENGINE_URL
               value: https://dev.kustodyan.io/api/engine
             - name: KUSTODYAN_DEFAULT_CLASSNAME
-              value: ch.tillo.paperless.SearchableDocument
-            # Protect full document content + these tag names (from-scratch PaperlessSearchable config).
+              value: ch.tillo.paperless.OpeDocument
+            # Protect full document content + these tag names (from-scratch PaperlessOPE config).
             - name: KUSTODYAN_PROTECT_DOCUMENT_CONTENT
               value: "true"
-            # Searchable mode: word-by-word deterministic tokenization → encrypted index is
-            # searchable by full word (AESDeterministicProtector), reversible only per role.
+            # Searchable mode: word-by-word order-preserving tokenization (ShiftedOPEStringToken) →
+            # encrypted index supports BOTH exact and begins-with (word*) search, reversible per role.
             - name: KUSTODYAN_SEARCHABLE_CONTENT
               value: "true"
+            # Companion property yielding the begins-with bound (ShiftedOPEIndexStartWith).
+            - name: KUSTODYAN_CONTENT_PFX_PROPERTY
+              value: content_pfx
             - name: KUSTODYAN_SENSITIVE_TAGS
               value: "patient,salary,confidential,medical,legal,hr,nda"
             - name: KUSTODYAN_CLIENT_ID
