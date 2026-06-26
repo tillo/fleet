@@ -97,8 +97,8 @@ spec:
       containers:
         - name: paperless
           # Custom image: paperless-ngx 2.20.15 + the paperless_kustodyan add-on app.
-          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest
-          imagePullPolicy: Always
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan@sha256:9d3b7f8d702aef57e1a17bdff55e80b517e9c47fc4db900727701edd20bd09b4
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
@@ -139,17 +139,21 @@ spec:
             # encrypted index supports BOTH exact and begins-with (word*) search, reversible per role.
             - name: KUSTODYAN_SEARCHABLE_CONTENT
               value: "true"
-            # Companion property yielding the begins-with bound (ShiftedOPEIndexStartWith).
+            # Content is equality-only deterministic now — no begins-with on the body (no order/prefix leak).
             - name: KUSTODYAN_CONTENT_PFX_PROPERTY
-              value: content_pfx
-            # Full-fidelity display: read content from a probabilistic full copy (exact case/punctuation);
-            # protect the title too (role-aware display).
+              value: ""
+            # Full-fidelity display: read content from a probabilistic full copy (exact case/punctuation).
             - name: KUSTODYAN_CONTENT_READ_PROPERTY
               value: content_full
             - name: KUSTODYAN_PROTECT_TITLE
               value: "true"
             - name: KUSTODYAN_TITLE_PROPERTY
               value: title_full
+            # Begins-with lives on the title (OPE), a small surface: display blob + OPE word tokens.
+            - name: KUSTODYAN_TITLE_OPE_PROPERTY
+              value: title_ope
+            - name: KUSTODYAN_TITLE_PFX_PROPERTY
+              value: title_pfx
             # Protect correspondent names + string custom-field values (full-fidelity, role-aware).
             - name: KUSTODYAN_PROTECT_CORRESPONDENTS
               value: "true"
