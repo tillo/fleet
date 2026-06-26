@@ -37,8 +37,8 @@ spec:
               [Interface]
               Address = 10.99.0.2/32
               PrivateKey = $(cat /secrets/private-key)
-              # Generalized bridge: forward so the CM-VM gateway reaches ANY in-cluster
-              # ClusterIP (service CIDR 10.53.0.0/16), not just paperless-pg via socat.
+              # Bridge router: forward so the CM-VM gateway reaches ANY in-cluster
+              # ClusterIP (service CIDR 10.53.0.0/16); producers target ClusterIPs directly.
               PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
               PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
 
@@ -66,15 +66,6 @@ spec:
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { cpu: 200m, memory: 64Mi }
-        - name: proxy
-          image: alpine/socat
-          command:
-            - sh
-            - -c
-            - socat TCP4-LISTEN:5432,fork,reuseaddr TCP4:paperless-pg-rw.paperless.svc.cluster.local:5432
-          resources:
-            requests: { cpu: 5m, memory: 16Mi }
-            limits: { cpu: 100m, memory: 32Mi }
       volumes:
         - { name: config, emptyDir: {} }
         - name: secrets
