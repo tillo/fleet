@@ -18,6 +18,14 @@ spec:
         app: akeyless-pg-bridge
     spec:
       initContainers:
+        # net.ipv4.ip_forward is a namespaced sysctl but "unsafe" in k8s, so NET_ADMIN
+        # can't set it from PostUp. A one-shot privileged init sets it on the shared pod
+        # netns (persists for the pod's life); the main container stays NET_ADMIN-only.
+        - name: enable-forwarding
+          image: busybox
+          command: ["sh", "-c", "sysctl -w net.ipv4.ip_forward=1"]
+          securityContext:
+            privileged: true
         - name: config
           image: busybox
           command:
@@ -31,7 +39,7 @@ spec:
               PrivateKey = $(cat /secrets/private-key)
               # Generalized bridge: forward so the CM-VM gateway reaches ANY in-cluster
               # ClusterIP (service CIDR 10.53.0.0/16), not just paperless-pg via socat.
-              PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
+              PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
               PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
 
               [Peer]
