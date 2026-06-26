@@ -19,6 +19,8 @@ spec:
       secretKey: KUSTODYAN_CLIENT_ID
     - remoteRef: { key: /kyos/kustodyan/ope-client-secret }
       secretKey: KUSTODYAN_CLIENT_SECRET
+    - remoteRef: { key: /kyos/kustodyan/search-salt }
+      secretKey: KUSTODYAN_SEARCH_SALT
 ---
 # Pull secret for zot.mdapi.ch.
 apiVersion: external-secrets.io/v1
@@ -95,8 +97,8 @@ spec:
       containers:
         - name: paperless
           # Custom image: paperless-ngx 2.20.15 + the paperless_kustodyan add-on app.
-          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest
-          imagePullPolicy: Always
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan@sha256:85b2ef64d6426f50f3c48fdbe49dae063bffea52a85be66b0a244a7b9a98e07c
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
               name: http
@@ -159,6 +161,9 @@ spec:
               valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: KUSTODYAN_CLIENT_ID } }
             - name: KUSTODYAN_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: KUSTODYAN_CLIENT_SECRET } }
+            # Secret salt prepended to content search tokens (separate from the engine keys).
+            - name: KUSTODYAN_SEARCH_SALT
+              valueFrom: { secretKeyRef: { name: paperless-kustodyan-secrets, key: KUSTODYAN_SEARCH_SALT } }
           volumeMounts:
             - name: data
               mountPath: /usr/src/paperless/data
