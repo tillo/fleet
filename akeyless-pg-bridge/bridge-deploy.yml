@@ -1,0 +1,70 @@
+# In-cluster end of the DMZ<->cluster WireGuard bridge.
+# - wireguard container: dials OUT to bpi-r4 wg_csm (zero cluster exposure), tunnel IP 10.99.0.2
+# - socat sidecar: forwards tunnel :5432 -> paperless-pg-rw (the CNPG primary)
+# The CM-VM gateway reaches 10.99.0.2:5432 via its default route -> bpi-r4 -> wg_csm.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: akeyless-pg-bridge
+  namespace: akeyless-pg-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: akeyless-pg-bridge
+  template:
+    metadata:
+      labels:
+        app: akeyless-pg-bridge
+    spec:
+      initContainers:
+        - name: config
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /config/wg_confs
+              cat > /config/wg_confs/wg0.conf << EOF
+              [Interface]
+              Address = 10.99.0.2/32
+              PrivateKey = $(cat /secrets/private-key)
+
+              [Peer]
+              PublicKey = lxw2utAc7/th3rLtm7Ga+78U9iSZBzbLT53j9bY1D00=
+              PresharedKey = $(cat /secrets/psk)
+              Endpoint = 192.168.1.254:51822
+              AllowedIPs = 10.99.0.1/32
+              PersistentKeepalive = 25
+              EOF
+          volumeMounts:
+            - { name: config, mountPath: /config }
+            - { name: secrets, mountPath: /secrets }
+      containers:
+        - name: wireguard
+          image: lscr.io/linuxserver/wireguard:latest
+          securityContext:
+            capabilities:
+              add: [NET_ADMIN]
+          env:
+            - { name: PUID, value: "1000" }
+            - { name: PGID, value: "1000" }
+          volumeMounts:
+            - { name: config, mountPath: /config }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+        - name: proxy
+          image: alpine/socat
+          command:
+            - sh
+            - -c
+            - socat TCP4-LISTEN:5432,fork,reuseaddr TCP4:paperless-pg-rw.paperless.svc.cluster.local:5432
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 32Mi }
+      volumes:
+        - { name: config, emptyDir: {} }
+        - name: secrets
+          secret:
+            secretName: wg-csm-bridge
