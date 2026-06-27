@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: openbao-bootstrap
+  namespace: openbao
+spec:
+  schedule: "0 0 1 1 *"          # never matters — suspended; trigger on demand
+  suspend: true                  # GitOps-mutable, never auto-fires
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: openbao-admin   # bound to k8s-auth role `admin`
+          restartPolicy: Never
+          containers:
+          - name: bootstrap
+            image: openbao/openbao:2.5.5       # provides the `bao` CLI
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh","/script/bootstrap.sh"]
+            env:
+            - name: BAO_ADDR
+              value: http://openbao.openbao.svc:8200
+            resources:
+              requests: {cpu: 50m, memory: 64Mi}
+              limits: {memory: 128Mi}
+            volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: bootstrap-token, mountPath: /bootstrap, readOnly: true}
+          volumes:
+          - {name: script, configMap: {name: openbao-bootstrap-script}}
+          # Optional: present ONLY during DR-from-scratch (key: root-token), like
+          # openbao-unseal-keys. Absent in steady state -> k8s-auth path is used.
+          - {name: bootstrap-token, secret: {secretName: openbao-bootstrap-token, optional: true}}

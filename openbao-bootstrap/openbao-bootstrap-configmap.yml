@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openbao-bootstrap-script
+  namespace: openbao
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    # Idempotent OpenBao internal-config bootstrap. Safe to re-run any time.
+    # Recreates the structural config that lives in raft (and is otherwise only
+    # imperative): KV v2 mount, kubernetes auth method+config, policies, roles.
+    # Secret VALUES are NOT handled here — those come from the mirror (P2) or the
+    # age cold-export (P3b). This only rebuilds the scaffolding.
+    set -eu
+    export BAO_ADDR="${BAO_ADDR:-http://openbao.openbao.svc:8200}"
+
+    # --- obtain a privileged token -------------------------------------------
+    # DR mode: fresh `bao operator init` root token mounted out-of-band.
+    # Steady mode: k8s-auth as the admin role (SA openbao-admin).
+    if [ -f /bootstrap/root-token ]; then
+      echo "[bootstrap] using root token from mounted Secret (DR mode)"
+      BAO_TOKEN=$(cat /bootstrap/root-token)
+    else
+      echo "[bootstrap] no root-token Secret -> k8s-auth login role=admin"
+      JWT=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+      RESP=$(bao write -format=json auth/kubernetes/login role=admin jwt="$JWT")
+      BAO_TOKEN=$(printf '%s' "$RESP" | grep '"client_token"' | head -1 \
+                  | sed -E 's/.*"client_token": ?"([^"]+)".*/\1/')
+    fi
+    [ -n "${BAO_TOKEN:-}" ] || { echo "[bootstrap] FATAL: no token obtained"; exit 1; }
+    export BAO_TOKEN
+
+    # --- 1. KV v2 secrets engine at mdapi/ -----------------------------------
+    if bao secrets list -format=json 2>/dev/null | grep -q '"mdapi/"'; then
+      echo "[bootstrap] kv mdapi/ already enabled"
+    else
+      echo "[bootstrap] enabling kv-v2 at mdapi/"
+      bao secrets enable -path=mdapi -version=2 kv
+    fi
+    # Cap version churn from the hourly mirror (was max_versions=0 = unlimited).
+    bao write mdapi/config max_versions=10
+
+    # --- 2. kubernetes auth method -------------------------------------------
+    if bao auth list -format=json 2>/dev/null | grep -q '"kubernetes/"'; then
+      echo "[bootstrap] kubernetes auth already enabled"
+    else
+      echo "[bootstrap] enabling kubernetes auth"
+      bao auth enable kubernetes
+    fi
+    bao write auth/kubernetes/config \
+      kubernetes_host="https://kubernetes.default.svc" \
+      disable_iss_validation=true
+
+    # --- 3. policies (idempotent overwrite) ----------------------------------
+    bao policy write admin - <<'POL'
+    path "*" { capabilities = ["create","read","update","delete","list","sudo"] }
+    POL
+    bao policy write eso-read - <<'POL'
+    path "mdapi/data/*"     { capabilities = ["read"] }
+    path "mdapi/metadata/*" { capabilities = ["read","list"] }
+    POL
+    bao policy write mirror - <<'POL'
+    path "mdapi/data/*"     { capabilities = ["create","update","read"] }
+    path "mdapi/metadata/*" { capabilities = ["list","read"] }
+    POL
+    bao policy write archive-read - <<'POL'
+    path "mdapi/data/*"     { capabilities = ["read"] }
+    path "mdapi/metadata/*" { capabilities = ["list","read"] }
+    POL
+    bao policy write snapshot-read - <<'POL'
+    path "sys/storage/raft/snapshot" { capabilities = ["read"] }
+    POL
+
+    # --- 4. kubernetes-auth roles (idempotent overwrite) ---------------------
+    bao write auth/kubernetes/role/admin \
+      bound_service_account_names=openbao-admin \
+      bound_service_account_namespaces=openbao \
+      policies=admin ttl=1h
+    bao write auth/kubernetes/role/eso \
+      bound_service_account_names=openbao-eso \
+      bound_service_account_namespaces=external-secrets \
+      policies=eso-read ttl=20m
+    bao write auth/kubernetes/role/mirror \
+      bound_service_account_names=openbao-mirror \
+      bound_service_account_namespaces=openbao \
+      policies=mirror ttl=30m
+    bao write auth/kubernetes/role/windmill-archive \
+      bound_service_account_names=windmill \
+      bound_service_account_namespaces=windmill \
+      policies=archive-read ttl=20m
+    bao write auth/kubernetes/role/windmill-snapshot \
+      bound_service_account_names=windmill \
+      bound_service_account_namespaces=windmill \
+      policies=snapshot-read ttl=10m
+
+    echo "[bootstrap] OpenBao internal config asserted OK"
+    echo "[bootstrap] policies:"; bao policy list
+    echo "[bootstrap] k8s-auth roles:"; bao list auth/kubernetes/role
