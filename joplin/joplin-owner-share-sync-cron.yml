@@ -16,12 +16,13 @@
 ## Server's "Process shared items" task (#11) then creates the recipient user_items
 ## within ~10s. Idempotent -- a run with nothing new uploads nothing.
 ##
-## IMAGE: reuse the cached joplin-mcp image only for its Node/npm runtime
-## (IfNotPresent -- no registry round-trip, survives registry outages); the joplin
-## CLI is npm-installed (pinned) into an emptyDir at runtime (~1-2 min). Stateless
-## on purpose: no PVC to corrupt or reattach, and a failed run simply retries next
-## tick. (If the per-run npm install ever becomes a concern, bake a small image
-## with joplin preinstalled and drop the install step.)
+## IMAGE: joplin-mcp image with the joplin CLI BAKED IN (mdapi/joplin-mcp
+## Dockerfile, npm i -g joplin@3.6.2 at build). Pinned to an immutable short-sha
+## tag in zot so IfNotPresent still picks up new builds -- no runtime `npm
+## install`, hence no registry/DNS dependency at run time (the old per-run install
+## failed ~half the time: sqlite3 node-pre-gyp prebuilt miss + transient DNS to
+## registry.npmjs.org). Stateless: HOME is an emptyDir, no PVC to corrupt. To bump
+## joplin: edit the Dockerfile, let CI build, then point the tag below at the new sha.
 ##
 ## SCHEDULE in UTC, NOT spec.timeZone: kube-state-metrics ships without tzdata and
 ## panics on named zones, taking every kube_* alert down with it (same reason as
@@ -54,7 +55,7 @@ spec:
           - name: zot-pull
           containers:
           - name: sync
-            image: zot.mdapi.ch/mdapi/joplin-mcp:latest
+            image: zot.mdapi.ch/mdapi/joplin-mcp:4e233193
             imagePullPolicy: IfNotPresent
             env:
             - name: HOME
@@ -73,28 +74,7 @@ spec:
             args:
             - |
               set -e
-              mkdir -p /work/npm
-              npm config set prefix /work/npm >/dev/null 2>&1
-              export PATH=/work/npm/bin:$PATH
-              # joplin pulls in sqlite3, whose node-pre-gyp step DOWNLOADS a
-              # prebuilt napi-v6 binary. That download is flaky; when it misses,
-              # node-pre-gyp falls back to compiling from source, which fails
-              # because this runtime image has no C toolchain -> the whole run
-              # fails (~half of them). The prebuilt is the only viable path, so
-              # just retry the install: a retry re-attempts the download and a
-              # successful one finishes in ~110s with no compile. Wipe the
-              # partial tree between attempts so a half-install can't poison it.
-              installed=0
-              for attempt in 1 2 3 4 5; do
-                if npm install -g joplin@3.6.2 >/tmp/npm.log 2>&1; then
-                  echo "npm install ok (attempt $attempt)"; installed=1; break
-                fi
-                echo "npm install attempt $attempt failed (node-pre-gyp prebuilt miss); retrying after backoff"
-                tail -3 /tmp/npm.log || true
-                rm -rf /work/npm/lib/node_modules/joplin 2>/dev/null || true
-                sleep $((attempt * 10))
-              done
-              if [ "$installed" != 1 ]; then echo "npm install failed after 5 attempts:"; tail -30 /tmp/npm.log; exit 1; fi
+              # joplin CLI is baked into the image (no runtime npm install).
               joplin config keychain.supported 0 >/dev/null
               joplin config sync.target 9 >/dev/null
               joplin config sync.9.path https://notes.mdapi.ch >/dev/null
