@@ -7,6 +7,8 @@ data:
   mirror.py: |
     # Akeyless -> OpenBao mirror. Reads every /mdapi item (api-key auth), writes
     # each to OpenBao KV v2 mdapi/<relpath> {"value": <raw>}. k8s-auth role `mirror`.
+    # DYNAMIC_SECRET items are materialized and stored as a point-in-time static
+    # snapshot (DR fallback); encryption/classic keys are skipped (no value).
     # Secret VALUES are NEVER printed (only counts + error key names).
     import json, ssl, time, urllib.request, urllib.error
     AK = "https://cm.mdapi.ch/akeyless-api/v2"
@@ -44,40 +46,55 @@ data:
         return f if isinstance(f, str) else (f.get("path") or f.get("folder_name") or f.get("name"))
 
     def list_items(path):
-        names, folders, pag = [], [], ""
+        items, folders, pag = [], [], ""
         while True:
             body = {"token": aktok, "path": path}
             if pag:
                 body["pagination-token"] = pag
             r = post(f"{AK}/list-items", body)
-            names += [it["item_name"] for it in (r.get("items") or [])]
+            items += [(it["item_name"], it.get("item_type", "")) for it in (r.get("items") or [])]
             folders += [fname(f) for f in (r.get("folders") or [])]
             pag = r.get("next_page") or ""
             if not pag:
                 break
         for f in folders:
             if f:
-                names += list_items(f)
-        return names
+                items += list_items(f)
+        return items
 
     items = sorted(set(list_items("/mdapi")))
     print(f"akeyless_items={len(items)}", flush=True)
-    ok = err = 0
+    # Encryption/classic keys carry no fetchable secret value -> skip them.
+    KEY_TYPES = {"AES128GCM", "AES256GCM", "AES128SIV", "AES256SIV",
+                 "RSA1024", "RSA2048", "RSA3072", "RSA4096",
+                 "CLASSIC_KEY", "DFC", "GPG"}
+    ok = err = dyn = skipped = 0
     errs = []
-    for name in items:
+    for name, itype in items:
         try:
+            rel = name[len("/mdapi/"):] if name.startswith("/mdapi/") else name.lstrip("/")
+            if itype in KEY_TYPES:
+                skipped += 1
+                continue
+            if itype == "DYNAMIC_SECRET":
+                # Materialize the producer and store a point-in-time STATIC
+                # snapshot in OpenBao as a DR fallback. TODO (implement dynamic
+                # later): give OpenBao its own DB secrets engine instead.
+                v = post(f"{AK}/get-dynamic-secret-value", {"token": aktok, "name": name})
+                post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": json.dumps(v)}}, tok_hdr=baotok)
+                dyn += 1
+                continue
             v = post(f"{AK}/get-secret-value", {"token": aktok, "names": [name]})
             val = v.get(name)
             if val is None:
                 err += 1; errs.append(name + ":noval"); continue
             if not isinstance(val, str):
                 val = json.dumps(val)
-            rel = name[len("/mdapi/"):] if name.startswith("/mdapi/") else name.lstrip("/")
             post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": val}}, tok_hdr=baotok)
             ok += 1
         except Exception as e:
             err += 1; errs.append(f"{name}:{type(e).__name__}")
-    print(f"mirrored={ok} errors={err}", flush=True)
+    print(f"mirrored={ok} dynamic={dyn} skipped_keys={skipped} errors={err}", flush=True)
     for e in errs[:25]:
         print("ERR", e)
     raise SystemExit(1 if err else 0)
