@@ -1,0 +1,111 @@
+# MongoDB — system of record for Lowcoder (apps, users, orgs, groups, datasource
+# configs). Floating tag + Keel (Lane-A, DB convention): a Fleet re-apply rewrites
+# the same major.minor tag, so it cannot downgrade the DB. Root password from Akeyless.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lowcoder-mongo-data
+  namespace: lowcoder
+  labels:
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/default: enabled
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: harvester-longhorn-2replicas
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: lowcoder-mongo-secret
+  namespace: lowcoder
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: lowcoder-mongo-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/lowcoder/mongo/password
+      secretKey: password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lowcoder-mongo
+  namespace: lowcoder
+spec:
+  selector:
+    app: lowcoder-mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lowcoder-mongo
+  namespace: lowcoder
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 24h"
+spec:
+  selector:
+    matchLabels:
+      app: lowcoder-mongo
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: lowcoder-mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 27017
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: MONGO_INITDB_DATABASE
+              value: lowcoder
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: lowcoder
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: lowcoder-mongo-secret
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /data/db
+          readinessProbe:
+            tcpSocket: { port: 27017 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 27017 }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: lowcoder-mongo-data

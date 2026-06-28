@@ -1,0 +1,69 @@
+# Lowcoder frontend (nginx SPA + reverse proxy to api/node). Listens on 3000; the
+# Ingress backend. Reads LOWCODER_API_SERVICE_URL / LOWCODER_NODE_SERVICE_URL to
+# template its proxy config. Pinned image, Renovate Lane-B.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lowcoder-frontend
+  namespace: lowcoder
+spec:
+  selector:
+    matchLabels:
+      app: lowcoder-frontend
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: lowcoder-frontend
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: lowcoder-frontend
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: frontend
+          image: lowcoderorg/lowcoder-ce-frontend:2.7.6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: lowcoder-config
+            - secretRef:
+                name: lowcoder-secret
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lowcoder-frontend
+  namespace: lowcoder
+spec:
+  selector:
+    app: lowcoder-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+  type: ClusterIP
