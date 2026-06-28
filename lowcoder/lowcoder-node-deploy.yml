@@ -21,6 +21,11 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 6060
+          env:
+            # Node auto-caps the V8 old-space heap to ~half the container limit;
+            # the JS plugin load OOMs at the 512Mi default, so give it a real heap.
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1024"
           envFrom:
             - configMapRef:
                 name: lowcoder-config
@@ -33,9 +38,9 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
-            limits:
               memory: 512Mi
+            limits:
+              memory: 1536Mi
 ---
 apiVersion: v1
 kind: Service
