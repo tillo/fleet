@@ -92,3 +92,40 @@ spec:
         description: |
           horizon_cert_metrics (hourly) has not pushed in >3h, so ManagedCertExpiring is blind.
           Check the f/infra_health/horizon_cert_metrics Windmill schedule.
+
+    # --- AOS-6 pull-model AP (.217 apin0325): served-cert drift + pipeline stall ---
+    # (aruba_aos6_cert_days_to_expiry — the cert-manager secret expiry — is already
+    #  covered by DeviceCertExpiringSoon/Critical via the .+_cert_days_to_expiry regex.)
+    - alert: Aos6CertOutOfSync
+      ## aruba_aos6_cert_insync is 1 when .217 serves the current secret cert on BOTH :443 and
+      ## :4343, 0 when a delivery failed (AP still serving the old/expiring cert). The daily
+      ## backstop self-heals drift, so a sustained 0 means delivery is genuinely failing.
+      expr: aruba_aos6_cert_insync == 0
+      for: 2h
+      labels:
+        severity: warning
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: ".217 (apin0325) serving a stale cert — AOS-6 pull delivery failing"
+        description: |
+          aruba_aos6_cert_insync=0: the served leaf on .217 :443/:4343 no longer matches the
+          cert-manager secret. The on_enroll -> cert_renew_dispatch -> aruba_aos6_cert_sync pull
+          path (and the daily backstop) is not landing. Run
+          `wmill script run f/infra_certs/aruba_aos6_cert_sync -d '{"force":true}'` and check
+          cert-host (.61) reachability from .217 and .217 SSH reachability from the certs worker.
+
+    - alert: Aos6CertSyncStale
+      ## last-run is pushed on every run (incl. failures), so >26h means the daily backstop AND
+      ## on_enroll are both silent — Aos6CertOutOfSync would then be blind.
+      expr: time() - max(aruba_aos6_cert_sync_last_run_timestamp_seconds) > 93600
+      for: 30m
+      labels:
+        severity: warning
+        component: certificates
+        team: mdapi
+      annotations:
+        summary: "AOS-6 .217 cert-sync metrics stale (>26h)"
+        description: |
+          aruba_aos6_cert_sync has not run in >26h (daily backstop + on_enroll both silent).
+          Check the f/infra_certs/aruba_aos6_cert_sync schedule and the certs worker group.
