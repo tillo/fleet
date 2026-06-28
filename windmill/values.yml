@@ -68,6 +68,30 @@ windmill:
       resources:
         limits:
           memory: 2Gi
+    # Dedicated group for cert-delivery jobs to PULL-ONLY devices. Mounts the
+    # cert-staging RWX (created by the cert-host Fleet bundle, also mounted
+    # read-only by the cert-host web pod at 192.168.1.61) so jobs can stage a
+    # PEM for a device to fetch (AOS-6 IAP `download-cert`, etc.), then delete
+    # it. Isolated here so a CephFS hiccup can't stall the default/native
+    # workers; tag delivery scripts with worker tag "certs". Non-privileged.
+    - name: certs
+      replicas: 1
+      mode: worker
+      controller: Deployment
+      privileged: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      volumes:
+        - name: cert-staging
+          persistentVolumeClaim:
+            claimName: cert-staging
+      volumeMounts:
+        - name: cert-staging
+          mountPath: /staging
+      resources:
+        limits:
+          memory: 1Gi
 ingress:
   annotations:
     cert-manager.io/issuer: letsencrypt-prod

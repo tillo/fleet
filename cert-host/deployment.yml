@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cert-host
+  namespace: windmill
+  labels:
+    app: cert-host
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cert-host
+  template:
+    metadata:
+      labels:
+        app: cert-host
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nginx
+          # unprivileged nginx: listens on 8080 as non-root
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: staging
+              mountPath: /staging
+              readOnly: true          # web pod never writes — only the worker does
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 30
+      volumes:
+        - name: staging
+          persistentVolumeClaim:
+            claimName: cert-staging
+        - name: nginx-conf
+          configMap:
+            name: cert-host-nginx
