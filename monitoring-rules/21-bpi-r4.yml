@@ -295,7 +295,14 @@ spec:
       ## — the producer pushes age = now - 0 for those, surfacing as
       ## ~1157 days. Configured-but-never-connected peers are router
       ## hygiene, not a tunnel-down condition.
-      expr: bpi_r4_wireguard_last_handshake_age_seconds > 3600 < 31536000
+      ##
+      ## peer!~ excludes intentionally-intermittent / decommissioned peers
+      ## (the metric carries only a 12-char pubkey prefix, no name label):
+      ##   MngKslaCTeXM = gum          (wg_s2s, Exion S2S link decommissioned)
+      ##   pYweSYJkNAgW = s23ultra     (phone, roams off-VPN by design)
+      ##   l+ka4hrO9vTr = displaytest   } near flaky AP APIN0325 —
+      ##   43iXioKHwISZ = skylightnorth } expected to flap, ignore
+      expr: 'bpi_r4_wireguard_last_handshake_age_seconds{peer!~"MngKslaCTeXM|pYweSYJkNAgW|l\+ka4hrO9vTr|43iXioKHwISZ"} > 3600 < 31536000'
       for: 5m
       labels: { severity: warning, team: mdapi, component: Smart Home }
       annotations:
