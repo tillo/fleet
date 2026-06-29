@@ -1,13 +1,24 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "mdapi Renovate — Lane-B image bumps + ALL Fleet Helm chart versions. Lane-A floating app images stay on Keel. See operator ~/imagepolicy-study/PROPOSAL.md.",
-  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled"],
+  "description": "mdapi Renovate — Lane-B image bumps + ALL Fleet Helm chart versions. Lane-A floating app images stay on Keel. Minor+patch updates auto-merge after each package's soak window (every manager, incl. critical infra — owner decision 2026-06-29); majors stay MR-only; security fixes auto-merge via vulnerabilityAlerts. See operator ~/imagepolicy-study/PROPOSAL.md.",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled", "mergeConfidence:all-badges"],
   "enabledManagers": ["kubernetes", "fleet"],
   "baseBranches": ["main", "test"],
   "automerge": false,
   "platformAutomerge": true,
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "automerge": true,
+    "addLabels": ["security"]
+  },
+  "timezone": "Europe/Zurich",
+  "automergeSchedule": ["* 0-6 * * *"],
+  "gitLabIgnoreApprovals": true,
+  "configMigration": true,
   "assignees": ["tillo"],
   "prHourlyLimit": 2,
+  "prConcurrentLimit": 10,
   "kubernetes": {
     "managerFilePatterns": ["/-deploy\\.ya?ml$/"]
   },
@@ -21,7 +32,7 @@
       "enabled": false
     },
     {
-      "description": "Lane-B custom mdapi images — X.Y.Z-mdapi.N versioning (CI mints these). Reviewed by default; minor/major upstream bumps need a human.",
+      "description": "Lane-B custom mdapi images — X.Y.Z-mdapi.N versioning (CI mints these). minor+patch auto-merge (trailing rule); only major upstream bumps need a human.",
       "matchManagers": ["kubernetes"],
       "matchPackageNames": [
         "registry.mdapi.ch/mdapi/unbound",
@@ -97,6 +108,30 @@
       "enabled": true,
       "groupName": "lowcoder-ce",
       "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Group prometheus-community charts (pushgateway + blackbox-exporter) into one MR/automerge — shared upstream release cadence.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["prometheus-pushgateway", "prometheus-blackbox-exporter"],
+      "groupName": "prometheus-community"
+    },
+    {
+      "description": "Group Rook-Ceph operator + cluster charts so they ALWAYS bump together — a rook-ceph vs rook-ceph-cluster version skew is unsupported and risks the Ceph RGW store behind GitLab.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["rook-ceph", "rook-ceph-cluster"],
+      "groupName": "rook-ceph"
+    },
+    {
+      "description": "Group Evertrust charts (horizon, horizon-issuer, stream) — same vendor release train. Renovate skips them if it lacks repo.evertrust.io creds, in which case the group is a harmless no-op.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["horizon", "horizon-issuer", "stream"],
+      "groupName": "evertrust"
+    },
+    {
+      "description": "Auto-merge ALL minor + patch updates — every manager, every package, including critical infra (owner decision 2026-06-29). Placed last so it overrides the automerge key on every rule above while leaving their minimumReleaseAge soaks intact (3-day default, 1-day mdapi images). Majors are NOT matched here, so they stay MR-only (the helm-major rule keeps its 7-day soak + review). platformAutomerge merges via GitLab merge-when-pipeline-succeeds once CI is green.",
+      "matchManagers": ["kubernetes", "fleet"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
     }
   ],
   "hostRules": [
