@@ -100,6 +100,13 @@ spec:
                 secretKeyRef:
                   name: kustodyan-mcp-secrets
                   key: KUSTODYAN_CLIENT_SECRET
+            # Operator manifest describing the live PaperlessOPE config (see datamodel.yml).
+            - name: KUSTODYAN_DATA_MODEL
+              value: /etc/kustodyan-mcp/datamodel.json
+          volumeMounts:
+            - name: datamodel
+              mountPath: /etc/kustodyan-mcp
+              readOnly: true
           startupProbe:
             httpGet: { path: /healthz, port: 8080 }
             failureThreshold: 30
@@ -112,6 +119,10 @@ spec:
             # Stateless request/response (a fresh MCP server per HTTP request) — flat,
             # low memory; no per-session caches to grow.
             limits: { memory: 384Mi }
+      volumes:
+        - name: datamodel
+          configMap:
+            name: kustodyan-mcp-datamodel
 ---
 apiVersion: v1
 kind: Service
