@@ -24,6 +24,14 @@ metadata:
       SecDebugLog /tmp/modsec_debug.log
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
       SecRuleRemoveById 911100
+    # Land everyone straight on the portal board instead of the /apps list.
+    # Exact-match only: the SSO lands members on /apps and bare-domain hits on /,
+    # so redirect just those two to the published board view. Subpaths (the app
+    # view itself, /apps/<id>/edit for admins, the SSO callback, /static assets)
+    # are prefix/other paths and are left untouched.
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location = / { return 302 /apps/6a416e14e518483df2594751/view; }
+      location = /apps { return 302 /apps/6a416e14e518483df2594751/view; }
 spec:
   ingressClassName: nginx
   rules:
