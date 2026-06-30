@@ -1,0 +1,113 @@
+## etcd CPU-priority node tuner.
+##
+## Root cause of the 2026-06-30 qua outage: a transient ~7.5s etcd fsync stall
+## under host load ~300 pushed the member past its raft heartbeat window; it
+## fell out of quorum (stuck term 126), wedged, and crash-looped rke2-server ->
+## node NotReady -> cluster-wide pod cascade.
+##
+## etcd runs as a Burstable static pod with cpu.weight=29 (BELOW the cgroup
+## default of 100). Under CPU contention it therefore LOSES scheduling share,
+## and its fsync-issuing thread gets starved -> the stall. This DaemonSet keeps
+## etcd's cgroup cpu.weight pinned to the maximum (10000) and renices its
+## threads, so etcd always wins CPU when the node is saturated. cpu.weight is
+## work-conserving: because etcd's steady-state demand is small (~0.3 core), a
+## high weight does not reserve CPU or starve other pods -- it only guarantees
+## etcd is scheduled FIRST when contended.
+##
+## Re-applied every 30s because the etcd cgroup + PID are recreated on every
+## etcd restart (e.g. an rke2-server restart resets cpu.weight back to 29).
+##
+## IO priority is deliberately NOT the mechanism: the etcd DB lives on a
+## FusionIO device whose block queue exposes no scheduler ('none'), so
+## io.weight / ionice weight-control is a no-op on this hardware. CPU latency
+## is the effective lever; the etcd election-timeout was independently raised
+## 5s -> 10s (config.yaml.d/99-rejoin-server.yaml) to ride out any residual
+## stall. Companion to the D9 etcd-quorum alert (monitoring-rules/24-etcd-quorum.yml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-priority-script
+  namespace: etcd-priority
+data:
+  prioritize.sh: |
+    #!/bin/sh
+    set -u
+    CG_BASE=/sys/fs/cgroup
+    WEIGHT=10000
+    echo "etcd-priority: starting (cpu.weight=$WEIGHT, renice -15, 30s loop)"
+    while true; do
+      found=0
+      for d in /proc/[0-9]*; do
+        [ -r "$d/comm" ] || continue
+        [ "$(cat "$d/comm" 2>/dev/null)" = "etcd" ] || continue
+        pid=${d#/proc/}
+        found=1
+        # CPU scheduling priority for every etcd thread (per-task on Linux)
+        for t in "$d"/task/*; do
+          tid=${t##*/}
+          renice -n -15 "$tid" >/dev/null 2>&1
+        done
+        # Best-effort highest IO class (mostly symbolic on FusionIO, harmless)
+        ionice -c 2 -n 0 -p "$pid" >/dev/null 2>&1
+        # cgroup v2 cpu.weight on the etcd container scope AND its pod slice
+        cg=$(awk -F: '/^0::/{print $3}' "$d/cgroup" 2>/dev/null)
+        [ -n "$cg" ] || continue
+        [ -w "${CG_BASE}${cg}/cpu.weight" ] && echo "$WEIGHT" > "${CG_BASE}${cg}/cpu.weight" 2>/dev/null
+        pod=${cg%/*}
+        [ -w "${CG_BASE}${pod}/cpu.weight" ] && echo "$WEIGHT" > "${CG_BASE}${pod}/cpu.weight" 2>/dev/null
+      done
+      [ "$found" = 0 ] && echo "etcd-priority: no etcd process found on this node yet"
+      sleep 30
+    done
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: etcd-priority
+  namespace: etcd-priority
+  labels:
+    app.kubernetes.io/name: etcd-priority
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etcd-priority
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: etcd-priority
+    spec:
+      # hostPID: see the host's etcd process to renice it and read its cgroup.
+      hostPID: true
+      nodeSelector:
+        node-role.kubernetes.io/etcd: "true"
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      containers:
+        - name: prioritize
+          image: alpine:3.20
+          command: ["/bin/sh", "/scripts/prioritize.sh"]
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+      volumes:
+        - name: script
+          configMap:
+            name: etcd-priority-script
+            defaultMode: 0755
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
