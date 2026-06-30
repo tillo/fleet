@@ -34,7 +34,7 @@ data:
     set -u
     CG_BASE=/sys/fs/cgroup
     WEIGHT=10000
-    echo "etcd-priority: starting (cpu.weight=$WEIGHT, renice -15, 30s loop)"
+    echo "etcd-priority: starting (cpu.weight=$WEIGHT, nice=-20, 30s loop)"
     while true; do
       found=0
       for d in /proc/[0-9]*; do
@@ -42,10 +42,13 @@ data:
         [ "$(cat "$d/comm" 2>/dev/null)" = "etcd" ] || continue
         pid=${d#/proc/}
         found=1
-        # CPU scheduling priority for every etcd thread (per-task on Linux)
+        # Max CPU scheduling priority (nice -20) for every etcd thread.
+        # busybox renice -n is a RELATIVE adjustment, so -40 from any starting
+        # nice in [-20,19] deterministically clamps to the -20 floor in one step
+        # (idempotent: -20 + -40 -> clamps -20). Per-task: nice is per-thread.
         for t in "$d"/task/*; do
           tid=${t##*/}
-          renice -n -15 "$tid" >/dev/null 2>&1
+          renice -n -40 "$tid" >/dev/null 2>&1
         done
         # Best-effort highest IO class (mostly symbolic on FusionIO, harmless)
         ionice -c 2 -n 0 -p "$pid" >/dev/null 2>&1
