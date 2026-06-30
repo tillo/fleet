@@ -28,6 +28,14 @@ data:
       header.hero{padding:72px 0 40px;border-bottom:1px solid var(--line)}
       .badge{display:inline-block;font-size:13px;color:var(--accent-2);
         border:1px solid var(--line);border-radius:999px;padding:4px 12px;margin-bottom:18px}
+      .statusbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+      .statusbar .badge{margin-bottom:0}
+      .status{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);
+        border:1px solid var(--line);border-radius:999px;padding:4px 12px}
+      .status:hover{text-decoration:none;border-color:var(--accent);color:var(--ink)}
+      .sdot{width:9px;height:9px;border-radius:50%;background:var(--muted)}
+      .sdot.ok{background:#34d399}.sdot.minor{background:#fbbf24}.sdot.major{background:#fb923c}
+      .sdot.critical{background:#f87171}.sdot.maint{background:var(--accent)}
       h1{font-size:clamp(28px,5vw,44px);line-height:1.15;margin:.1em 0 .3em;letter-spacing:-.02em}
       h1 .dot{color:var(--accent)}
       .lede{font-size:clamp(16px,2.4vw,19px);color:var(--muted);max-width:64ch;margin:0 0 28px}
@@ -55,7 +63,12 @@ data:
     </head>
     <body>
     <header class="hero"><div class="wrap">
-      <span class="badge">self-hosted &middot; GitOps &middot; Kubernetes</span>
+      <div class="statusbar">
+        <span class="badge">self-hosted &middot; GitOps &middot; Kubernetes</span>
+        <a class="status" id="status-pill" href="https://mdapi.statuspage.io/" target="_blank" rel="noopener noreferrer" title="Live service status">
+          <span class="sdot" id="sdot"></span><span id="status-text">Service status</span>
+        </a>
+      </div>
       <h1>mdapi<span class="dot">.</span>ch</h1>
       <p class="lede">A self-hosted homelab running a production-grade Kubernetes stack at home —
          identity, mail, storage, automation, home-automation and the websites it hosts, all
@@ -63,6 +76,7 @@ data:
       <div class="cta">
         <a class="btn primary" href="https://docs.mdapi.ch">Explore the docs &rarr;</a>
         <a class="btn ghost" href="https://github.com/MDAPI-Repos">View the GitOps on GitHub</a>
+        <a class="btn ghost" href="https://mdapi.statuspage.io/" target="_blank" rel="noopener noreferrer">System status &rarr;</a>
       </div>
     </div></header>
 
@@ -134,7 +148,30 @@ data:
     <footer><div class="wrap">
       Built on RKE2 · Rancher · Fleet · Longhorn · Ceph · cert-manager.
       GitOps is public at <a href="https://github.com/MDAPI-Repos">github.com/MDAPI-Repos</a>.
+      Live status at <a href="https://mdapi.statuspage.io/">mdapi.statuspage.io</a>.
       Neighbours of the En&nbsp;Vuassu association: <a href="https://www.envuassu.ch">envuassu.ch</a>.
     </div></footer>
+
+    <script>
+    (function(){
+      var DESC={none:'All Systems Operational',minor:'Minor Service Issue',major:'Partial Outage',critical:'Major Outage',maintenance:'Under Maintenance'};
+      var CLS={none:'ok',minor:'minor',major:'major',critical:'critical',maintenance:'maint'};
+      fetch('https://mdapi.statuspage.io/api/v2/status.json',{cache:'no-store'})
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var i=(d&&d.status&&d.status.indicator)||'none';
+          var t=(d&&d.status&&d.status.description)||DESC[i]||'Service status';
+          var dot=document.getElementById('sdot');
+          if(dot){dot.className='sdot '+(CLS[i]||'ok');}
+          var el=document.getElementById('status-text');
+          if(el){el.textContent=t;}
+        })
+        .catch(function(){
+          var dot=document.getElementById('sdot');
+          if(dot){dot.className='sdot ok';}
+        });
+    })();
+    </script>
+    <script src="https://mdapi.statuspage.io/embed/script.js"></script>
     </body>
     </html>
