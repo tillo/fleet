@@ -1,0 +1,148 @@
+# En Vuassu neighbourhood homepage (envuassu.ch), rebuilt in-house.
+# Custom nginx image (Jekyll _site + an /enrol reverse-proxy) built by CI in
+# gitlab.mdapi.ch/mdapi/envuassu and pushed to zot.mdapi.ch/envuassu/site.
+# The /enrol proxy forwards the public sign-up form to the Windmill enrolment
+# flow (f/envuassu/enrol_resident) with a scoped token injected server-side.
+---
+# Scoped Windmill token (run:flow/f/envuassu/enrol_resident) — injected into
+# nginx as $WINDMILL_TOKEN so it never appears in the served HTML.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: envuassu-windmill-token
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: envuassu-windmill-token
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/envuassu/windmill-token/token
+      secretKey: token
+---
+# Pull secret for zot.mdapi.ch, templated from the zot htpasswd password.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-pull
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-pull
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: kubernetes.io/dockerconfigjson
+      engineVersion: v2
+      mergePolicy: Replace
+      data:
+        .dockerconfigjson: |
+          {"auths":{"zot.mdapi.ch":{"username":"zot","password":"{{ .password }}","auth":"{{ printf "zot:%s" .password | b64enc }}"}}}
+  data:
+    - remoteRef:
+        key: /mdapi/zot/zot-auth/password
+      secretKey: password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envuassu-site
+  # Floating :latest tracked by Keel (poll every 4h); reloader restarts on token rotation.
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envuassu-site
+  template:
+    metadata:
+      labels:
+        app: envuassu-site
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: site
+          image: zot.mdapi.ch/mdapi/envuassu:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          env:
+            # Consumed by the nginx entrypoint's envsubst into the /enrol proxy's
+            # Authorization header (see nginx.conf.template in the site repo).
+            - name: WINDMILL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: envuassu-windmill-token
+                  key: token
+          startupProbe:
+            httpGet: { path: /, port: 80 }
+            failureThreshold: 20
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envuassu-site
+spec:
+  selector:
+    app: envuassu-site
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: envuassu-site
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    # ModSec OFF — the /enrol JSON POST trips CRS false positives (per kustodyan-mcp/k8s-mcp).
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - envuassu.ch
+        - www.envuassu.ch
+      secretName: envuassu-site-tls
+  rules:
+    - host: envuassu.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: envuassu-site
+                port:
+                  number: 80
+    - host: www.envuassu.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: envuassu-site
+                port:
+                  number: 80
