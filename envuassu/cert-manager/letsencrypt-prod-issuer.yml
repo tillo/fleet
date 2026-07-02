@@ -10,14 +10,18 @@ spec:
       name: letsencrypt-prod
     server: https://acme-v02.api.letsencrypt.org/directory
     solvers:
+      # Post-NS-cutover the zone is served by our BIND (ns.mdapi.ch) — DNS-01
+      # goes through rfc2136/nsupdate like the mdapi.ch issuers. The former
+      # Infomaniak webhook solver stopped being usable the moment Infomaniak's
+      # nameservers stopped being authoritative for envuassu.ch.
       - dns01:
-          webhook:
-            groupName: acme.infomaniak.com
-            solverName: infomaniak
-            config:
-              apiTokenSecretRef:
-                name: infomaniak-api-credentials
-                key: api-token
+          rfc2136:
+            nameserver: 31.3.128.59:53
+            tsigKeyName: mdapi
+            tsigAlgorithm: HMACSHA256
+            tsigSecretSecretRef:
+              name: tsig-secret
+              key: tsig-secret-key
         selector:
           dnsZones:
           - 'envuassu.ch'
