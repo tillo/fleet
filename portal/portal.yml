@@ -1,0 +1,188 @@
+# mdapi family portal — static Basecoat front-end (repo mdapi/portal, web/)
+# over the Windmill portal endpoints. Served at panel.mdapi.ch behind the
+# oauth2-proxy-portal instance (any tilloch-realm user); the ingress forwards
+# the authenticated X-Auth-Request-Email and the pod's nginx injects it
+# server-side into every Windmill call (see web/nginx.conf.template in the
+# repo). Replaces the Lowcoder board at start.mdapi.ch after user sign-off —
+# cutover = move the host here and retire the lowcoder bundle.
+---
+# Scoped Windmill token (resolve_board + the three request runnables only).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: portal-windmill-token
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: portal-windmill-token
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/portal/windmill-token/token
+      secretKey: token
+---
+# Pull secret for zot.mdapi.ch, templated from the zot htpasswd password.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-pull
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-pull
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: kubernetes.io/dockerconfigjson
+      engineVersion: v2
+      mergePolicy: Replace
+      data:
+        .dockerconfigjson: |
+          {"auths":{"zot.mdapi.ch":{"username":"zot","password":"{{ .password }}","auth":"{{ printf "zot:%s" .password | b64enc }}"}}}
+  data:
+    - remoteRef:
+        key: /mdapi/zot/zot-auth/password
+      secretKey: password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal
+  # Floating :latest tracked by Keel; reloader restarts on token rotation.
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: portal
+  template:
+    metadata:
+      labels:
+        app: portal
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: portal
+          image: zot.mdapi.ch/mdapi/portal:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          env:
+            # Consumed by the nginx entrypoint's envsubst into the /api proxies'
+            # Authorization header (see web/nginx.conf.template in the repo).
+            - name: WINDMILL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: portal-windmill-token
+                  key: token
+          startupProbe:
+            httpGet: { path: /, port: 80 }
+            failureThreshold: 20
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal
+spec:
+  selector:
+    app: portal
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: portal
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-portal.oauth2-proxy.svc.cluster.local/portal/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/portal/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-Email
+    # ModSec OFF — the /api JSON POSTs trip CRS false positives (per
+    # kustodyan-mcp/envuassu precedent); the surface is SSO-gated anyway.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - panel.mdapi.ch
+      secretName: portal-tls
+  rules:
+    - host: panel.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: portal
+                port:
+                  number: 80
+---
+# Namespaced Let's Encrypt issuer (rfc2136 against our BIND, like the
+# mdapi.ch issuers in bootstrap/docs) + its TSIG secret.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+  namespace: portal
+spec:
+  acme:
+    email: tillo@tillo.ch
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    server: https://acme-v02.api.letsencrypt.org/directory
+    solvers:
+      - dns01:
+          rfc2136:
+            nameserver: 31.3.128.59:53
+            tsigKeyName: mdapi
+            tsigAlgorithm: HMACSHA256
+            tsigSecretSecretRef:
+              name: tsig-secret
+              key: tsig-secret-key
+        selector:
+          dnsZones:
+            - mdapi.ch
+      - http01:
+          ingress:
+            class: nginx
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: tsig-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: tsig-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/zot/tsig-secret/tsig-secret-key
+      secretKey: tsig-secret-key

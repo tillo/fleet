@@ -1,0 +1,85 @@
+# Third oauth2-proxy instance: the family portal (panel/start.mdapi.ch).
+# Unlike admin/tv this one has NO role restriction — every tilloch-realm user
+# may sign in; the portal backend (resolve_board) decides what they see.
+# set_xauthrequest exposes X-Auth-Request-Email on the auth response so the
+# consuming ingress can forward the identity to the portal nginx, which
+# injects it server-side into the Windmill calls.
+replicaCount: 2
+
+config:
+  provider: keycloak-oidc
+  cookieName: mdapi-portal
+  existingSecret: oauth2-proxy-portal-credentials
+  configFile: |-
+    provider="keycloak-oidc"
+    provider_display_name="MDAPI"
+    proxy_prefix="/portal/oauth2"
+    redirect_url="https://auth.mdapi.ch/portal/oauth2/callback"
+    oidc_issuer_url="https://idp.mdapi.ch/realms/tilloch"
+    skip_provider_button=true
+    cookie_domains=["mdapi.ch"]
+    whitelist_domains=[".mdapi.ch"]
+    email_domains=["*"]
+    set_xauthrequest=true
+sessionStorage:
+  type: redis
+  redis:
+    clientType: sentinel
+    sentinel:
+      masterName: mymaster
+      connectionUrls:
+        - redis://oauth2-proxy-portal-redis-ha:26379
+redis-ha:
+  enabled: true
+  persistentVolume:
+    enabled: false
+  image:
+    repository: zot.mdapi.ch/library/redis
+    tag: 8.2.4-alpine
+    pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: zot-pull
+ingress:
+  enabled: true
+  path: /portal
+  hosts:
+    - auth.mdapi.ch
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      SecRule REQUEST_URI "@rx ^/portal/oauth2/(?:start|auth)" \
+        "id:1000,\
+        phase:1,\
+        pass,\
+        t:none,\
+        nolog,\
+        ctl:ruleRemoveById=949110"
+  tls:
+    - secretName: auth-cert
+      hosts:
+        - auth.mdapi.ch
+image:
+  registry: zot.mdapi.ch
+  repository: oauth2-proxy/oauth2-proxy
+  tag: v7.15.2
+  pullPolicy: IfNotPresent
+imagePullSecrets:
+  - name: zot-pull
+keelImageRepository: zot.mdapi.ch/oauth2-proxy/oauth2-proxy
+keel:
+  policy: minor
+  trigger: poll
+  pollSchedule: "@every 4h"
+  images:
+    - repository: keelImageRepository
+      tag: image.tag
