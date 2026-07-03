@@ -148,3 +148,29 @@ spec:
           HelmChartConfig still carries the `enabled: false` flags and that Fleet
           has reconciled it; then confirm the embedded Prometheus/AM/Grafana/adapter
           are gone again.
+
+  - name: meta-monitoring.scrape-targets
+    rules:
+    - alert: SnmpTargetDown
+      ## A dead SNMP scrape target previously went unnoticed for 9 days:
+      ## the zyxel rez AP (192.168.1.199) power-cycled 2026-06-24 and came
+      ## back with SNMP disabled (the activation had never been written to
+      ## startup config), and nothing alerted on up==0 for the snmp jobs.
+      ## Covers every job scraped through snmp-exporter (aruba-snmp,
+      ## host_snmp, ilo_snmp, msm_snmp, zyxel_snmp + future additions).
+      ## `for: 30m` rides out device reboots and firmware flashes.
+      expr: up{job=~".*snmp.*"} == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "SNMP target {{ $labels.instance }} ({{ $labels.job }}) unreachable"
+        description: |
+          The SNMP scrape target {{ $labels.instance }} of job {{ $labels.job }}
+          has been down for 30 minutes. If the device is reachable (ping/ssh)
+          but SNMP is off, check whether its SNMP config survived the last
+          reboot — on the Zyxel AP, CLI changes are lost unless saved with
+          `write`. Probe manually:
+            kubectl --context=mdapi-prod get --raw "/api/v1/namespaces/monitoring/services/snmp-exporter:9116/proxy/snmp?target={{ $labels.instance }}&auth=public_v2c&module=ifmib"
