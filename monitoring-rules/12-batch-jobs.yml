@@ -583,6 +583,9 @@ spec:
   - name: app-batch-jobs.infra-health
     rules:
     - alert: FleetBundlesNotReady
+      ## Since 2026-07-03 the gauge is split per fleet cluster (daily_infra_health
+      ## emits cluster="mdapi"|"local"|"c-rackspacetest2"|...) so breakage on one
+      ## cluster can't hide new breakage on another. One alert fires per cluster.
       expr: fleet_bundle_deployments_not_ready > 0
       for: 30m
       labels:
@@ -590,7 +593,7 @@ spec:
         component: Platform
         team: mdapi
       annotations:
-        summary: "{{ $value }} Fleet BundleDeployment(s) not Ready"
+        summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }}"
         description: "Check via `kubectl --context mdapi-rancher get bundledeployments -A | grep -v Ready`."
     - alert: CertExpiringSoon
       expr: cert_expiry_days < 30
