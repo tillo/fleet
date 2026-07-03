@@ -48,9 +48,10 @@ secret-scan:
 
 # Renovate — Lane-B image bumps + all Fleet Helm chart versions (config in
 # renovate.json). Runs ONLY on a pipeline
-# schedule or a manual web run, never on normal pushes/MRs. Opens MRs (automerge
-# OFF). Token from the masked RENOVATE_TOKEN CI variable (Akeyless source of truth:
-# /mdapi/renovate/gitlab-token). Part of the 2026-06 image-policy work.
+# schedule or a manual web run, never on normal pushes/MRs. Minor/patch MRs
+# auto-merge after their soak window (renovate.json, owner decision 2026-06-29);
+# majors stay MR-only. Token from the masked RENOVATE_TOKEN CI variable (Akeyless
+# source of truth: /mdapi/renovate/gitlab-token). Part of the 2026-06 image-policy work.
 #
 # Release notes: Renovate runs on GitLab but several Lane-B deps (zot, Technitium,
 # keel) have sourceUrl on github.com. Fetching their changelogs needs a github.com
@@ -77,5 +78,27 @@ renovate:
     RENOVATE_GIT_AUTHOR: "Renovate Bot <renovate@mdapi.ch>"
     RENOVATE_HOST_RULES: '[{"matchHost":"registry.mdapi.ch","hostType":"docker","username":"renovate-bot","password":"$RENOVATE_TOKEN"}]'
     LOG_LEVEL: info
+  before_script:
+    # This GitLab recomputes MR mergeability only ON DEMAND: after any push to
+    # main, every open MR sits at detailed_merge_status=checking until something
+    # asks for a recheck, so Renovate's nightly automerge pass saw the MRs as
+    # unmergeable and never merged them (diagnosed 2026-07-03: four nights of
+    # green, conflict-free minor-bump MRs left open; sidekiq shows
+    # MergeRequestMergeabilityCheckWorker firing only for explicit API
+    # rechecks). Poke a synchronous recheck for every open renovate/* MR and
+    # give the workers a moment before Renovate evaluates automerge.
+    - |
+      node -e '
+      const base = process.env.CI_API_V4_URL, proj = process.env.CI_PROJECT_ID;
+      const h = {"PRIVATE-TOKEN": process.env.RENOVATE_TOKEN};
+      (async () => {
+        const mrs = await (await fetch(`${base}/projects/${proj}/merge_requests?state=opened&per_page=100`, {headers: h})).json();
+        for (const m of mrs.filter(m => m.source_branch.startsWith("renovate/"))) {
+          await fetch(`${base}/projects/${proj}/merge_requests/${m.iid}?with_merge_status_recheck=true`, {headers: h});
+          console.log(`mergeability recheck poked: !${m.iid} ${m.source_branch}`);
+        }
+        await new Promise(r => setTimeout(r, 20000));
+      })().catch(e => console.error("recheck poke failed (non-fatal):", e.message));
+      '
   script:
     - renovate
