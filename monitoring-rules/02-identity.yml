@@ -87,3 +87,45 @@ spec:
         team: mdapi
       annotations:
         summary: "openldap/{{ $labels.pod }} restarting frequently"
+
+    - alert: IdentityOpenLDAPSocketLeak
+      ## 2026-07-02: Joplin's LDAP SSO leaked one slapd socket per auth attempt
+      ## until slapd hit its fd ceiling (then 1024, ULIMIT_N now 8192) — postfix
+      ## LDAP lookups timed out and inbound mail 451-tempfailed for ~15h.
+      ## Healthy baseline is ~10–30 sockets; the incident peaked at 1017.
+      expr: |
+        max by (pod) (
+          container_sockets{namespace="openldap", container="openldap"}
+        ) > 500
+      for: 30m
+      labels:
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} holding {{ $value }} sockets — client connection leak"
+        description: |
+          Some LDAP client is leaking connections (2026-07-02 culprit: Joplin
+          LDAP SSO — sessions from the owner-share-sync cron + MCP). At the
+          ULIMIT_N=8192 ceiling slapd stops answering and mail tempfails.
+          Find the leaker: decode /proc/net/tcp in the openldap pod, group
+          remote IPs, map to pods. Fix: rollout restart the leaking client
+          (e.g. kubectl -n joplin rollout restart deploy/joplin).
+
+    - alert: IdentityOpenLDAPSocketExhaustionNear
+      expr: |
+        max by (pod) (
+          container_sockets{namespace="openldap", container="openldap"}
+        ) > 6000
+      for: 10m
+      labels:
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} at {{ $value }} sockets — nearing the 8192 fd ceiling"
+        description: |
+          slapd is close to its ULIMIT_N=8192 file-descriptor ceiling; binds
+          will start timing out (Keycloak logins + postfix recipient lookups
+          -> mail 451). Restart the leaking client pod NOW (see
+          IdentityOpenLDAPSocketLeak) or restart openldap as a stopgap.
