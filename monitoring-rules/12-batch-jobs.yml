@@ -586,7 +586,13 @@ spec:
       ## Since 2026-07-03 the gauge is split per fleet cluster (daily_infra_health
       ## emits cluster="mdapi"|"local"|"c-rackspacetest2"|...) so breakage on one
       ## cluster can't hide new breakage on another. One alert fires per cluster.
-      expr: fleet_bundle_deployments_not_ready > 0
+      ## c-rackspacetest2 is EXCLUDED: 11 bundles sit in a terminal fleet-agent
+      ## phantom state ("release secrets vN not found" with zero release secrets
+      ## in existence — 2026-06-30/07-04 investigations; only cluster re-import or
+      ## decommission cures it). Workloads there are healthy; the cluster is
+      ## awaiting decommission. Remove the exclusion (or the whole label) when it
+      ## goes away. The series itself still exists for dashboards.
+      expr: fleet_bundle_deployments_not_ready{cluster!="c-rackspacetest2"} > 0
       for: 30m
       labels:
         severity: warning
