@@ -16,6 +16,17 @@ metadata:
       SecAuditLogFormat JSON
       SecAuditLog /dev/stdout
       SecDebugLog /tmp/modsec_debug.log
+      ## Keycloak admin REST uses PUT for user updates and for
+      ## execute-actions-email, DELETE for removals. CRS default
+      ## tx.allowed_methods is GET HEAD POST OPTIONS, so PUT scores 5 on
+      ## rule 911100 and trips the 949110 anomaly threshold. This blocked
+      ## the envuassu resident provisioning flow
+      ## (f/envuassu/provision_resident, internal 192.168.1.254) on
+      ## 2026-07-04. Same setvar pattern as paperless-ing.yml id:1002;
+      ## ctl:ruleRemoveById=911100 does not work from here because 911100
+      ## is itself phase 1 inside the CRS Include.
+      ## NOTE: no apostrophes anywhere in this snippet including comments.
+      SecAction "id:1002,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
 spec:
   ingressClassName: nginx
