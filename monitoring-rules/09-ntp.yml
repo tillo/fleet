@@ -119,6 +119,27 @@ spec:
           all time sources (GPS refclock and upstream NTP). Clients
           will reject it as unsynchronised.
 
+    - alert: NtpChronyGpsRefclockLost
+      ## The pool chrony serves stratum 1 from the GPS NMEA+PPS refclocks;
+      ## stratum 2-15 means it silently fell back to network sources. On
+      ## 2026-07-04 gpsd's TIOCMGET PPS thread died on a transient tty EIO and
+      ## the pool sat at stratum 2 for ~3h — only the >=16 rule existed, so
+      ## nobody was paged. `for: 1h` rides out pod restarts (PPS re-locks in
+      ## ~3 minutes after a clean start).
+      expr: ntp_probe_stratum > 1 and ntp_probe_stratum < 16
+      for: 1h
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "pool chrony degraded to stratum {{ $value }} (GPS refclock lost)"
+        description: |
+          chrony (ntppool ns, LB 192.168.1.58) is serving from network NTP
+          instead of GPS. Check `chronyc sources` in the pod: if PPS reach
+          is 0 while /sys/class/pps/pps0/assert on qui still ticks, gpsd's
+          PPS thread died — restart the chrony deployment.
+
     - alert: NtpProbeStale
       expr: time() - ntp_probe_last_run_timestamp_seconds > 1800
       for: 5m
