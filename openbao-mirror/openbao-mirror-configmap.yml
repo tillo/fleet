@@ -23,10 +23,12 @@ data:
         if tok_hdr:
             h["X-Vault-Token"] = tok_hdr
         data = json.dumps(body).encode()
-        # Retry transient network/DNS failures (e.g. EAI_AGAIN resolving
-        # cm.mdapi.ch) so a brief blip doesn't fail the whole hourly run.
-        # An HTTPError (4xx/5xx) is a real answer and is never retried.
-        for attempt in range(5):
+        # Retry transient network failures. OSError (not just URLError) so
+        # read-timeouts (TimeoutError, 2026-06-30) are covered too, and the
+        # backoff window is ~2 min because the 2026-07-05 DNS blip outlasted
+        # the previous 20 s schedule. An HTTPError (4xx/5xx) is a real answer
+        # and is never retried.
+        for attempt in range(8):
             try:
                 req = urllib.request.Request(url, data=data, headers=h, method="POST")
                 with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
@@ -34,10 +36,10 @@ data:
                     return json.loads(b) if b else {}
             except urllib.error.HTTPError:
                 raise
-            except urllib.error.URLError:
-                if attempt == 4:
+            except OSError:
+                if attempt == 7:
                     raise
-                time.sleep(2 * (attempt + 1))
+                time.sleep(min(60, 2 ** attempt))
 
     aktok = post(f"{AK}/auth", {"access-id": akid, "access-type": "api_key", "access-key": akkey})["token"]
     baotok = post(f"{BAO}/v1/auth/kubernetes/login", {"role": "mirror", "jwt": sa})["auth"]["client_token"]
@@ -70,30 +72,48 @@ data:
                  "CLASSIC_KEY", "DFC", "GPG"}
     ok = err = dyn = skipped = 0
     errs = []
+
+    def mirror_one(name, itype):
+        rel = name[len("/mdapi/"):] if name.startswith("/mdapi/") else name.lstrip("/")
+        if itype in KEY_TYPES:
+            return "skip"
+        if itype == "DYNAMIC_SECRET":
+            # Materialize the producer and store a point-in-time STATIC
+            # snapshot in OpenBao as a DR fallback. TODO (implement dynamic
+            # later): give OpenBao its own DB secrets engine instead.
+            v = post(f"{AK}/get-dynamic-secret-value", {"token": aktok, "name": name})
+            post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": json.dumps(v)}}, tok_hdr=baotok)
+            return "dyn"
+        v = post(f"{AK}/get-secret-value", {"token": aktok, "names": [name]})
+        val = v.get(name)
+        if val is None:
+            return "noval"
+        if not isinstance(val, str):
+            val = json.dumps(val)
+        post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": val}}, tok_hdr=baotok)
+        return "ok"
+
     for name, itype in items:
         try:
-            rel = name[len("/mdapi/"):] if name.startswith("/mdapi/") else name.lstrip("/")
-            if itype in KEY_TYPES:
-                skipped += 1
-                continue
-            if itype == "DYNAMIC_SECRET":
-                # Materialize the producer and store a point-in-time STATIC
-                # snapshot in OpenBao as a DR fallback. TODO (implement dynamic
-                # later): give OpenBao its own DB secrets engine instead.
-                v = post(f"{AK}/get-dynamic-secret-value", {"token": aktok, "name": name})
-                post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": json.dumps(v)}}, tok_hdr=baotok)
-                dyn += 1
-                continue
-            v = post(f"{AK}/get-secret-value", {"token": aktok, "names": [name]})
-            val = v.get(name)
-            if val is None:
-                err += 1; errs.append(name + ":noval"); continue
-            if not isinstance(val, str):
-                val = json.dumps(val)
-            post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": val}}, tok_hdr=baotok)
-            ok += 1
+            try:
+                res = mirror_one(name, itype)
+            except Exception:
+                # One item-level retry: a single slow dynamic-secret
+                # materialization (2026-06-30 paperless-pg-readonly) failed the
+                # whole run's exit code even though 369/370 items mirrored.
+                time.sleep(5)
+                res = mirror_one(name, itype)
         except Exception as e:
             err += 1; errs.append(f"{name}:{type(e).__name__}")
+            continue
+        if res == "skip":
+            skipped += 1
+        elif res == "dyn":
+            dyn += 1
+        elif res == "noval":
+            err += 1; errs.append(name + ":noval")
+        else:
+            ok += 1
     print(f"mirrored={ok} dynamic={dyn} skipped_keys={skipped} errors={err}", flush=True)
     for e in errs[:25]:
         print("ERR", e)
