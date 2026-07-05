@@ -20,6 +20,8 @@ spec:
       labels:
         app: home-assistant
     spec:
+      # Home's control plane — evicted last among user workloads (N-1 program).
+      priorityClassName: mdapi-critical
       # Pinned to the node that physically hosts the Zigbee USB stick.
       # Pod is privileged, so /dev access is granted unconditionally —
       # no device plugin needed. Edit this if the stick is moved.
@@ -89,7 +91,17 @@ spec:
         - name: dev-serial
           mountPath: /dev/serial
           readOnly: true
-        resources: {}
+        # Honest request = observed steady-state (~2.4Gi). The main container was
+        # BestEffort ({}), so HA was first against the wall on node-memory
+        # eviction/OOM — unacceptable for the home's control plane (2026-07-05
+        # N-1 program). Limit left generous for recorder/history spikes; this
+        # only makes the scheduler account for memory HA already uses.
+        resources:
+          requests:
+            cpu: 200m
+            memory: 2560Mi
+          limits:
+            memory: 4Gi
       # Sidecar: hourly off-site sync of /config/backups → Garage S3.
       # Local retention is unchanged (auto_backup keeps the rolling window).
       - name: rclone-backups-s3
