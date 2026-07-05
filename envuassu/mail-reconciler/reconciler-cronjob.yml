@@ -1,0 +1,99 @@
+# Shared-mailbox reconciler (2026-07-05). Makes the ask->approve->enroll->CONFIGURE
+# loop fully automatic: for each Nextcloud group -> shared @envuassu.ch mailbox, it
+# ensures every group member's Nextcloud Mail has the shared account configured.
+# Idempotent (skips accounts already present), so it simply catches members up as
+# they first log in via SSO (which is when their NC account materialises), and
+# configures newly-provisioned shared addresses for their group. Runs every 30 min.
+#
+# Nextcloud Mail's built-in provisioning can't do this (it maps a user's OWN email
+# domain to a personal mailbox; we need a group-scoped SHARED mailbox), hence this.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mail-reconciler-script
+  namespace: envuassu
+data:
+  # MAP format: one "group|address|PWENV|label" per line. Add a line to grant a new
+  # shared mailbox to a Nextcloud group; passwords come from the envuassu-shared-mail
+  # secret (envvar named in field 3).
+  map.txt: |
+    Comité|contact@envuassu.ch|CONTACT_PW|PPE En Vuassu (Comité)
+    Finance|finance@envuassu.ch|FINANCE_PW|PPE En Vuassu (Finance)
+  reconcile.sh: |
+    #!/bin/sh
+    set -eu
+    NS=envuassu
+    NCPOD=$(kubectl -n "$NS" get pod -l io.kompose.service=nextcloud-aio-nextcloud \
+             -o jsonpath='{.items[0].metadata.name}')
+    [ -n "$NCPOD" ] || { echo "no nextcloud pod found"; exit 1; }
+    occ() { kubectl -n "$NS" exec "$NCPOD" -c nextcloud-aio-nextcloud -- \
+              sudo -u www-data php -d memory_limit=512M /var/www/html/occ "$@"; }
+    GROUPS=$(occ group:list --output=json 2>/dev/null)
+    created=0; skipped=0; failed=0
+    # read the group->mailbox map
+    while IFS='|' read -r grp addr pwenv label; do
+      [ -n "$grp" ] || continue
+      case "$grp" in \#*) continue;; esac
+      pw=$(eval "printf '%s' \"\$$pwenv\"")
+      [ -n "$pw" ] || { echo "no password in \$$pwenv for $addr, skipping group $grp"; continue; }
+      echo "$GROUPS" | jq -r --arg g "$grp" '.[$g][]? // empty' | while IFS= read -r m; do
+        [ -n "$m" ] || continue
+        if occ mail:account:export "$m" 2>/dev/null | grep -qF "E-Mail: $addr"; then
+          echo "ok      $m already has $addr"
+        elif occ mail:account:create "$m" "$label" "$addr" \
+               mail.mdapi.ch 993 ssl "$addr" "$pw" \
+               mail.mdapi.ch 465 ssl "$addr" "$pw" password >/dev/null 2>&1; then
+          echo "created $m <- $addr"
+        else
+          echo "FAILED  $m <- $addr"
+        fi
+      done
+    done < /config/map.txt
+    echo "reconcile complete"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mail-reconciler
+  namespace: envuassu
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: mail-reconciler
+        spec:
+          serviceAccountName: mail-reconciler
+          restartPolicy: Never
+          automountServiceAccountToken: true
+          containers:
+            - name: reconciler
+              image: alpine/k8s:1.31.1
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/reconcile.sh"]
+              envFrom:
+                - secretRef:
+                    name: envuassu-shared-mail
+              volumeMounts:
+                - { name: script, mountPath: /scripts }
+                - { name: mapcfg, mountPath: /config }
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { memory: 256Mi }
+          volumes:
+            - name: script
+              configMap:
+                name: mail-reconciler-script
+                items: [{ key: reconcile.sh, path: reconcile.sh }]
+            - name: mapcfg
+              configMap:
+                name: mail-reconciler-script
+                items: [{ key: map.txt, path: map.txt }]
