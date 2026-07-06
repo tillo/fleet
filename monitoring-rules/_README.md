@@ -1,35 +1,75 @@
 # monitoring-rules
 
-App-level PrometheusRule + (later) AlertmanagerConfig CRDs that the
-existing rancher-monitoring stack picks up automatically (its operator
-selectors are `{}` for SM/PM/Rule/AlertmanagerConfig and a label match
-on Probe).
+App-level `PrometheusRule` CRDs for the **mdapi** monitoring stack. The VictoriaMetrics
+operator converts every PrometheusRule carrying `monitoring-stack: mdapi` into a VMRule;
+vmalert evaluates them; alerts route through the VMAlertmanager config in
+`../monitoring-vmalertmanager-config/`.
 
-## Conventions
+Rewritten 2026-07-06 (fleet+vmalert cleanup — see `~/fleet-monitoring-study/PROPOSAL.md`).
+Conventions here are enforced by **Check D in `../lint.py`** (runs in fleet CI).
 
-Every alert MUST carry these labels so AM routing and the statuspage
-adapter know what to do:
+## Routing — read this before adding an alert
 
-| Label | Values | Purpose |
-|-------|--------|---------|
-| `severity` | `critical`, `warning`, `info` | Maps to statuspage status: critical→major_outage, warning→degraded_performance |
-| `component` | `Mail`, `Identity`, `GitLab`, `Files`, `Notes`, `Websites`, `DNS` | Maps to statuspage component_id (see memory `reference_statuspage_components`) |
-| `team` | `mdapi` | Distinguishes our alerts from rancher-monitoring's defaults so AM routes can scope cleanly |
+The parent route is a **deliberate black-hole**: an alert that matches no child route is
+evaluated, fires, and is silently dropped. The child routes match `team="mdapi"` and tier by
+severity:
 
-Annotations that should always be set:
-- `summary` — short, one-line, includes `{{ $labels.namespace }}/{{ $labels.deployment_or_pod }}`
-- `description` — longer; what it means and what to check
+| severity | Pushover priority | repeat |
+|---|---|---|
+| `critical` | 1 (interrupts) | 4h |
+| `warning` / `info` | −1 (in-app, silent) | 7d |
 
-## Files
+The deadman (`WatchdogMdapi`, `team: mdapi-watchdog`, `severity: none`) has its own VMAC route.
+**History:** 94 alerts — the entire imported Ceph pack among them — carried no `team` label and
+notified nobody until 2026-07-06 (the 07-04 qui wedge evicted 5 Ceph OSDs without a single
+Ceph page). That is why the label contract below is lint-enforced.
 
-- `00-namespace.yml` — the `monitoring` namespace
-- `01-mail.yml` … `07-dns.yml` — one PrometheusRule per statuspage component
+## Label contract (every alert)
 
-## What this bundle does NOT do
+| Label | Required value | Purpose |
+|---|---|---|
+| `team` | `mdapi` (`mdapi-watchdog` for the deadman only) | escapes the black-hole |
+| `severity` | `critical` \| `warning` \| `info` | Pushover tier + statuspage status |
+| `component` | one of the taxonomy below | Alertmanager grouping + statuspage component |
 
-- No AlertmanagerConfig yet (added in `monitoring-alertmanager-config` bundle)
-- No receivers wired (Pushover / statuspage adapter come later)
-- No exporter-specific alerts (postfix-exporter, blackbox come in their own bundles)
+Component taxonomy (source of truth — lint's `RULE_COMPONENTS` mirrors it; the statuspage
+mapping lives in `../monitoring-statuspage-adapter/adapter-cm.yml` components.json):
 
-So pushing this bundle alone changes nothing visible — the alerts will load
-into Prometheus's `/alerts` page but won't notify anyone yet.
+- **statuspage-mapped:** `Mail`, `Sign-in (SSO)`, `Files & Documents`, `Websites`, `DNS`,
+  `Internet`, `Smart Home`, `Platform`, `Backups`, `NTP`
+- **internal-only (Pushover, no statuspage component):** `Storage`, `Logging` — the adapter
+  logs "unknown component" (throttled) and skips them, by design
+
+Exceptions (also encoded in lint): the three `SyntheticProbe*` alerts inherit `component`
+per-target from the blackbox Probe `targetLabels` — do NOT add a static component there
+(rule labels override series labels and would clobber the per-target value).
+
+Annotations: `summary` (one line, include the failing object), `description` (what it means,
+what to check, and the runbook/memory pointer when one exists).
+
+## File numbering
+
+- `NN-topic.yml`, two digits; take the **next free number** for a new topic.
+- `NNa-`, `NNb-` letter suffixes are for a **related sub-series** of NN only
+  (e.g. `20-longhorn-disk-capacity` / `20a-pvc-growth`).
+- Never reuse a freed number; collisions fail CI (lint `RULES-NUMBERING`).
+
+| Range in use | Theme (grown, not designed — bands are not enforced) |
+|---|---|
+| 01–08 | statuspage components / user-facing services |
+| 09–17 | probes, logging pipeline*, monitor-the-monitoring, watchdog |
+| 18–25 | nodes, storage (Longhorn/PV), router |
+| 26–31 | platform services (OpenBao, certs, ESO), Ceph, VolSync |
+
+(*) The `13*/14*/15-logging-flow/output` files hold ClusterFlow/ClusterOutput CRDs and are
+being rehomed to the `monitoring-logging` bundle; the Probe files (`10`, `17`) to
+`monitoring-blackbox`. After that, this bundle is PrometheusRule-only.
+
+## Adding an alert — checklist
+
+1. Pick the file by topic (or a new `NN-topic.yml` with the next free number).
+2. Labels per the contract above; severity honestly (`critical` buzzes the phone).
+3. `python3 ../lint.py` locally, or let CI catch it.
+4. Windmill-pushed metrics: the generic `BatchJobStale` in `12-batch-jobs.yml` already covers
+   staleness of any job that pushes `<job>_last_run_timestamp_seconds` — don't add per-job
+   staleness rules. Business rules go in a per-script group `app-batch-jobs.<name>`.

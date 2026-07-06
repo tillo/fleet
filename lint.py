@@ -249,6 +249,78 @@ for path in all_yaml_files():
 
 
 # ---------------------------------------------------------------------------
+# Check D — monitoring-rules alert label contract (black-hole guard)
+# ---------------------------------------------------------------------------
+# The mdapi Alertmanager parent route is a deliberate black-hole: an alert
+# without team=mdapi (mdapi-watchdog for the deadman) is evaluated, fires, and
+# is silently dropped at routing. 94 alerts — the entire imported Ceph pack
+# among them — sat in that state until 2026-07-06. This check makes the label
+# contract structural. Taxonomy source of truth: monitoring-rules/_README.md.
+
+RULE_COMPONENTS = {
+    # statuspage-mapped
+    "Mail", "Sign-in (SSO)", "Files & Documents", "Websites", "DNS",
+    "Internet", "Smart Home",
+    # internal-only
+    "Platform", "Storage", "Backups", "Logging", "NTP",
+}
+RULE_SEVERITIES = {"critical", "warning", "info"}
+RULE_TEAMS = {"mdapi", "mdapi-watchdog"}
+# component inherited from series labels (blackbox Probe targetLabels):
+RULE_COMPONENT_EXEMPT = {"SyntheticProbeFailing", "SyntheticProbeSlowResponse",
+                         "SyntheticProbeTLSExpiringSoon"}
+# the deadman: severity none by design, routed by its own VMAC on team:
+RULE_FULL_EXEMPT = {"WatchdogMdapi"}
+
+_seen_prefix: dict[str, str] = {}
+for path in sorted((REPO / "monitoring-rules").glob("*.yml")):
+    m = re.match(r"^(\d+[a-z]?)-", path.name)
+    if m:
+        if m.group(1) in _seen_prefix:
+            errors.append(
+                f"[RULES-NUMBERING] monitoring-rules/{path.name} collides with "
+                f"{_seen_prefix[m.group(1)]} on prefix {m.group(1)} — pick the "
+                "next free number (letter suffix only for a related sub-series)."
+            )
+        else:
+            _seen_prefix[m.group(1)] = path.name
+    for doc in load_docs(path):
+        if not isinstance(doc, dict) or doc.get("kind") != "PrometheusRule":
+            continue
+        if doc.get("metadata", {}).get("labels", {}).get("monitoring-stack") != "mdapi":
+            errors.append(
+                f"[RULES-SELECTOR] monitoring-rules/{path.name}: PrometheusRule "
+                f"{doc.get('metadata', {}).get('name')} lacks `monitoring-stack: "
+                "mdapi` — vmalert will never load it."
+            )
+        for grp in (doc.get("spec", {}).get("groups") or []):
+            for rule in (grp.get("rules") or []):
+                if "alert" not in rule:
+                    continue
+                name = rule["alert"]
+                lab = rule.get("labels") or {}
+                where = f"monitoring-rules/{path.name}: alert {name}"
+                if lab.get("team") not in RULE_TEAMS:
+                    errors.append(
+                        f"[RULES-TEAM] {where}: team={lab.get('team')!r} — the "
+                        "parent route black-holes it; nobody will ever be notified."
+                    )
+                if name in RULE_FULL_EXEMPT:
+                    continue
+                if lab.get("severity") not in RULE_SEVERITIES:
+                    errors.append(
+                        f"[RULES-SEVERITY] {where}: severity={lab.get('severity')!r} "
+                        f"not in {sorted(RULE_SEVERITIES)}."
+                    )
+                if name not in RULE_COMPONENT_EXEMPT and lab.get("component") not in RULE_COMPONENTS:
+                    errors.append(
+                        f"[RULES-COMPONENT] {where}: component={lab.get('component')!r} "
+                        "not in the _README.md taxonomy (statuspage mapping + "
+                        "Pushover grouping key on it)."
+                    )
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 for w in warnings:
