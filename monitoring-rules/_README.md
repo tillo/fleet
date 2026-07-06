@@ -61,9 +61,12 @@ what to check, and the runbook/memory pointer when one exists).
 | 18–25 | nodes, storage (Longhorn/PV), router |
 | 26–31 | platform services (OpenBao, certs, ESO), Ceph, VolSync |
 
-(*) The `13*/14*/15-logging-flow/output` files hold ClusterFlow/ClusterOutput CRDs and are
-being rehomed to the `monitoring-logging` bundle; the Probe files (`10`, `17`) to
-`monitoring-blackbox`. After that, this bundle is PrometheusRule-only.
+(*) The logging ClusterFlow/ClusterOutput CRs moved to the `monitoring-logging-flows`
+bundle (2026-07-06). The blackbox Probe files (`10`, `17`) STAY here by design: the
+monitoring-blackbox bundle is an external-chart bundle (raw manifests beside it are ignored
+by Fleet), and the Probes belong next to the `11-blackbox-alerts` that fire on their metrics.
+15b keeps its ServiceMonitor for the same external-chart reason. So: this bundle =
+PrometheusRules + the Probe targets they alert on.
 
 ## Adding an alert — checklist
 
