@@ -909,3 +909,72 @@ spec:
           Stream is within 5% of its stream-ca certificate cap
           ({{ with query "stream_certificate_count{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }}/{{ with query "stream_license_certificate_limit{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }}).
           CA issuance is blocked at 100% — install a larger Stream license now.
+
+  - name: app-batch-jobs.image-policy
+    rules:
+    ## Source: f/infra_health/image_policy_lint (Windmill, daily 05:20 Zurich) —
+    ## the 2-lane pull-policy convention from the 2026-06-06 postmortem (A2).
+    ## Lane A = floating tag + Always + keel annotation (apps).
+    ## Lane B = pinned tag + IfNotPresent, Renovate-driven (bootstrap-critical).
+    ## The lint job group is fully replaced on every push, so a fixed violation
+    ## clears the alert on the next daily run.
+    - alert: ImagePolicyFail
+      expr: max(image_policy_fail_total) > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} image-policy FAIL violation(s) — bootstrap-critical off Lane B or un-updatable image"
+        description: |
+          The image-policy lint found FAIL-class violations: a bootstrap-critical
+          workload off Lane B (pinned+IfNotPresent), or floating+IfNotPresent
+          (can never update). This is the cold-bootstrap deadlock class from the
+          2026-06-06 postmortem.
+          Targets: {{ range query "image_policy_violation{severity='fail'} == 1" }}{{ .Labels.target }} ({{ .Labels.image }}); {{ end }}
+          Fix the fleet manifest per lane, or update the lint's CRITICAL/ALLOW sets.
+
+    - alert: ImagePolicyWarn
+      ## 50h = two daily lint runs must confirm, so a short-lived experiment or
+      ## a workload deployed minutes before the lint doesn't page.
+      expr: max(image_policy_warn_total) > 0
+      for: 50h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} image-policy WARN violation(s) for >2 days — workload with no updater driving it"
+        description: |
+          WARN-class lint violations persisting across daily runs: floating+Always
+          with NO keel annotation (nothing updates it — how the akeyless-pg-bridge
+          wireguard sat unnoticed), pinned+Always (boot-fragile), or unclassified.
+          Targets: {{ range query "image_policy_violation{severity='warn'} == 1" }}{{ .Labels.target }} ({{ .Labels.image }}); {{ end }}
+          Put each on a lane: add keel.sh annotations (Lane A) or pin + IfNotPresent
+          under Renovate (Lane B).
+
+    - alert: KeelUpdatesSilent
+      ## keel_updates_7d comes from f/infra_health/keel_update_log (weekly Mon
+      ## 07:55). Several keel-managed images rebuild at least weekly
+      ## (linuxserver), so 3+ weeks of zero audit events across the whole fleet
+      ## means keel itself is likely broken (registry polling, auth, approvals
+      ## stuck) even though every workload annotation looks correct. The second
+      ## clause gates on >=20 days of metric history so a freshly-created gauge
+      ## can't fire this prematurely.
+      expr: |
+        max_over_time(keel_updates_7d[22d]) == 0
+        and (time() - min_over_time(keel_update_log_last_run_timestamp_seconds[22d])) > 20 * 86400
+      for: 6h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Keel has performed zero updates for 3+ weeks — updater likely dead"
+        description: |
+          No Keel audit events for three consecutive weekly reports. Lane-A
+          workloads (floating+Always+keel) silently stop updating when keel is
+          broken; the image-policy lint cannot see this (annotations still look
+          right). Check the keel pod logs, registry reachability (lscr.io,
+          docker.io), and any stuck approvals.
