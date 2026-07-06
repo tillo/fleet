@@ -14,17 +14,23 @@ metadata:
     nginx.ingress.kubernetes.io/enable-modsecurity: "true"
     nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
     nginx.ingress.kubernetes.io/modsecurity-snippet: |
-      # MeshCentral pushes binary WebSocket frames on /agent.ashx, /meshrelay.ashx,
-      # /control.ashx and /desktoprelay.ashx. OWASP CRS reliably false-positives on
-      # these. Start in DetectionOnly to gather logs; tighten after observation.
-      SecRuleEngine DetectionOnly
+      # Blocking since 2026-07-06 (was DetectionOnly "until agent WS samples
+      # accumulate" — none ever did: 50 days, zero agents, while public
+      # scanners were only being *detected*; standing WAF rule 3 forbids
+      # DetectionOnly on public hosts). The MeshCentral WS endpoints
+      # (agent/relay/control/desktoprelay .ashx) carry binary frames and
+      # agent-protocol handshakes the CRS is known to false-positive on;
+      # the app authenticates those itself, so CRS is bypassed for exactly
+      # those paths (esphome WS pattern) and blocks everywhere else.
+      SecRuleEngine On
       SecAuditEngine RelevantOnly
       SecAuditLogRelevantStatus "^(?:5|4(?!04))"
       SecAuditLogParts ABIJDEFHZ
       SecAuditLogType Serial
       SecAuditLogFormat JSON
       SecAuditLog /dev/stdout
-      SecDebugLog /tmp/modsec_debug.log
+      SecRule REQUEST_URI "@rx ^/(agent|meshrelay|control|desktoprelay)\.ashx" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
       Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
 spec:
   ingressClassName: nginx
