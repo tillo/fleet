@@ -7,7 +7,7 @@
 ## for a stall by any cause, in two layers:
 ##
 ##  1. End-to-end output freshness: the Windmill probe
-##     f/infra_health/logging_pipeline_freshness (every 5m) queries OpenObserve
+##     f/probe/logging_pipeline_freshness (every 5m) queries OpenObserve
 ##     for the newest row in the `modsec` stream and pushes its age to
 ##     Pushgateway (job logging_pipeline_freshness). ModsecFeedStale fires if no
 ##     new row in >1h -- catches a break at ANY stage (ingress, fluentd, Cribl,
@@ -69,7 +69,7 @@ spec:
           2026-06-11 torn-queue incident went ~44h undetected). Check:
             kubectl -n cattle-logging-system logs sts/rancher-logging-root-fluentd -c fluentd | grep -i cribl
             Cribl httpraw source persistent-queue health (cribl.mdapi.ch)
-          Source: Windmill f/infra_health/logging_pipeline_freshness.
+          Source: Windmill f/probe/logging_pipeline_freshness.
     - alert: LoggingFreshnessProbeStale
       ## The freshness probe itself stopped reporting -> ModsecFeedStale is blind.
       expr: time() - logging_pipeline_freshness_last_run_timestamp_seconds > 1800
@@ -81,7 +81,7 @@ spec:
       annotations:
         summary: "logging-freshness probe silent for {{ $value | humanizeDuration }}"
         description: |
-          The Windmill probe f/infra_health/logging_pipeline_freshness (5m
+          The Windmill probe f/probe/logging_pipeline_freshness (5m
           schedule) has not pushed metrics in >30m, so the ModsecFeedStale
           detector is blind. Check the Windmill schedule + the probe's last run.
   - name: app-logging-freshness.fluentd-buffer

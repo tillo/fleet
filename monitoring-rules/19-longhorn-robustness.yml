@@ -55,7 +55,7 @@ spec:
 
     - alert: LonghornRebuildStuck
       ## A WO (write-only) replica's `progress%` is reported by the
-      ## f/infra_health/longhorn_rebuild_stuck Windmill probe every 5 min.
+      ## f/heal/longhorn_rebuild_stuck Windmill probe every 5 min.
       ## If the gauge sits unchanged for ≥15 min while progress < 100 — this
       ## includes a rebuild frozen at 0% (a WO target that retries but never
       ## starts transferring, e.g. pvc-e9bef15c after the 2026-06-06 outage) —
@@ -85,7 +85,7 @@ spec:
         description: |
           The rebuild of replica {{ $labels.replica }} on volume {{ $labels.volume }}
           has been at {{ $value }}% with no change for ≥15 min. The
-          f/infra_health/longhorn_rebuild_stuck probe will auto-delete the replica
+          f/heal/longhorn_rebuild_stuck probe will auto-delete the replica
           after 30 min total stall (one per run). If you want to act sooner:
             kubectl --context=mdapi-prod -n longhorn-system delete replica {{ $labels.replica }}
           Auto-balance (best-effort) will re-schedule on a healthier node.
@@ -97,7 +97,7 @@ spec:
       ## occupying the slot and NEVER starts a rebuild, so the volume sits
       ## degraded on a single replica forever. There is no WO replica, so
       ## LonghornRebuildStuck is blind to it (it watches rebuild progress).
-      ## The f/infra_health/longhorn_degraded_stuck probe (every 5 min)
+      ## The f/heal/longhorn_degraded_stuck probe (every 5 min)
       ## counts these and auto-deletes the ghost (cap 8/run) so Longhorn
       ## replenishes — a healed volume gets a WO rebuild and drops out of the
       ## count within 1-2 runs. So a non-zero count sustained for 30 min means
@@ -114,7 +114,7 @@ spec:
         description: |
           {{ $value }} rep>=2 Longhorn volume(s) have been degraded for >20 min on a
           single replica with an inert stopped/failedAt-empty replica and no rebuild
-          in progress, and the f/infra_health/longhorn_degraded_stuck probe has not
+          in progress, and the f/heal/longhorn_degraded_stuck probe has not
           cleared them in 30 min. The auto-delete is likely failing. Check the probe's
           Windmill run logs, then clear manually:
             kubectl --context=mdapi-prod -n longhorn-system get replica \
@@ -136,7 +136,7 @@ spec:
       annotations:
         summary: "Longhorn ghost-slot autoheal probe stale (no run in >30 min)"
         description: |
-          f/infra_health/longhorn_degraded_stuck has not pushed metrics in >30 min
+          f/heal/longhorn_degraded_stuck has not pushed metrics in >30 min
           (it runs every 5 min). The ghost-slot stall is now undetected. Check the
           Windmill job run history for errors (Rancher token, API reachability).
 
@@ -193,7 +193,7 @@ spec:
           The first 2026-05-19 cases were openldap/lam (config/ subtree EIO)
           and openldap configs after the qua node's instance-manager fault.
           Check the latest Windmill run logs:
-            f/infra_health/longhorn_eio_autoheal → detected_pods[]
+            f/heal/longhorn_eio_autoheal → detected_pods[]
           Pods are auto-deleted (subject to per-pod 30-min cooldown and
           global 6/h cap). If this fires repeatedly for the same pod, the
           underlying Longhorn volume has a persistent FS corruption and

@@ -21,7 +21,7 @@ spec:
     ## Single per-job staleness rule, replacing the previous two-tier
     ## BatchJobStale + BatchJobStaleWeekly which relied on a hand-edited
     ## regex of weekly job names. The Windmill probe
-    ## `f/infra_health/schedule_cadence_map` publishes
+    ## `f/probe/schedule_cadence_map` publishes
     ## `windmill_schedule_interval_seconds` per job (basename of script
     ## path) every day; this rule joins on `job` and triggers when the
     ## last-run timestamp is older than 2× that interval.
@@ -54,7 +54,7 @@ spec:
           A scheduled job has stopped pushing its `*_last_run_timestamp_seconds`
           for more than 2× its scheduled interval (one missed run of grace).
           Threshold is read live from `windmill_schedule_interval_seconds`,
-          which f/infra_health/schedule_cadence_map publishes daily from the
+          which f/probe/schedule_cadence_map publishes daily from the
           Windmill schedule list.
 
           Either the job is broken, its schedule was disabled, or its
@@ -380,7 +380,7 @@ spec:
           PersistentVolume(s) left in Released phase — the bound PVC was
           deleted but reclaimPolicy=Retain kept the PV, and for Longhorn the
           backing volume too, which keeps consuming disk. See the
-          f/infra_health/resource_waste Windmill run log for the PV names.
+          f/heal/resource_waste Windmill run log for the PV names.
           Clean up: `kubectl delete pv <name>` and, for Longhorn,
           `kubectl -n longhorn-system delete volumes.longhorn.io <name>`.
 
@@ -403,7 +403,7 @@ spec:
         description: |
           A 4-hourly image-builder schedule appears to have stopped firing.
           Check https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
-          (full detection logic in Windmill: f/infra_health/gitlab_image_builder_health).
+          (full detection logic in Windmill: f/probe/gitlab_image_builder_health).
 
     - alert: GitlabImageBuilderScheduleCollision
       ## Two image-builders sharing the same cron minute = unnecessary runner
@@ -419,7 +419,7 @@ spec:
         summary: "{{ $value }} GitLab image-builder schedule(s) collide on the same cron minute"
         description: |
           Two or more mdapi/* projects use the same `<M> <H> * * *` schedule.
-          Inspect the latest Windmill run of f/infra_health/gitlab_image_builder_health
+          Inspect the latest Windmill run of f/probe/gitlab_image_builder_health
           for the `schedule_collisions` field listing the offenders.
 
     - alert: GitlabImageBuilderDescriptionDrift
@@ -440,7 +440,7 @@ spec:
           One or more mdapi/* pipeline schedules have descriptions that no
           longer match their cron expression. The canonical template is
           'Every 4h at minute X hour-base Y'. Inspect the latest Windmill
-          run of f/infra_health/gitlab_image_builder_health for the full
+          run of f/probe/gitlab_image_builder_health for the full
           drift list (project, current desc, expected desc).
 
     - alert: GitlabCIBulkFailure
@@ -463,7 +463,7 @@ spec:
           A single root cause is cascading across multiple mdapi/* projects:
           {{ $value }} projects failed in the last 24h at the same job
           ({{ $labels.job_name }}) for the same reason ({{ $labels.failure_reason }}).
-          Inspect the latest Windmill run of f/infra_health/gitlab_ci_failure_groupby
+          Inspect the latest Windmill run of f/probe/gitlab_ci_failure_groupby
           for the full project list + a sample pipeline URL.
 
   - name: app-batch-jobs.waf-audit
@@ -490,7 +490,7 @@ spec:
           for rules 921250/932160). Steady-state count is 0.
 
     - alert: WafNoveltyDetected
-      ## Novelty surfaced by f/infra_health/waf_novelty_audit: a new
+      ## Novelty surfaced by f/probe/waf_novelty_audit: a new
       ## (host, matched_rules) combination, a new host in the WAF
       ## top-20, or >=10x deviation on an existing combination.  Most
       ## days this is zero; when it fires, a human needs to classify
@@ -507,7 +507,7 @@ spec:
         description: |
           Run `/waf-audit` to classify each row as scanner / attack /
           false positive. The novelty list is in the latest Windmill
-          run output of f/infra_health/waf_novelty_audit.
+          run output of f/probe/waf_novelty_audit.
 
     - alert: WafNoveltyAuditStale
       ## The cron is scheduled daily 06:00 UTC; 25h with no fresh
@@ -523,7 +523,7 @@ spec:
       annotations:
         summary: "WAF novelty audit has not run in {{ $value | humanizeDuration }}"
         description: |
-          Check the Windmill schedule f/infra_health/waf_novelty_audit
+          Check the Windmill schedule f/probe/waf_novelty_audit
           and the last job status.
 
   - name: app-batch-jobs.upgrade
@@ -660,7 +660,7 @@ spec:
         description: "Node filesystem usage > 80%. Investigate growth source."
 
   - name: app-batch-jobs.schedule-integrity
-    ## Gauges pushed by f/infra_health/schedule_integrity_check every hour
+    ## Gauges pushed by f/probe/schedule_integrity_check every hour
     ## (cron 0 42 * * * * Europe/Zurich). The script holds an embedded
     ## REQUIRED_SCHEDULES manifest; drift surfaces as schedule_integrity_*
     ## gauges per offending schedule path.
@@ -685,7 +685,7 @@ spec:
       annotations:
         summary: "Windmill required schedule {{ $labels.path }} is missing"
         description: |
-          The schedule_integrity_check (f/infra_health/schedule_integrity_check)
+          The schedule_integrity_check (f/probe/schedule_integrity_check)
           asserts {{ $labels.path }} is required. It is absent from the
           Windmill workspace — the classic `wmill sync push` orphan-archive
           pattern.
@@ -725,7 +725,7 @@ spec:
           and redeploy) or someone edited the wrong field via the UI.
 
   - name: app-batch-jobs.chassis-health
-    ## Gauges pushed by f/infra_health/chassis_health every 15 min. Reads
+    ## Gauges pushed by f/probe/chassis_health every 15 min. Reads
     ## ipmitool chassis status + sel info + sdr elist over SSH on the 5
     ## bare-metal hosts (qui/quo/qua HPE + salt/pepper IBM TrueNAS).
     ##
@@ -799,13 +799,13 @@ spec:
         component: Platform
         team: mdapi
       annotations:
-        summary: "f/infra_health/chassis_health has not run in over an hour"
+        summary: "f/probe/chassis_health has not run in over an hour"
         description: |
           The Windmill chassis_health job (every 15m) has not pushed metrics
           for more than an hour. Check Windmill schedule and worker pods.
 
   - name: app-batch-jobs.cert-discovery
-    ## f/infra_health/k8s_cert_discovery (hourly, 0 23 * * * * UTC) enumerates
+    ## f/probe/k8s_cert_discovery (hourly, 0 23 * * * * UTC) enumerates
     ## every kubernetes.io/tls secret across local/prod/test (via the Rancher
     ## proxy) and feeds each cert into Horizon's `kubernetes` discovery campaign
     ## (POST /api/v1/discovery/feed; 201=new cert, 204=already known — both are
@@ -832,7 +832,7 @@ spec:
       annotations:
         summary: "k8s cert discovery: {{ $value }} cert(s) failed to feed into Horizon"
         description: |
-          The hourly f/infra_health/k8s_cert_discovery job got non-2xx responses
+          The hourly f/probe/k8s_cert_discovery job got non-2xx responses
           (or exceptions) feeding certs into Horizon's `kubernetes` discovery
           campaign for >2h (two runs). 201/204 are both success, so this is a
           real fault — Horizon down/unreachable from the worker, the
@@ -841,7 +841,7 @@ spec:
           cluster/namespace/secret + HTTP status).
 
   - name: app-batch-jobs.horizon-license
-    ## f/infra_health/horizon_license_usage (hourly) publishes the total Horizon
+    ## f/probe/horizon_license_usage (hourly) publishes the total Horizon
     ## certificate count vs the clm.<N> license cap (decoded live from the
     ## horizon-license secret). The discovery jobs (netscan + k8s_cert_discovery)
     ## keep growing the count, so warn BEFORE the cap blocks issuance/import.
@@ -861,7 +861,7 @@ spec:
           Horizon holds {{ with query "horizon_certificate_count{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }} of {{ with query "horizon_license_certificate_limit{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }} licensed CLM certificates (>80%).
           The discovery jobs (netscan, k8s_cert_discovery) keep adding certs; at
           100% Horizon refuses new issuance/import. Raise the license (clm.N) or
-          prune discovered certs. Source: f/infra_health/horizon_license_usage.
+          prune discovered certs. Source: f/probe/horizon_license_usage.
     - alert: HorizonCertCountNearLicenseLimit
       expr: horizon_license_certificate_used_ratio{job="horizon_license_usage"} > 0.95
       for: 30m
@@ -878,7 +878,7 @@ spec:
           prune certificates now.
 
   - name: app-batch-jobs.stream-license
-    ## f/infra_health/stream_license_usage (hourly) publishes Stream's total X509
+    ## f/probe/stream_license_usage (hourly) publishes Stream's total X509
     ## certificate count vs the stream-ca.<N> license cap (decoded live from the
     ## stream-license secret). Mirrors the Horizon CLM alert. Staleness covered by
     ## the generic BatchJobStale rule (job label stream_license_usage).
@@ -895,7 +895,7 @@ spec:
         description: |
           Stream holds {{ with query "stream_certificate_count{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }} of {{ with query "stream_license_certificate_limit{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }} licensed certificates (stream-ca, >80%).
           At 100% the CAs refuse new issuance. Raise the Stream license (stream-ca.N)
-          or revoke/prune certs. Source: f/infra_health/stream_license_usage.
+          or revoke/prune certs. Source: f/probe/stream_license_usage.
     - alert: StreamCertCountNearLicenseLimit
       expr: stream_license_certificate_used_ratio{job="stream_license_usage"} > 0.95
       for: 30m
@@ -912,7 +912,7 @@ spec:
 
   - name: app-batch-jobs.image-policy
     rules:
-    ## Source: f/infra_health/image_policy_lint (Windmill, daily 05:20 Zurich) —
+    ## Source: f/probe/image_policy_lint (Windmill, daily 05:20 Zurich) —
     ## the 2-lane pull-policy convention from the 2026-06-06 postmortem (A2).
     ## Lane A = floating tag + Always + keel annotation (apps).
     ## Lane B = pinned tag + IfNotPresent, Renovate-driven (bootstrap-critical).
@@ -955,7 +955,7 @@ spec:
           under Renovate (Lane B).
 
     - alert: KeelUpdatesSilent
-      ## keel_updates_7d comes from f/infra_health/keel_update_log (weekly Mon
+      ## keel_updates_7d comes from f/probe/keel_update_log (weekly Mon
       ## 07:55). Several keel-managed images rebuild at least weekly
       ## (linuxserver), so 3+ weeks of zero audit events across the whole fleet
       ## means keel itself is likely broken (registry polling, auth, approvals

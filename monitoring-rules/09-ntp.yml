@@ -8,7 +8,7 @@
 ##      chronyd drops the pod out of Ready, replicas_available falls,
 ##      and NtpChronyUnavailable fires.
 ##   2. Crashloop detection.
-##   3. Functional NTP probe — f/infra_health/ntp_health sends a real
+##   3. Functional NTP probe — f/probe/ntp_health sends a real
 ##      NTP client request to the chrony LB IP every 5 min and pushes
 ##      ntp_probe_* to Pushgateway. Catches "answers but unsynchronised"
 ##      and "unreachable on the LB IP" — blackbox-exporter's tcp prober
@@ -49,7 +49,7 @@ spec:
           ntp.mdapi.ch (chrony) is unavailable. Every host syncing
           against it (router, NAS, mbptillo) will drift. Watch for
           chrony-side time-source loss too if this is a USB-GPS issue
-          — see f/infra_health/bpir4_health.py + akri usb-drift watch.
+          — see f/probe/bpir4_health.py + akri usb-drift watch.
 
     - alert: NtpChronyCrashLooping
       expr: |
@@ -77,7 +77,7 @@ spec:
         summary: "chrony NTP server not answering"
         description: |
           The ntppool chrony server (192.168.1.58) did not answer an
-          NTP client request from f/infra_health/ntp_health. Hosts
+          NTP client request from f/probe/ntp_health. Hosts
           syncing against it will drift. Catches the "pod Running but
           chronyd dead / unreachable on the LB IP" case the
           deployment-availability alert above can miss.
@@ -150,5 +150,5 @@ spec:
       annotations:
         summary: "NTP functional probe is stale"
         description: |
-          f/infra_health/ntp_health has not reported to Pushgateway in
+          f/probe/ntp_health has not reported to Pushgateway in
           over 30 min — the NTP functional monitor itself may be down.
