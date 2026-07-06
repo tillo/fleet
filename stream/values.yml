@@ -59,7 +59,7 @@ ingress:
   hostname: stream.mdapi.ch
   tls: true
   annotations:
-    cert-manager.io/issuer: letsencrypt-prod
+    cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/enable-modsecurity: "true"
     nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
     # PKI REST API uses PUT/PATCH/DELETE -> raise CRS allowed methods before the include.
@@ -151,55 +151,6 @@ extraObjects:
             key: /mdapi/stream/event-seal-secret
           secretKey: eventSealSecret
 
-  # TSIG key for cert-manager DNS-01.
-  - apiVersion: external-secrets.io/v1
-    kind: ExternalSecret
-    metadata:
-      name: tsig-secret
-    spec:
-      refreshInterval: 1m0s
-      secretStoreRef:
-        kind: ClusterSecretStore
-        name: cm-akeyless
-      target:
-        name: tsig-secret
-        creationPolicy: Owner
-      data:
-        - remoteRef:
-            key: /mdapi/stream/tsig-secret/tsig-secret-key
-          secretKey: tsig-secret-key
-
-  # Namespaced ACME issuer (DNS-01 via BIND RFC2136), same as horizon/joplin.
-  - apiVersion: cert-manager.io/v1
-    kind: Issuer
-    metadata:
-      name: letsencrypt-prod
-    spec:
-      acme:
-        email: tillo@tillo.ch
-        privateKeySecretRef:
-          name: letsencrypt-prod
-        server: https://acme-v02.api.letsencrypt.org/directory
-        solvers:
-          - dns01:
-              rfc2136:
-                nameserver: 31.3.128.59:53
-                tsigKeyName: mdapi
-                tsigAlgorithm: HMACSHA256
-                tsigSecretSecretRef:
-                  name: tsig-secret
-                  key: tsig-secret-key
-            selector:
-              dnsZones:
-                - 'mdapi.ch'
-          - http01:
-              ingress:
-                class: nginx
-
-  # --- Public PKI-artifact server (root CA download at crl.mdapi.ch/) ---
-  # Tiny unprivileged nginx serving the MDAPI Root CA so phones/devices fetch it at
-  # https://crl.mdapi.ch/MDAPI-Root-CA.crt (DER; nginx maps .crt -> application/x-x509-ca-cert,
-  # which triggers the Android CA installer). The CA cert is PUBLIC, not secret. ~10m/24Mi, 1 replica.
   - apiVersion: v1
     kind: ConfigMap
     metadata:
@@ -306,7 +257,7 @@ extraObjects:
     metadata:
       name: stream-crl
       annotations:
-        cert-manager.io/issuer: letsencrypt-prod
+        cert-manager.io/cluster-issuer: letsencrypt-prod
         # Serve the CRL over plain HTTP too (no forced redirect). CRLs are conventionally
         # fetched over http:// (avoids the cert-to-validate-the-cert chicken-and-egg), and
         # Horizon's CA crl_url only accepts http://. TLS still available for browsers.

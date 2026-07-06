@@ -117,7 +117,7 @@ kind: Ingress
 metadata:
   name: portal
   annotations:
-    cert-manager.io/issuer: letsencrypt-prod
+    cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-portal.oauth2-proxy.svc.cluster.local/portal/oauth2/auth
     nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/portal/oauth2/start?rd=https://$host$escaped_request_uri
     nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-Email
@@ -141,49 +141,3 @@ spec:
                 name: portal
                 port:
                   number: 80
----
-# Namespaced Let's Encrypt issuer (rfc2136 against our BIND, like the
-# mdapi.ch issuers in bootstrap/docs) + its TSIG secret.
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: letsencrypt-prod
-  namespace: portal
-spec:
-  acme:
-    email: tillo@tillo.ch
-    privateKeySecretRef:
-      name: letsencrypt-prod
-    server: https://acme-v02.api.letsencrypt.org/directory
-    solvers:
-      - dns01:
-          rfc2136:
-            nameserver: 31.3.128.59:53
-            tsigKeyName: mdapi
-            tsigAlgorithm: HMACSHA256
-            tsigSecretSecretRef:
-              name: tsig-secret
-              key: tsig-secret-key
-        selector:
-          dnsZones:
-            - mdapi.ch
-      - http01:
-          ingress:
-            class: nginx
----
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  name: tsig-secret
-spec:
-  refreshInterval: 1m0s
-  secretStoreRef:
-    kind: ClusterSecretStore
-    name: cm-akeyless
-  target:
-    name: tsig-secret
-    creationPolicy: Owner
-  data:
-    - remoteRef:
-        key: /mdapi/zot/tsig-secret/tsig-secret-key
-      secretKey: tsig-secret-key
