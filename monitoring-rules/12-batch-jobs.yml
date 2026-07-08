@@ -405,6 +405,30 @@ spec:
           Check https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
           (full detection logic in Windmill: f/probe/gitlab_image_builder_health).
 
+    - alert: GitlabImageBuilderNoSchedule
+      ## A non-archived mdapi/* project with Dockerfile+.gitlab-ci.yml but
+      ## NO active 4-hourly pipeline schedule. Day-one signal for a newly
+      ## created builder repo: push activity during initial development
+      ## keeps pipelines_24h >= 4, masking the missing schedule from
+      ## GitlabImageBuilderSilent until development stops (mdapi/portal,
+      ## created 2026-06-30, only surfaced as "silent" on 07-06).
+      expr: gitlab_image_builder_projects_no_schedule{job="gitlab_image_builder_health"} > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab image-builder project(s) have no 4-hourly schedule"
+        description: |
+          The offending project list is the `no_schedule` field in the latest
+          Windmill run result of f/probe/gitlab_image_builder_health. Fix by
+          creating a pipeline schedule on the project: canonical description
+          'Every 4h at minute X hour-base Y', a cron minute/hour-base slot not
+          used by any other project (the probe log prints the full cron map),
+          ref=main, active. Or add the project to the probe's EXCLUDE set if
+          4-hourly rebuilds are genuinely not wanted.
+
     - alert: GitlabImageBuilderScheduleCollision
       ## Two image-builders sharing the same cron minute = unnecessary runner
       ## contention. The detection script publishes the count of colliding
