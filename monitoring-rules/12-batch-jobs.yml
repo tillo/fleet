@@ -623,7 +623,12 @@ spec:
         summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }}"
         description: "Check via `kubectl --context mdapi-rancher get bundledeployments -A | grep -v Ready`."
     - alert: CertExpiringSoon
-      expr: cert_expiry_days < 30
+      ## Warning only when cert-manager has NO future renewalTime (or the
+      ## scheduled renewal has passed and the cert still hasn't rotated) —
+      ## i.e. nothing is going to fix this by itself. Until the probe pushes
+      ## cert_renewal_scheduled (deployed 2026-07-09), `unless` matches
+      ## nothing and this behaves like the old unconditional rule.
+      expr: cert_expiry_days < 30 unless on(namespace, cert) cert_renewal_scheduled == 1
       for: 1h
       labels:
         severity: warning
@@ -631,7 +636,20 @@ spec:
         team: mdapi
       annotations:
         summary: "Cert {{ $labels.namespace }}/{{ $labels.cert }} expires in {{ $value }}d"
-        description: "cert-manager Certificate close to expiry; investigate renewal."
+        description: "cert-manager Certificate close to expiry with no future renewalTime; investigate renewal."
+    - alert: CertExpiringSoon
+      ## Same window but a future renewalTime exists — rotation is planned.
+      ## 47d horizon-private certs (aruba-apin*) renew ~16d before expiry, so
+      ## they spend ~14d of every cycle inside the 30d window. FYI only.
+      expr: cert_expiry_days < 30 and on(namespace, cert) cert_renewal_scheduled == 1
+      for: 1h
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Cert {{ $labels.namespace }}/{{ $labels.cert }} expires in {{ $value }}d (renewal scheduled)"
+        description: "cert-manager has a future renewalTime for this Certificate; rotation is planned. Escalates to warning automatically if the scheduled renewal passes without rotation."
     - alert: LonghornBackupStale
       # 40d (was 70d): the recurring `default` group backs up monthly (1st of
       # month), so a healthy volume maxes ~31-35d before its next run. 70d only
