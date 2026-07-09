@@ -195,10 +195,14 @@ spec:
           config-backups/technitium backup is >72h old. Restore manually if so.
 
     - alert: TechnitiumAutoRestoreFired
+      ## info: by the time this fires the guard has ALREADY restored the
+      ## primary — it's a record of automation acting, not a pending problem.
+      ## The failure modes stay warnings: TechnitiumRestoreGuardStale (guard
+      ## dead) and the zone-diff/notify alerts (restore didn't converge).
       expr: technitium_restore_guard_restore_fired == 1
       for: 0m
       labels:
-        severity: warning
+        severity: info
         component: DNS
         team: mdapi
       annotations:

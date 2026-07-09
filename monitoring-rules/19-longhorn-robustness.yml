@@ -24,19 +24,47 @@ spec:
   - name: app-longhorn-robustness.workload
     rules:
     - alert: LonghornVolumeDegraded
-      expr: longhorn_volume_robustness == 2
+      ## info while the rebuild drains (routine after node restarts; the
+      ## max-2 rebuild limit can queue volumes for hours post-incident).
+      ## Genuinely-stuck cases are caught much earlier by LonghornRebuildStuck
+      ## (5m no-progress), LonghornGhostSlotStuck and the auto-heals; the 12h
+      ## continuous tier below is the severity backstop.
+      expr: longhorn_volume_robustness == 2 unless min_over_time(longhorn_volume_robustness[12h]) == 2
       for: 15m
+      labels:
+        severity: info
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} degraded (rebuilding)"
+        description: |
+          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }}) is
+          attached but running with fewer replicas than configured. Auto-recovery is
+          usually fine — escalates to warning if still degraded after 12h continuous.
+          Check `kubectl -n longhorn-system get volume {{ $labels.volume }} -o yaml`.
+
+    - alert: LonghornVolumeDegraded
+      ## Continuously degraded for 12 straight hours — the rebuild queue
+      ## should have long drained; redundancy has been reduced this whole
+      ## time. min_over_time from TSDB so a vmalert restart can't reset the
+      ## clock. min of {degraded=2, faulted=3} is still 2, so a
+      ## degraded→faulted excursion keeps counting (faulted has its own
+      ## alert); a dip to healthy(1) or detached(0) resets the window.
+      expr: min_over_time(longhorn_volume_robustness[12h]) == 2
+      for: 1h
       labels:
         severity: warning
         component: Backups
         team: mdapi
       annotations:
-        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} degraded"
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} degraded 12h+ — rebuild not happening"
         description: |
-          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }}) is
-          attached but running with fewer replicas than configured. Auto-recovery is
-          usually fine; if it persists > 15m the rebuild has stalled. Check
-          `kubectl -n longhorn-system get volume {{ $labels.volume }} -o yaml`.
+          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }})
+          has run with reduced redundancy for over 12 hours straight — no rebuild
+          has completed in that window. Check for an orphaned/stale replica
+          (delete all replicas except the authoritative RW one so the controller
+          schedules a fresh rebuild) and the max-2 rebuild-limit queue.
+          `kubectl -n longhorn-system get volume {{ $labels.volume }} -o yaml`
 
     - alert: LonghornVolumeFaulted
       expr: longhorn_volume_robustness == 3
