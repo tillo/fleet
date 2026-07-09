@@ -395,7 +395,11 @@ spec:
       ## count daily; this fires when a project drops below 4 — late enough
       ## that one missed run doesn't alert, early enough that two missed
       ## runs do.
-      expr: gitlab_image_builder_pipelines_24h{job="gitlab_image_builder_health"} < 4
+      ## `unless schedule_recent`: a schedule created < 26h ago can't have
+      ## put 4 runs in the window yet — that recovery/warm-up phase fires
+      ## as the info tier below instead (mdapi/portal, 2026-07-08: fix
+      ## deployed at 22:00 but the warning kept firing ~20h more).
+      expr: gitlab_image_builder_pipelines_24h{job="gitlab_image_builder_health"} < 4 unless on(project) gitlab_image_builder_schedule_recent{job="gitlab_image_builder_health"} == 1
       for: 30h
       labels:
         severity: warning
@@ -406,6 +410,25 @@ spec:
         description: |
           A 4-hourly image-builder schedule appears to have stopped firing.
           Check https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
+    - alert: GitlabImageBuilderSilent
+      ## Same low count but the active 4h schedule is < 26h old — it hasn't
+      ## had time to fire 4 times. Warming up, self-solving; once the
+      ## schedule ages past 26h the recent flag drops and, if the count is
+      ## still < 4 (scheduled pipelines failing/not firing), the warning
+      ## tier above takes over automatically.
+      expr: gitlab_image_builder_pipelines_24h{job="gitlab_image_builder_health"} < 4 and on(project) gitlab_image_builder_schedule_recent{job="gitlab_image_builder_health"} == 1
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab project mdapi/{{ $labels.project }} at {{ $value }} pipelines/24h — schedule freshly created, warming up"
+        description: |
+          The project's 4-hourly schedule was created less than 26h ago, so
+          the 24h pipeline window can't contain 4 runs yet. No action needed;
+          escalates to warning if the count is still low after the schedule
+          matures.
           (full detection logic in Windmill: f/probe/gitlab_image_builder_health).
 
     - alert: GitlabImageBuilderNoSchedule
