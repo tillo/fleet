@@ -42,6 +42,12 @@ spec:
         ##   registry. Tag regex filters: latest/stable/main/master + any
         ##   semver-ish tag (v1, v1.2, 1.2.3, 1.2.3-suffix). Prevents
         ##   accidentally mirroring 1000+ tags from things like nginx.
+        ## http.readTimeout/writeTimeout: zot's CLI defaults both to 60s
+        ##   when unset (pkg/cli/server/root.go), and Go's timeouts cover
+        ##   the WHOLE request/response body — any blob layer taking >60s
+        ##   to transfer is killed mid-stream ("i/o timeout", client 502).
+        ##   The 423 MiB horizon-ciphertrust layer reproducibly died at
+        ##   exactly 1m0s (2026-07-10), on ingress AND direct paths.
         ## ─────────────────────────────────────────────────────────────
         config.json: |
           {
@@ -66,6 +72,8 @@ spec:
             "http": {
               "address": "0.0.0.0",
               "port": "5000",
+              "readTimeout": "30m",
+              "writeTimeout": "30m",
               "auth": {
                 "htpasswd": {
                   "path": "/etc/zot/htpasswd"
