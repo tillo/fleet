@@ -314,16 +314,24 @@ spec:
       ## queryable per-image via `pod_image_cve_count{severity="critical"}`;
       ## this rule just collapses the alert surface.
       ##
+      ## 2026-07-10: restricted to fix_state="fixed" — criticals with an
+      ## upstream package fix released. Unfixed criticals (wont-fix /
+      ## not-fixed / unknown) are excluded: nothing to act on. They stay
+      ## queryable via fix_state="unfixed"; wont-fix suppressions for our
+      ## own images flow through the grype curator MRs, upstream-image
+      ## suppressions via fleet/security/grype-cluster-ignore.yaml.
+      ##
       ## Joins the scan output (image-keyed) with kube_pod_container_info
       ## (namespace+image keyed) so we can group_left a namespace onto
       ## each vulnerable image. Result: one alert per namespace, value =
-      ## count of distinct images with critical CVEs in that namespace.
+      ## count of distinct images with fixable critical CVEs in that
+      ## namespace.
       expr: |
         count by (namespace) (
           group by (namespace, image) (
             kube_pod_container_info
             * on (image) group_left()
-            (pod_image_cve_count{severity="critical"} > 0)
+            (pod_image_cve_count{severity="critical",fix_state="fixed"} > 0)
           )
         )
       for: 30m
@@ -332,16 +340,19 @@ spec:
         component: Platform
         team: mdapi
       annotations:
-        summary: "{{ $labels.namespace }}: {{ $value }} container image(s) with critical CVE(s)"
+        summary: "{{ $labels.namespace }}: {{ $value }} image(s) with fixable critical CVE(s)"
         description: |
           Most recent grype scan flagged {{ $value }} image(s) in
-          namespace `{{ $labels.namespace }}` with at least one CRITICAL CVE.
+          namespace `{{ $labels.namespace }}` with at least one CRITICAL
+          CVE whose fix is already released upstream (fix_state="fixed").
 
           Drill in:
-            pod_image_cve_count{severity="critical"} > 0
+            pod_image_cve_count{severity="critical",fix_state="fixed"} > 0
           and join with kube_pod_container_info on `image` to see which
-          pods are affected. Mitigations: pin a fixed version, set
-          pull-policy=Always to refresh, or accept (for :latest upstream).
+          pods are affected. Mitigations: bump the pinned version
+          (Renovate usually has the MR), refresh :latest via Keel/rebuild,
+          or for our own images bump the base image. Unfixed criticals
+          are intentionally excluded (fix_state="unfixed" to inspect).
 
   - name: app-batch-jobs.cluster-waste
     rules:
