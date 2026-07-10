@@ -161,22 +161,28 @@ spec:
     - remoteRef: { key: /mdapi/home-assistant/garage-region }
       secretKey: REGION
 ---
-## Nightly base backup at 01:30 (WAL is streamed continuously). CNPG
+## Nightly base backup at 03:00 (WAL is streamed continuously). CNPG
 ## ScheduledBackup; retention managed by Garage bucket lifecycle / the
 ## offsite job, not barman here.
 ##
-## Moved 03:30 -> 01:30 on 2026-06-16: the ~30Gi base backup takes ~90min to
-## upload and was overrunning into the 04:00 UTC garage_offsite_backup Windmill
-## job, which saturates the same salt/pepper Garage cluster. The contention
-## produced intermittent 504 Gateway Timeouts on CompleteMultipartUpload
-## (e.g. 2026-06-16 05:01Z). 01:30 gives a clear ~2.5h window before 04:00.
+## Schedule history — this slot is squeezed between three other writers
+## on the same salt/pepper Garage (single large HDD per node):
+##   * Longhorn `weekly` group: Fri 01:00 UTC, ~140Gi until ~02:05
+##   * gitlab-toolbox-backup:   daily 02:00 UTC, done by ~02:20
+##   * garage_offsite_backup:   daily 04:00 UTC (Windmill)
+## Moved 03:30 -> 01:30 on 2026-06-16 (then-~30Gi/90min backup overran into
+## the 04:00 offsite job -> 504s on CompleteMultipartUpload). That landed it
+## inside the Friday Longhorn wave instead: Friday runs degraded 16 -> 41 ->
+## 62 min and failed on 2026-07-10 (UploadPart 503 backpressure, exit 1).
+## Moved 01:30 -> 03:00 on 2026-07-10: backup is now ~14Gi/7-10min, so it
+## clears both the Friday wave/GitLab tail and finishes well before 04:00.
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:
   name: ha-recorder-pg-daily
   namespace: home-assistant
 spec:
-  schedule: "0 30 1 * * *"
+  schedule: "0 0 3 * * *"
   backupOwnerReference: self
   cluster:
     name: ha-recorder-pg
