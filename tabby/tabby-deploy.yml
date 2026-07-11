@@ -1,7 +1,9 @@
 # Tabby code-completion trial (LLM assessment 2026-05 Option B).
-# CPU-only: nodes are E5-2640 v2 (no AVX2) — Q4 GGUF via llama.cpp fallback
-# path, expected 5-15 tok/s. Acceptance: 1-week parity feel vs Copilot.
-# Completion model only (no --chat-model): chat on Ivy Bridge is not the trial.
+# CPU-only: nodes are E5-2640 v2 (no AVX2). Tabby's bundled llama-server is
+# CUDA-linked (no CPU image exists since ~0.27), so inference is delegated to
+# the ollama deployment via /data/config.toml (tabby-cm.yml) — Tabby here is
+# only the auth/UI/API/index layer. Expected 5-15 tok/s on Ivy Bridge;
+# acceptance: 1-week parity feel vs Copilot. Completion only, no chat model.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,10 +26,6 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - serve
-            - --model
-            - Qwen2.5-Coder-1.5B
-            - --device
-            - cpu
           env:
             - name: TABBY_DISABLE_USAGE_COLLECTION
               value: "1"
@@ -36,21 +34,22 @@ spec:
               name: http
           resources:
             requests:
-              cpu: "2"
-              memory: 3Gi
+              cpu: 250m
+              memory: 512Mi
             limits:
-              cpu: "8"
-              memory: 8Gi
+              cpu: "2"
+              memory: 2Gi
           volumeMounts:
             - name: data
               mountPath: /data
-          # First start downloads the completion + embedding models (~2 GiB):
-          # give the startup probe 20 min before liveness takes over.
+            - name: config
+              mountPath: /data/config.toml
+              subPath: config.toml
           startupProbe:
             tcpSocket:
               port: 8080
             periodSeconds: 10
-            failureThreshold: 120
+            failureThreshold: 60
           livenessProbe:
             tcpSocket:
               port: 8080
@@ -60,3 +59,6 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: tabby-data
+        - name: config
+          configMap:
+            name: tabby-config

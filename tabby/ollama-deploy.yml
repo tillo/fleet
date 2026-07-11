@@ -1,0 +1,60 @@
+# Inference backend for the Tabby trial. Ollama (not Tabby's bundled
+# llama-server) because tabbyml/tabby images ship a CUDA-linked llama-server
+# since ~0.27 — no CPU build exists — while Ollama selects a CPU variant at
+# runtime and runs on these AVX-only (no AVX2) E5-2640 v2 nodes.
+# Models are pulled once via `ollama pull` (see tabby bundle notes) and
+# persist on the PVC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.31.2
+          imagePullPolicy: IfNotPresent
+          env:
+            # Keep the completion model resident — an idle-unload would add
+            # seconds of reload latency to the first completion after a pause.
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"
+          ports:
+            - containerPort: 11434
+              name: http
+          resources:
+            requests:
+              cpu: "2"
+              memory: 3Gi
+            limits:
+              cpu: "8"
+              memory: 6Gi
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          startupProbe:
+            httpGet:
+              path: /
+              port: 11434
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            periodSeconds: 30
+            failureThreshold: 4
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
