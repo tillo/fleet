@@ -320,10 +320,11 @@ configMaps:
       newaliases
 
       # --- CAMAC enquete webhook (2026-07-11) ---------------------------------
-      # Pipe a copy of each info.camac@vd.ch avis d'enquete to Windmill
-      # f/desk/camac_enquete_watch (distance-tiered Pushover with swisstopo map).
-      # Global sieve-before rule so the user's roundcube/managesieve script stays
-      # untouched; "pipe :copy" preserves normal delivery + user filters.
+      # Sieve pipe program for the "CAMAC enquete webhook" rule in tillo's OWN
+      # roundcube sieve script (managed via Roundcube/managesieve — deliberately
+      # NOT a global sieve-before rule, which would also fire on other users'
+      # mail). Sends the raw message to Windmill f/desk/camac_enquete_watch
+      # (distance-tiered Pushover with swisstopo map).
       # CAMAC_WEBHOOK_TOKEN comes from the docker-mailserver-env-secret ES
       # (Akeyless), scoped in Windmill to run only that script; it is embedded at
       # startup because dovecot's pipe processes don't inherit the container env.
@@ -343,14 +344,6 @@ configMaps:
       CAMACEOF
       chown root:docker /usr/lib/dovecot/sieve-pipe/camac-webhook.sh
       chmod 750 /usr/lib/dovecot/sieve-pipe/camac-webhook.sh
-
-      cat > /usr/lib/dovecot/sieve-global/before/50-camac-webhook.sieve <<'SIEVEEOF'
-      require ["vnd.dovecot.pipe", "copy"];
-      if address :is "from" "info.camac@vd.ch" {
-        pipe :copy "camac-webhook.sh";
-      }
-      SIEVEEOF
-      sievec /usr/lib/dovecot/sieve-global/before/50-camac-webhook.sieve
 extraDeploy:
 - apiVersion: v1
   kind: ServiceAccount
