@@ -67,6 +67,35 @@ spec:
           securityContext:
             capabilities:
               add: ["NET_BIND_SERVICE"]
+        ## cert-init above snapshots the secret into znc.pem only at pod
+        ## start, so a cert-manager renewal never reached a long-lived pod:
+        ## znc.mdapi.ch served a 24-day-stale cert on 2026-07-11 (renewed
+        ## 07-06, pod up since 06-17) and would have expired 07-17. This
+        ## sidecar re-concats znc.pem whenever the projected secret rotates;
+        ## znc picks the file up on new TLS connections without a restart.
+        ## Backstop if that assumption fails: Horizon ManagedCertExpiring
+        ## fires at 7 days on the live-served cert.
+        - name: cert-sync
+          image: alpine:3
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                if [ /tls/tls.crt -nt /znc-data/znc.pem ] || [ ! -f /znc-data/znc.pem ]; then
+                  cat /tls/tls.key /tls/tls.crt > /znc-data/znc.pem.new
+                  chmod 600 /znc-data/znc.pem.new
+                  mv /znc-data/znc.pem.new /znc-data/znc.pem
+                  echo "znc.pem refreshed: $(ls -l /znc-data/znc.pem)"
+                fi
+                sleep 300
+              done
+          volumeMounts:
+            - name: znc-data
+              mountPath: /znc-data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
       volumes:
         - name: znc-data
           persistentVolumeClaim:
