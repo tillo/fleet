@@ -1,0 +1,62 @@
+# Tabby code-completion trial (LLM assessment 2026-05 Option B).
+# CPU-only: nodes are E5-2640 v2 (no AVX2) — Q4 GGUF via llama.cpp fallback
+# path, expected 5-15 tok/s. Acceptance: 1-week parity feel vs Copilot.
+# Completion model only (no --chat-model): chat on Ivy Bridge is not the trial.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tabby
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tabby
+  template:
+    metadata:
+      labels:
+        app: tabby
+    spec:
+      containers:
+        - name: tabby
+          image: tabbyml/tabby:0.32.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            - --model
+            - Qwen2.5-Coder-1.5B
+            - --device
+            - cpu
+          env:
+            - name: TABBY_DISABLE_USAGE_COLLECTION
+              value: "1"
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: "2"
+              memory: 3Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # First start downloads the completion + embedding models (~2 GiB):
+          # give the startup probe 20 min before liveness takes over.
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 120
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 30
+            failureThreshold: 4
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tabby-data
