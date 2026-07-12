@@ -27,6 +27,14 @@ spec:
         - name: nut
           image: instantlinux/nut-upsd:latest
           imagePullPolicy: Always
+          # The image's upsmon executes its own power-fail shutdown at LB
+          # (sets FSD, calls the absent /sbin/shutdown, container exits —
+          # crash-looping upsd exactly during the low-battery endgame and
+          # blinding the HA choreography; observed 2026-07-12 run 2a, 4
+          # restarts). Neuter SHUTDOWNCMD in the stock config BEFORE the
+          # entrypoint appends its MONITOR line: this pod only observes,
+          # Home Assistant owns all shutdown decisions.
+          command: ["/bin/sh", "-c", "sed -i 's|^SHUTDOWNCMD.*|SHUTDOWNCMD \"/bin/true\"|' /etc/nut/upsmon.conf && exec /usr/local/bin/entrypoint.sh"]
           resources: {}
           securityContext:
             privileged: true
