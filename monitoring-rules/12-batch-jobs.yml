@@ -568,15 +568,15 @@ spec:
       ## days this is zero; when it fires, a human needs to classify
       ## the rows.
       ##
-      ## 2026-07-13: for 0m→90m. Reality diverged from "most days zero" —
-      ## the gauge was >0 in roughly half the hourly runs (86 firing
-      ## episodes/13d, all classified clean in the standing audits):
-      ## scanner-rotation churn in the top-20 counts as "novelty" for a
-      ## single run. 90m = signals must persist across two consecutive
-      ## runs before paging; one-run blips (the noise) never fire. The
-      ## deeper fix is probe-side baseline logic, tracked separately.
+      ## 2026-07-13: the flap fix lives in the PROBE (v2 baselines:
+      ## persistent 90d known-hosts, 28d combo memory, COALESCE host
+      ## derivation) — the v1 baselines made ~half of all hourly runs
+      ## signal "novelty" (86 clean-classified episodes/13d). for: MUST
+      ## stay 0m: a signal lives only until the next hourly run merges it
+      ## into state (~60m), so any for: >= the run interval would mean the
+      ## alert can never fire at all.
       expr: waf_novelty_signals{job="waf_novelty_audit"} > 0
-      for: 90m
+      for: 0m
       labels:
         severity: info
         component: Platform
