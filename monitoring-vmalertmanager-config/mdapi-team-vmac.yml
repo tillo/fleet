@@ -36,13 +36,27 @@ spec:
     ## visibility in the Pushover app; only criticals buzz.
     ## InfoInhibitor / Watchdog stay exclude-listed defensively (vendor
     ## rules, no mdapi label post-cutover) so a stray label can't page.
+    ## CVE inventory alert deliberately NOT notified (2026-07-13, user
+    ## decision): the grype curator digest is the single CVE channel and
+    ## this alert duplicated it (it was also the top flap source — 298
+    ## episodes/13d). The rule still evaluates (AM UI, dashboards, PromQL
+    ## via ALERTS) — it just routes to the black-hole. Listed FIRST so it
+    ## wins regardless of severity.
+    - receiver: black-hole
+      matchers:
+      - 'alertname="NamespaceWithCriticalCves"'
     - receiver: statuspage-and-pushover
       matchers:
       - 'team="mdapi"'
       - 'alertname!~"InfoInhibitor|Watchdog"'
       - 'severity="critical"'
       repeat_interval: 4h
-    - receiver: statuspage-and-pushover
+    ## Non-criticals use the -quiet receiver: same statuspage webhook, but
+    ## Pushover send_resolved OFF (2026-07-13, user decision) — resolved
+    ## ✅ messages for warnings/info were half the non-critical volume and
+    ## carry no action. Criticals (route above) keep their resolved
+    ## notifications (badge-only via the priority template).
+    - receiver: statuspage-and-pushover-quiet
       matchers:
       - 'team="mdapi"'
       - 'alertname!~"InfoInhibitor|Watchdog"'
@@ -119,6 +133,50 @@ spec:
         {{ .CommonAnnotations.description }}
         {{- end }}
       ## One-tap from notification to the live time-series view.
+      url: |-
+        {{- $c := .CommonLabels.component -}}
+        {{- if or (eq $c "Internet") (eq $c "Time") (eq $c "VPN") (eq $c "DNS") -}}
+        https://grafana.mdapi.ch/d/bpi-r4-overview
+        {{- else if eq $c "Home" -}}
+        https://grafana.mdapi.ch/d/home-assistant-overview
+        {{- else -}}
+        https://grafana.mdapi.ch
+        {{- end -}}
+      url_title: 📊 Open Grafana
+
+  ## Identical to statuspage-and-pushover except pushover send_resolved is
+  ## OFF — used by the non-critical route. The webhook keeps send_resolved
+  ## so the statuspage adapter still clears component status on recovery.
+  - name: statuspage-and-pushover-quiet
+    webhook_configs:
+    - url: http://statuspage-adapter.monitoring.svc.cluster.local:8080/webhook
+      send_resolved: true
+      max_alerts: 0
+    pushover_configs:
+    - user_key:
+        name: pushover
+        key: user-key
+      token:
+        name: pushover
+        key: api-token
+      send_resolved: false
+      ## Only ever fires for .Status == firing (send_resolved false);
+      ## severity branch kept identical to the main receiver.
+      priority: |-
+        {{- if eq .CommonLabels.severity "critical" -}}1
+        {{- else if eq .CommonLabels.severity "warning" -}}-1
+        {{- else -}}-2
+        {{- end -}}
+      title: |-
+        [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.component }}: {{ .CommonLabels.alertname }}
+      message: |-
+        {{ range .Alerts -}}
+        {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .Annotations.summary }}
+        {{ end }}
+        {{ if .CommonAnnotations.description -}}
+        ---
+        {{ .CommonAnnotations.description }}
+        {{- end }}
       url: |-
         {{- $c := .CommonLabels.component -}}
         {{- if or (eq $c "Internet") (eq $c "Time") (eq $c "VPN") (eq $c "DNS") -}}
