@@ -98,6 +98,33 @@ spec:
         team: mdapi
         probe: keycloak
 
+# ====== Evertrust Stream PKI ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: pki-stream
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: pki-stream
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        ## Root 301s to the login app; any HTTP response proves the stream
+        ## deployment is serving. Added 2026-07-13 after the 07-12 27.5h
+        ## REPLICA_SET_GHOST outage that no availability signal caught
+        ## (only hourly wmfails of f/probe/stream_license_usage).
+        - https://stream.mdapi.ch/
+      labels:
+        component: Platform
+        team: mdapi
+        probe: stream-pki
+
 # ====== GitLab ======
 ---
 apiVersion: monitoring.coreos.com/v1
