@@ -326,12 +326,23 @@ spec:
       ## each vulnerable image. Result: one alert per namespace, value =
       ## count of distinct images with fixable critical CVEs in that
       ## namespace.
+      ##
+      ## 2026-07-13 flap fix (298 firing episodes in 13d — the single
+      ## largest Pushover source): (a) pod churn briefly broke the join
+      ## per namespace, resolving + re-firing the alert; last_over_time
+      ## keeps a deleted pod's container_info alive 30m to bridge
+      ## restarts/reschedules. (b) after a pushgateway pod replacement,
+      ## pod_image_cve_count existed under TWO pod labels within the
+      ## staleness window — duplicate series in the on(image) match group
+      ## errored the whole query and mass-resolved all namespaces (the
+      ## 07-12 wedge produced 64 episodes this way); group by (image)
+      ## collapses to one series per image so duplicates can never error.
       expr: |
         count by (namespace) (
           group by (namespace, image) (
-            kube_pod_container_info
+            last_over_time(kube_pod_container_info[30m])
             * on (image) group_left()
-            (pod_image_cve_count{severity="critical",fix_state="fixed"} > 0)
+            group by (image) (pod_image_cve_count{severity="critical",fix_state="fixed"} > 0)
           )
         )
       for: 30m
@@ -556,8 +567,16 @@ spec:
       ## top-20, or >=10x deviation on an existing combination.  Most
       ## days this is zero; when it fires, a human needs to classify
       ## the rows.
+      ##
+      ## 2026-07-13: for 0m→90m. Reality diverged from "most days zero" —
+      ## the gauge was >0 in roughly half the hourly runs (86 firing
+      ## episodes/13d, all classified clean in the standing audits):
+      ## scanner-rotation churn in the top-20 counts as "novelty" for a
+      ## single run. 90m = signals must persist across two consecutive
+      ## runs before paging; one-run blips (the noise) never fire. The
+      ## deeper fix is probe-side baseline logic, tracked separately.
       expr: waf_novelty_signals{job="waf_novelty_audit"} > 0
-      for: 0m
+      for: 90m
       labels:
         severity: info
         component: Platform

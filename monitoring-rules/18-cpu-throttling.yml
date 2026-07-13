@@ -45,13 +45,19 @@ spec:
       ## surfaced into kube_pod_labels via the KSM metricLabelsAllowlist set
       ## in rancher-monitoring-config/. A missing/typo'd label fails safe
       ## (the pod simply keeps alerting).
+      ## 2026-07-13: rate window [5m]→[30m] + for 15m→1h. This is a
+      ## chronic-condition alert (tune/remove a CPU limit), yet with the
+      ## 5m window the ratio oscillated around the 5% threshold and
+      ## produced 217 firing episodes in 13 days (~2 Pushover messages
+      ## each). A limit that needs tuning is throttled for HOURS — a 30m
+      ## average sustained for 1h loses nothing actionable.
       expr: |
         sum by (namespace, pod, container) (
           rate(container_cpu_cfs_throttled_periods_total{
             container!="",container!="POD",
             namespace!~"harvester-system|cattle-fleet-system|cattle-provisioning-capi-system",
             pod!~"harvester-.*|virt-.*|kube-vip-.*|cloud-controller-manager-.*"
-          }[5m])
+          }[30m])
         )
         /
         sum by (namespace, pod, container) (
@@ -59,11 +65,11 @@ spec:
             container!="",container!="POD",
             namespace!~"harvester-system|cattle-fleet-system|cattle-provisioning-capi-system",
             pod!~"harvester-.*|virt-.*|kube-vip-.*|cloud-controller-manager-.*"
-          }[5m])
+          }[30m])
         ) > 0.05
         unless on (namespace, pod)
         kube_pod_labels{label_monitoring_mdapi_ch_cpu_throttle_exempt="true"}
-      for: 15m
+      for: 1h
       labels:
         severity: warning
         component: Platform

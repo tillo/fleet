@@ -51,6 +51,13 @@ spec:
       ## drain (5,251/mo, 2026-06). Weekly re-page is plenty for priority -1
       ## warnings. (Kept in `h` units to match the rest of this file.)
       repeat_interval: 168h
+      ## 30m (was parent 5m): a group whose member set churns (e.g. 45
+      ## NamespaceWithCriticalCves namespaces flapping through one group
+      ## during pod churn) re-notifies at group_interval, not
+      ## repeat_interval — 5m turned every flap wave into a message every
+      ## 5 minutes (measured 2026-07-13: ~65 msgs/day baseline, 1,685 on
+      ## the 06-30 outage day). Criticals keep the parent 5m.
+      group_interval: 30m
 
   inhibit_rules:
   ## When LonghornVolumeDegraded fires for a given (pvc_namespace, pvc),
@@ -62,6 +69,14 @@ spec:
     target_matchers:
     - 'alertname="LonghornVolumeStatusWarning"'
     equal: [pvc_namespace, pvc]
+  ## A probe that is outright failing should not ALSO page for being slow:
+  ## during ingress/node incidents both fire per instance and double the
+  ## message count (storm audit 2026-07-13).
+  - source_matchers:
+    - 'alertname="SyntheticProbeFailing"'
+    target_matchers:
+    - 'alertname="SyntheticProbeSlowResponse"'
+    equal: [instance]
 
   receivers:
   - name: black-hole
@@ -83,8 +98,13 @@ spec:
       ## delivered silently (-1, no sound/vibration); info and anything else
       ## is badge-only (-2). CommonLabels.severity is stable because the
       ## group_by includes alertname (one severity per rule).
+      ## RESOLVED messages are always -2 (badge only): before 2026-07-13 a
+      ## resolved critical buzzed at priority 1 — every flap episode of a
+      ## critical rule produced TWO interrupts. The ✅ line stays visible
+      ## in the app; it just never buzzes.
       priority: |-
-        {{- if eq .CommonLabels.severity "critical" -}}1
+        {{- if eq .Status "resolved" -}}-2
+        {{- else if eq .CommonLabels.severity "critical" -}}1
         {{- else if eq .CommonLabels.severity "warning" -}}-1
         {{- else -}}-2
         {{- end -}}
