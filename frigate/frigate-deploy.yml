@@ -28,8 +28,15 @@ spec:
       # Frigate 0.17.1 ships go2rtc 1.9.10. Newer go2rtc (1.9.14) has WebRTC
       # ICE/Filter rework that may fix the SDP offer Google's SDM service
       # rejects with 500 for some Nest cam generations (see balconycam). The
-      # initContainer downloads the upstream binary; the frigate container
-      # mounts it over the bundled path via subPath.
+      # initContainer downloads the binary; the frigate container mounts it
+      # over the bundled path via subPath.
+      # 2026-07-13: switched to our patched 1.9.14-nestfix1 build
+      # (gitlab.mdapi.ch/mdapi/go2rtc): upstream's nest source extends the
+      # Google media session only ONCE (one-shot timer) and shares one
+      # session-state object across same-credential cameras, so every Nest
+      # cam renegotiated (with an ffmpeg "no PPS/no frame" wedge + watchdog
+      # restart = 20s outage) every 5-10 min. Version string of the fixed
+      # build: "1.9.14+dev.b5948cf.dirty". Revert = restore the github URL.
       initContainers:
       - name: fetch-go2rtc
         image: busybox:latest
@@ -40,7 +47,8 @@ spec:
           set -eu
           cd /go2rtc-override
           if [ ! -x go2rtc ]; then
-            wget -qO go2rtc https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64
+            wget -qO go2rtc https://gitlab.mdapi.ch/api/v4/projects/214/packages/generic/go2rtc/1.9.14-nestfix1/go2rtc_linux_amd64
+            echo "2ef746791322a4c1bdb5c4e86a9d5014d930784cf97794739235cd5885f6ea81  go2rtc" | sha256sum -c
             chmod +x go2rtc
           fi
           /go2rtc-override/go2rtc --version
