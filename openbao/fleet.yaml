@@ -9,7 +9,6 @@
 #
 # TODO before this is a real failover target (post-P1):
 #   - internal-CA TLS (currently global.tlsDisable=true, in-cluster http only)
-#   - mirror image -> zot.mdapi.ch (Lane B: pinned + IfNotPresent)
 #   - scale ha.replicas 1 -> 3 if HA wanted
 # defaultNamespace (not `namespace:`) — the chart ships a cluster-scoped
 # ClusterRoleBinding (openbao-server-binding, for k8s TokenReview / ESO auth),
@@ -23,6 +22,8 @@ helm:
   values:
     global:
       tlsDisable: true        # P1 PoC only — add internal-CA TLS before production failover use
+      imagePullSecrets:
+        - name: zot-pull      # ES in fleet/zot-pull-secrets (htpasswd user zot)
     injector:
       enabled: false
     csi:
@@ -31,7 +32,8 @@ helm:
       enabled: true
     server:
       image:
-        repository: openbao/openbao
+        registry: zot.mdapi.ch          # Lane B: mirrored from quay.io/openbao/openbao
+        repository: mdapi/openbao
         tag: "2.5.5"
         pullPolicy: IfNotPresent
       dataStorage:
@@ -63,7 +65,7 @@ helm:
             optional: true
       extraContainers:
         - name: unsealer
-          image: openbao/openbao:2.5.5
+          image: zot.mdapi.ch/mdapi/openbao:2.5.5
           env:
             - name: BAO_ADDR
               value: http://127.0.0.1:8200
