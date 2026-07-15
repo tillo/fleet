@@ -9,6 +9,10 @@
 ##   checks are scrub-staleness (PG_NOT_SCRUBBED / PG_NOT_DEEP_SCRUBBED).
 ## - CephPGNotScrubbed + CephPGNotDeepScrubbed two-tier: info while the
 ##   backlog drains, warning only after 7d continuously stuck. (2026-07-09)
+## - CephPGNotDeepScrubbed warning tier additionally suppressed while the
+##   overdue-PG count is measurably declining (ceph_scrub_overdue_pgs gauge
+##   from f/probe/ceph_scrub_backlog); dead/stale gauge falls back to the
+##   plain 7d rule. (2026-07-15)
 ## - CephPGsUnclean two-tier: info during recovery/rebalance, warning after
 ##   4h continuously unclean. (2026-07-09)
 apiVersion: monitoring.coreos.com/v1
@@ -636,11 +640,19 @@ spec:
       ## min_over_time from TSDB (ceph_health_detail exports all checks at 0
       ## when inactive) so a vmalert restart can't reset the clock the way
       ## `for: 7d` would.
+      ## 2026-07-15: 7d-active alone misread a measured 94->73/24h drain as
+      ## "stuck" (a wide cohort can take >7d to clear while draining fine).
+      ## The unless-gate suppresses the warning while the overdue-PG count
+      ## (ceph_scrub_overdue_pgs, f/probe/ceph_scrub_backlog) declined over
+      ## the last 48h. Fail-safe by construction: a dead or stale gauge goes
+      ## flat, delta >= 0, nothing suppressed -> plain 7d rule. A growth
+      ## phase >= 7d also fires — same as before this gate, and growth is
+      ## covered by the info tier's cohort note above.
       annotations:
-        description: The PG_NOT_DEEP_SCRUBBED health check has been continuously active for 7+ days on cluster {{ $labels.cluster }} — the deep-scrub backlog is NOT draining. Check pace via the DEEP_SCRUB_STAMP date distribution (needs ~63 PGs/day at the 14d interval) and osd_max_scrubs / load gating.
+        description: The PG_NOT_DEEP_SCRUBBED health check has been continuously active for 7+ days AND the overdue-PG count has not declined in 48h on cluster {{ $labels.cluster }} — the deep-scrub backlog is NOT draining. Check pace via the DEEP_SCRUB_STAMP date distribution (needs ~63 PGs/day at the 14d interval) and osd_max_scrubs / load gating.
         documentation: https://docs.ceph.com/en/latest/rados/operations/health-checks#pg-not-deep-scrubbed
         summary: Deep-scrub backlog stuck for 7+ days on cluster {{ $labels.cluster }}
-      expr: min_over_time(ceph_health_detail{name="PG_NOT_DEEP_SCRUBBED"}[7d]) == 1
+      expr: min_over_time(ceph_health_detail{name="PG_NOT_DEEP_SCRUBBED"}[7d]) == 1 unless on() (delta(ceph_scrub_overdue_pgs{kind="deep"}[48h]) < 0)
       for: 1h
       labels:
         severity: warning
