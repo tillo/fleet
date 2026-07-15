@@ -2,7 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": "mdapi Renovate — Lane-B image bumps + ALL Fleet Helm chart versions. Lane-A floating app images stay on Keel. Minor+patch updates auto-merge after each package's soak window (every manager, incl. critical infra — owner decision 2026-06-29); majors stay MR-only; security fixes auto-merge via vulnerabilityAlerts. See operator ~/imagepolicy-study/PROPOSAL.md.",
   "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled", "mergeConfidence:all-badges"],
-  "enabledManagers": ["kubernetes", "fleet"],
+  "enabledManagers": ["kubernetes", "fleet", "custom.regex"],
   "baseBranchPatterns": [
     "main",
     "test"
@@ -30,6 +30,15 @@
   "fleet": {
     "managerFilePatterns": ["/(^|/)fleet\\.ya?ml$/"]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Lane-B pins living inside Helm values files, invisible to the kubernetes manager (Lane-B blind-spot closure 2026-07-15): stream ca-pub static-serving image.",
+      "managerFilePatterns": ["/^stream/values\\.yml$/"],
+      "matchStrings": ["image: (?<depName>nginxinc/nginx-unprivileged):(?<currentValue>\\S+)"],
+      "datasourceTemplate": "docker"
+    }
+  ],
   "packageRules": [
     {
       "description": "Default OFF — do not touch Lane-A floating image refs (Keel owns them).",
@@ -96,9 +105,16 @@
       "minimumReleaseAge": "3 days"
     },
     {
-      "description": "Lane-B upstream stock: nginxinc/nginx-unprivileged (showcase + cert-host static serving). Pinned tag, Renovate-owned (not Keel). Manual review + 3-day soak.",
-      "matchManagers": ["kubernetes"],
+      "description": "Lane-B upstream stock: nginxinc/nginx-unprivileged (showcase + cert-host + stream ca-pub static serving; ca-pub comes in via the custom.regex manager). Pinned tag, Renovate-owned (not Keel). Manual review + 3-day soak.",
+      "matchManagers": ["kubernetes", "custom.regex"],
       "matchPackageNames": ["nginxinc/nginx-unprivileged"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream stock: alpine/k8s (mail-reconciler CronJob kubectl/helm toolbox). Pinned tag, Renovate-owned (not Keel); sat invisible at 1.31.1 for ~a year before the 2026-07-15 blind-spot closure. Manual review + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["alpine/k8s"],
       "enabled": true,
       "minimumReleaseAge": "3 days"
     },
@@ -134,7 +150,7 @@
     },
     {
       "description": "Auto-merge ALL minor + patch updates — every manager, every package, including critical infra (owner decision 2026-06-29). Placed last so it overrides the automerge key on every rule above while leaving their minimumReleaseAge soaks intact (3-day default, 1-day mdapi images). Majors are NOT matched here, so they stay MR-only (the helm-major rule keeps its 7-day soak + review). platformAutomerge merges via GitLab merge-when-pipeline-succeeds once CI is green.",
-      "matchManagers": ["kubernetes", "fleet"],
+      "matchManagers": ["kubernetes", "fleet", "custom.regex"],
       "matchUpdateTypes": ["minor", "patch"],
       "automerge": true
     }
