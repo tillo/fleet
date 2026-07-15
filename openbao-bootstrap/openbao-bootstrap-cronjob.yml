@@ -17,22 +17,28 @@ spec:
         spec:
           serviceAccountName: openbao-admin   # bound to k8s-auth role `admin`
           restartPolicy: Never
+          imagePullSecrets:
+          - name: zot-pull
           containers:
           - name: bootstrap
-            image: openbao/openbao:2.5.5       # provides the `bao` CLI
+            image: zot.mdapi.ch/mdapi/openbao:2.5.5   # provides the `bao` CLI (Lane B mirror)
             imagePullPolicy: IfNotPresent
             command: ["/bin/sh","/script/bootstrap.sh"]
             env:
             - name: BAO_ADDR
-              value: http://openbao.openbao.svc:8200
+              value: https://openbao.openbao.svc:8200
+            - name: BAO_CACERT
+              value: /trust/ca-bundle.crt
             resources:
               requests: {cpu: 50m, memory: 64Mi}
               limits: {memory: 128Mi}
             volumeMounts:
             - {name: script, mountPath: /script}
             - {name: bootstrap-token, mountPath: /bootstrap, readOnly: true}
+            - {name: trust, mountPath: /trust, readOnly: true}
           volumes:
           - {name: script, configMap: {name: openbao-bootstrap-script}}
+          - {name: trust, configMap: {name: mdapi-trust-bundle}}
           # Optional: present ONLY during DR-from-scratch (key: root-token), like
           # openbao-unseal-keys. Absent in steady state -> k8s-auth path is used.
           - {name: bootstrap-token, secret: {secretName: openbao-bootstrap-token, optional: true}}

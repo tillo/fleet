@@ -12,11 +12,14 @@ data:
     # Secret VALUES are NEVER printed (only counts + error key names).
     import json, ssl, time, urllib.request, urllib.error
     AK = "https://cm.mdapi.ch/akeyless-api/v2"
-    BAO = "http://openbao.openbao.svc:8200"
+    BAO = "https://openbao.openbao.svc:8200"
     akid = open("/creds/access-id").read().strip()
     akkey = open("/creds/access-key").read().strip()
     sa = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
     ctx = ssl.create_default_context()
+    # mdapi-trust-bundle (mounted): Mozilla roots + MDAPI Root CA, so the same
+    # context verifies both Akeyless (public LE) and OpenBao (CA01).
+    ctx.load_verify_locations("/trust/ca-bundle.crt")
 
     def post(url, body, tok_hdr=None):
         h = {"Content-Type": "application/json"}
