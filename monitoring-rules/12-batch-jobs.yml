@@ -743,6 +743,20 @@ spec:
       annotations:
         summary: "Longhorn volume {{ $labels.namespace }}/{{ $labels.pvc }} unhealthy"
         description: "Robustness != healthy or state in (faulted, error)."
+    - alert: LonghornRebuildLimitDrift
+      ## concurrent-replica-rebuild-per-node-limit hard ceiling is 2
+      ## (2026-06-07 rule; storms at 4 on 06-07 and 3 on 07-12 were both
+      ## found mid-incident). Gauge pushed hourly by f/probe/
+      ## daily_infra_health; -1 means the setting could not be read.
+      expr: longhorn_rebuild_limit != 2
+      for: 15m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn rebuild limit is {{ $value }} (must be 2)"
+        description: "concurrent-replica-rebuild-per-node-limit drifted from the hard max of 2 (or is unreadable, -1). Patch it back: kubectl -n longhorn-system patch setting.longhorn.io concurrent-replica-rebuild-per-node-limit --type=merge -p '{\"value\":\"2\"}'"
     - alert: NodeDiskHigh
       expr: node_disk_used_pct > 80
       for: 1h
