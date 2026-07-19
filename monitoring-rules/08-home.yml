@@ -161,6 +161,33 @@ spec:
           For Frigate cams: check go2rtc producers (`/api/streams?src=<name>`)
           and ffmpeg logs. For Nest cams: a Google SDM 500 on the device
           usually means the Nest cam itself is offline — check Google Home app.
+          balconycam/garagecam stale-WebRTC deaths are auto-bounced by
+          f/heal/frigate_nest_camera_bounce (2h cooldown).
+
+    ## f/heal/frigate_nest_camera_bounce (every 5 min): bounces the frigate
+    ## pod when balconycam/garagecam sit in the go2rtc stale-WebRTC half-death
+    ## (h264-none, fps 0) for >=15m. Info while it acts; warning only when the
+    ## offline condition survives the heal for 45m (bounce didn't fix it, or
+    ## the 2h cooldown is blocking a repeat — either way a human should look).
+    - alert: FrigateNestBounceHealActive
+      expr: (time() - frigate_nest_camera_bounce_last_bounce_timestamp_seconds{job="frigate_nest_camera_bounce"}) < 3600
+      labels:
+        severity: info
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Frigate Nest heal bounced the pod in the last hour"
+        description: "Stale Nest WebRTC session auto-remediation ran. Cameras blip ~90s during the bounce; no action needed unless FrigateNestBounceStuck follows."
+
+    - alert: FrigateNestBounceStuck
+      expr: min_over_time(frigate_nest_camera_bounce_offline_cameras{job="frigate_nest_camera_bounce"}[45m]) > 0
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Nest camera still offline despite auto-bounce heal"
+        description: "An eligible Nest camera (balconycam/garagecam) has been continuously offline for 45m+ with the auto-bounce heal running — the bounce did not fix it or the cooldown is blocking. Check go2rtc producer state, Google Home app, and heal runs at https://windmill.mdapi.ch/runs?path=f%2Fheal%2Ffrigate_nest_camera_bounce"
 
     ## HA backup integration tracks last successful + last failed timestamps.
     ## binary_sensor.auto_backup_backup_status: 0 healthy, 1 last attempt failed.
