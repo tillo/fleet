@@ -318,6 +318,14 @@ for path in sorted((REPO / "monitoring-rules").glob("*.yml")):
                         "not in the _README.md taxonomy (statuspage mapping + "
                         "Pushover grouping key on it)."
                     )
+                # Optional statuspage opt-out: the adapter skips alerts labeled
+                # statuspage=exclude. Any other value is a typo that would
+                # silently keep degrading the public page — fail it here.
+                if "statuspage" in lab and lab["statuspage"] != "exclude":
+                    errors.append(
+                        f"[RULES-STATUSPAGE] {where}: statuspage={lab['statuspage']!r} "
+                        "— the only supported value is 'exclude' (adapter opt-out)."
+                    )
 
 
 # ---------------------------------------------------------------------------

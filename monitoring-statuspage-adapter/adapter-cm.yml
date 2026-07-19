@@ -165,10 +165,20 @@ data:
         """
         Given the alerts touching one component (firing + resolved mixed),
         compute the worst-case current status. Resolved alerts contribute nothing.
+
+        Alerts labeled `statuspage: exclude` never influence the public page:
+        they are internal tune-signals (chronic CPU-throttling etc.) whose
+        component label exists for Pushover grouping, not for the statuspage.
+        Both paths funnel through here — webhook alerts carry their labels
+        verbatim, reconcile synthesizes the same shape — so this single check
+        covers both. The label value is lint-enforced (fleet lint.py) to
+        guard against typos silently re-degrading the page.
         """
         worst = "operational"
         for a in alerts:
             if a.get("status") != "firing":
+                continue
+            if a.get("labels", {}).get("statuspage") == "exclude":
                 continue
             sev = a.get("labels", {}).get("severity", "warning")
             candidate = SEVERITY_STATUS.get(sev, "degraded_performance")
