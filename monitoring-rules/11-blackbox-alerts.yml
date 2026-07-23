@@ -21,17 +21,44 @@ spec:
       ## recovery a SINGLE successful 15s scrape resolved the alert, the
       ## next failure window re-fired it — 140 firing episodes in 13 days,
       ## each = 2 priority-1 Pushover messages. avg_over_time gives
-      ## hysteresis on BOTH edges: fires after ~1m hard failure + for:4m
-      ## (≈5m detection, same as before), resolves only once the success
-      ## rate over the last 5m is back above 80%.
+      ## hysteresis on BOTH edges: fires after ~1m hard failure + for:,
+      ## resolves only once the success rate over the last 5m is back
+      ## above 80%.
       ## dns_external_google is a REFERENCE probe (is the internet broken,
       ## not us) — split into the info-tier rule below.
-      expr: avg_over_time(probe_success{component!="", team="mdapi", probe!="dns_external_google"}[5m]) < 0.8
-      for: 4m
+      ##
+      ## 2026-07-23 blip fix (infra-health, user-approved 06:14Z): for:
+      ## 4m -> 8m on everything EXCEPT Mail. Three unattributable sub-6-min
+      ## self-resolved blips in a week (07-16, 07-19, 07-21) each fired
+      ## critical for 1-2min; ≈9m detection rides those out. Known trade:
+      ## a real-but-short outage (07-23 pushgateway OOM, ~5min) no longer
+      ## pages. Mail is priority 1 and keeps the 4m rule below.
+      expr: avg_over_time(probe_success{component!="", component!="Mail", team="mdapi", probe!="dns_external_google"}[5m]) < 0.8
+      for: 8m
       labels:
         severity: critical
         team: mdapi
         # component label is inherited from the Probe target, no need to set
+      annotations:
+        summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} failing"
+        description: |
+          Blackbox probe `{{ $labels.instance }}` (module: {{ $labels.module }})
+          has had <80% success over the last 5m for >8m.
+          Component {{ $labels.component }} on statuspage will go to major_outage.
+          Investigate from a workstation:
+            curl -v {{ $labels.instance }}    (for HTTP probes)
+            dig @{{ reReplaceAll ":53" "" $labels.instance }} mdapi.ch  (for DNS)
+
+    - alert: SyntheticProbeFailing
+      ## Mail split (2026-07-23): mail is priority 1 — keeps the original
+      ## 4m (≈5m detection). Same alertname on purpose: routing, statuspage
+      ## mapping and the SlowResponse inhibition all key on alertname, and
+      ## each probe_success series matches exactly one of the two rules.
+      expr: avg_over_time(probe_success{component="Mail", team="mdapi"}[5m]) < 0.8
+      for: 4m
+      labels:
+        severity: critical
+        team: mdapi
       annotations:
         summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} failing"
         description: |
