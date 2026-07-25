@@ -1,0 +1,102 @@
+# In-cluster SSH/mosh bastion.
+# Secrets (jump-hostkeys, jump-authorized-keys) and the entrypoint ConfigMap
+# (jump-entrypoint) are created imperatively by apply.sh so no key material lives
+# in this file. This manifest is the parts safe to keep in Git / a Fleet bundle.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jump-home
+  namespace: jump
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jump-bastion
+  namespace: jump
+  labels: { app: jump-bastion }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # RWO PVC — single attach
+  selector:
+    matchLabels: { app: jump-bastion }
+  template:
+    metadata:
+      labels: { app: jump-bastion }
+    spec:
+      automountServiceAccountToken: false   # network bastion, NOT a cluster console
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: bastion
+          image: debian:trixie-slim
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/opt/entrypoint/entrypoint.sh"]
+          env:
+            - { name: TLS_BACKEND, value: "ingress-expose.kube-system.svc.cluster.local:443" }
+            - { name: MOSH_PORT,   value: "443" }
+            - { name: SSLH_PORT,   value: "4443" }
+          securityContext:
+            runAsUser: 0                     # sshd needs root
+            allowPrivilegeEscalation: true   # setcap on mosh-server; su to tillo
+            capabilities:
+              drop: ["ALL"]
+              # NET_BIND_SERVICE: sslh/sshd/mosh bind low ports.
+              # SETFCAP: entrypoint setcap's mosh-server so non-root tillo binds udp/443.
+              # SYS_CHROOT: OpenSSH pre-auth privsep child chroots to /run/sshd (mandatory).
+              # SETUID/SETGID: sshd privsep + su to tillo. CHOWN/DAC_OVERRIDE/FOWNER: home/key setup.
+              add: ["NET_BIND_SERVICE", "SETFCAP", "SYS_CHROOT", "SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "FOWNER"]
+          ports:
+            - { name: sslh, containerPort: 4443, protocol: TCP }
+            - { name: mosh, containerPort: 443,  protocol: UDP }
+          readinessProbe:
+            tcpSocket: { port: 4443 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 4443 }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "50m",  memory: "96Mi" }
+            limits:   { cpu: "1",    memory: "384Mi" }
+          volumeMounts:
+            - { name: entrypoint, mountPath: /opt/entrypoint, readOnly: true }
+            - { name: hostkeys,   mountPath: /etc/ssh/keys, readOnly: true }
+            - { name: authkeys,   mountPath: /etc/ssh/authorized_keys.d, readOnly: true }
+            - { name: home,       mountPath: /home/tillo }
+      volumes:
+        - name: entrypoint
+          configMap: { name: jump-entrypoint, defaultMode: 0555 }
+        - name: hostkeys
+          secret: { secretName: jump-hostkeys, defaultMode: 0600 }
+        - name: authkeys
+          secret: { secretName: jump-authorized-keys, defaultMode: 0644 }
+        - name: home
+          persistentVolumeClaim: { claimName: jump-home }
+---
+# Single mixed-protocol LB service (tcp/443 sslh + udp/443 mosh), pinned via
+# spec.loadBalancerIP — the convention every working LB service here uses (cf.
+# technitium-dns), which this MetalLB build honors over the newer annotation.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jump
+  namespace: jump
+  labels: { app: jump-bastion }
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.62
+  externalTrafficPolicy: Cluster
+  selector: { app: jump-bastion }
+  ports:
+    - { name: sslh, port: 443, targetPort: 4443, protocol: TCP }
+    - { name: mosh, port: 443, targetPort: 443,  protocol: UDP }

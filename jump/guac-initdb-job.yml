@@ -1,0 +1,57 @@
+# One-shot: generate Guacamole's Postgres schema and load it into guac-pg.
+# Idempotent — guarded by a to_regclass check, so re-running is a no-op.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: guac-initdb
+  namespace: jump
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      initContainers:
+        - name: gen-schema
+          image: guacamole/guacamole:1.6.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - /opt/guacamole/bin/initdb.sh --postgresql > /schema/001-schema.sql && echo "schema generated ($(wc -l < /schema/001-schema.sql) lines)"
+          volumeMounts: [ { name: schema, mountPath: /schema } ]
+          securityContext:
+            allowPrivilegeEscalation: false      # image USER 'guacamole' is non-root
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: apply-schema
+          image: postgres:16-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "waiting for $PGHOST…"
+              for i in $(seq 1 60); do pg_isready -q && break; sleep 2; done
+              exists=$(psql -tAc "SELECT to_regclass('public.guacamole_user')")
+              if [ -n "$exists" ]; then
+                echo "guacamole schema already present ($exists) — nothing to do"; exit 0
+              fi
+              echo "loading schema…"
+              psql -v ON_ERROR_STOP=1 -f /schema/001-schema.sql
+              echo "schema loaded."
+          env:
+            - { name: PGHOST, value: "guac-pg-rw" }
+            - { name: PGPORT, value: "5432" }
+            - { name: PGDATABASE, value: "guacamole_db" }
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: guac-pg-app, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: guac-pg-app, key: password } }
+          volumeMounts: [ { name: schema, mountPath: /schema } ]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: schema
+          emptyDir: {}

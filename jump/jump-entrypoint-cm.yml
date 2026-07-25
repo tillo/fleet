@@ -1,0 +1,99 @@
+apiVersion: v1
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    # In-cluster SSH/mosh bastion — interim entrypoint.
+    # INTERIM: packages are apt-installed at start because the mbptillo buildroot
+    # (which would bake a proper image) is down. Once it's back, replace this with a
+    # pre-baked image and drop the apt step. Pod restarts are rare (PVC-backed home),
+    # so the per-start install cost is tolerable meanwhile.
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    log() { echo "[jump-entrypoint] $*"; }
+
+    TLS_BACKEND="${TLS_BACKEND:-ingress-expose.kube-system.svc.cluster.local:443}"
+    MOSH_PORT="${MOSH_PORT:-443}"
+    SSLH_PORT="${SSLH_PORT:-4443}"
+
+    # 1. Tools (idempotent: only when missing) --------------------------------
+    if ! command -v sslh >/dev/null 2>&1; then
+      log "installing tools (interim apt path)…"
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        openssh-server mosh sslh byobu tmux libcap2-bin \
+        ca-certificates iproute2 iputils-ping less vim-tiny bash-completion
+      apt-get clean; rm -rf /var/lib/apt/lists/*
+    fi
+
+    # mosh refuses to run without a UTF-8 locale. C.UTF-8 ships with glibc (no
+    # locale-gen needed); pam_env loads /etc/environment into the ssh session, so
+    # mosh-server (exec'd non-interactively by the mosh client) inherits it.
+    echo 'LANG=C.UTF-8'  > /etc/environment
+    echo 'LC_ALL=C.UTF-8' >> /etc/environment
+
+    # 2. Login user (home is the mounted PVC) ---------------------------------
+    if ! id tillo >/dev/null 2>&1; then
+      useradd -M -s /bin/bash -d /home/tillo -u 1000 tillo
+    fi
+    # PVC may be empty on first boot; populate skeleton without clobbering.
+    mkdir -p /home/tillo/.ssh
+    [ -f /home/tillo/.bashrc ] || cp /etc/skel/.bashrc /home/tillo/.bashrc 2>/dev/null || true
+    grep -q 'C.UTF-8' /home/tillo/.bashrc 2>/dev/null || \
+      printf '\n# mosh/byobu need a UTF-8 locale\nexport LANG=C.UTF-8 LC_ALL=C.UTF-8\n' >> /home/tillo/.bashrc
+    [ -f /home/tillo/.profile ] || cp /etc/skel/.profile /home/tillo/.profile 2>/dev/null || true
+    install -m 600 /etc/ssh/authorized_keys.d/authorized_keys /home/tillo/.ssh/authorized_keys
+    chown -R tillo:tillo /home/tillo
+    chmod 700 /home/tillo/.ssh
+
+    # 3. Host keys from the mounted Secret (stable identity across restarts) ---
+    for k in ssh_host_ed25519_key ssh_host_rsa_key; do
+      if [ -f "/etc/ssh/keys/$k" ]; then
+        install -m 600 "/etc/ssh/keys/$k"      "/etc/ssh/$k"
+        install -m 644 "/etc/ssh/keys/$k.pub"  "/etc/ssh/$k.pub"
+      fi
+    done
+
+    # 4. sshd — listens only on loopback; sslh is the front door -------------
+    mkdir -p /run/sshd /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/jump.conf <<EOF
+    Port 22
+    ListenAddress 127.0.0.1
+    AddressFamily inet
+    PermitRootLogin no
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PubkeyAuthentication yes
+    AllowUsers tillo
+    X11Forwarding no
+    AllowAgentForwarding yes
+    AllowTcpForwarding yes
+    PermitTunnel no
+    ClientAliveInterval 60
+    ClientAliveCountMax 3
+    AcceptEnv LANG LC_* COLORTERM TERM
+    EOF
+
+    # mosh-server runs as the (non-root) login user but must bind udp/${MOSH_PORT}
+    # (<1024). Grant the file capability so it can, without running mosh as root.
+    if command -v setcap >/dev/null 2>&1; then
+      setcap cap_net_bind_service=+ep "$(command -v mosh-server)" || \
+        log "WARN: setcap on mosh-server failed; mosh on ${MOSH_PORT} may not bind"
+    fi
+
+    log "starting sshd (127.0.0.1:22)…"
+    /usr/sbin/sshd -e
+
+    # 5. sslh front door: tcp/${SSLH_PORT} -> ssh(22) | tls(ingress) ----------
+    # Silent clients (SSH sends no banner first) fall through to ssh after timeout.
+    log "starting sslh on 0.0.0.0:${SSLH_PORT} (ssh->127.0.0.1:22, tls->${TLS_BACKEND})"
+    exec sslh --foreground \
+      --listen "0.0.0.0:${SSLH_PORT}" \
+      --ssh "127.0.0.1:22" \
+      --tls "${TLS_BACKEND}" \
+      --timeout 2 \
+      --on-timeout ssh
+kind: ConfigMap
+metadata:
+  name: jump-entrypoint
+  namespace: jump
