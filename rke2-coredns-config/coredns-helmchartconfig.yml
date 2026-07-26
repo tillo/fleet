@@ -1,28 +1,29 @@
 ## Override the rke2-coredns chart values to:
 ##
-##   1. Stop forwarding everything blindly to /etc/resolv.conf (which on the
-##      RKE2 nodes points at 192.168.1.1 = the BPI-R4 dnsmasq). That made
-##      external DNS for the whole cluster a SPOF on the router: a single
-##      ~10-min router DNS hiccup on 2026-05-25 (08:51–10:01 UTC) cascaded
-##      into cribl image-pull failures (docker.io), statuspage-adapter
-##      URLErrors (api.statuspage.io), and gitlab-runner clone failures
-##      (gitlab.mdapi.ch is also forwarded upstream via this path).
+##   1. Resolve everything through the internal resolver FIRST: 192.168.1.1
+##      is pfSense/Unbound (NOT the bpi-r4, which sits at .254 — verified
+##      2026-07-26). Only .1 holds the full split-horizon view: the internal
+##      mdapi.ch record set (gitlab.mdapi.ch → 192.168.1.191, etc. —
+##      Technitium serves the PUBLIC mdapi.ch view even to LAN sources),
+##      plus home.tillo.ch and the 168.192.in-addr.arpa PTRs (Technitium-
+##      backed). in-addr.arpa/ip6.arpa fall through the kubernetes plugin
+##      into the default forward, so LAN PTRs resolve via .1 as well.
 ##
-##   2. Preserve mdapi.ch resolution through the router's dnsmasq — the
-##      router holds the authoritative-cache hints for our owned zones
-##      (gitlab.mdapi.ch → 192.168.1.191, etc.). Routing mdapi.ch direct
-##      to public DNS would only return the public record set.
+##   2. NextDNS (45.90.28.16/.30.16) is the ONLY fallback — internal-first,
+##      NextDNS-fallback, per the NextDNS-only resolver policy (1.1.1.1 /
+##      9.9.9.9 removed 2026-07-26). .1's Unbound itself forwards upstream
+##      to NextDNS (egress verified via whoami.akamai.net +
+##      o-o.myaddr.l.google.com + test.nextdns.io edge = dns.nextdns.io),
+##      so the paid filtering profile (Linked-IP on the WAN block) stays
+##      in-path on BOTH the primary and fallback routes.
 ##
-##   3. Use NextDNS first for everything else, with public DNS as fallback.
-##      NextDNS (paid plan) applies the filtering profile keyed on our WAN
-##      IP block (Linked-IP feature; SNAT'd cluster egress lands on
-##      31.3.128.48/28 so the profile matches). 1.1.1.1 and 9.9.9.9 are
-##      fallbacks for when NextDNS itself is unreachable or rate-limiting.
-##
-##   `policy sequential` walks the upstream list in order until one answers,
-##   so NextDNS gets priority — fallback only on its failure. `health_check`
-##   pulls a healthcheck every 5s and stops sending queries to upstreams
-##   that fail twice in a row.
+##   3. The 2026-05-25 cascade (router DNS hiccup 08:51–10:01 UTC → cribl
+##      image pulls, statuspage-adapter, gitlab-runner clones all failed)
+##      happened because the then-config had NO fallback past the router.
+##      `policy sequential` + `health_check 5s` + `max_fails 2` now flips
+##      queries to NextDNS within seconds of a .1 outage. Fallback answers
+##      lose the internal view (public records only) — acceptable
+##      degradation vs SERVFAIL for non-pinned names.
 ##
 ##   See [[SESSION_REVIEW_20260517_DNSSEC_ROOT_CAUSE_CF_DESIGN_NEXTDNS.md]]
 ##   for the prior NextDNS-vs-DNSSEC analysis. CoreDNS here is a non-
@@ -94,8 +95,11 @@ spec:
         configBlock: |-
           health_check 5s
           max_fails 2
-    ## Default zone — cluster.local handling (unchanged) + NextDNS-first
-    ## upstream chain for everything else.
+    ## Default zone — cluster.local handling (unchanged) + internal-first
+    ## upstream chain: .1 (full split-horizon view; its own upstream is
+    ## NextDNS), NextDNS direct as the only fallback. The mdapi.ch /
+    ## home.tillo.ch pins above deliberately keep NO public fallback: a
+    ## public answer there is wrong-not-degraded, so fail loudly instead.
     - port: 53
       zones:
       - use_tcp: true
@@ -114,7 +118,7 @@ spec:
       - name: prometheus
         parameters: 0.0.0.0:9153
       - name: forward
-        parameters: . 45.90.28.16 45.90.30.16 1.1.1.1 9.9.9.9
+        parameters: . 192.168.1.1 45.90.28.16 45.90.30.16
         configBlock: |-
           policy sequential
           health_check 5s
