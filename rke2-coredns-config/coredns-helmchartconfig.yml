@@ -1,21 +1,25 @@
 ## Override the rke2-coredns chart values to:
 ##
 ##   1. Resolve everything through the internal resolver FIRST: 192.168.1.1
-##      is pfSense/Unbound (NOT the bpi-r4, which sits at .254 — verified
-##      2026-07-26). Only .1 holds the full split-horizon view: the internal
-##      mdapi.ch record set (gitlab.mdapi.ch → 192.168.1.191, etc. —
-##      Technitium serves the PUBLIC mdapi.ch view even to LAN sources),
-##      plus home.tillo.ch and the 168.192.in-addr.arpa PTRs (Technitium-
-##      backed). in-addr.arpa/ip6.arpa fall through the kubernetes plugin
-##      into the default forward, so LAN PTRs resolve via .1 as well.
+##      is the IN-CLUSTER split-horizon Unbound (fleet/split-horizon/, ns
+##      split-horizon, MetalLB single-address pool — NOT the bpi-r4, which
+##      sits at .254; verified 2026-07-26). Only .1 serves the full
+##      split-horizon view: 14 transparent local-zones (mdapi.ch, tillo.ch,
+##      dellambrogio.*, …) with the mdapi.ch ingress records auto-generated
+##      by external-dns, plus home.tillo.ch and 168.192.in-addr.arpa
+##      forwarded to Technitium (.54). Technitium itself serves the PUBLIC
+##      mdapi.ch view even to LAN sources — never test split horizon with
+##      `dig @.54`. in-addr.arpa/ip6.arpa fall through the kubernetes
+##      plugin into the default forward, so LAN PTRs resolve via .1 too.
+##      Being in-cluster, this first hop adds NO router dependency.
 ##
 ##   2. NextDNS (45.90.28.16/.30.16) is the ONLY fallback — internal-first,
 ##      NextDNS-fallback, per the NextDNS-only resolver policy (1.1.1.1 /
-##      9.9.9.9 removed 2026-07-26). .1's Unbound itself forwards upstream
-##      to NextDNS (egress verified via whoami.akamai.net +
-##      o-o.myaddr.l.google.com + test.nextdns.io edge = dns.nextdns.io),
-##      so the paid filtering profile (Linked-IP on the WAN block) stays
-##      in-path on BOTH the primary and fallback routes.
+##      9.9.9.9 removed 2026-07-26). .1's default recursion path is
+##      Technitium (.54) → DoT to NextDNS (egress verified via
+##      whoami.akamai.net + o-o.myaddr.l.google.com + test.nextdns.io
+##      edge = dns.nextdns.io), so the paid filtering profile (Linked-IP
+##      on the WAN block) stays in-path on BOTH primary and fallback routes.
 ##
 ##   3. The 2026-05-25 cascade (router DNS hiccup 08:51–10:01 UTC → cribl
 ##      image pulls, statuspage-adapter, gitlab-runner clones all failed)
