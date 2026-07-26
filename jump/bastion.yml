@@ -35,9 +35,17 @@ spec:
       terminationGracePeriodSeconds: 20
       securityContext:
         seccompProfile: { type: RuntimeDefault }
+      imagePullSecrets:
+        - name: mdapi-registry            # see mdapi-registry-es.yml
       containers:
         - name: bastion
-          image: debian:trixie-slim
+          # Pre-baked image (mdapi/jump-bastion, TODO-when-mbptillo-back §2b) —
+          # replaced the interim debian:trixie-slim + apt-at-entrypoint on
+          # 2026-07-26; the entrypoint's apt step is a no-op on it. NOTE: this
+          # was committed while Fleet was down and deliberately NOT applied live
+          # (working sessions run inside the pod; Recreate = brief jump outage).
+          # Fleet's first reconcile after Rancher returns WILL roll the pod once.
+          image: registry.mdapi.ch/mdapi/jump-bastion:2.1.4-mdapi.1
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "/opt/entrypoint/entrypoint.sh"]
           env:
