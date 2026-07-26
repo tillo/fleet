@@ -549,8 +549,6 @@ spec:
   targets:
     staticConfig:
       static:
-        - https://rancher.home.tillo.ch
-        - https://rancher.mdapi.ch
         - https://harvester.mdapi.ch
         ## /admin is the only mounted oauth2-proxy ingress path at
         ## auth.mdapi.ch (the other being /tv). Probing the bare host
@@ -559,6 +557,35 @@ spec:
       labels:
         component: Platform
         team: mdapi
+---
+## Management-plane probes (Rancher on mbptillo). Split out of infra-platform
+## 2026-07-26: mbptillo being down showed the PUBLIC statuspage "Platform"
+## component as major_outage for 3 days while every public service was fine.
+## `statuspage: exclude` keeps these out of the public page (the adapter's
+## derive_status skips the label — the mechanism built for internal signals)
+## while alerting/Pushover behavior stays identical.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-mgmt
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: infra-mgmt
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://rancher.home.tillo.ch
+        - https://rancher.mdapi.ch
+      labels:
+        component: Platform
+        team: mdapi
+        statuspage: exclude
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: Probe
