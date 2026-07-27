@@ -25,6 +25,11 @@ spec:
         # honored via the KSM pod-label allowlist in rancher-monitoring-config.
         monitoring.mdapi.ch/cpu-throttle-exempt: "true"
     spec:
+      # Coral USB TPU is plugged into qui (2026-07-27) — the pod must sit
+      # there and see the raw USB bus (privileged; the device re-enumerates
+      # 1a6e:089a -> 18d1:9302 on first inference load).
+      nodeSelector:
+        kubernetes.io/hostname: qui
       # Frigate 0.17.1 ships go2rtc 1.9.10. Newer go2rtc (1.9.14) has WebRTC
       # ICE/Filter rework that may fix the SDP offer Google's SDM service
       # rejects with 500 for some Nest cam generations (see balconycam). The
@@ -81,6 +86,8 @@ spec:
 #        - '-c'
 #        - >-
 #          tail -f /dev/null
+        securityContext:
+          privileged: true
         env:
         - name: TZ
           value: Europe/Zurich
@@ -88,6 +95,8 @@ spec:
           - secretRef:
               name: frigate-env-secret
         volumeMounts:
+        - name: coral-usb
+          mountPath: /dev/bus/usb
         - name: frigate-config
           mountPath: /config
         - name: frigate-media
@@ -199,6 +208,9 @@ spec:
             cpu: 2
             memory: 512Mi
       volumes:
+      - name: coral-usb
+        hostPath:
+          path: /dev/bus/usb
       - name: frigate-config
         persistentVolumeClaim:
           claimName: frigate-config
