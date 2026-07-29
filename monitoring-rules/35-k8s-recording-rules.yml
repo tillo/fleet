@@ -1,0 +1,152 @@
+## kube-prometheus RECORDING rules — the subset the provisioned Grafana dashboards use.
+##
+## Why this exists: when the VM stack replaced rancher-monitoring's Prometheus on
+## 2026-06-04 16:16 (vmsingle/vmagent/vmalert), the kube-prometheus recording rules
+## were never migrated into vmalert — every `instance:node_*`, `k8s.rules` and
+## workload-relabel series died at that exact timestamp (verified via
+## tlast_over_time during the 2026-07-29 dashboard audit). That silently broke the
+## Node Exporter USE-Method dashboards entirely and large parts of the
+## Kubernetes/Compute-Resources and Rancher dashboards for ~8 weeks.
+##
+## This file restores the canonical exprs (kubernetes-mixin/node-exporter-mixin),
+## verified 2026-07-29 against live labels: node-exporter job="node-exporter",
+## cadvisor job="kubelet" metrics_path="/metrics/cadvisor", kube-state-metrics
+## present. NOT restored (dashboard panels stay dark, deliberately):
+## apiserver_request:availability30d + SLI quantile chains (needs the full
+## kube-apiserver-avail recording pyramid — heavy, 2 panels only) and
+## node_namespace_pod_container:container_memory_swap (swap is off cluster-wide).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k8s-recording-rules
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: node-exporter.rules
+    rules:
+    - record: instance:node_num_cpu:sum
+      expr: count without (cpu, mode) (node_cpu_seconds_total{job="node-exporter",mode="idle"})
+    - record: instance:node_cpu_utilisation:rate5m
+      expr: 1 - avg without (cpu) (sum without (mode) (rate(node_cpu_seconds_total{job="node-exporter",mode=~"idle|iowait|steal"}[5m])))
+    - record: instance:node_load1_per_cpu:ratio
+      expr: node_load1{job="node-exporter"} / instance:node_num_cpu:sum{job="node-exporter"}
+    - record: instance:node_memory_utilisation:ratio
+      expr: >-
+        1 - (
+          (node_memory_MemAvailable_bytes{job="node-exporter"}
+           or (node_memory_Buffers_bytes{job="node-exporter"}
+               + node_memory_Cached_bytes{job="node-exporter"}
+               + node_memory_MemFree_bytes{job="node-exporter"}
+               + node_memory_Slab_bytes{job="node-exporter"}))
+          / node_memory_MemTotal_bytes{job="node-exporter"})
+    - record: instance:node_vmstat_pgmajfault:rate5m
+      expr: rate(node_vmstat_pgmajfault{job="node-exporter"}[5m])
+    - record: instance_device:node_disk_io_time_seconds:rate5m
+      expr: rate(node_disk_io_time_seconds_total{job="node-exporter",device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[5m])
+    - record: instance_device:node_disk_io_time_weighted_seconds:rate5m
+      expr: rate(node_disk_io_time_weighted_seconds_total{job="node-exporter",device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[5m])
+    - record: instance:node_network_receive_bytes_excluding_lo:rate5m
+      expr: sum without (device) (rate(node_network_receive_bytes_total{job="node-exporter",device!="lo"}[5m]))
+    - record: instance:node_network_transmit_bytes_excluding_lo:rate5m
+      expr: sum without (device) (rate(node_network_transmit_bytes_total{job="node-exporter",device!="lo"}[5m]))
+    - record: instance:node_network_receive_drop_excluding_lo:rate5m
+      expr: sum without (device) (rate(node_network_receive_drop_total{job="node-exporter",device!="lo"}[5m]))
+    - record: instance:node_network_transmit_drop_excluding_lo:rate5m
+      expr: sum without (device) (rate(node_network_transmit_drop_total{job="node-exporter",device!="lo"}[5m]))
+  - name: k8s.rules
+    rules:
+    - record: node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate5m
+      expr: >-
+        sum by (cluster, namespace, pod, container) (
+          rate(container_cpu_usage_seconds_total{job="kubelet",metrics_path="/metrics/cadvisor",image!=""}[5m])
+        ) * on (cluster, namespace, pod) group_left (node)
+        topk by (cluster, namespace, pod) (1, max by (cluster, namespace, pod, node) (kube_pod_info{node!=""}))
+    - record: node_namespace_pod_container:container_memory_working_set_bytes
+      expr: >-
+        container_memory_working_set_bytes{job="kubelet",metrics_path="/metrics/cadvisor",image!=""}
+        * on (cluster, namespace, pod) group_left (node)
+        topk by (cluster, namespace, pod) (1, max by (cluster, namespace, pod, node) (kube_pod_info{node!=""}))
+    - record: node_namespace_pod_container:container_memory_rss
+      expr: >-
+        container_memory_rss{job="kubelet",metrics_path="/metrics/cadvisor",image!=""}
+        * on (cluster, namespace, pod) group_left (node)
+        topk by (cluster, namespace, pod) (1, max by (cluster, namespace, pod, node) (kube_pod_info{node!=""}))
+    - record: node_namespace_pod_container:container_memory_cache
+      expr: >-
+        container_memory_cache{job="kubelet",metrics_path="/metrics/cadvisor",image!=""}
+        * on (cluster, namespace, pod) group_left (node)
+        topk by (cluster, namespace, pod) (1, max by (cluster, namespace, pod, node) (kube_pod_info{node!=""}))
+    - record: namespace_cpu:kube_pod_container_resource_requests:sum
+      expr: >-
+        sum by (namespace, cluster) (sum by (namespace, pod, cluster) (
+          max by (namespace, pod, container, cluster) (kube_pod_container_resource_requests{resource="cpu"})
+          * on (namespace, pod, cluster) group_left ()
+          max by (namespace, pod, cluster) (kube_pod_status_phase{phase=~"Pending|Running"} == 1)))
+    - record: namespace_cpu:kube_pod_container_resource_limits:sum
+      expr: >-
+        sum by (namespace, cluster) (sum by (namespace, pod, cluster) (
+          max by (namespace, pod, container, cluster) (kube_pod_container_resource_limits{resource="cpu"})
+          * on (namespace, pod, cluster) group_left ()
+          max by (namespace, pod, cluster) (kube_pod_status_phase{phase=~"Pending|Running"} == 1)))
+    - record: namespace_memory:kube_pod_container_resource_requests:sum
+      expr: >-
+        sum by (namespace, cluster) (sum by (namespace, pod, cluster) (
+          max by (namespace, pod, container, cluster) (kube_pod_container_resource_requests{resource="memory"})
+          * on (namespace, pod, cluster) group_left ()
+          max by (namespace, pod, cluster) (kube_pod_status_phase{phase=~"Pending|Running"} == 1)))
+    - record: namespace_memory:kube_pod_container_resource_limits:sum
+      expr: >-
+        sum by (namespace, cluster) (sum by (namespace, pod, cluster) (
+          max by (namespace, pod, container, cluster) (kube_pod_container_resource_limits{resource="memory"})
+          * on (namespace, pod, cluster) group_left ()
+          max by (namespace, pod, cluster) (kube_pod_status_phase{phase=~"Pending|Running"} == 1)))
+    - record: cluster:namespace:pod_cpu:active:kube_pod_container_resource_requests
+      expr: >-
+        kube_pod_container_resource_requests{resource="cpu"} * on (namespace, pod, cluster)
+        group_left () max by (namespace, pod, cluster) ((kube_pod_status_phase{phase=~"Pending|Running"} == 1))
+    - record: cluster:namespace:pod_cpu:active:kube_pod_container_resource_limits
+      expr: >-
+        kube_pod_container_resource_limits{resource="cpu"} * on (namespace, pod, cluster)
+        group_left () max by (namespace, pod, cluster) ((kube_pod_status_phase{phase=~"Pending|Running"} == 1))
+    - record: cluster:namespace:pod_memory:active:kube_pod_container_resource_requests
+      expr: >-
+        kube_pod_container_resource_requests{resource="memory"} * on (namespace, pod, cluster)
+        group_left () max by (namespace, pod, cluster) ((kube_pod_status_phase{phase=~"Pending|Running"} == 1))
+    - record: cluster:namespace:pod_memory:active:kube_pod_container_resource_limits
+      expr: >-
+        kube_pod_container_resource_limits{resource="memory"} * on (namespace, pod, cluster)
+        group_left () max by (namespace, pod, cluster) ((kube_pod_status_phase{phase=~"Pending|Running"} == 1))
+    - record: cluster:node_cpu:ratio_rate5m
+      expr: >-
+        sum(rate(node_cpu_seconds_total{job="node-exporter",mode!="idle",mode!="iowait",mode!="steal"}[5m]))
+        / count(sum(node_cpu_seconds_total{job="node-exporter"}) by (cluster, instance, cpu))
+    - record: node_memory_MemAvailable_bytes:sum
+      expr: sum by (cluster) (node_memory_MemAvailable_bytes{job="node-exporter"})
+  - name: k8s.rules.pod_owner
+    rules:
+    - record: namespace_workload_pod:kube_pod_owner:relabel
+      labels: {workload_type: deployment}
+      expr: >-
+        max by (cluster, namespace, workload, pod) (
+          label_replace(label_replace(kube_pod_owner{owner_kind="ReplicaSet"},
+            "replicaset", "$1", "owner_name", "(.*)")
+          * on (replicaset, namespace) group_left (owner_name)
+          topk by (replicaset, namespace) (1, max by (replicaset, namespace, owner_name) (kube_replicaset_owner)),
+          "workload", "$1", "owner_name", "(.*)"))
+    - record: namespace_workload_pod:kube_pod_owner:relabel
+      labels: {workload_type: daemonset}
+      expr: >-
+        max by (cluster, namespace, workload, pod) (
+          label_replace(kube_pod_owner{owner_kind="DaemonSet"}, "workload", "$1", "owner_name", "(.*)"))
+    - record: namespace_workload_pod:kube_pod_owner:relabel
+      labels: {workload_type: statefulset}
+      expr: >-
+        max by (cluster, namespace, workload, pod) (
+          label_replace(kube_pod_owner{owner_kind="StatefulSet"}, "workload", "$1", "owner_name", "(.*)"))
+    - record: namespace_workload_pod:kube_pod_owner:relabel
+      labels: {workload_type: job}
+      expr: >-
+        max by (cluster, namespace, workload, pod) (
+          label_replace(kube_pod_owner{owner_kind="Job"}, "workload", "$1", "owner_name", "(.*)"))
