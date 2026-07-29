@@ -19,7 +19,13 @@ data:
     LEAP=https://download.opensuse.org/distribution/leap/16.0/repo/oss/
     log(){ echo "[cephfs-kmod $(date -u +%T)] $*"; }
 
-    ko_current(){ [ -f "$KO" ] && modinfo "$KO" 2>/dev/null | grep -qE "^vermagic: *${KVER}( |\$)"; }
+    # Read the module's vermagic WITHOUT modinfo. modinfo ships in the `kmod` package,
+    # which is NOT present in the base opensuse/leap image and only appears AFTER build()
+    # installs it. Using modinfo here made this check fail on every fresh pod, so a full
+    # ~50 min rebuild of a byte-identical ceph.ko ran after EVERY node reboot even though
+    # the module was already persisted on /usr/local (found + fixed 2026-07-29).
+    ko_vermagic(){ grep -aoP 'vermagic=\K[^[:space:]]+' "$1" 2>/dev/null | head -1; }
+    ko_current(){ [ -f "$KO" ] && [ "$(ko_vermagic "$KO")" = "$KVER" ]; }
 
     build(){
       local KPKG KSRC KOBJ
@@ -47,7 +53,7 @@ data:
       strip --strip-debug "$KSRC/fs/ceph/ceph.ko"
       mkdir -p "$DEST"
       install -m0644 "$KSRC/fs/ceph/ceph.ko" "$KO"
-      modinfo "$KO" | grep -qE "^vermagic: *${KVER}( |\$)" || { log "FATAL: built vermagic mismatch"; return 1; }
+      [ "$(ko_vermagic "$KO")" = "$KVER" ] || { log "FATAL: built vermagic mismatch"; return 1; }
       log "installed $KO ($(stat -c%s "$KO") bytes)"
     }
 
