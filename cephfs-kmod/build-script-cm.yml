@@ -27,6 +27,48 @@ data:
     ko_vermagic(){ grep -aoP 'vermagic=\K[^[:space:]]+' "$1" 2>/dev/null | head -1; }
     ko_current(){ [ -f "$KO" ] && [ "$(ko_vermagic "$KO")" = "$KVER" ]; }
 
+    # ---- cross-node module cache -------------------------------------------------
+    # A compiled ceph.ko is identical on every node running the same kernel, yet each node
+    # used to compile its own (~50 min each) after a kernel upgrade. Share it through a
+    # Secret keyed by kernel version: the first node to build publishes, the rest fetch in
+    # seconds. Entirely BEST-EFFORT -- every failure path falls through to a local build,
+    # so this can never make the boot-critical path worse. gzip'd module ~340 KB, well
+    # inside the 1 MiB Secret limit (measured 2026-07-29).
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    CACHE_SECRET="cephfs-kmod-${KVER}"
+    kapi(){ # $1=method $2=path [$3=body]
+      [ -r "$SA/token" ] || return 1
+      curl -sS --max-time 60 --cacert "$SA/ca.crt" \
+        -H "Authorization: Bearer $(cat "$SA/token")" \
+        -H 'Content-Type: application/json' -X "$1" \
+        ${3:+--data-binary @"$3"} \
+        "https://kubernetes.default.svc/api/v1/namespaces/cephfs-kmod/secrets$2"
+    }
+    cache_fetch(){
+      local body b64
+      body="$(kapi GET "/$CACHE_SECRET" 2>/dev/null)" || return 1
+      case "$body" in *'"code": 404'*|*'"code":404'*) return 1;; esac
+      b64="$(printf '%s' "$body" | grep -o '"ceph.ko.gz":"[^"]*"' | head -1 | cut -d'"' -f4)"
+      [ -n "$b64" ] || return 1
+      mkdir -p "$DEST"
+      printf '%s' "$b64" | base64 -d 2>/dev/null | gzip -dc > "$KO.tmp" 2>/dev/null || { rm -f "$KO.tmp"; return 1; }
+      # never trust the cache blindly -- it must match the running kernel exactly
+      [ "$(ko_vermagic "$KO.tmp")" = "$KVER" ] || { rm -f "$KO.tmp"; return 1; }
+      mv "$KO.tmp" "$KO"; log "fetched ceph.ko from cluster cache ($CACHE_SECRET)"
+    }
+    cache_publish(){
+      local b64 f=/tmp/cache.json
+      b64="$(gzip -9 -c "$KO" | base64 -w0)" || return 1
+      printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s"},"data":{"ceph.ko.gz":"%s"}}' \
+        "$CACHE_SECRET" "$b64" > "$f"
+      if kapi POST "" "$f" | grep -q '"kind": *"Secret"\|"kind":"Secret"'; then
+        log "published ceph.ko to cluster cache ($CACHE_SECRET)"
+      else
+        kapi PUT "/$CACHE_SECRET" "$f" >/dev/null 2>&1 && log "updated cluster cache ($CACHE_SECRET)"
+      fi
+      rm -f "$f"
+    }
+
     build(){
       local KPKG KSRC KOBJ
       KPKG="$(rpm --dbpath "$HOSTRPM" -q --qf '%{VERSION}-%{RELEASE}' kernel-default 2>/dev/null | head -1)"
@@ -66,7 +108,14 @@ data:
       if h insmod /usr/local/lib/ceph-kmod/ceph.ko; then log "ceph.ko loaded"; else log "ERROR: insmod failed"; return 1; fi
     }
 
-    if ko_current; then log "ceph.ko already current for $KVER"; else build || exit 1; fi
+    if ko_current; then
+      log "ceph.ko already current for $KVER"
+    elif cache_fetch 2>/dev/null && ko_current; then
+      log "using cached ceph.ko (skipped local build)"
+    else
+      build || exit 1
+      cache_publish 2>/dev/null || log "cache publish skipped (non-fatal)"
+    fi
     load || exit 1
     h grep -qw ceph /proc/filesystems && log "cephfs registered; OK"
     log "done; idling (re-checks on pod restart / kernel change)"
