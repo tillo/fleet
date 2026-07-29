@@ -1,0 +1,25 @@
+## Metrics for the EXTERNAL garage cluster via the in-cluster witness.
+## 2026-07-29 dashboard audit: salt/pepper don't expose :3903 on the LAN, but the
+## witness is a full cluster member — its cluster_* metrics (connected nodes,
+## partitions quorum, storage nodes ok) describe the whole external cluster, which
+## is exactly what the Backup Landscape dashboard needs. Same token pattern as the
+## openobserve/garage scrape.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: garage
+  namespace: garage-witness
+spec:
+  selector:
+    matchLabels:
+      app: garage-witness
+  endpoints:
+  - port: admin
+    path: /metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    authorization:
+      type: Bearer
+      credentials:
+        name: garage-tokens
+        key: GARAGE_METRICS_TOKEN
