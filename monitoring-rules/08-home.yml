@@ -266,12 +266,17 @@ spec:
     ## per domain rather than absolute counts. >10 newly-unavailable entities
     ## in a single domain over 1h almost always means an integration/hub/
     ## bridge dropped off, not a few stragglers powering down.
+    ## 2026-07-30 (infra-health, user-approved): for: 30m -> 1h. All five
+    ## firings since 07-15 were upstream-cloud polling blips (Garmin Connect
+    ## ~40min, similar cloud integrations) that self-resolved — nothing on
+    ## our side to fix. A real hub/bridge/integration failure stays
+    ## unavailable well past 1h and still fires.
     - alert: HomeAssistantUnavailableEntitiesSpike
       expr: |
         (count by (domain) (hass_entity_available == 0))
         - (count by (domain) ((hass_entity_available offset 1h) == 0))
         > 10
-      for: 30m
+      for: 1h
       labels:
         severity: warning
         component: Smart Home

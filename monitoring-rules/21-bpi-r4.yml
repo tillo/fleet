@@ -131,7 +131,11 @@ spec:
       ## persistent case; this alert flags any deviation for inspection.
       expr: bpi_r4_onu_ploam_state != 51
       for: 2m
-      labels: { severity: warning, team: mdapi, component: Internet }
+      ## statuspage: exclude (2026-07-30, user-approved): PLOAM-not-O5.1 is
+      ## an inspection signal — intermittent LODS keeps the datapath mostly
+      ## up. A real user-visible internet outage fires the synthetic/WAN
+      ## probes, which own the public Internet component.
+      labels: { severity: warning, team: mdapi, component: Internet, statuspage: exclude }
       annotations:
         summary: "BPI-R4 ONU PLOAM in state {{ $value }} (not O5.1)"
         description: |
@@ -362,8 +366,16 @@ spec:
     - alert: BpiR4TcpRetransmitsHigh
       ## Baseline is < 0.2 retransmits/s on this device. A sustained
       ## spike usually means WAN-side packet loss or routing instability.
-      expr: bpi_r4:tcp_retrans_per_s:rate5m > 5
-      for: 10m
+      ## 2026-07-30 (infra-health, user-approved): 5-10min self-resolving
+      ## spikes (4 episodes since 07-21, mostly during PON/OnuPloam
+      ## degradation) paged warning and were gone before anyone could look.
+      ## min_over_time[15m] requires the rate to stay above threshold for
+      ## 15 continuous minutes; the instant clause keeps the rule off dead
+      ## series after exporter/label churn.
+      expr: |
+        bpi_r4:tcp_retrans_per_s:rate5m > 5
+        and min_over_time(bpi_r4:tcp_retrans_per_s:rate5m[15m]) > 5
+      for: 5m
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
         summary: "BPI-R4 TCP host-stack retransmits {{ $value }}/s"
