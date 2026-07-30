@@ -1,0 +1,46 @@
+## Vendor/management-plane Deployment availability.
+##
+## Gap found 2026-07-29 (infra-health, user-approved 07-30): the Harvester
+## whereabouts-controller Deployment sat at 0/1 with ReplicaFailure
+## (priority-admission FailedCreate) for a full day and NOTHING fired — app
+## namespaces have synthetic probes and per-app alerts, but the vendor
+## planes (kube-system, cattle-*, harvester-system) had no availability
+## coverage at all.
+##
+## kube-state-metrics (cattle-monitoring-system) exports both series. The
+## 1h `for:` rides out upgrades and rollouts (a rolling restart keeps
+## available >= spec-1 only briefly); an hour below spec is stuck, which
+## per the severity policy is when warning is warranted.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: k8s-deployment-availability
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-k8s.deployment-availability
+    rules:
+    - alert: VendorPlaneDeploymentUnavailable
+      expr: |
+        kube_deployment_status_replicas_available{namespace=~"kube-system|cattle-system|cattle-fleet-system|cattle-fleet-local-system|harvester-system|cattle-monitoring-system|cattle-logging-system"}
+          < kube_deployment_spec_replicas
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Internal plane — never degrade the public statuspage.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }} below spec ({{ $value }} available) for >1h"
+        description: |
+          A vendor/management-plane Deployment has been under its spec'd
+          replica count for over an hour — a rollout does not take this
+          long, so something is stuck (FailedCreate, admission rejection,
+          image pull, scheduling). Check:
+            kubectl -n {{ $labels.namespace }} describe deploy {{ $labels.deployment }}
+          Precedent: whereabouts-controller 0/1 ReplicaFailure 07-29
+          (pod template carried explicit priority: 0 vs computed 1000 —
+          fix was stripping .spec.template.spec.priority).
