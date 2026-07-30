@@ -17,3 +17,26 @@ spec:
     secretKey: ZO_ROOT_USER_EMAIL
   - remoteRef: { key: /mdapi/openobserve/o2/root-password }
     secretKey: ZO_ROOT_USER_PASSWORD
+---
+# S3 access creds for OpenObserve. Migrated 2026-06-17 from the in-cluster Garage
+# to Ceph RGW: now sourced from the RGW CephObjectStoreUser keys mirrored into
+# Akeyless /mdapi/openobserve/rgw/*. Secret name + keys kept so o2-sts is
+# unchanged. Old /mdapi/openobserve/garage/o2-* paths retained for rollback.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: garage-openobserve-s3-creds
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: garage-openobserve-s3-creds
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/rgw/access-key }
+    secretKey: access_key
+  - remoteRef: { key: /mdapi/openobserve/rgw/secret-key }
+    secretKey: secret_key
