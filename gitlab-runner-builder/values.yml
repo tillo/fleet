@@ -93,3 +93,44 @@ nodeSelector:
 
 metrics:
   enabled: true
+
+## --- Supporting resources. NOTE: this chart renders extraObjects as
+##     `tpl (toYaml .)`, so entries must be MAPPINGS (not string blocks)
+##     and any ESO/Go-template braces must be tpl-escaped as below.
+extraObjects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: openwrt-workspace
+      namespace: gitlab-runner-builder
+      labels:
+        recurring-job-group.longhorn.io/default: disabled
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: harvester-longhorn-1replica
+      resources:
+        requests:
+          storage: 60Gi
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: gitlab-runner-builder-token
+      namespace: gitlab-runner-builder
+    spec:
+      refreshInterval: 5m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: gitlab-runner-builder-token
+        creationPolicy: Owner
+        template:
+          engineVersion: v2
+          data:
+            runner-registration-token: ''
+            runner-token: '{{ "{{ .token }}" }}'
+      data:
+      - remoteRef:
+          key: /mdapi/gitlab/runner-builder-token
+        secretKey: token
