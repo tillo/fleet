@@ -685,14 +685,34 @@ spec:
       ## tune-signal, not a user-visible Internet outage. Observed degrading
       ## the public page 07-30 via a pushgateway-wipe series reset (VM
       ## counts a reappearing counter's first value as increase()).
-      labels: { severity: warning, team: mdapi, component: Internet, statuspage: exclude }
+      ## severity: info since 2026-08-01 (approved): drops are accounting-only
+      ## and self-recover; root-caused to flow-churn storms (e.g. cluster CI
+      ## cold-build downloads egressing through the router) that overflow the
+      ## netlink buffer regardless of size — 16 MiB was live during the 08-01
+      ## 12:20Z firing. Persistent loss escalates via the Persistent rule below.
+      labels: { severity: info, team: mdapi, component: Internet, statuspage: exclude }
       annotations:
         summary: "BPI-R4 nlbwmon dropped netlink batches ({{ $value }} in 1h)"
         description: |
-          nlbwmon NETLINK_ENOBUFS — flow accounting is losing data.
-          Buffer is 16 MiB; sustained drops mean traffic spike exceeds
-          drain rate. Inspect /var/log on bpi-r4 and consider lowering
-          refresh_interval or shedding accounted subnets.
+          nlbwmon NETLINK_ENOBUFS — flow accounting lost a batch (transient,
+          self-recovering; typically a flow-churn storm such as a cluster CI
+          cold-build download). Buffer is 16 MiB and package-owned. Only the
+          Persistent variant below warrants action.
+
+    - alert: BpiR4NlbwmonEnobufsPersistent
+      ## Escalation per the severity policy: warning only when demonstrably
+      ## stuck — drops present in EVERY 5m window for 15m (min_over_time over
+      ## a bool subquery, not a long for:). A pushgateway series reset fakes
+      ## one window's increase(), never three consecutive ones.
+      expr: |
+        min_over_time((increase(bpi_r4_nlbwmon_enobufs_total[5m]) > bool 0)[15m:5m]) == 1
+      labels: { severity: warning, team: mdapi, component: Internet, statuspage: exclude }
+      annotations:
+        summary: "BPI-R4 nlbwmon losing netlink batches for 15m+ (persistent)"
+        description: |
+          nlbwmon NETLINK_ENOBUFS increasing in three consecutive 5m windows —
+          not a transient churn blip. Inspect logread on bpi-r4 and consider
+          lowering refresh_interval or shedding accounted subnets.
 
   - name: app-bpi-r4.speedtest
     rules:
