@@ -1,0 +1,46 @@
+## Persistent OpenWrt build workspace. Deliberately rep-1: the contents are
+## 100% reconstructible (git tree + downloads + object files), and a second
+## replica would double write amplification on the exact IO path the
+## storage-stall family lives on. Sized for the full tree: a warm OpenWrt
+## workspace measures ~9.8 GiB build_dir/target + ~5 GiB toolchain/host +
+## ~3 GiB ccache + ~5 GiB dl + staging_dir — 60Gi leaves real headroom.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwrt-workspace
+  namespace: gitlab-runner-builder
+  labels:
+    ## Never back this up: disposable build state, and it is big + churny.
+    recurring-job-group.longhorn.io/default: "disabled"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: harvester-longhorn-1replica
+  resources:
+    requests:
+      storage: 60Gi
+---
+## Runner authentication token (glrt-…), created 2026-08-01 against project
+## mdapi/openwrt (runner id 789, tag builder-persistent, run_untagged=false).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gitlab-runner-builder-token
+  namespace: gitlab-runner-builder
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: gitlab-runner-builder-token
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        runner-registration-token: ""
+        runner-token: "{{ .token }}"
+  data:
+    - remoteRef:
+        key: /mdapi/gitlab/runner-builder-token
+      secretKey: token
