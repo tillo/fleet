@@ -253,7 +253,15 @@ cephFileSystems:
           # biggest offender by opportunity. fio is reserved for metadata only.
           deviceClass: ssd
           replicated:
-            size: 2
+            # 2 -> 3 (2026-08-02, phase 1c of the replica rework). The big one:
+            # 2.5 TiB stored / 645k objects (the tv media that moved off Longhorn),
+            # raw 4.9 -> 7.4 TiB. This pool held only 2 copies of the largest data
+            # set in the estate. Ceph rebuilds within a host, so no rebuild-headroom
+            # cost. Runs under mclock 'balanced' (~12.6x faster than high_client_ops)
+            # — deliberately NOT left to crawl, because osd_scrub_during_recovery is
+            # false and this pool is 512 of 876 PGs, so a slow backfill would
+            # suppress deep-scrub across most of the cluster.
+            size: 3
           parameters:
             min_size: "1"
             bulk: "true"
