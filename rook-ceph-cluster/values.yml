@@ -15,14 +15,17 @@ configOverride: |
   osd_pool_default_min_size = 1
   mon_warn_on_pool_no_redundancy = false
   [osd]
-  # 2026-08-02: high_client_ops -> balanced. Measured during the replica rework:
-  # under high_client_ops backfill ran at 64 objects/min (a 341 GiB pool needed ~4 h,
-  # and the 2.5 TiB CephFS pool would have taken DAYS). Under balanced the same
-  # backfill ran at 806 objects/min — 12.6x — with no client complaints.
-  # User decision: keep balanced unless clients complain or instability appears.
+  # 2026-08-02 (REVERSED post-storm, supersedes the balanced decision earlier
+  # today): under balanced with 512 CephFS PGs backfilling, 5 OSDs hit
+  # BLUESTORE_SLOW_OP_ALERT, osd.7 was peer-marked down and 5 PGs went inactive
+  # (16:48Z storm). Standing decision: high_client_ops unattended; balanced only
+  # behind a leading-signal tripwire automation (slow-ops>=3 or any PG inactive
+  # -> revert) running outside a session. Raw throughput note: the "64 obj/min
+  # under high_client_ops" figure was a serialized-tail measurement artifact;
+  # with full PG parallelism high_client_ops sustains ~47 obj/s.
   # NB with mclock, osd_max_backfills/osd_recovery_max_active below are IGNORED
   # unless osd_mclock_override_recovery_settings=true (it is false).
-  osd_mclock_profile = balanced
+  osd_mclock_profile = high_client_ops
   osd_max_backfills = 1
   osd_recovery_max_active = 1
   osd_recovery_sleep_hdd = 0.1
