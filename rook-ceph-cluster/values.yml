@@ -186,7 +186,11 @@ cephBlockPools:
     spec:
       failureDomain: host
       replicated:
-        size: 2
+        # 2 -> 3 (2026-08-02): replica-policy rework. Ceph is the bulk tier (15x SATA
+        # SSD, 28 TiB) and had only 2 copies; unlike Longhorn rep3 on 3 nodes, Ceph
+        # rebuilds WITHIN a host (5 SSD OSDs each), so size 3 keeps rebuild headroom.
+        # Cost: stored 341 GiB -> raw 681 -> 1023 GiB.
+        size: 3
       # min_size is not a first-class replicated field; applied as a pool parameter.
       # VERIFY post-deploy: `ceph osd pool get ceph-blockpool min_size` == 1
       parameters:
