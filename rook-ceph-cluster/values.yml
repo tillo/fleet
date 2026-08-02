@@ -15,7 +15,14 @@ configOverride: |
   osd_pool_default_min_size = 1
   mon_warn_on_pool_no_redundancy = false
   [osd]
-  osd_mclock_profile = high_client_ops
+  # 2026-08-02: high_client_ops -> balanced. Measured during the replica rework:
+  # under high_client_ops backfill ran at 64 objects/min (a 341 GiB pool needed ~4 h,
+  # and the 2.5 TiB CephFS pool would have taken DAYS). Under balanced the same
+  # backfill ran at 806 objects/min — 12.6x — with no client complaints.
+  # User decision: keep balanced unless clients complain or instability appears.
+  # NB with mclock, osd_max_backfills/osd_recovery_max_active below are IGNORED
+  # unless osd_mclock_override_recovery_settings=true (it is false).
+  osd_mclock_profile = balanced
   osd_max_backfills = 1
   osd_recovery_max_active = 1
   osd_recovery_sleep_hdd = 0.1
@@ -185,6 +192,13 @@ cephBlockPools:
   - name: ceph-blockpool
     spec:
       failureDomain: host
+      # 2026-08-02: PIN TO ssd. Without this the crush rule targets bare `default`,
+      # i.e. EVERY device class — including the three 15 GiB /dev/fioa3 OSDs that exist
+      # solely for the CephFS metadata pool. Bulk RBD data was landing on them (quo's
+      # fio OSD was 34.5% full vs 2.1% on its peers, 5.1 GiB of foreign DATA), which
+      # squeezes the metadata pool's ceiling (MAX AVAIL 9.1 of 15 GiB). Only
+      # ceph-filesystem-metadata may use the fio class.
+      deviceClass: ssd
       replicated:
         # 2 -> 3 (2026-08-02): replica-policy rework. Ceph is the bulk tier (15x SATA
         # SSD, 28 TiB) and had only 2 copies; unlike Longhorn rep3 on 3 nodes, Ceph
@@ -234,6 +248,10 @@ cephFileSystems:
       dataPools:
         - name: data0
           failureDomain: host
+          # 2026-08-02: PIN TO ssd — this pool's rule targeted bare `default`, so its
+          # PGs could land on the 15 GiB fio metadata OSDs. With 512 PGs it is the
+          # biggest offender by opportunity. fio is reserved for metadata only.
+          deviceClass: ssd
           replicated:
             size: 2
           parameters:
@@ -289,10 +307,14 @@ cephObjectStores:
     spec:
       metadataPool:
         failureDomain: host
+        # 2026-08-02: PIN TO ssd (see cephBlockPools) — the fio class is reserved for
+        # the CephFS metadata pool alone. Covers the rgw index/log/meta pools too.
+        deviceClass: ssd
         replicated:
           size: 3
       dataPool:
         failureDomain: host
+        deviceClass: ssd
         replicated:
           size: 2
         parameters:
