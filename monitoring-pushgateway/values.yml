@@ -39,6 +39,22 @@ serviceMonitor:
   enabled: true
   ## Default selector ({}) on the Prometheus CRD picks any SM. No release
   ## label needed.
+  ##
+  ## Drop pod-identity target labels from everything scraped off the
+  ## pushgateway. Pushed series describe their SOURCE (bpi_r4, storage
+  ## probes, batch jobs), not the pushgateway pod that happens to relay
+  ## them — but the scrape attaches pod/container/endpoint, so every pod
+  ## replacement (chart bump, OOM, node move) turned each pushed series
+  ## into a "new" series and increase()/changes() counted its first value
+  ## as a delta-from-0. 2026-08-03 03:28Z: a Renovate chart-bump roll
+  ## fired six false BpiR4 alerts (crash/WAN-drop/PPPoE) that way; the
+  ## 07-28/29 OOM rolls did the same. instance/job already come from the
+  ## push (honorLabels), so after this drop series identity is fully
+  ## pod-independent. Applies to pushgateway self-metrics too (single
+  ## replica; the service label still identifies it).
+  metricRelabelings:
+    - action: labeldrop
+      regex: "pod|container|endpoint"
 
 ## Expose Pushgateway to off-cluster pushers (BPI-R4 router, future devices)
 ## via an internal-only ingress. Hostname is LAN-resolved via BPI-R4 dnsmasq
