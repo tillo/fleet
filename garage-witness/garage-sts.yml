@@ -44,7 +44,11 @@ spec:
         - { name: config, mountPath: /etc/garage/garage.toml, subPath: garage.toml }
         resources:
           requests: { cpu: 100m, memory: 256Mi }
-          limits:   { cpu: 500m, memory: 1Gi }
+          # cpu limit 500m -> 1: ~38h continuous ContainerCpuThrottling during
+          # the 2026-08-01..03 storage-rework windows (garage-0 held statuspage
+          # Platform at degraded the whole time). Same lever as the approved
+          # webtunnel-bridge raise; witness node stays tiny at rest.
+          limits:   { cpu: "1", memory: 1Gi }
       volumes:
       - name: config
         configMap:
