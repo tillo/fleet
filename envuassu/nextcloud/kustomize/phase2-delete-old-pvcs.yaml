@@ -1,0 +1,27 @@
+# Phase-2 storage migration (2026-08-03): the AIO chart still renders the
+# original Longhorn PVCs, but data moved to the -ceph claims (see
+# phase2-ceph-pvcs.yaml) and the old live PVCs were deleted in the final
+# sweep. Delete-patch them out of the render so Fleet stops reporting
+# "pvc ... missing" — and so a forced redeploy can't recreate 225Gi of
+# orphaned Longhorn volumes. (nextcloud-aio-database is NOT here: it still
+# lives on Longhorn by design.)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-aio-clamav
+  namespace: envuassu
+  $patch: delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-aio-database-dump
+  namespace: envuassu
+  $patch: delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-aio-nextcloud-data
+  namespace: envuassu
+  $patch: delete
