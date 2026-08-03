@@ -27,3 +27,21 @@ speaker:
 # rules.resources is {bgppeers, ipaddresspools, bgpadvertisements,
 # communities, bfdprofiles, l2advertisements}). Default failurePolicy=Fail
 # is therefore safe — only writes to MetalLB's own CRDs would block.
+
+# Bundled frr-k8s subchart values (key = subchart name, with the hyphen).
+# Probe tolerance raise (approved 2026-08-03): under node IO saturation
+# (storage-rework windows on quo) the 1s-timeout probes flunk and restart-
+# loop the frr container — +10 restarts / x56 liveness failures on quo
+# during the 08-03 phase-2 window alone, no actual frr fault. failureThreshold
+# 3 -> 6 applies to BOTH the controller (:7572) and frr (:9141/livez) probes;
+# timeoutSeconds 1 -> 5 reaches only the controller probes (the frr container
+# template hardcodes no timeout field, so it keeps the 1s default — its
+# tolerance comes from the doubled failure budget).
+frr-k8s:
+  frrk8s:
+    livenessProbe:
+      failureThreshold: 6
+      timeoutSeconds: 5
+    readinessProbe:
+      failureThreshold: 6
+      timeoutSeconds: 5
