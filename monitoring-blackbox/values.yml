@@ -8,6 +8,15 @@ fullnameOverride: blackbox
 
 replicas: 1
 
+## Unprivileged ICMP for the icmp module: the container securityContext
+## drops ALL caps (chart default), so the prober can't open raw sockets.
+## Datagram ICMP sockets are allowed for GIDs in ping_group_range — a
+## kubelet-safe sysctl — and blackbox falls back to them automatically.
+podSecurityContext:
+  sysctls:
+    - name: net.ipv4.ping_group_range
+      value: "0 65534"
+
 resources:
   requests:
     cpu: 10m
@@ -57,6 +66,16 @@ config:
       prober: tcp
       timeout: 5s
       tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+
+    icmp:
+      ## Continuous WAN latency/loss trending between the 6h speedtest runs
+      ## (Probe CRD wan-icmp-latency). Deliberately NOT statuspage-coupled —
+      ## its targets carry no component/team labels.
+      prober: icmp
+      timeout: 5s
+      icmp:
         preferred_ip_protocol: ip4
         ip_protocol_fallback: false
 

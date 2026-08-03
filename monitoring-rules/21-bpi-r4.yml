@@ -717,16 +717,33 @@ spec:
   - name: app-bpi-r4.speedtest
     rules:
     - alert: BpiR4SpeedtestStale
-      ## Weekly cron — if we miss two consecutive runs the job is broken.
-      expr: time() - bpi_r4_speedtest_last_run_timestamp_seconds > 1209600
+      ## Producer changed 2026-08-03: Windmill f/probe/wan_speedtest, every
+      ## 6h from a node's 10G NIC (the router-cron producer measured its own
+      ## CPU softpath and is retired). push_time_seconds updates on EVERY
+      ## push, success or not — >26h means 4 missed cycles, the schedule or
+      ## the probe itself is broken. Failed-but-running is the info rule below.
+      expr: time() - push_time_seconds{job="bpi_r4_speedtest"} > 93600
       for: 1h
       labels: { severity: warning, team: mdapi, component: Internet }
       annotations:
-        summary: "BPI-R4 speedtest hasn't completed in 14d"
+        summary: "WAN speedtest probe hasn't pushed in 26h+"
         description: |
-          Weekly speedtest cron isn't pushing. Likely speedtest.net
-          CLI broken or lock-file stuck. Run `/usr/local/bin/speedtest-metrics.sh`
-          on the router manually.
+          f/probe/wan_speedtest (Windmill schedule, every 6h) isn't pushing.
+          Check the schedule and recent job logs in Windmill; run the script
+          manually with a pinned node to debug.
+    - alert: BpiR4SpeedtestFailing
+      ## Probe runs but produces no measurement (Ookla AND iperf3 both
+      ## failed) for 2+ consecutive cycles. Pushgateway retains the last
+      ## value, so a single failed run keeps success=0 until the next push —
+      ## the 13h max_over_time window requires two.
+      expr: max_over_time(bpi_r4_speedtest_success[13h]) == 0
+      labels: { severity: info, team: mdapi, component: Internet }
+      annotations:
+        summary: "WAN speedtest failing for 13h+ (2+ consecutive runs)"
+        description: |
+          The measurement pod runs but Ookla and the iperf3 fallbacks all
+          failed. Read the pod tail in the Windmill job output; likely a
+          server-list or egress problem rather than a schedule problem.
 
   ## ─────────────────────────────────────────────────────────────────────
   ## NAT64 (Jool) — translates IPv6-only client traffic to IPv4 so that

@@ -1,4 +1,5 @@
-## 7 Probe CRDs — one per statuspage component.
+## Probe CRDs — one per statuspage component, plus the non-statuspage
+## wan-icmp-latency trending probe at the bottom.
 ##
 ## Probes MUST carry the `release: rancher-monitoring` label because the
 ## existing Prometheus's `probeSelector` is `matchLabels: {release: rancher-monitoring}`
@@ -654,3 +655,33 @@ spec:
       labels:
         component: Media
         team: mdapi
+---
+# ====== WAN latency trending (NOT a statuspage component) ======
+# Continuous ICMP RTT/loss between the 6h wan_speedtest runs. Targets carry
+# NO component/team labels ON PURPOSE: SyntheticProbeFailing matches
+# probe_success{component!="", team="mdapi"} and would page critical +
+# flip a statuspage component — these are trend series, not availability.
+#   185.71.139.251 — PPPoE BNG first hop (ptp peer; if the ISP renumbers the
+#                    BNG this target goes dark — update, don't page).
+#   45.90.28.16    — NextDNS anycast, stable internet reference (~4.8ms).
+# (The router LAN VIP 192.168.1.1 filters ICMP — verified 2026-08-03 — so
+# there is no LAN-side baseline target here.)
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: wan-icmp-latency
+  namespace: monitoring
+spec:
+  jobName: wan-icmp-latency
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: icmp
+  targets:
+    staticConfig:
+      static:
+        - 185.71.139.251
+        - 45.90.28.16
+      labels:
+        probe: icmp
+        purpose: wan-latency
