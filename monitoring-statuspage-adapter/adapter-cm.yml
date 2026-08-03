@@ -107,6 +107,12 @@ data:
     _unknown_comp_last_log: dict[str, float] = {}
     _unknown_comp_lock = threading.Lock()
 
+    # Components that are IN the monitoring-rules taxonomy but intentionally
+    # have no statuspage mapping (internal-only: Pushover grouping key, no
+    # public component). Not "unknown" — skip them without the warning noise.
+    # Source of truth: monitoring-rules/_README.md + lint.py RULE_COMPONENTS.
+    INTERNAL_COMPONENTS = {"Storage", "Logging"}
+
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
 
@@ -119,6 +125,60 @@ data:
             _unknown_comp_last_log[comp] = now
         log(f"WARN: alert with unknown component '{comp}' (alerts: {n_alerts}) "
             f"— throttled, next log in {UNKNOWN_COMP_LOG_INTERVAL_SEC}s")
+
+    # --- declared-maintenance suppression (approved 2026-08-03) -----------
+    # Planned windows (storage migrations, node reboots) used to show as
+    # organic public outages: the 2026-08-03 phase-2 Longhorn->Ceph window
+    # put "Files & Documents" + "Websites" into major_outage on the public
+    # page although every 503 was a deliberate scale-down. Runbook side:
+    # declare the window as a Scheduled Maintenance on mdapi.statuspage.io
+    # (UI or API) listing the affected components. Adapter side (here):
+    # while a component is under an ACTIVE maintenance, do not PATCH it at
+    # all — statuspage itself shows under_maintenance, and fighting it in
+    # either direction (degrading OR clearing early) is wrong. When the
+    # maintenance ends the reconcile loop converges the component within
+    # ~RECONCILE_INTERVAL_SEC + MAINT_REFRESH_SEC.
+    MAINT_REFRESH_SEC = int(os.environ.get("MAINT_REFRESH_SEC", "120"))
+    MAINT_SKIP_LOG_INTERVAL_SEC = 600
+    _maint = {"ids": frozenset(), "fetched": 0.0}
+    _maint_lock = threading.Lock()
+    _maint_skip_last_log: dict[str, float] = {}
+
+    def maint_components():
+        """Component ids covered by an active scheduled maintenance, cached
+        MAINT_REFRESH_SEC. On fetch failure keep the last known set (a stale
+        suppression self-heals at the next successful refresh; never raise —
+        callers are the PATCH paths)."""
+        now = time.time()
+        with _maint_lock:
+            if now - _maint["fetched"] < MAINT_REFRESH_SEC:
+                return _maint["ids"]
+        ids = None
+        try:
+            req = urllib.request.Request(
+                f"https://api.statuspage.io/v1/pages/{PAGE_ID}/incidents/active_maintenance",
+                headers={"Authorization": f"OAuth {API_KEY}"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                incidents = json.loads(r.read())
+            ids = frozenset(c["id"] for inc in incidents
+                            for c in (inc.get("components") or []) if c.get("id"))
+        except Exception as e:
+            log(f"maintenance fetch failed (keeping last set): {e}")
+        with _maint_lock:
+            _maint["fetched"] = time.time()
+            if ids is not None and ids != _maint["ids"]:
+                log(f"active-maintenance components -> {sorted(ids) or []}")
+                _maint["ids"] = ids
+            return _maint["ids"]
+
+    def log_maint_skip(component_id: str, status: str):
+        now = time.time()
+        last = _maint_skip_last_log.get(component_id, 0)
+        if now - last < MAINT_SKIP_LOG_INTERVAL_SEC:
+            return
+        _maint_skip_last_log[component_id] = now
+        log(f"suppressed PATCH {component_id} -> {status}: under declared "
+            f"maintenance (throttled {MAINT_SKIP_LOG_INTERVAL_SEC}s)")
 
     def patch_component(component_id: str, status: str):
         """Set a single component's status via PATCH. Suppress if unchanged.
@@ -133,6 +193,9 @@ data:
         reconcile thread silently, and the page stopped tracking reality
         until the next pod restart.
         """
+        if component_id in maint_components():
+            log_maint_skip(component_id, status)
+            return 0  # under declared maintenance — hands off (see above)
         with LAST_SENT_LOCK:
             if LAST_SENT.get(component_id) == status:
                 return 0  # cached, no-op
@@ -217,7 +280,8 @@ data:
             for comp, alerts in by_component.items():
                 cid = COMPONENTS.get(comp)
                 if not cid:
-                    log_unknown_component(comp, len(alerts))
+                    if comp not in INTERNAL_COMPONENTS:
+                        log_unknown_component(comp, len(alerts))
                     continue
                 target_status = derive_status(alerts)
                 code = patch_component(cid, target_status)
