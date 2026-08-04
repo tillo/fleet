@@ -1117,3 +1117,30 @@ spec:
           broken; the image-policy lint cannot see this (annotations still look
           right). Check the keel pod logs, registry reachability (lscr.io,
           docker.io), and any stuck approvals.
+  - name: app-batch-jobs.ha-stream-wedge
+    rules:
+    ## f/probe/ha_stream_wedge_check (15-min cadence, 65-min window) pushes
+    ## ha_stream_wedge_active{camera=...}=1 when a camera shows a sustained
+    ## stream_worker "Error opening stream" retry loop (>=3 errors spanning
+    ## >=25 min). Incident 2026-08-02→04: such a loop — spawned by a hung
+    ## camera.record, immune to automation kill — woke the battery Nest
+    ## doorbell every 10-19 min for 37.5 h and emptied its battery. The
+    ## Pushgateway group is fully replaced each run, so recovery (or an HA
+    ## restart, the only real fix) resolves the alert on the next probe run.
+    - alert: HAStreamWedge
+      expr: ha_stream_wedge_active == 1
+      for: 5m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA stream retry loop wedged on camera.{{ $labels.camera }}"
+        description: |
+          camera.{{ $labels.camera }} has had a sustained stream_worker
+          "Error opening stream" retry loop for the whole probe window. The
+          loop lives in HA's stream component: it survives killing the
+          automation that spawned it and keeps re-opening the go2rtc
+          restream, waking the camera (a battery Nest doorbell drains to
+          empty this way). Only an HA core restart reliably ends it —
+          restart HA core, then confirm the probe reports wedged=0.
