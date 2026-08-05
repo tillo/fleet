@@ -1,0 +1,329 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-switch-dashboard
+  namespace: cattle-dashboards
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: Network
+data:
+  network-c9300-stack.json: |
+    {
+      "title": "Network / c9300-stack",
+      "uid": "net-c9300-stack",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "1m",
+      "time": {
+        "from": "now-6h",
+        "to": "now"
+      },
+      "tags": [
+        "network",
+        "snmp"
+      ],
+      "panels": [
+        {
+          "id": 1,
+          "type": "timeseries",
+          "title": "10G ports + port-channels \u2014 in",
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 9
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bps",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "8 * rate(ifHCInOctets{job=\"switch_snmp\",ifDescr=~\"TenGigabitEthernet.*|Port-channel.*\"}[5m]) > 1000",
+              "legendFormat": "{{ifDescr}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "10G ports + port-channels \u2014 out",
+          "gridPos": {
+            "x": 12,
+            "y": 0,
+            "w": 12,
+            "h": 9
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bps",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "8 * rate(ifHCOutOctets{job=\"switch_snmp\",ifDescr=~\"TenGigabitEthernet.*|Port-channel.*\"}[5m]) > 1000",
+              "legendFormat": "{{ifDescr}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "timeseries",
+          "title": "1G ports \u2014 in",
+          "gridPos": {
+            "x": 0,
+            "y": 9,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bps",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "8 * rate(ifHCInOctets{job=\"switch_snmp\",ifDescr=~\"GigabitEthernet.*\"}[5m]) > 1000",
+              "legendFormat": "{{ifDescr}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "1G ports \u2014 out",
+          "gridPos": {
+            "x": 12,
+            "y": 9,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bps",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "8 * rate(ifHCOutOctets{job=\"switch_snmp\",ifDescr=~\"GigabitEthernet.*\"}[5m]) > 1000",
+              "legendFormat": "{{ifDescr}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "interface errors/s (any port)",
+          "gridPos": {
+            "x": 0,
+            "y": 17,
+            "w": 8,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "pps",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "rate(ifInErrors{job=\"switch_snmp\"}[5m]) > 0",
+              "legendFormat": "{{ifDescr}} in",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(ifOutErrors{job=\"switch_snmp\"}[5m]) > 0",
+              "legendFormat": "{{ifDescr}} out",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "CPU 5min %",
+          "gridPos": {
+            "x": 8,
+            "y": 17,
+            "w": 5,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "cpmCPUTotal5minRev{job=\"switch_snmp\"}",
+              "legendFormat": "cpu {{cpuIndex}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "memory pool used %",
+          "gridPos": {
+            "x": 13,
+            "y": 17,
+            "w": 5,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "100 * ciscoMemoryPoolUsed{job=\"switch_snmp\"} / (ciscoMemoryPoolUsed{job=\"switch_snmp\"} + ciscoMemoryPoolFree{job=\"switch_snmp\"})",
+              "legendFormat": "pool {{poolIndex}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "temperature \u00b0C",
+          "gridPos": {
+            "x": 18,
+            "y": 17,
+            "w": 6,
+            "h": 7
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "celsius",
+              "custom": {
+                "fillOpacity": 8
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            }
+          },
+          "targets": [
+            {
+              "expr": "ciscoEnvMonTemperature{job=\"switch_snmp\"}",
+              "legendFormat": "sensor {{tempIndex}}",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }

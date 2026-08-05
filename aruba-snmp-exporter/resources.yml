@@ -253,6 +253,45 @@ spec:
                   type: counter
                   indexes: [{labelname: ifIndex, type: gauge}]
                   lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+            cisco:
+              # Catalyst platform health (c9300-stack): per-interface errors +
+              # CPU / memory pools / temperature sensors. Interfaces come from
+              # the shared ifmib module (scraped as module=ifmib,cisco).
+              walk:
+                - 1.3.6.1.2.1.2.2.1.2
+                - 1.3.6.1.2.1.2.2.1.14
+                - 1.3.6.1.2.1.2.2.1.20
+                - 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+                - 1.3.6.1.4.1.9.9.48.1.1.1.5
+                - 1.3.6.1.4.1.9.9.48.1.1.1.6
+                - 1.3.6.1.4.1.9.9.13.1.3.1.3
+              metrics:
+                - name: ifInErrors
+                  oid: 1.3.6.1.2.1.2.2.1.14
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+                - name: ifOutErrors
+                  oid: 1.3.6.1.2.1.2.2.1.20
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}]
+                - name: cpmCPUTotal5minRev
+                  oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+                  type: gauge
+                  indexes: [{labelname: cpuIndex, type: gauge}]
+                - name: ciscoMemoryPoolUsed
+                  oid: 1.3.6.1.4.1.9.9.48.1.1.1.5
+                  type: gauge
+                  indexes: [{labelname: poolIndex, type: gauge}]
+                - name: ciscoMemoryPoolFree
+                  oid: 1.3.6.1.4.1.9.9.48.1.1.1.6
+                  type: gauge
+                  indexes: [{labelname: poolIndex, type: gauge}]
+                - name: ciscoEnvMonTemperature
+                  oid: 1.3.6.1.4.1.9.9.13.1.3.1.3
+                  type: gauge
+                  indexes: [{labelname: tempIndex, type: gauge}]
   data:
     - secretKey: authpass
       remoteRef:
@@ -407,6 +446,26 @@ spec:
       params:
         auth: [public_v2c]
         module: [ifmib]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# Cisco C9300 LAN core (c9300-stack) — if_mib + Catalyst health via the monitoring v3 user
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: switch-snmp
+  namespace: monitoring
+spec:
+  jobName: switch_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.250"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [aruba_v3]
+        module: ["ifmib,cisco"]
       relabelConfigs:
         - {sourceLabels: [__address__], targetLabel: __param_target}
         - {sourceLabels: [__param_target], targetLabel: instance}
