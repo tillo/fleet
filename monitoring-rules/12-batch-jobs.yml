@@ -1144,3 +1144,31 @@ spec:
           restream, waking the camera (a battery Nest doorbell drains to
           empty this way). Only an HA core restart reliably ends it —
           restart HA core, then confirm the probe reports wedged=0.
+  - name: app-batch-jobs.ceph-campaign
+    rules:
+    ## f/heal/ceph_osd_recreate_campaign (10-min state machine): deep-scrub
+    ## verify sweep then staged recreation of every OSD under
+    ## bluestore_elastic_shared_blobs=false (Ceph #70390, user-approved
+    ## 2026-08-05). It halts itself — and sets this gauge — on any scrub
+    ## error (latent corruption found: repair before recreating!) or a step
+    ## stuck past its timeout. An actual inconsistency also drives Ceph to
+    ## HEALTH_ERR, which pages via the Ceph rules; this alert catches the
+    ## campaign-level stop either way. Stale-job coverage comes from the
+    ## generic BatchJobStale on the auto last_run gauge.
+    - alert: CephOsdRecreateCampaignHalted
+      expr: ceph_osd_recreate_campaign_halted == 1
+      for: 10m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "Ceph OSD-recreate campaign halted"
+        description: |
+          The #70390 remediation campaign stopped itself. Check the last
+          f/heal/ceph_osd_recreate_campaign run log for the halt reason:
+          scrub errors mean latent corruption was found (ceph health detail,
+          ceph pg repair — do NOT resume recreation until repaired); a stuck
+          step means drain/zap/re-provision didn't converge (check the zap
+          Job, the Rook operator log, and 'ceph status'). Resume by fixing
+          the cause and clearing 'phase: halted' in the schedule state.
