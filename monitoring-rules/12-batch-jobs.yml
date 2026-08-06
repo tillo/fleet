@@ -1240,3 +1240,45 @@ spec:
           do NOT self-update: open trapeye.anantis.io -> the device -> Update,
           and it upgrades on the next check-in. Container decoys instead need
           their image tag bumped in fleet honeypot/trapeye-*.yml.
+
+  ## f/heal/esphome_firmware_sync — monthly change-detected OTA of the ESPHome
+  ## fleet. Staleness is already covered by the generic BatchJobStale rule via
+  ## esphome_firmware_sync_last_run_timestamp_seconds.
+  - name: app-batch-jobs.esphome-firmware-sync
+    rules:
+    ## The job stops at the first device that fails, so exactly one device is
+    ## flagged and the rest were left untouched — the fleet is not half-broken,
+    ## but nothing further will update until this one is resolved.
+    - alert: EsphomeFirmwareUpdateFailed
+      expr: esphome_firmware_update_failed == 1
+      for: 15m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "ESPHome firmware update failed for {{ $labels.device }}"
+        description: |
+          Compile or OTA failed, or the device did not come back within
+          settle_seconds after a successful upload. The run STOPPED at this
+          device, so later devices in the alphabet were skipped entirely.
+          Check the Windmill job log for the compile/upload output. If the
+          device is genuinely dead it needs a power cycle, and if that fails a
+          USB reflash — OTA cannot recover a device that will not boot.
+    ## Offline is not a failure (you cannot flash what is not there), but a
+    ## device offline across two monthly runs is a device nobody noticed died.
+    - alert: EsphomeDeviceOfflinePersistent
+      expr: esphome_device_offline == 1
+      for: 32d
+      labels:
+        severity: info
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "ESPHome device {{ $labels.device }} has been unreachable for over a month"
+        description: |
+          Skipped by the firmware sync as unreachable across consecutive runs.
+          Known offenders: carnotzetdoor is battery powered and may simply be
+          flat; skylightnorth periodically wedges its wireguard tunnel and is
+          still reachable on its LAN address (192.168.1.155) when 10.8.0.7 is
+          dead — that needs a power cycle, not a reflash.
