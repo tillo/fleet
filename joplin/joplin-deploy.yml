@@ -3,11 +3,12 @@ kind: Deployment
 metadata:
   name: joplin
   namespace: joplin
-  annotations:
-    keel.sh/policy: force
-    keel.sh/match-tag: "true"
-    keel.sh/trigger: poll
-    keel.sh/pollSchedule: "@every 4h"
+  ## Lane-B since 2026-08-06: pinned tag, Renovate-owned (minor+patch automerge
+  ## per the trailing renovate.json rule; majors MR-only). Keel removed after a
+  ## 2026-05-18 auto-update jumped several versions at once and ran 4 pending
+  ## schema migrations (incl. split_changes) unannounced — a contributing factor
+  ## to the 2026-08-06 stale-client-sync note corruption. A stateful SYNC server
+  ## must change versions deliberately.
 spec:
   selector:
     matchLabels:
@@ -36,8 +37,8 @@ spec:
       - name: zot-pull
       containers:
       - name: joplin
-        image: zot.mdapi.ch/joplin/server:latest
-        imagePullPolicy: Always
+        image: joplin/server:3.7.1
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 22300
         env:
