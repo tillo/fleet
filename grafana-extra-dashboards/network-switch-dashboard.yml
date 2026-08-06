@@ -56,7 +56,7 @@ data:
           "targets": [
             {
               "expr": "8 * rate(ifHCInOctets{job=\"switch_snmp\",ifDescr=~\"TenGigabitEthernet.*|Port-channel.*\"}[5m]) > 1000",
-              "legendFormat": "{{ifDescr}}",
+              "legendFormat": "{{ifAlias}}",
               "refId": "A"
             }
           ]
@@ -93,7 +93,7 @@ data:
           "targets": [
             {
               "expr": "8 * rate(ifHCOutOctets{job=\"switch_snmp\",ifDescr=~\"TenGigabitEthernet.*|Port-channel.*\"}[5m]) > 1000",
-              "legendFormat": "{{ifDescr}}",
+              "legendFormat": "{{ifAlias}}",
               "refId": "A"
             }
           ]
@@ -130,7 +130,7 @@ data:
           "targets": [
             {
               "expr": "8 * rate(ifHCInOctets{job=\"switch_snmp\",ifDescr=~\"GigabitEthernet.*\"}[5m]) > 1000",
-              "legendFormat": "{{ifDescr}}",
+              "legendFormat": "{{ifAlias}}",
               "refId": "A"
             }
           ]
@@ -167,7 +167,7 @@ data:
           "targets": [
             {
               "expr": "8 * rate(ifHCOutOctets{job=\"switch_snmp\",ifDescr=~\"GigabitEthernet.*\"}[5m]) > 1000",
-              "legendFormat": "{{ifDescr}}",
+              "legendFormat": "{{ifAlias}}",
               "refId": "A"
             }
           ]
@@ -204,12 +204,12 @@ data:
           "targets": [
             {
               "expr": "rate(ifInErrors{job=\"switch_snmp\"}[5m]) > 0",
-              "legendFormat": "{{ifDescr}} in",
+              "legendFormat": "{{ifAlias}} in",
               "refId": "A"
             },
             {
               "expr": "rate(ifOutErrors{job=\"switch_snmp\"}[5m]) > 0",
-              "legendFormat": "{{ifDescr}} out",
+              "legendFormat": "{{ifAlias}} out",
               "refId": "B"
             }
           ]
@@ -322,6 +322,98 @@ data:
               "expr": "ciscoEnvMonTemperature{job=\"switch_snmp\"}",
               "legendFormat": "sensor {{tempIndex}}",
               "refId": "A"
+            }
+          ]
+        },
+        {
+          "id": 9,
+          "type": "table",
+          "title": "port map — device ↔ port",
+          "description": "Legend for the graphs above: which physical port / port-channel each device name refers to. Sourced live from the switch port descriptions (ifAlias).",
+          "gridPos": {
+            "x": 0,
+            "y": 24,
+            "w": 12,
+            "h": 11
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Status"
+                },
+                "properties": [
+                  {
+                    "id": "mappings",
+                    "value": [
+                      {
+                        "type": "value",
+                        "options": {
+                          "1": {
+                            "text": "up",
+                            "color": "green",
+                            "index": 0
+                          },
+                          "2": {
+                            "text": "down",
+                            "color": "red",
+                            "index": 1
+                          }
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-text"
+                    }
+                  },
+                  {
+                    "id": "custom.width",
+                    "value": 90
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "sortBy": [
+              {
+                "displayName": "Device",
+                "desc": false
+              }
+            ]
+          },
+          "targets": [
+            {
+              "expr": "ifOperStatus{job=\"switch_snmp\",ifAlias!=\"\"}",
+              "instant": true,
+              "format": "table",
+              "refId": "A"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "filterFieldsByName",
+              "options": {
+                "include": {
+                  "pattern": "^(ifAlias|ifDescr|Value.*)$"
+                }
+              }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "renameByName": {
+                  "ifAlias": "Device",
+                  "ifDescr": "Port",
+                  "Value": "Status",
+                  "Value #A": "Status"
+                }
+              }
             }
           ]
         }
