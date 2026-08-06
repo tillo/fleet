@@ -1172,3 +1172,31 @@ spec:
           step means drain/zap/re-provision didn't converge (check the zap
           Job, the Rook operator log, and 'ceph status'). Resume by fixing
           the cause and clearing 'phase: halted' in the schedule state.
+  - name: app-batch-jobs.joplin-canary
+    rules:
+    ## f/probe/joplin_note_canary (15-min): watches every Joplin note's
+    ## content_size in the server DB and fires when one shrinks >30% AND
+    ## >10KB between runs — the signature of the 2026-08-06 incident where
+    ## a stale mobile client overwrote the 334KB TODO/Backlog note with a
+    ## weeks-old 183KB copy. Restore sources: the canary's own shadow
+    ## copies (s3://config-backups/joplin-note-shadow/, written on every
+    ## TODO-note change, 14d) and the daily joplin_pg_backup dump. Gauge is
+    ## group-replaced each run, so the alert self-resolves once sizes are
+    ## re-baselined; act on it FAST (restore, then investigate which client
+    ## pushed — changes_2 table, user_id column).
+    - alert: JoplinNoteShrunk
+      expr: joplin_note_shrunk == 1
+      labels:
+        severity: warning
+        component: Joplin
+        team: mdapi
+      annotations:
+        summary: "Joplin note {{ $labels.note }} shrank sharply — possible stale-client overwrite"
+        description: |
+          A Joplin note lost >30% (>10KB) of its body between canary runs.
+          Likely a stale client sync clobbering newer content (2026-08-06
+          incident pattern). Restore from the newest shadow copy in
+          s3://config-backups/joplin-note-shadow/ (TODO note) or from the
+          daily joplin-pg dump; identify the writer via changes_2.user_id
+          in the joplin DB. NOTE: the gauge self-resolves next run (state
+          re-baselines) — the Pushover is the durable signal.
