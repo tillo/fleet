@@ -53,6 +53,16 @@ spec:
     ## ~2.4x the observed worst-case burst above the ~21Gi steady state.
     size: 50Gi
 
+  ## Dedicated WAL volume (follow-up to the 2026-07-30 incident above): a
+  ## purge-night archiving stall now fills the 20Gi WAL PVC instead of
+  ## starving the data volume, so the failure mode becomes "WAL volume
+  ## full, writes pause" rather than a crashlooping primary. 20Gi = ~2.5x
+  ## the observed 8GB burst. Adding this rolls both instances (operator
+  ## restarts the replica, switches over, then restarts the old primary).
+  walStorage:
+    storageClass: harvester-longhorn-2replicas
+    size: 20Gi
+
   postgresql:
     parameters:
       max_connections: "100"
@@ -61,6 +71,12 @@ spec:
       ## recorder is write-heavy with frequent purges; give autovacuum
       ## room and keep WAL modest.
       maintenance_work_mem: 128MB
+      ## The ~8GB purge-night WAL burst is mostly full-page images: the
+      ## 02:12Z recorder purge mass-deletes a day of states/events rows,
+      ## and every heap+index page first touched after a checkpoint is
+      ## written whole into WAL. lz4-compressing FPIs shrinks the burst
+      ## at negligible CPU cost. Reloadable — applies without a restart.
+      wal_compression: lz4
 
     ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
     ## primary waits for the one standby to confirm each commit before it
