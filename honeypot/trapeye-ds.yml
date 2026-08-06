@@ -48,14 +48,47 @@ spec:
         - name: postgresql
           containerPort: 5432
           hostPort: 5432
+        ## Per-node fixed UUID. A DaemonSet pod can't select a per-node key
+        ## through the downward API alone, so the UUID map is mounted as files
+        ## (one per node name) and the entrypoint picks its own before exec'ing
+        ## the vendor binary unchanged (/app/trapeye, image entrypoint "./trapeye"
+        ## with workdir /app). Fails loudly rather than starting without a UUID —
+        ## a missing key would otherwise let the agent mint a fresh one on every
+        ## restart, which is exactly the churn this replaces. Adding a 4th node
+        ## means adding its key to Akeyless + the ExternalSecret first.
+        command: ["/usr/bin/sh", "-c"]
+        args:
+        - |
+          TRAPEYE_UUID=`cat /etc/trapeye-uuid/$NODE_NAME 2>/dev/null`
+          if [ -z "$TRAPEYE_UUID" ]; then
+            echo "FATAL: no TRAPEYE_UUID mapping for node $NODE_NAME" >&2
+            exit 1
+          fi
+          export TRAPEYE_UUID
+          echo "trapeye: node $NODE_NAME -> UUID $TRAPEYE_UUID"
+          exec /app/trapeye
         env:
         - name: TZ
           value: Europe/Zurich
-        - name: TRAPEYE_UUID
+        - name: NODE_NAME
           valueFrom:
-            secretKeyRef:
-              name: trapeye-uuid-secret
-              key: TRAPEYE_UUID_DAEMONSET
+            fieldRef:
+              fieldPath: spec.nodeName
         envFrom:
         - secretRef:
             name: trapeye-env-secret
+        volumeMounts:
+        - name: trapeye-uuid
+          mountPath: /etc/trapeye-uuid
+          readOnly: true
+      volumes:
+      - name: trapeye-uuid
+        secret:
+          secretName: trapeye-uuid-secret
+          items:
+          - key: TRAPEYE_UUID_NODE_qui
+            path: qui
+          - key: TRAPEYE_UUID_NODE_quo
+            path: quo
+          - key: TRAPEYE_UUID_NODE_qua
+            path: qua
