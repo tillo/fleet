@@ -84,6 +84,35 @@ spec:
           The Windmill probe f/probe/logging_pipeline_freshness (5m
           schedule) has not pushed metrics in >30m, so the ModsecFeedStale
           detector is blind. Check the Windmill schedule + the probe's last run.
+  - name: app-logging-freshness.trapeye
+    rules:
+    - alert: TrapeyeFeedStale
+      ## The Anantis TrapEye webhook pushes honeypot interactions straight into
+      ## the OpenObserve `trapeye_honeypot` stream (a vendor-side HTTP/JSON
+      ## integration, live since 2026-06-21 — no credential of ours, nothing in
+      ## our cluster to restart, so a silent stop is invisible from our side).
+      ## Baseline is ~120-130 interactions/day (continuous internal scanning),
+      ## so a 6h gap is well outside normal burstiness while staying quiet on
+      ## genuinely idle stretches.
+      expr: logging_stream_freshness_age_seconds{stream="trapeye_honeypot"} > 21600
+      for: 30m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "TrapEye honeypot feed stale -- newest interaction {{ $value | humanizeDuration }} old"
+        description: |
+          No new row in the OpenObserve `trapeye_honeypot` stream for over 6h.
+          Either the decoys stopped seeing traffic (check TrapeyeDecoyOffline —
+          a dead decoy is silent by design) or the vendor-side webhook stopped
+          delivering. Verify decoys are reporting at trapeye.anantis.io, then
+          the integration config in the PROD tenant. Cross-check against the
+          API: f/probe/trapeye_decoy_health_check queries api.anantis.io
+          independently of the webhook, so if decoys look alive there but this
+          stream is stale, the webhook is the broken half.
+          Source: Windmill f/probe/logging_pipeline_freshness.
+
   - name: app-logging-freshness.fluentd-buffer
     rules:
     - alert: FluentdCriblOutputBufferFilling
