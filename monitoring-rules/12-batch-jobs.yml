@@ -1200,3 +1200,43 @@ spec:
           daily joplin-pg dump; identify the writer via changes_2.user_id
           in the joplin DB. NOTE: the gauge self-resolves next run (state
           re-baselines) — the Pushover is the durable signal.
+  - name: app-batch-jobs.trapeye
+    rules:
+    ## f/probe/trapeye_decoy_health_check (daily). A honeypot that dies emits
+    ## nothing — absence is the only signal it was ever there. MDA-VM-LAN went
+    ## silent 2026-06-06 (guest died in the all-nodes-down outage) and that went
+    ## unnoticed for two months; this closes that gap. Fires per decoy so a
+    ## single dead one is named in the alert.
+    - alert: TrapeyeDecoyOffline
+      expr: trapeye_decoy_offline == 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "TrapEye decoy {{ $labels.decoy }} is not reporting"
+        description: |
+          The decoy has not checked in for over 30 minutes (see
+          trapeye_decoy_offline_minutes for how long). A silent decoy provides
+          no detection coverage. For container decoys check the honeypot ns
+          pods; for VM decoys check the KubeVirt VMI has an IPv4 lease and a
+          live guest agent (a dead guest shows only a MAC-derived IPv6 and
+          answers no NDP — that was the 2026-06-06 failure).
+    ## VM/appliance agents never self-update — they need a manual Update press
+    ## in the console (the public API exposes no trigger). Containers follow the
+    ## pinned image tag, so a version gap means the VM decoys drifted behind.
+    - alert: TrapeyeDecoyVersionBehind
+      expr: trapeye_decoy_version_behind == 1
+      for: 24h
+      labels:
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "TrapEye decoy {{ $labels.decoy }} runs old agent v{{ $labels.version }}"
+        description: |
+          This decoy is behind the newest agent version in the fleet. VM decoys
+          do NOT self-update: open trapeye.anantis.io -> the device -> Update,
+          and it upgrades on the next check-in. Container decoys instead need
+          their image tag bumped in fleet honeypot/trapeye-*.yml.
