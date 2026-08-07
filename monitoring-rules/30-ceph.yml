@@ -21,6 +21,12 @@
 ##   the campaign recreates one, so suppress only then; >1 OSD down always
 ##   fires, mon alerts untouched. Stale/absent gauge = no suppression
 ##   (fail-safe). (2026-08-06)
+## - CephOsdmapFlagLeftSet (NEW, not upstream): catches a maintenance flag
+##   (noout/nodown/norebalance) left set. Rook's exporter publishes NO
+##   per-flag metric -- ceph_osdmap_flag_noout and friends have no series
+##   (verified 2026-08-07 with noout actually set) -- so it keys on
+##   ceph_health_detail{name="OSDMAP_FLAGS"} and cannot name the flag.
+##   (2026-08-07)
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -69,6 +75,36 @@ spec:
       for: 15m
       labels:
         severity: info
+        type: ceph_default
+        team: mdapi
+        component: Storage
+    - alert: CephOsdmapFlagLeftSet
+      ## noout / nodown / norebalance are MAINTENANCE flags: correct to set
+      ## before a reboot or firmware flash, dangerous to forget. With noout in
+      ## particular a genuinely dead OSD is never marked out, so Ceph never
+      ## re-replicates away from it -- self-healing is silently off for as long
+      ## as the flag is set, while the cluster still reads "HEALTH_WARN" for
+      ## what looks like a benign reason.
+      ##
+      ## Cannot name the flag: Rook's exporter has no per-flag metric (checked
+      ## 2026-08-07 with noout set -- ceph_osdmap_flag_* returned no series).
+      ##
+      ## 8h clears a normal maintenance window (reboot + firmware + backfill
+      ## settle) without nagging, but still catches "set it Friday, remembered
+      ## Monday". The generic CephHealthWarning already fires at 15m; this is
+      ## the escalation that names the remedy.
+      annotations:
+        description: |
+          An osdmap maintenance flag has been set for more than 8 hours on cluster {{ $labels.cluster }}.
+          If this is noout, Ceph is NOT marking dead OSDs out and will NOT re-replicate away from
+          them -- redundancy has stopped self-healing for that whole period.
+          Identify it with 'ceph osd dump | grep flags' or 'ceph health detail', and clear it with
+          e.g. 'ceph osd unset noout' once the maintenance that needed it is finished.
+        summary: Ceph osdmap maintenance flag left set >8h on cluster {{ $labels.cluster }}
+      expr: ceph_health_detail{name="OSDMAP_FLAGS"} == 1
+      for: 8h
+      labels:
+        severity: warning
         type: ceph_default
         team: mdapi
         component: Storage
