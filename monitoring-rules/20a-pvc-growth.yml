@@ -52,3 +52,29 @@ spec:
           exec into the pod, du -sh on the mount, identify the noisy
           consumer. Common causes: app log rotation broken, transcoder
           temp dir not being cleaned, runaway sync loop.
+
+    - alert: PVCNearFull
+      ## Static backstop for the predictive rule above. PVCWillFillIn24h
+      ## is provably blind to "already full": once writes start failing,
+      ## growth stops, the 6h slope flattens, and the prediction resolves
+      ## — exactly what happened when openobserve's data PVC sat at 99.8%
+      ## for 6h on 2026-08-06 while every log write ENOSPC'd. A volume
+      ## SITTING at >90% is a problem regardless of slope.
+      ## Namespaces with the 85% FilesPVCNearlyFull static rule (04-files)
+      ## are excluded to avoid double-firing.
+      expr: |
+        kubelet_volume_stats_used_bytes{namespace!~"owncloud|spider3|tv|paperless|mirror"}
+          / kubelet_volume_stats_capacity_bytes{namespace!~"owncloud|spider3|tv|paperless|mirror"}
+          > 0.90
+      for: 15m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+        description: |
+          Static >90% threshold, independent of growth rate. Expand the
+          PVC or clean up. If this is firing with PVCWillFillIn24h quiet,
+          the volume is likely already full and writes may be failing
+          silently (check the app's logs for ENOSPC).
