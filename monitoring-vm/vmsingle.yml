@@ -1,5 +1,17 @@
 ## Single-node VictoriaMetrics instance. Long retention for multi-year energy
-## / solar analysis. PVC on Longhorn (3-replica default).
+## / solar analysis. PVC on Longhorn (2 replicas, fio-hot tier).
+##
+## SIZING: grew to 92% of 50Gi by 2026-08-07 (3.8 GiB free, ~1 GiB/day => ~4
+## days to full). A full disk stops ingestion, which blinds every probe/heal
+## job that queries VM. Raised to 100Gi (~50 days of headroom at that rate;
+## the fio tier had ~2 TiB free per node, so 2 replicas cost ~100 GiB).
+##
+## UNRESOLVED: `retentionPeriod: 3y` has never been achievable at this volume
+## size -- at ~1 GiB/day three years needs ~1 TiB, not 100 GiB. VictoriaMetrics
+## does NOT trim to fit the disk, it just runs out. So this will recur roughly
+## every 50 days until either retention is cut to something that fits or the
+## volume is sized for the real retention target. Deliberately left as a
+## decision rather than guessed at.
 ## Operator naming: pod and Service get the prefix `vmsingle-mdapi`.
 ## The Service exposes :8429 (HTTP API + remoteWrite endpoint).
 apiVersion: operator.victoriametrics.com/v1beta1
@@ -23,7 +35,7 @@ spec:
     storageClassName: longhorn
     resources:
       requests:
-        storage: 50Gi
+        storage: 100Gi
   resources:
     requests:
       cpu: 100m
