@@ -100,8 +100,27 @@ spec:
         - name: dashboards-provider
           mountPath: /etc/grafana/provisioning/dashboards
           readOnly: true
-        - name: dashboards-mdapi
-          mountPath: /var/lib/grafana/dashboards/mdapi
+        ## One mount per dashboard folder. Each becomes a Grafana folder via the
+        ## provider's foldersFromFilesStructure. Split from a single ConfigMap on
+        ## 2026-08-07: the combined CM had reached 83% of the 1 MiB cap.
+        ## Adding a folder = a dir under dashboards/, a mount here, and a volume below.
+        - name: dashboards-overview
+          mountPath: /var/lib/grafana/dashboards/mdapi/Overview
+          readOnly: true
+        - name: dashboards-ceph
+          mountPath: /var/lib/grafana/dashboards/mdapi/Ceph
+          readOnly: true
+        - name: dashboards-storage
+          mountPath: /var/lib/grafana/dashboards/mdapi/Storage
+          readOnly: true
+        - name: dashboards-network
+          mountPath: /var/lib/grafana/dashboards/mdapi/Network
+          readOnly: true
+        - name: dashboards-home
+          mountPath: /var/lib/grafana/dashboards/mdapi/Home
+          readOnly: true
+        - name: dashboards-platform
+          mountPath: /var/lib/grafana/dashboards/mdapi/Platform
           readOnly: true
         - name: dashboards-harvester
           mountPath: /var/lib/grafana/dashboards/harvester
@@ -174,8 +193,23 @@ spec:
       - name: dashboards-provider
         configMap:
           name: grafana-dashboards-provider
-      - name: dashboards-mdapi
+      - name: dashboards-overview
         configMap:
-          name: grafana-dashboards-mdapi
+          name: grafana-dashboards-overview
+      - name: dashboards-ceph
+        configMap:
+          name: grafana-dashboards-ceph
+      - name: dashboards-storage
+        configMap:
+          name: grafana-dashboards-storage
+      - name: dashboards-network
+        configMap:
+          name: grafana-dashboards-network
+      - name: dashboards-home
+        configMap:
+          name: grafana-dashboards-home
+      - name: dashboards-platform
+        configMap:
+          name: grafana-dashboards-platform
       - name: dashboards-harvester
         emptyDir: {}
