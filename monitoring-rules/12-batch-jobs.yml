@@ -781,11 +781,15 @@ spec:
       for: 1h
       labels:
         severity: warning
-        component: Backups
+        ## Storage (internal-only), NOT Backups: a node /opt filling with
+        ## container images is ops work — it was degrading the PUBLIC
+        ## statuspage Backups component (2026-08-07). Weekly
+        ## f/heal/node_opt_image_prune now keeps /opt down.
+        component: Storage
         team: mdapi
       annotations:
         summary: "{{ $labels.node }}:{{ $labels.mount }} is {{ $value }}% full"
-        description: "Node filesystem usage > 80%. Investigate growth source."
+        description: "Node filesystem usage > 80%. Investigate growth source (usually containerd image accumulation on /opt — f/heal/node_opt_image_prune handles that weekly; if this fires, the prune failed or something else is growing)."
 
   - name: app-batch-jobs.schedule-integrity
     ## Gauges pushed by f/probe/schedule_integrity_check every hour
