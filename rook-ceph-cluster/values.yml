@@ -14,6 +14,14 @@ configOverride: |
   osd_pool_default_size = 2
   osd_pool_default_min_size = 1
   mon_warn_on_pool_no_redundancy = false
+  # 2026-08-07: v19.2.5 multi-copy bdev labels crash freshly mkfs'd OSDs in
+  # rook's expand-bluefs init (_check_main_bdev_label "5!=4" ceph_assert in
+  # BlueStore::expand_devices — upstream PR #61671 family; first hit = the
+  # OSD-recreate campaign's osd.0). Must live HERE, not the mon config-db:
+  # ceph-volume mkfs and ceph-bluestore-tool run --no-mon-config, so only
+  # this file reaches them. Single-label = pre-squid behavior, proven for
+  # years on the other 17 OSDs. Revisit when squid ships the fix.
+  bluestore_bdev_label_multi = false
   [osd]
   # 2026-08-02: osd_mclock_profile is deliberately NOT set here. A value in
   # this file beats the mon config-db (proven live: restarted OSDs ignored a
