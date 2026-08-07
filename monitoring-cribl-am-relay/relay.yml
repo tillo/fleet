@@ -314,15 +314,33 @@ data:
             body = b"".join(chunks)
             actual = len(body)
 
+            # Decode explicitly with errors="replace" BEFORE parsing.
+            # json.loads(bytes) decodes the WHOLE buffer as UTF-8 and raises
+            # UnicodeDecodeError -- which is a ValueError but NOT a
+            # JSONDecodeError, so it escaped the handler below, killed the
+            # request, and took every event in the batch with it. On 2026-08-06
+            # a 0x8b gzip magic byte ~96 KB into a body did exactly that: 173
+            # batches discarded between 15:00 and 21:00, alert-worthy lines
+            # included, with nothing but a traceback to show for it. One bad
+            # byte from one pod must not be able to silence the alert path.
+            text = body.decode("utf-8", errors="replace")
+            n_bad = text.count("�")
+            if n_bad:
+                print(f"  LOSSY DECODE: {n_bad} undecodable byte(s) replaced "
+                      f"(body={actual} B) -- batch still processed", flush=True)
+
             # Try to parse as JSON. If unterminated, append `]` and try again.
+            # Catch ValueError, not just JSONDecodeError, so any future decode
+            # surprise degrades to the recovery path instead of a 500.
             try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
+                parsed = json.loads(text)
+            except ValueError:
                 try:
-                    parsed = json.loads(body + b"]")
+                    parsed = json.loads(text + "]")
                     print(f"  RECOVERED truncated JSON ({actual}->good)", flush=True)
                 except Exception as e2:
-                    print(f"  PARSE FAILED: {e2!r} body={body!r}", flush=True)
+                    # Bounded: a 500 KB body in a log line was its own problem.
+                    print(f"  PARSE FAILED: {e2!r} body[:400]={body[:400]!r}", flush=True)
                     self.send_response(400)
                     self.end_headers()
                     return
