@@ -39,6 +39,15 @@ windmill:
         runAsUser: 0
       terminationGracePeriodSeconds: 604800
       resources:
+        # requests MUST be declared explicitly: with only `limits` set, k8s
+        # defaults the request to equal the limit, so these 3 pods each
+        # reserved 4Gi while using ~420Mi — 90% of qua/qui's schedulable
+        # memory was over-request, not use (rancher-topology-study E8).
+        # 2Gi tracks the VPA recommendation (mode Off = recommend-only, so it
+        # will not fight this value): target 1.85GiB, lowerBound 826Mi.
+        # The 4Gi LIMIT is unchanged and still covers the burst described above.
+        requests:
+          memory: 2Gi
         limits:
           memory: 4Gi
     - name: native
@@ -96,10 +105,16 @@ windmill:
         - name: cert-staging
           mountPath: /staging
       resources:
+        # Explicit request so this pod stops reserving its whole 2Gi limit for
+        # a steady ~190Mi (see the default group above / study E8). No VPA on
+        # this deployment, so nothing will overwrite it.
+        requests:
+          memory: 512Mi
         limits:
           # 2Gi since 2026-07-30: daily aruba_aos6_cert_sync OOM-killed the
           # worker at 1Gi during the uv install phase (cold cache after the
           # 07-29 reschedule; cryptography wheel set) three days running.
+          # UNCHANGED — the request above only affects scheduling, not this cap.
           memory: 2Gi
 ingress:
   annotations:
