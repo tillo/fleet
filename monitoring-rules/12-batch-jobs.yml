@@ -1286,3 +1286,33 @@ spec:
           flat; skylightnorth periodically wedges its wireguard tunnel and is
           still reachable on its LAN address (192.168.1.155) when 10.8.0.7 is
           dead — that needs a power cycle, not a reflash.
+
+  ## Windmill worker pods ARE the automation plane — when one crash-loops,
+  ## every job on its tag dies invisibly: the job zombies (RestartLimit 3),
+  ## Windmill only schedules a schedule's NEXT tick when the current job
+  ## completes, and a zombie takes ZOMBIE_JOB_TIMEOUT (24h) to complete — so
+  ## one crash-loop silently swallows a whole day of that schedule. Seen on
+  ## wk-certs 08-07/08-08/08-09: aruba_aos6_cert_sync OOM-burst kills the
+  ## worker in <40s (too fast for the 30s scrape to show), the first signal
+  ## was the downstream Aos6CertSyncStale 2.5h later. This rule surfaces the
+  ## crash-loop itself within minutes, from kube-state-metrics restart counts.
+  - name: app-batch-jobs.workers
+    rules:
+    - alert: WindmillWorkerCrashLoop
+      expr: increase(kube_pod_container_status_restarts_total{namespace="windmill"}[15m]) >= 3
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill {{ $labels.pod }} crash-looping ({{ $value | humanize }} restarts in 15m)"
+        description: |
+          A windmill-namespace container restarted 3+ times in 15 minutes.
+          Jobs on that worker's tags are dying and will zombie for 24h,
+          which also delays their schedules' next ticks by a day. Check
+          `kubectl -n windmill get pod {{ $labels.pod }}` lastState (OOM
+          bursts can be faster than the scrape interval — trust the
+          termination reason, not the memory graph) and the affected
+          scripts' runs at https://windmill.mdapi.ch/runs. History:
+          wk-certs killed daily at 06:47Z by aruba_aos6_cert_sync since
+          2026-08-07 (infra-health ledger restart:windmill/windmill-workers-certs).
