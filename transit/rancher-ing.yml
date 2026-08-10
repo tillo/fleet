@@ -1,12 +1,15 @@
 ## rancher.mdapi.ch -> transit/rancher Service -> rancher-mgmt-1/2/3 :443
-## (the ACTIVE in-cluster Rancher; serves the rancher.home.tillo.ch vhost
-## via its alias ingress + dual-SAN cert. mbptillo .246 is the standby.)
+## (the ACTIVE in-cluster Rancher; its alias ingress serves rancher.mdapi.ch
+## FIRST-CLASS with a 3-SAN cert. mbptillo .246 is the standby.)
 ##
-## upstream-vhost rewrites the HTTP Host header so the upstream Rancher
-## matches its `rancher.home.tillo.ch` vhost; proxy-ssl-server-name +
-## proxy-ssl-name set the matching SNI on the TLS handshake. Read/send
-## timeouts bumped to 3600s so kubectl-exec / shell / log-tail streams
-## from the Rancher UI don't get cut at the default 60s.
+## NO Host rewrite since 2026-08-10: the original rancher.mdapi.ch Host passes
+## through, so Rancher generates absolute links/self-URLs the browser can
+## actually resolve. (The old upstream-vhost=rancher.home.tillo.ch rewrite made
+## the dashboard fetch an internal-only name -> login "network error" from
+## outside.) proxy-ssl-server-name/-name still pin the upstream SNI so the mgmt
+## ingress picks the matching vhost + cert. Read/send timeouts bumped to 3600s
+## so kubectl-exec / shell / log-tail streams from the Rancher UI don't get cut
+## at the default 60s.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -15,9 +18,8 @@ metadata:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/backend-protocol: HTTPS
-    nginx.ingress.kubernetes.io/upstream-vhost: rancher.home.tillo.ch
     nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
-    nginx.ingress.kubernetes.io/proxy-ssl-name: rancher.home.tillo.ch
+    nginx.ingress.kubernetes.io/proxy-ssl-name: rancher.mdapi.ch
     nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
