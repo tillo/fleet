@@ -101,9 +101,17 @@ windmill:
         - name: cert-staging
           persistentVolumeClaim:
             claimName: cert-staging
+        # Pod-lifetime dep cache: an OOM kill restarts only the container, so
+        # this emptyDir keeps /tmp/windmill/cache (uv wheels + py_runtime)
+        # warm across restarts — otherwise each OOM wipes the cache and the
+        # next job start re-bursts cold, a self-sustaining crash loop.
+        - name: dep-cache
+          emptyDir: {}
       volumeMounts:
         - name: cert-staging
           mountPath: /staging
+        - name: dep-cache
+          mountPath: /tmp/windmill/cache
       resources:
         # Explicit request so this pod stops reserving its whole 2Gi limit for
         # a steady ~190Mi (see the default group above / study E8). No VPA on
@@ -111,11 +119,12 @@ windmill:
         requests:
           memory: 512Mi
         limits:
-          # 2Gi since 2026-07-30: daily aruba_aos6_cert_sync OOM-killed the
-          # worker at 1Gi during the uv install phase (cold cache after the
-          # 07-29 reschedule; cryptography wheel set) three days running.
-          # UNCHANGED — the request above only affects scheduling, not this cap.
-          memory: 2Gi
+          # 4Gi since 2026-08-10: the cold-cache uv install burst at aos6 job
+          # start OOM-killed the worker at 2Gi on 08-09 and 08-10 (exit 137
+          # <40s after start, too fast for the 30s scrape). The dep-cache
+          # emptyDir above removes the burst on restarts; 4Gi absorbs the one
+          # cold burst after a genuine pod replacement.
+          memory: 4Gi
 ingress:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
