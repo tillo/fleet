@@ -40,6 +40,12 @@ helm:
         size: 5Gi
         storageClass: ceph-block
         accessMode: ReadWriteOnce
+      # The exec probe (`bao status`) blocks on storage IO; at the chart-default
+      # 3s it flapped 51x/48h under Ceph OSD-recreate backfill (2026-08-10),
+      # dropping the Service endpoint and deadline-killing the hourly mirror job.
+      readinessProbe:
+        enabled: true
+        timeoutSeconds: 10
       ha:
         enabled: true
         replicas: 1
