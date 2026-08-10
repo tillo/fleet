@@ -263,6 +263,7 @@ RULE_COMPONENTS = {
     "Internet", "Smart Home",
     # internal-only
     "Platform", "Storage", "Backups", "Logging", "NTP",
+    "Joplin", "Security", "Automation",
 }
 RULE_SEVERITIES = {"critical", "warning", "info"}
 RULE_TEAMS = {"mdapi", "mdapi-watchdog"}

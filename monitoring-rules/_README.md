@@ -37,7 +37,8 @@ mapping lives in `../monitoring-statuspage-adapter/adapter-cm.yml` components.js
 
 - **statuspage-mapped:** `Mail`, `Sign-in (SSO)`, `Files & Documents`, `Websites`, `DNS`,
   `Internet`, `Smart Home`, `Platform`, `Backups`, `NTP`
-- **internal-only (Pushover, no statuspage component):** `Storage`, `Logging` — the adapter
+- **internal-only (Pushover, no statuspage component):** `Storage`, `Logging`, `Joplin`,
+  `Security` (Trapeye decoys), `Automation` (ESPHome/HA plumbing) — the adapter
   logs "unknown component" (throttled) and skips them, by design
 
 Exceptions (also encoded in lint): the three `SyntheticProbe*` alerts inherit `component`
