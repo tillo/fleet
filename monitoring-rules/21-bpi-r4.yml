@@ -678,7 +678,7 @@ spec:
       ## alert for an hour while N ages out of the window — see the
       ## BpiR4PppoeSessionThrashing comment above for the full pattern.
       expr: |
-        increase(bpi_r4_nlbwmon_enobufs_total[1h]) > 0
+        increase(bpi_r4_nlbwmon_enobufs_total[1h]) > 10
       for: 15m
       ## statuspage: exclude (2026-07-30, same approved hardening as the
       ## OnuPloam exclude): lost nlbwmon accounting batches are an internal
@@ -690,6 +690,12 @@ spec:
       ## cold-build downloads egressing through the router) that overflow the
       ## netlink buffer regardless of size — 16 MiB was live during the 08-01
       ## 12:20Z firing. Persistent loss escalates via the Persistent rule below.
+      ## threshold >0 -> >10 (2026-08-10, approved re-tune): the 08-08..08-10
+      ## firings were all single lost batches (increase == 1 in every nonzero
+      ## hour over 72h), and one blip holds increase[1h] > 0 for a full hour so
+      ## `for: 15m` filters nothing. >10/h only fires on an actual churn storm;
+      ## scattered singles stay visible in the metric, and sustained loss still
+      ## escalates via the Persistent rule regardless of burst size.
       labels: { severity: info, team: mdapi, component: Internet, statuspage: exclude }
       annotations:
         summary: "BPI-R4 nlbwmon dropped netlink batches ({{ $value }} in 1h)"
