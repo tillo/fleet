@@ -56,12 +56,35 @@ data:
     chmod 700 /home/tillo/.ssh
 
     # 3. Host keys from the mounted Secret (stable identity across restarts) ---
+    # Akeyless round-trips STRIP the trailing newline; libcrypto then rejects
+    # the PEM ("error in libcrypto") and sshd silently falls back to the
+    # image-baked ecdsa key, which churns on every image rebuild (found
+    # 2026-08-11: the stable keys had never actually loaded). Normalize the
+    # trailing newline on install and verify each key parses.
+    STABLE_KEYS_OK=1
     for k in ssh_host_ed25519_key ssh_host_rsa_key; do
       if [ -f "/etc/ssh/keys/$k" ]; then
-        install -m 600 "/etc/ssh/keys/$k"      "/etc/ssh/$k"
+        cp "/etc/ssh/keys/$k" "/etc/ssh/$k"
+        [ "$(tail -c 1 "/etc/ssh/$k" | od -An -tx1 | tr -d ' ')" = "0a" ] || echo >> "/etc/ssh/$k"
+        chmod 600 "/etc/ssh/$k"
         install -m 644 "/etc/ssh/keys/$k.pub"  "/etc/ssh/$k.pub"
+        if ! ssh-keygen -lf "/etc/ssh/$k" >/dev/null 2>&1; then
+          log "WARN: $k from Secret does not parse — keeping baked fallback keys"
+          STABLE_KEYS_OK=0
+        fi
+      else
+        STABLE_KEYS_OK=0
       fi
     done
+    # Only when the stable pair is usable, drop the baked key types so the
+    # host identity clients see survives pod rolls AND image bumps. If not,
+    # keep the baked ecdsa — unstable identity beats an unreachable bastion.
+    if [ "$STABLE_KEYS_OK" = 1 ]; then
+      rm -f /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
+            /etc/ssh/ssh_host_dsa_key /etc/ssh/ssh_host_dsa_key.pub
+    else
+      log "WARN: baked host keys kept as fallback — host identity NOT stable"
+    fi
 
     # 4. sshd — listens only on loopback; sslh is the front door -------------
     mkdir -p /run/sshd /etc/ssh/sshd_config.d
