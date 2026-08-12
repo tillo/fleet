@@ -5,10 +5,9 @@ metadata:
   namespace: openobserve
   annotations:
     reloader.stakater.com/auto: "true"
-    keel.sh/policy: force
-    keel.sh/match-tag: "true"
-    keel.sh/trigger: poll
-    keel.sh/pollSchedule: "@every 24h"
+    # Keel annotations removed with the digest pin (approved 2026-08-12,
+    # ext:o2-search-topk-blind): a 24h force-poll on latest-amd64 was a silent
+    # upgrade path — o2 version changes are now deliberate git edits here.
 spec:
   serviceName: openobserve
   replicas: 1
@@ -25,9 +24,15 @@ spec:
       containers:
       - name: openobserve
         # Use the non-SIMD amd64 variant; the SIMD build SIGILLs on Xeon nodes
-        # without AVX2. Keel will track the same tag family for updates.
-        image: public.ecr.aws/zinclabs/openobserve:latest-amd64
-        imagePullPolicy: Always
+        # without AVX2. Pinned by digest (approved 2026-08-12, infra-health
+        # ext:o2-search-topk-blind): unpinned latest-amd64 + pullPolicy Always
+        # meant any pod recreation could silently change the o2 version —
+        # observed across the 08-10 08:45Z restart while diagnosing the
+        # search-layer blindness. Digest = the build running since that
+        # restart (resolved from the live pod's imageID on 2026-08-12).
+        # To upgrade: resolve the new digest deliberately and edit here.
+        image: public.ecr.aws/zinclabs/openobserve@sha256:acca9befd53991d159ce23255ad2b8917a578c72f4c24086cd304c8a0cda7d26
+        imagePullPolicy: IfNotPresent
         envFrom:
         - configMapRef:
             name: openobserve-config
