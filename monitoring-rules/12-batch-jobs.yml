@@ -1316,3 +1316,37 @@ spec:
           scripts' runs at https://windmill.mdapi.ch/runs. History:
           wk-certs killed daily at 06:47Z by aruba_aos6_cert_sync since
           2026-08-07 (infra-health ledger restart:windmill/windmill-workers-certs).
+  - name: app-batch-jobs.pvc-backup-coverage
+    ## f/probe/pvc_backup_coverage (daily 07:35 UTC) — asserts every PVC has a
+    ## backup story and every external-Garage bucket an offsite disposition
+    ## (beads infra-jjb, born from the 2026-08-14 audit: 200Gi silently
+    ## unbacked for 11 days after a storage-class migration). The generic
+    ## BatchJobStale covers missed runs via the cadence map.
+    rules:
+    - alert: PvcBackupUncovered
+      expr: pvc_backup_uncovered_total > 0 or pvc_backup_cnpg_nobarman_total > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} PVC(s)/cluster(s) have NO backup story"
+        description: |
+          f/probe/pvc_backup_coverage found PVCs without any backup mechanism
+          (or CNPG clusters without barman). See the job log for the list;
+          either wire a backup (VolSync/Longhorn group/barman) or add a
+          documented entry to the probe's EXEMPT list.
+    - alert: GarageBucketUnswept
+      expr: garage_bucket_unswept_total > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} external-Garage bucket(s) missing from the offsite sweep"
+        description: |
+          A bucket exists on the salt/pepper Garage that is neither in
+          garage_offsite_backup's BUCKETS list nor in the probe's
+          BUCKET_EXEMPT. Data there does not reach B2/SFTP.
