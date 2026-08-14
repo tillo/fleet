@@ -1,0 +1,38 @@
+## VolSync backup of paperless-data-ceph (Ceph RBD — document originals,
+## thumbnails, archive PDFs; ~0.7 GiB today and growing). copyMethod Snapshot
+## -> crash-consistent CSI snapshot via the ceph-block VolumeSnapshotClass,
+## then restic to the external Garage ceph-backup bucket (off-site replicated
+## to B2/SFTP by garage_offsite_backup at 04:00). Daily 03:15 UTC — staggered
+## after owncloud's 02:30, done before the off-site sweep. Retain 7 daily /
+## 4 weekly / 3 monthly; prune weekly. The paperless DB is CNPG (barman ->
+## s3://paperless-pg-backup) so only the file data lives here.
+## Added 2026-08-14 — PVC audit gap G2 (beads infra-jjb).
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: paperless-data-ceph
+spec:
+  sourcePVC: paperless-data-ceph
+  trigger:
+    schedule: "15 3 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    # Mover runs as uid/gid 1000 — the owner of /usr/src/paperless/{data,media}.
+    # Same lesson as the owncloud RS: VolSync's restic container drops ALL
+    # capabilities (no CAP_DAC_OVERRIDE), so root still fails on any mode-600
+    # file owned by 1000; reading as the owning uid sidesteps it. No fsGroup —
+    # avoids a recursive chown of the snapshot clone.
+    moverSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+    cacheCapacity: 2Gi
+    # restic cache on fast Longhorn, not the Ceph tier being backed up.
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3
