@@ -125,6 +125,32 @@ windmill:
           # emptyDir above removes the burst on restarts; 4Gi absorbs the one
           # cold burst after a genuine pod replacement.
           memory: 4Gi
+    # Dedicated group for hours-scale slot holders (infra-health ledger
+    # ext:windmill-worker-pool-contention): the nightly garage_offsite_backup
+    # held a default slot for 5h+ (02:00-07:10), which together with the
+    # hourly skill_dispatch hold (15-90 min) left ONE free default slot — a
+    # third long job starved the whole heal/probe layer for ~25 min on
+    # 2026-08-07. Scripts tagged "long" run here; the 3 default slots stay
+    # for short latency-sensitive jobs. The dispatcher deliberately stays on
+    # default: on this 1-slot group it would queue behind the 5h backup.
+    - name: long
+      replicas: 1
+      mode: worker
+      controller: Deployment
+      privileged: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      # 6h grace: let an in-flight nightly backup finish during a roll
+      terminationGracePeriodSeconds: 21600
+      extraEnv:
+        - name: WORKER_TAGS
+          value: "long"
+      resources:
+        requests:
+          memory: 512Mi
+        limits:
+          memory: 2Gi
 ingress:
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
