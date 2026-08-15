@@ -1,7 +1,8 @@
-## S2a (infra-ka2, 2026-08-14): apache behind the ingress — ClusterIP on the
-## reverse-proxy port. Replaces the dedicated MetalLB LoadBalancer .40 with
-## direct TLS/QUIC (3443/4443/443) that bypassed the WAF. Talk's TURN
-## LoadBalancer (.41) is unaffected.
+## S2a (infra-ka2, 2026-08-14/15): apache behind the ingress — ClusterIP on
+## the reverse-proxy port. The chart renders 11000 tcp+udp (QUIC twin) with
+## mergeKey=port, which collapsed into UDP-only on plain merge (503, zero
+## nginx endpoints) — hence the explicit $patch: replace on the ports list.
+## Talk's TURN LoadBalancer (.41) is unaffected.
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,6 +14,7 @@ spec:
   externalTrafficPolicy: null
   loadBalancerIP: null
   ports:
+    - $patch: replace
     - name: http
       port: 11000
       protocol: TCP
