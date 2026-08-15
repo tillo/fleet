@@ -32,7 +32,9 @@ spec:
       remoteRef:
         key: /mdapi/volsync/ceph-backup/secret-access-key
 ---
-## spider3 user file storage (web + SFTPGo double-mount), uid 1000.
+## spider3 user file storage (web + SFTPGo double-mount) — data is owned by
+## the sftpgo uid 10006 / gid 33 (www-data), incl. 0700/0640 entries, so the
+## mover MUST run as that identity to read everything.
 apiVersion: volsync.backube/v1alpha1
 kind: ReplicationSource
 metadata:
@@ -41,14 +43,15 @@ metadata:
 spec:
   sourcePVC: spider3-data-ceph
   trigger:
-    schedule: "30 3 * * *"
+    # TEMP verification slot after the mover-uid fix; revert to "30 3 * * *"
+    schedule: "0 18 * * *"
   restic:
     repository: volsync-ceph-backup-restic
     copyMethod: Snapshot
     volumeSnapshotClassName: ceph-block
     moverSecurityContext:
-      runAsUser: 1000
-      runAsGroup: 1000
+      runAsUser: 10006
+      runAsGroup: 33
       runAsNonRoot: true
     cacheCapacity: 2Gi
     cacheStorageClassName: harvester-longhorn-1replica
