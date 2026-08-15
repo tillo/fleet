@@ -19,6 +19,23 @@ metadata:
   name: grafana-pg
   namespace: monitoring
 spec:
+  backup:
+    ## G6 (infra-jjb, 2026-08-15): barman to the external Garage — this
+    ## cluster previously had NO offsite story at all.
+    barmanObjectStore:
+      destinationPath: s3://grafana-pg-backup
+      endpointURL: https://api.garage.home.tillo.ch
+      s3Credentials:
+        accessKeyId:
+          name: grafana-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: grafana-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        region:
+          name: grafana-pg-backup-s3
+          key: REGION
+    retentionPolicy: "14d"
   instances: 2
   imageName: ghcr.io/cloudnative-pg/postgresql:16
   primaryUpdateStrategy: unsupervised
@@ -95,3 +112,45 @@ spec:
     - remoteRef:
         key: /mdapi/grafana/pg-password
       secretKey: password
+---
+## S3 creds for grafana-pg barman backups (G6, beads infra-jjb, 2026-08-15).
+## Key GK3afd8019c7a64b6ebe8b49d5 scoped RW to the grafana-pg-backup bucket on the external Garage;
+## offsite-swept to B2/SFTP by garage_offsite_backup.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: grafana-pg-backup-s3
+  namespace: monitoring
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: grafana-pg-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ACCESS_KEY_ID: "{{ .access_key }}"
+        ACCESS_SECRET_KEY: "{{ .secret_key }}"
+        ## Garage validates the SigV4 region scope; barman defaults us-east-1.
+        REGION: "garage"
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/monitoring/grafana-pg-backup-s3/access_key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/monitoring/grafana-pg-backup-s3/secret_key
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: grafana-pg-daily
+  namespace: monitoring
+spec:
+  schedule: "0 30 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: grafana-pg

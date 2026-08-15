@@ -9,6 +9,23 @@ metadata:
   name: guac-pg
   namespace: jump
 spec:
+  backup:
+    ## G6 (infra-jjb, 2026-08-15): barman to the external Garage — this
+    ## cluster previously had NO offsite story at all.
+    barmanObjectStore:
+      destinationPath: s3://guac-pg-backup
+      endpointURL: https://api.garage.home.tillo.ch
+      s3Credentials:
+        accessKeyId:
+          name: guac-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: guac-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        region:
+          name: guac-pg-backup-s3
+          key: REGION
+    retentionPolicy: "14d"
   instances: 2
   imageName: ghcr.io/cloudnative-pg/postgresql:16.4
   storage:
@@ -151,3 +168,45 @@ spec:
           - path: /
             pathType: Prefix
             backend: { service: { name: guacamole, port: { number: 80 } } }
+---
+## S3 creds for guac-pg barman backups (G6, beads infra-jjb, 2026-08-15).
+## Key GK4e5c90e0ae114aeac5a5fffe scoped RW to the guac-pg-backup bucket on the external Garage;
+## offsite-swept to B2/SFTP by garage_offsite_backup.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: guac-pg-backup-s3
+  namespace: jump
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: guac-pg-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ACCESS_KEY_ID: "{{ .access_key }}"
+        ACCESS_SECRET_KEY: "{{ .secret_key }}"
+        ## Garage validates the SigV4 region scope; barman defaults us-east-1.
+        REGION: "garage"
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/jump/guac-pg-backup-s3/access_key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/jump/guac-pg-backup-s3/secret_key
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: guac-pg-daily
+  namespace: jump
+spec:
+  schedule: "0 40 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: guac-pg
