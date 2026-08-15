@@ -1350,3 +1350,45 @@ spec:
           A bucket exists on the salt/pepper Garage that is neither in
           garage_offsite_backup's BUCKETS list nor in the probe's
           BUCKET_EXEMPT. Data there does not reach B2/SFTP.
+  - name: app-batch-jobs.restic-freshness
+    rules:
+    - alert: ResticSnapshotStale
+      expr: restic_snapshot_age_hours > 30
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "restic repo {{ $labels.repo }} newest snapshot is {{ $value }}h old"
+        description: |
+          f/probe/restic_snapshot_freshness lists <repo>/snapshots/ directly on
+          the external Garage; the newest object exceeds 30h for this daily
+          source. VolSync may still be reporting success — check the mover job
+          and the repo (stale lock? mover writing nothing?).
+    - alert: ResticRepoEmptyOrDuplicate
+      expr: restic_snapshot_empty_total > 0 or restic_repo_duplicate_total > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "restic repo anomaly: empty repo or two sources sharing one repo"
+        description: |
+          Either a ReplicationSource's repo has ZERO snapshot objects (mover
+          lying about success) or two sources write the same repo URL
+          (retention poison). See the probe log for which.
+    - alert: ResticFreshnessCheckBroken
+      expr: restic_snapshot_check_ok == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "the restic freshness check itself is failing"
+        description: |
+          f/probe/restic_snapshot_freshness could not read a repo secret or
+          list a bucket — freshness assertion is blind, treat as failure
+          (same loud-soft-fail contract as the coverage probe).
