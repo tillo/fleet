@@ -43,8 +43,7 @@ metadata:
 spec:
   sourcePVC: spider3-data-ceph
   trigger:
-    # TEMP verification slot after the mover-uid fix; revert to "30 3 * * *"
-    schedule: "0 18 * * *"
+    schedule: "30 3 * * *"
   restic:
     repository: volsync-ceph-backup-restic
     copyMethod: Snapshot
@@ -52,6 +51,9 @@ spec:
     moverSecurityContext:
       runAsUser: 10006
       runAsGroup: 33
+      # fsGroup keeps the restic cache volume accessible if the mover uid
+      # ever changes again (the uid-1000 seed left a root-y cache behind)
+      fsGroup: 33
       runAsNonRoot: true
     cacheCapacity: 2Gi
     cacheStorageClassName: harvester-longhorn-1replica
