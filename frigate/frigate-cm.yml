@@ -12,6 +12,14 @@
 ## UI's config editor cannot save. That is deliberate: git is the only source of
 ## truth. Change flow is edit here -> push -> Fleet applies -> restart Frigate
 ## (a subPath mount does not refresh in place).
+##
+## UPGRADE GOTCHA: Frigate logs "Config file is read-only, unable to migrate
+## config file." at every start. Harmless while `version:` below matches the
+## running Frigate (migrate_frigate_config() tests writability BEFORE deciding
+## whether a migration is even needed, so it bails out either way). It stops
+## being harmless the day a Frigate upgrade DOES need a config migration: it
+## will skip it silently. When bumping the Frigate image, apply the migration
+## here by hand and update `version:` in the same commit.
 apiVersion: v1
 kind: ConfigMap
 metadata:
