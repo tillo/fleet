@@ -23,8 +23,18 @@ kustomize:
 # ships every container with resources unset; an op:remove against a
 # missing path fails atomically and leaves the whole patch unapplied,
 # which is what kept this bundle Modified.
+#
+# The apache Service additionally carries an app.kubernetes.io/managed-by
+# label that the chart's own reconciler re-applies but the rendered manifest
+# does not declare, so the bundle sat Modified indefinitely. Same jsonPointers
+# treatment as the resources blocks above.
 diff:
   comparePatches:
+  - apiVersion: v1
+    kind: Service
+    name: nextcloud-aio-apache
+    namespace: envuassu
+    jsonPointers: ["/metadata/labels/app.kubernetes.io~1managed-by"]
   - apiVersion: apps/v1
     kind: Deployment
     name: nextcloud-aio-apache
