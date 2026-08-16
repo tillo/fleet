@@ -99,6 +99,15 @@ spec:
           mountPath: /dev/bus/usb
         - name: frigate-config
           mountPath: /config
+        ## config.yaml comes from git (frigate-cm.yml), mounted read-only over
+        ## the PVC copy so it cannot drift. The PVC still backs the rest of
+        ## /config (frigate.db, model cache, exports). A subPath mount does not
+        ## refresh in place, so a config change needs a Frigate restart — which
+        ## it needs anyway. Side effect: the UI config editor cannot save.
+        - name: frigate-config-yaml
+          mountPath: /config/config.yaml
+          subPath: config.yaml
+          readOnly: true
         - name: frigate-media
           mountPath: /media
         - name: frigate-shm
@@ -214,6 +223,9 @@ spec:
       - name: frigate-config
         persistentVolumeClaim:
           claimName: frigate-config
+      - name: frigate-config-yaml
+        configMap:
+          name: frigate-config-yaml
       - name: frigate-media
         persistentVolumeClaim:
           claimName: frigate-media-ceph
