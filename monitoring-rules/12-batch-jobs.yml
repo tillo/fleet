@@ -1176,6 +1176,32 @@ spec:
           step means drain/zap/re-provision didn't converge (check the zap
           Job, the Rook operator log, and 'ceph status'). Resume by fixing
           the cause and clearing 'phase: halted' in the schedule state.
+          NOTE the halt is LATCHED in that state — fixing the underlying
+          cause does NOT resume the campaign on its own, and the stuck
+          step's 'since' timestamp must be reset too or the timeout check
+          re-halts it immediately on the next tick.
+    ## Completion is actionable here, not just informational: the CRUSH
+    ## device-class fix (bulk pools can still land PGs on the three 15 GiB
+    ## fio OSDs, which is what stranded a backfill for two days on
+    ## 2026-08-14) is deliberately deferred until no OSD is being recreated,
+    ## because every recreated OSD re-applies its CRUSH location at start.
+    - alert: CephOsdRecreateCampaignComplete
+      expr: ceph_osd_recreate_campaign_phase == 2
+      for: 10m
+      labels:
+        severity: info
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "Ceph OSD-recreate campaign complete — deferred CRUSH fix can now run"
+        description: |
+          Every OSD has been recreated under bluestore_elastic_shared_blobs
+          =false, so the deferred fio-root CRUSH change is now safe to apply.
+          Runbook and apply script: ~/ceph-fio-root-fix/ (README.md explains
+          why the obvious device-class rule is the WRONG fix here — measured
+          75% PG remap versus 3 PGs for the root move). After it lands,
+          re-enable the Ceph balancer, which is currently OFF because it
+          prunes the manual upmap holding PG 6.12b off the full fio OSD.
   - name: app-batch-jobs.joplin-canary
     rules:
     ## f/probe/joplin_note_canary (15-min): watches every Joplin note's
