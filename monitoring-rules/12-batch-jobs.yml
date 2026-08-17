@@ -690,6 +690,25 @@ spec:
         summary: "Longhorn label enforcer had {{ $value }} error(s)"
         description: "Enforcer failed to patch labels on one or more PVCs. Check the Windmill run."
 
+  - name: app-batch-jobs.frigate-config
+    rules:
+    - alert: FrigateConfigMigrationPending
+      ## infra-0ga: Frigate's config.yaml is a read-only fleet ConfigMap, so
+      ## its startup config-migration is disabled — while the :stable image
+      ## auto-updates via Keel (4h force-poll). The daily probe
+      ## f/probe/frigate_config_version_check compares the ConfigMap's
+      ## version: against CURRENT_CONFIG_VERSION of the RUNNING release.
+      ## Not auto-solving (needs a hand migration commit) -> warning.
+      expr: frigate_config_version_mismatch == 1
+      for: 1h
+      labels:
+        severity: warning
+        component: Frigate
+        team: mdapi
+      annotations:
+        summary: "Frigate is running with an unmigrated config (read-only ConfigMap)"
+        description: "The running Frigate release expects a newer config version than fleet/frigate/frigate-cm.yml pins. Apply the upstream config migration by hand in the ConfigMap and bump version: in the same commit (see probe log for versions)."
+
   - name: app-batch-jobs.infra-health
     rules:
     - alert: FleetBundlesNotReady
@@ -714,7 +733,7 @@ spec:
         team: mdapi
       annotations:
         summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }}"
-        description: "Check via `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
+        description: "Names: query fleet_bundle_deployment_not_ready_info (same hourly push, works from the jump seat) or `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
 
     - alert: FleetBundlesNotReadySustained
       expr: |
@@ -726,7 +745,7 @@ spec:
         team: mdapi
       annotations:
         summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }} for >1h"
-        description: "Not-ready across two consecutive hourly pushes — not a rollout blip. Check via `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
+        description: "Not-ready across two consecutive hourly pushes — not a rollout blip. Names: query fleet_bundle_deployment_not_ready_info (same hourly push, works from the jump seat) or `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
     - alert: CertExpiringSoon
       ## Warning only when cert-manager has NO future renewalTime (or the
       ## scheduled renewal has passed and the cert still hasn't rotated) —
