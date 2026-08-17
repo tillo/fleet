@@ -1013,6 +1013,48 @@ spec:
           Issuance/import is blocked at 100% — install a larger license (clm.N) or
           prune certificates now.
 
+  - name: app-batch-jobs.horizon-lic001
+    ## f/heal/horizon_lic001_heal (every 10 min) probes GET /api/v1/licenses;
+    ## the recurring Pekko DCV-singleton wedge (LIC-001, AskTimeout on
+    ## dcv-policy-manager-proxy after in-place horizon-0 restarts; hit
+    ## 2026-07-02 and 2026-08-12→16) makes it hang 60s then 500. The heal
+    ## deletes horizon-0 after a 12-min dwell, max once per 6h. Severity per
+    ## the auto-solving policy: info while the heal handles it, warning when
+    ## the heal is demonstrably not working (suppressed re-wedge inside the
+    ## cooldown, or wedged 45+ min). Staleness covered by the generic
+    ## BatchJobStale rule (job label horizon_lic001_heal).
+    rules:
+    - alert: HorizonLic001Wedged
+      expr: horizon_lic001_wedged{job="horizon_lic001_heal"} == 1
+      for: 5m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon LIC-001 DCV-singleton wedge detected (auto-heal engaged)"
+        description: |
+          GET /api/v1/licenses is hanging with the LIC-001 Pekko AskTimeout
+          signature. f/heal/horizon_lic001_heal will restart horizon-0 after its
+          12-min dwell; no action needed unless HorizonLic001HealIneffective fires.
+    - alert: HorizonLic001HealIneffective
+      expr: >-
+        horizon_lic001_heal_suppressed{job="horizon_lic001_heal"} == 1
+        or min_over_time(horizon_lic001_wedged{job="horizon_lic001_heal"}[45m]) == 1
+      for: 5m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon LIC-001 wedge persists — auto-heal not resolving it"
+        description: |
+          The LIC-001 wedge either re-appeared inside the 6h heal cooldown
+          (restart demonstrably not fixing it) or has persisted 45+ min without
+          a successful heal (pod gate blocking, or restart not clearing it).
+          Investigate horizon-0 by hand: kubectl -n horizon logs horizon-0 |
+          grep LIC-001. Source: f/heal/horizon_lic001_heal (beads infra-0pl).
+
   - name: app-batch-jobs.stream-license
     ## f/probe/stream_license_usage (hourly) publishes Stream's total X509
     ## certificate count vs the stream-ca.<N> license cap (decoded live from the
