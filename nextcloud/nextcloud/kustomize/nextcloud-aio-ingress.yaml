@@ -1,13 +1,14 @@
-## S2a (infra-ka2, 2026-08-14): nc.mdapi.ch through the normal ingress —
+## S2a (infra-ka2, 2026-08-14): Nextcloud through the normal ingress —
 ## restores ModSec/WAF coverage and cert-manager certs; kills the dedicated
 ## LB IP. ModSec snippet cloned from the proven owncloud ingress: the
 ## controller-mounted Nextcloud CRS rule-exclusions plugin does the heavy
 ## lifting; 1008 keeps native-client OAuth2 loopback redirects working; 1011
 ## blankets /remote.php/dav/ for sync-client PROPFIND variants (920340/941100
 ## family). owncloud's /graph/ rule (1009) is ownCloud-only — not cloned.
-## Public DNS: nc.mdapi.ch A 31.3.128.53 -> 31.3.128.50 (nsupdate, same
-## night); internal override auto-managed from this Ingress by the
-## external-dns -> unbound-webhook chain.
+## The original nc.mdapi.ch host was retired 2026-08-17 (cloud.mdapi.ch is
+## the sole domain since the ownCloud cutover); internal split-horizon
+## records are auto-managed from this Ingress by the external-dns ->
+## unbound-webhook chain.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -42,16 +43,6 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: nc.mdapi.ch
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: nextcloud-aio-apache
-                port:
-                  number: 11000
     # cloud.mdapi.ch: household cutover from ownCloud 10 -> Nextcloud on
     # 2026-08-17. ownCloud was put in maintenance mode and its ingress
     # retargeted to oc-legacy.mdapi.ch (kept for rollback). Public DNS for
@@ -68,9 +59,6 @@ spec:
                 port:
                   number: 11000
   tls:
-    - hosts:
-        - nc.mdapi.ch
-      secretName: nextcloud-aio-tls
     - hosts:
         - cloud.mdapi.ch
       secretName: nextcloud-cloud-tls
