@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: litellm
+data:
+  config.yaml: |
+    model_list:
+      # --- local: one LM Studio on the laptop, reached via two NICs.
+      #     api_base values are injected from Akeyless (see litellm-es.yml) so no
+      #     internal hostname lands in this public repo. os.environ/ refs in
+      #     api_base are resolved by LiteLLM (same as the documented Azure pattern).
+      - model_name: local-wifi
+        litellm_params:
+          model: openai/qwen/qwen3-coder-30b   # provider=openai, model id as served by LM Studio
+          api_base: os.environ/LMSTUDIO_WIFI_URL
+          api_key: "lm-studio"                 # dummy; LM Studio ignores it
+      # --- Anthropic tails (directly selectable, and used as fallbacks) ---
+      - model_name: opus
+        litellm_params:
+          model: anthropic/claude-opus-5
+          api_key: os.environ/ANTHROPIC_API_KEY
+      - model_name: fable
+        litellm_params:
+          model: anthropic/claude-fable-5
+          api_key: os.environ/ANTHROPIC_API_KEY
+      # --- public aliases: PRIMARY = wired; chain is defined in fallbacks ---
+      - model_name: infra
+        litellm_params:
+          model: openai/qwen/qwen3-coder-30b
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: "lm-studio"
+      - model_name: infra-fable
+        litellm_params:
+          model: openai/qwen/qwen3-coder-30b
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: "lm-studio"
+      - model_name: local-only
+        litellm_params:
+          model: openai/qwen/qwen3-coder-30b
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: "lm-studio"
+
+    litellm_settings:
+      fallbacks:
+        - infra:       ["local-wifi", "opus"]    # wired -> wifi -> Opus
+        - infra-fable: ["local-wifi", "fable"]   # wired -> wifi -> Fable
+        - local-only:  ["local-wifi"]            # wired -> wifi -> STOP (fails closed)
+      num_retries: 0            # don't retry a dead endpoint; fall over immediately
+      request_timeout: 20
+      allowed_fails: 1          # one failure trips the cooldown
+      cooldown_time: 30         # skip a downed path for 30s instead of re-timing-out
+
+    router_settings:
+      background_health_checks: true
+      health_check_interval: 30
+
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY

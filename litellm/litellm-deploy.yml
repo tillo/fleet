@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: litellm
+  annotations:
+    # Restart pods when the ConfigMap or the Akeyless-backed Secret changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: litellm
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: litellm
+        # Mirrored from ghcr.io/berriai/litellm:v1.97.0 into zot (supply-chain:
+        # well past the 1.82.7/1.82.8 malware). Pinned; no Keel auto-bump.
+        image: zot.mdapi.ch/mdapi/litellm:v1.97.0
+        imagePullPolicy: IfNotPresent
+        args: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+        ports:
+        - containerPort: 4000
+        envFrom:
+        - secretRef:
+            name: litellm-env-secret
+        volumeMounts:
+        - name: config
+          mountPath: /etc/litellm
+          readOnly: true
+        resources:
+          requests:
+            cpu: 25m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+      imagePullSecrets:
+      - name: zot-pull
+      volumes:
+      - name: config
+        configMap:
+          name: litellm-config
