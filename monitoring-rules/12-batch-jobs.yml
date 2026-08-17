@@ -622,6 +622,36 @@ spec:
         summary: "{{ $labels.component }} upgrade available"
         description: "{{ $labels.component }} has a newer same-minor release. Plan an upgrade window."
 
+  - name: app-batch-jobs.k8s-orphan-audit
+    rules:
+    - alert: K8sOrphanObjects
+      ## info-only housekeeping surface from f/probe/k8s_orphan_audit (daily,
+      ## prod + mgmt): Released/Failed PVs, service-less EndpointSlices, helm
+      ## releases stuck pending-* >24h, warning-event storms >=1000, VMs with
+      ## missing cloud-init secrets, PV-less Longhorn volumes. Classes from
+      ## the 2026-08-17 sweep — each had sat unnoticed for weeks-to-months.
+      expr: k8s_orphan_audit_findings{job="k8s_orphan_audit"} > 0
+      for: 90m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.cluster }}: {{ $value }} {{ $labels.class }} finding(s)"
+        description: "k8s_orphan_audit found {{ $value }} {{ $labels.class }} on {{ $labels.cluster }} — object names are in the probe's job log."
+    - alert: K8sFailedPodCorpses
+      ## a pile of Failed-phase pods = active node trouble (DiskPressure storm
+      ## class: 507 corpses on rancher-mgmt sat 5 days unnoticed 2026-08-12).
+      expr: k8s_orphan_audit_failed_pods{job="k8s_orphan_audit"} > 10
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.cluster }}: {{ $value }} Failed-phase pod corpses"
+        description: "Pod corpse pile-up on {{ $labels.cluster }} — check node conditions (DiskPressure?), then clean with: kubectl delete pods -A --field-selector=status.phase=Failed"
+
   - name: app-batch-jobs.host-updates
     rules:
     - alert: HostUpdateAvailable
