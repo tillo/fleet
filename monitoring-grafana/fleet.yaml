@@ -24,9 +24,16 @@ diff:
     name: grafana
     namespace: monitoring
     operations:
-    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    # resources: use `add` with a string "{}" (Fleet types operations[].value as
+    # STRING) instead of `remove` — the dashboard-sidecar ships NO resources in
+    # the rendered chart, so `remove .../containers/1/resources` fails
+    # ("doc is missing path") and voids the WHOLE patch, spamming the agent and
+    # letting grafana flap Modified. `add` tolerates an absent key (creates it)
+    # and normalizes BOTH desired+live resources to the same "{}" -> drift
+    # ignored. Fixed 2026-08-17 (was silently failing for weeks).
+    - {"op": "add", "path": "/spec/template/spec/containers/0/resources", "value": "{}"}
     - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
     # container 1 = dashboard-sidecar: VPA(Auto) may write resources, and Keel's
     # force-policy can re-pin the image digest on its poll. Strip both from drift.
-    - {"op": "remove", "path": "/spec/template/spec/containers/1/resources"}
+    - {"op": "add", "path": "/spec/template/spec/containers/1/resources", "value": "{}"}
     - {"op": "remove", "path": "/spec/template/spec/containers/1/image"}
