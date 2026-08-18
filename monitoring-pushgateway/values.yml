@@ -12,7 +12,13 @@ resources:
     cpu: 5m
     memory: 16Mi
   limits:
-    memory: 64Mi
+    ## Working set grows ~4Mi/day from pushed-series accumulation; 64Mi
+    ## was a ~10-day OOM fuse (exit-137 rolls 07-28, 08-16). Persistence
+    ## makes the restart itself harmless, but each OOM still fails the
+    ## scheduled pushes in flight for ~1h. 128Mi stretches the fuse well
+    ## past the pod's natural roll cadence (chart bumps). 2026-08-18,
+    ## user-approved.
+    memory: 128Mi
 
 ## Persist pushed metrics across pod restarts (small PVC).
 ## Without this, every pod restart loses all currently-stored values.
