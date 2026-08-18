@@ -135,6 +135,49 @@ data:
       return { prompt_tokens: prompt, completion_tokens: u.output_tokens || 0, total_tokens: prompt + (u.output_tokens || 0) };
     }
 
+    // Map OpenAI Responses API input to chat-completions-style messages.
+    function responsesToMessages(payload) {
+      const messages = [];
+      if (payload.instructions) messages.push({ role: 'system', content: String(payload.instructions) });
+      const input = payload.input;
+      if (typeof input === 'string') { messages.push({ role: 'user', content: input }); return messages; }
+      if (!Array.isArray(input)) throw Object.assign(new Error('unsupported input'), { code: 400 });
+      for (const item of input) {
+        const role = item.role || (item.type === 'message' ? 'user' : null);
+        if (!role) continue; // skip non-message items (tool calls etc.)
+        let content = item.content;
+        if (Array.isArray(content)) {
+          content = content.map(p => {
+            if (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text') return { type: 'text', text: p.text || '' };
+            if (p.type === 'input_image') {
+              const url = typeof p.image_url === 'string' ? p.image_url : (p.image_url || {}).url || '';
+              return { type: 'image_url', image_url: { url } };
+            }
+            return { type: 'text', text: `[${p.type}]` };
+          });
+        }
+        messages.push({ role, content });
+      }
+      return messages;
+    }
+
+    function responseObj(id, created, model, status, text, usage) {
+      return {
+        id, object: 'response', created_at: created, status, model,
+        error: null, incomplete_details: null, instructions: null, metadata: {},
+        parallel_tool_calls: false, tool_choice: 'none', tools: [],
+        output: status === 'completed' ? [{
+          type: 'message', id: `msg_${id}`, status: 'completed', role: 'assistant',
+          content: [{ type: 'output_text', text, annotations: [] }],
+        }] : [],
+        usage: usage ? {
+          input_tokens: usage.prompt_tokens, output_tokens: usage.completion_tokens,
+          total_tokens: usage.total_tokens,
+          input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+        } : null,
+      };
+    }
+
     function send(res, code, obj) {
       const body = JSON.stringify(obj);
       res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
@@ -156,7 +199,51 @@ data:
       if (req.method === 'GET' && url === '/v1/models') {
         return send(res, 200, { object: 'list', data: MODELS.map(id => ({ id, object: 'model', owned_by: 'claude-shim' })) });
       }
-      if (req.method !== 'POST' || url !== '/v1/chat/completions') return oaiError(res, 404, 'not found');
+      if (req.method === 'POST' && url === '/v1/responses') {
+        let rbody = '';
+        req.on('data', d => { rbody += d; if (rbody.length > 64 * 1024 * 1024) req.destroy(); });
+        req.on('end', async () => {
+          let payload;
+          try { payload = JSON.parse(rbody); } catch { return oaiError(res, 400, 'invalid JSON'); }
+          const model = payload.model || MODELS[0];
+          if (!MODELS.includes(model)) return oaiError(res, 404, `model '${model}' not in [${MODELS.join(', ')}]`);
+          let turn;
+          try { turn = buildTurn(responsesToMessages(payload)); } catch (e) { return oaiError(res, e.code || 400, e.message); }
+          try { await acquire(); } catch { return oaiError(res, 429, 'shim at capacity, retry later'); }
+          const id = `resp_${randomUUID().replace(/-/g, '')}`;
+          const created = Math.floor(Date.now() / 1000);
+          try {
+            if (payload.stream) {
+              res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+              let seq = 0;
+              const ev = (type, extra) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...extra })}\n\n`);
+              const itemId = `msg_${id}`;
+              ev('response.created', { response: responseObj(id, created, model, 'in_progress', '', null) });
+              ev('response.output_item.added', { output_index: 0, item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] } });
+              ev('response.content_part.added', { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+              const r = await runClaude(model, turn.system, turn.blocks,
+                t => ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: t }));
+              if (!r.emitted && r.text) ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: r.text });
+              ev('response.output_text.done', { item_id: itemId, output_index: 0, content_index: 0, text: r.text });
+              ev('response.content_part.done', { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: r.text, annotations: [] } });
+              ev('response.output_item.done', { output_index: 0, item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: r.text, annotations: [] }] } });
+              ev('response.completed', { response: responseObj(id, created, model, 'completed', r.text, usageOut(r.usage)) });
+              res.end();
+            } else {
+              const r = await runClaude(model, turn.system, turn.blocks, null);
+              send(res, 200, responseObj(id, created, model, 'completed', r.text, usageOut(r.usage)));
+            }
+          } catch (e) {
+            if (!res.headersSent) oaiError(res, e.code || 500, e.message);
+            else { try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', message: e.message })}\n\n`); res.end(); } catch {} }
+          } finally { release(); }
+        });
+        return;
+      }
+      if (req.method !== 'POST' || url !== '/v1/chat/completions') {
+        console.log(`404 ${req.method} ${url}`);
+        return oaiError(res, 404, 'not found');
+      }
 
       let body = '';
       req.on('data', d => { body += d; if (body.length > 64 * 1024 * 1024) req.destroy(); });
