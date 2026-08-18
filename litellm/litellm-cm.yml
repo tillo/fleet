@@ -16,14 +16,22 @@ data:
           api_base: os.environ/LMSTUDIO_WIFI_URL
           api_key: "lm-studio"                 # dummy; LM Studio ignores it
       # --- Anthropic tails (directly selectable, and used as fallbacks) ---
+      #     Since 2026-08-18 these go through claude-shim (headless Claude Code
+      #     on the Max subscription) instead of the pay-per-token API. The
+      #     per-model request_timeout overrides the global 20s fail-fast, which
+      #     is sized for the local LM Studio hops, not a real Claude answer.
       - model_name: opus
         litellm_params:
-          model: anthropic/claude-opus-5
-          api_key: os.environ/ANTHROPIC_API_KEY
+          model: openai/claude-opus-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
       - model_name: fable
         litellm_params:
-          model: anthropic/claude-fable-5
-          api_key: os.environ/ANTHROPIC_API_KEY
+          model: openai/claude-fable-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
       # --- public aliases: PRIMARY = wired; chain is defined in fallbacks ---
       - model_name: infra
         litellm_params:
