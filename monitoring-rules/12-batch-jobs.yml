@@ -544,8 +544,10 @@ spec:
     rules:
     - alert: WafCarveoutRegression
       ## A WAF rule that was carved out by a Fleet ingress
-      ## modsecurity-snippet (921250/932160 on idp OIDC, 934110 on oauth2,
-      ## 942290 on Graph API) registered a 403 in the last 24h.  Either
+      ## modsecurity-snippet (921250/932160 on idp OIDC, 934110/942290 on
+      ## the oc-legacy owncloud oauth2 + Graph APIs — re-scoped off
+      ## cloud.mdapi.ch after the 2026-08-17 Nextcloud cutover) registered
+      ## a 403 in the last 24h.  Either
       ## the carveout regex no longer covers a new path variant, the
       ## Fleet ingress drifted, or a novel attack matches the same rule
       ## outside the carveout scope.  All three are worth a look.
@@ -748,6 +750,24 @@ spec:
       annotations:
         summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }} for >1h"
         description: "Not-ready across two consecutive hourly pushes — not a rollout blip. Names: query fleet_bundle_deployment_not_ready_info (same hourly push, works from the jump seat) or `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
+    - alert: InfraHealthCollectorDegraded
+      ## daily_infra_health degrades per collector since 2026-08-18
+      ## (infra-health, user-approved): a failing upstream (rancher-mgmt
+      ## proxy timeout during an upgrade, a transient 500 on one API group)
+      ## no longer kills the whole run — the collector reports 0 here and
+      ## its metric family is re-pushed from the last good values, so the
+      ## family's own alerts don't false-resolve. Blips self-clear on the
+      ## next hourly run; only a full 3h of consecutive failures is worth
+      ## eyes. collector="fleet" also reads 0 while the Rancher management
+      ## plane is deliberately skipped (fleet_mgmt_reachable=0 says why).
+      expr: max_over_time(infra_health_collector_up[3h]) == 0
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "infra-health collector {{ $labels.collector }} degraded >3h"
+        description: "daily_infra_health collector {{ $labels.collector }} has not succeeded for 3h+; its gauges are frozen at last-good values. Check the hourly run logs in Windmill (f/probe/daily_infra_health)."
     - alert: CertExpiringSoon
       ## Warning only when cert-manager has NO future renewalTime (or the
       ## scheduled renewal has passed and the cert still hasn't rotated) —
