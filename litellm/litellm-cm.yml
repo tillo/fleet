@@ -20,16 +20,22 @@ data:
       #     because a fallback list is per-GROUP: a mid-stream failure on the WG
       #     hop resolves the WG group's own fallbacks, so each cloud chain needs
       #     a WG hop that tails into ITS cloud model to keep the tail correct.
+      #     request_timeout 60 (not the global 20s fail-fast): if the qwen pin
+      #     was lost (LM Studio restart), the first request JIT-loads the model
+      #     in ~40s — proven 2026-08-19 when the 20s cap knocked the WG hop out
+      #     of the chain mid-load. 60s still tails to the cloud within a minute.
       - model_name: local-wg
         litellm_params:
           model: openai/qwen/qwen3-coder-30b
           api_base: os.environ/LMSTUDIO_WG_URL
           api_key: "lm-studio"
+          request_timeout: 60
       - model_name: local-wg-fable
         litellm_params:
           model: openai/qwen/qwen3-coder-30b
           api_base: os.environ/LMSTUDIO_WG_URL
           api_key: "lm-studio"
+          request_timeout: 60
       # --- Anthropic tails (directly selectable, and used as fallbacks) ---
       #     Since 2026-08-18 these go through claude-shim (headless Claude Code
       #     on the Max subscription) instead of the pay-per-token API. The
