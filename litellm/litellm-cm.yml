@@ -15,6 +15,21 @@ data:
           model: openai/qwen/qwen3-coder-30b   # provider=openai, model id as served by LM Studio
           api_base: os.environ/LMSTUDIO_WIFI_URL
           api_key: "lm-studio"                 # dummy; LM Studio ignores it
+      # --- same LM Studio over its WireGuard road-warrior tunnel (2026-08-19):
+      #     reachable when the laptop is away from home. Two identical groups
+      #     because a fallback list is per-GROUP: a mid-stream failure on the WG
+      #     hop resolves the WG group's own fallbacks, so each cloud chain needs
+      #     a WG hop that tails into ITS cloud model to keep the tail correct.
+      - model_name: local-wg
+        litellm_params:
+          model: openai/qwen/qwen3-coder-30b
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: "lm-studio"
+      - model_name: local-wg-fable
+        litellm_params:
+          model: openai/qwen/qwen3-coder-30b
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: "lm-studio"
       # --- Anthropic tails (directly selectable, and used as fallbacks) ---
       #     Since 2026-08-18 these go through claude-shim (headless Claude Code
       #     on the Max subscription) instead of the pay-per-token API. The
@@ -81,9 +96,16 @@ data:
         # No local-wifi hop in the cloud chains: same physical box as wired, and a
         # mid-stream failure on the hop ends the chain before the cloud tail
         # (litellm resolves fallbacks for the FAILED group, not the original).
-        - infra:       ["opus"]                  # wired -> Opus
-        - infra-fable: ["fable"]                 # wired -> Fable
-        - local-only:  ["local-wifi"]            # wired -> wifi -> STOP (fails closed)
+        # The WG hop (laptop away from home) IS in the chains, and each WG group
+        # carries its own cloud tail so even a mid-stream WG failure still lands
+        # on the right cloud model.
+        - infra:          ["local-wg", "opus"]         # wired -> WG -> Opus
+        - infra-fable:    ["local-wg-fable", "fable"]  # wired -> WG -> Fable
+        - local-wg:       ["opus"]
+        - local-wg-fable: ["fable"]
+        - local-only:     ["local-wifi"]         # wired -> wifi -> STOP (fails closed;
+                                                 # deliberately NO WG hop: local-wg's
+                                                 # fallback would leak to the cloud tail)
       num_retries: 0            # don't retry a dead endpoint; fall over immediately
       request_timeout: 20
       allowed_fails: 1          # one failure trips the cooldown
