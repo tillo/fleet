@@ -92,7 +92,7 @@ spec:
               value: "1"
             # ---- Mail polling cadence ----
             ## Poll the documents@mdapi.ch IMAP inbox every 5 min (default is
-            ## 10) — matches the consume-puller's OwnCloud poll interval. The
+            ## 10) — matches the consume-puller's Nextcloud poll interval. The
             ## mail account + rule themselves are DB config, managed in the UI.
             - name: PAPERLESS_EMAIL_TASK_CRON
               value: "*/5 * * * *"
@@ -201,19 +201,20 @@ spec:
             requests: {cpu: 50m, memory: 128Mi}
             limits:   {cpu: 2,   memory: 1Gi}
 
-        ## consume-puller: every 5 min, rclone-move files from the OwnCloud
+        ## consume-puller: every 5 min, rclone-move files from the Nextcloud
         ## share /Paperless-Consume (owned by the `documents` LDAP service
         ## account, R+W-shared with mdellambrogio) into paperless's local
-        ## /consume directory. Files vanish from OwnCloud once moved, so the
+        ## /consume directory. Files vanish from Nextcloud once moved, so the
         ## source folder is a true drop-zone (no double-consume on next poll).
         ## Subdir structure is preserved so paperless's SUBDIRS_AS_TAGS
         ## auto-tags each ingested doc with its parent folder name.
         ##
-        ## The OwnCloud user-name path component is the LDAP entryUUID
-        ## (d1a8901f-...) because OwnCloud's `ldapUserName=samaccountname`
-        ## mapping has no samaccountname attribute on this entry and falls
-        ## back to the UUID. The display name "Documents Mailbox" is still
-        ## what shows up in shares.
+        ## Nextcloud (cloud.mdapi.ch since the 2026-08-17 cutover) maps the
+        ## LDAP account to the plain `documents` user id in the WebDAV path —
+        ## unlike the old ownCloud, which fell back to the LDAP entryUUID
+        ## (d1a8901f-...). The rclone remote is still *named* "owncloud"
+        ## (env-var prefix + the paperless-env-secret key) so the Akeyless /
+        ## secret wiring stays untouched.
         ##
         ## rclone's WebDAV password env var must be in obscured form. We
         ## store the pre-obscured value in Akeyless at
@@ -226,7 +227,7 @@ spec:
           image: rclone/rclone:latest
           imagePullPolicy: Always
           ## Run as paperless's uid/gid (1000) — NOT root. rclone creates the
-          ## /consume subdirectories as it mirrors the OwnCloud folder tree;
+          ## /consume subdirectories as it mirrors the Nextcloud folder tree;
           ## if it runs as root those dirs are root:root 0755 and paperless's
           ## uid-1000 celery worker cannot delete the source file after
           ## consuming it ([Errno 13] → infinite re-OCR loop). uid 1000 owns
@@ -253,9 +254,9 @@ spec:
             - name: RCLONE_CONFIG_OWNCLOUD_TYPE
               value: "webdav"
             - name: RCLONE_CONFIG_OWNCLOUD_URL
-              value: "https://cloud.mdapi.ch/remote.php/dav/files/d1a8901f-7a33-46f1-a985-02e450a7a35a/"
+              value: "https://cloud.mdapi.ch/remote.php/dav/files/documents/"
             - name: RCLONE_CONFIG_OWNCLOUD_VENDOR
-              value: "owncloud"
+              value: "nextcloud"
             - name: RCLONE_CONFIG_OWNCLOUD_USER
               value: "documents"
             - name: RCLONE_CONFIG_OWNCLOUD_PASS
@@ -393,19 +394,20 @@ spec:
             limits:   {cpu: 500m, memory: 256Mi}
 
         ## library-pusher: every 5 min, rclone-sync the paperless archive tree
-        ## (OCR'd searchable PDFs) into the OwnCloud `documents` user folder
-        ## /Paperless-Library. Shares 153/154 expose that folder read-only to
-        ## mdellambrogio (Tillo) and elisadellambrogio (Elisa), so they can
-        ## browse the {year}/{correspondent}/{title} document tree from
-        ## OwnCloud without granting any Paperless access.
+        ## (OCR'd searchable PDFs) into the Nextcloud `documents` user folder
+        ## /Paperless-Library. Read-only shares (migrated from ownCloud on the
+        ## 2026-08-17 cutover) expose that folder to mdellambrogio (Tillo) and
+        ## elisadellambrogio (Elisa), so they can browse the
+        ## {year}/{correspondent}/{title} document tree from Nextcloud without
+        ## granting any Paperless access.
         ##
-        ## Direction is one-way: Paperless is source of truth, OwnCloud copy
-        ## mirrors deletions too. The read-only share keeps consumers from
+        ## Direction is one-way: Paperless is source of truth, the Nextcloud
+        ## copy mirrors deletions too. The read-only share keeps consumers from
         ## modifying files only to have them reverted on the next sync.
         ##
         ## Mount is `media/documents` (subPath) at /library read-only so the
         ## sidecar can't accidentally write back into the archive. Same rclone
-        ## env block as consume-puller (same OwnCloud creds via secretKeyRef).
+        ## env block as consume-puller (same WebDAV creds via secretKeyRef).
         - name: library-pusher
           image: rclone/rclone:latest
           imagePullPolicy: Always
@@ -429,9 +431,9 @@ spec:
             - name: RCLONE_CONFIG_OWNCLOUD_TYPE
               value: "webdav"
             - name: RCLONE_CONFIG_OWNCLOUD_URL
-              value: "https://cloud.mdapi.ch/remote.php/dav/files/d1a8901f-7a33-46f1-a985-02e450a7a35a/"
+              value: "https://cloud.mdapi.ch/remote.php/dav/files/documents/"
             - name: RCLONE_CONFIG_OWNCLOUD_VENDOR
-              value: "owncloud"
+              value: "nextcloud"
             - name: RCLONE_CONFIG_OWNCLOUD_USER
               value: "documents"
             - name: RCLONE_CONFIG_OWNCLOUD_PASS
