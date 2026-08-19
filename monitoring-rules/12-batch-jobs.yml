@@ -1282,12 +1282,16 @@ spec:
       annotations:
         summary: "Ceph OSD-recreate campaign halted"
         description: |
-          The #70390 remediation campaign stopped itself. Check the last
-          f/heal/ceph_osd_recreate_campaign run log for the halt reason:
+          The #70390 remediation campaign stopped itself{{ range query "ceph_osd_recreate_campaign_halt_info" }} — latched at
+          step={{ .Labels.step }} osd.{{ .Labels.osd }}
+          ({{ .Labels.reason_class }}){{ end }}. The full halt_reason text is
+          in the last f/heal/ceph_osd_recreate_campaign run result:
           scrub errors mean latent corruption was found (ceph health detail,
           ceph pg repair — do NOT resume recreation until repaired); a stuck
           step means drain/zap/re-provision didn't converge (check the zap
-          Job, the Rook operator log, and 'ceph status'). Resume by fixing
+          Job, the Rook operator log, and 'ceph status';
+          ..._drain_pgs_left / ..._misplaced_objects gauges show whether
+          data is actually moving). Resume by fixing
           the cause and clearing 'phase: halted' in the schedule state.
           NOTE the halt is LATCHED in that state — fixing the underlying
           cause does NOT resume the campaign on its own, and the stuck
