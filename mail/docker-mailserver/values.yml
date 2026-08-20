@@ -144,6 +144,14 @@ configMaps:
       # cron output from system users (e.g. clamav@mail.mdapi.ch) doesn't
       # try to relay back to ourselves and bounce as "loops back to myself".
       mydestination = $myhostname, localhost.$mydomain, localhost
+      # Throttle SASL brute-force to 10 AUTH/min per client IP (2026-08-20).
+      # anvil accounts clients by the PROXY-protocol IP, so this works where
+      # in-pod fail2ban provably cannot (all external TCP arrives from the
+      # haproxy hop; attacker IPs never appear as packet sources). Exceeded
+      # clients get a temporary 450, not a lockout; $mynetworks is exempt by
+      # default (smtpd_client_event_limit_exceptions); real MUAs do ~1 AUTH
+      # per connection and never approach 10/min.
+      smtpd_client_auth_rate_limit = 10
   dovecot.cf:
     create: true
     path: dovecot.cf
