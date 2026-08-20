@@ -330,6 +330,76 @@ for path in sorted((REPO / "monitoring-rules").glob("*.yml")):
 
 
 # ---------------------------------------------------------------------------
+# Check E — helm v4 dash-run shredding guard (fleet-agent >= v0.15 / helm v4)
+# ---------------------------------------------------------------------------
+# helm v4's action.fixDocSeparators mis-detects the second `---` group inside
+# a run of dashes as a document separator (its line-start guard can't look
+# back once the scan index is 0 after consuming the first group). Any run of
+# >= 6 dashes in RENDERED template output — e.g. a `# --- section ------`
+# comment ruler inside ConfigMap data fed from Helm values — is shredded into
+# bogus YAML docs; 1-2-dash remnants become scalar documents and the bundle
+# fails with:  ErrApplied ... error merging manifests: ... wrong node kind:
+# expected MappingNode but got ScalarNode: node contents: --
+# (mail bundle outage-adjacent incident 2026-08-20; runs of <= 5 dashes are
+# safe). Only helm-type bundles are exposed — raw-manifest bundles skip helm
+# template rendering entirely. This walks the PARSED string values of each
+# helm bundle's valuesFiles + inline values, so YAML comments in the values
+# file itself (which never reach rendered output) are not flagged, while
+# dash runs inside block scalars (the real hazard) are. Limitation: rulers
+# inside an external chart's own templates are out of this repo's reach.
+
+RE_DASH_RUN = re.compile(r"-{6,}")
+
+
+def e_walk_strings(node, keypath=""):
+    """Yield (keypath, string) for every string leaf in a values structure."""
+    if isinstance(node, str):
+        yield keypath, node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield from e_walk_strings(v, f"{keypath}.{k}" if keypath else str(k))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from e_walk_strings(v, f"{keypath}[{i}]")
+
+
+def e_check_values(source_desc: str, data):
+    for keypath, s in e_walk_strings(data):
+        if RE_DASH_RUN.search(s):
+            run = max(len(m.group(0)) for m in RE_DASH_RUN.finditer(s))
+            errors.append(
+                f"[HELM4-DASH-RUN] {source_desc}: values key `{keypath}` contains "
+                f"a run of {run} dashes. helm v4 (fleet-agent >= v0.15) shreds "
+                "runs of >= 6 dashes in rendered output into bogus YAML docs -> "
+                "bundle ErrApplied 'wrong node kind ... node contents: --'. "
+                "Use `===` rulers instead (2026-08-20 mail bundle incident)."
+            )
+
+
+for fleet_yaml in REPO.rglob("fleet.y*ml"):
+    docs = load_docs(fleet_yaml)
+    root = docs[0] if docs and isinstance(docs[0], dict) else {}
+    helm = root.get("helm") or {}
+    if not helm.get("chart"):
+        continue                     # raw-manifest bundle: not helm-rendered
+    bundle_dir = fleet_yaml.parent
+    if isinstance(helm.get("values"), dict):
+        e_check_values(f"{fleet_yaml.relative_to(REPO)} (inline helm.values)",
+                       helm["values"])
+    for vf in helm.get("valuesFiles") or []:
+        vpath = bundle_dir / vf
+        if not vpath.exists():
+            warnings.append(
+                f"[HELM4-DASH-RUN] {fleet_yaml.relative_to(REPO)}: valuesFiles "
+                f"entry {vf} not found next to the fleet file."
+            )
+            continue
+        for doc in load_docs(vpath):
+            if doc is not None:
+                e_check_values(str(vpath.relative_to(REPO)), doc)
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 for w in warnings:
