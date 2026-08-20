@@ -80,13 +80,61 @@ config:
         ip_protocol_fallback: false
 
     smtp_banner:
+      ## Port 25 (MX). Deepened from banner-only to a full EHLO round-trip
+      ## 2026-08-20: postscreen can serve the 220 banner while every real
+      ## smtpd process is crash-looping (helm-v4 empty-env incident) — the
+      ## banner check alone only caught it because in-cluster probes are
+      ## permit_mynetworks and skip postscreen. EHLO + SIZE proves a real
+      ## smtpd answered; expect scans lines until the regex matches, so
+      ## multi-line EHLO replies are fine (official blackbox pattern).
       prober: tcp
-      timeout: 10s
+      timeout: 15s
       tcp:
         preferred_ip_protocol: ip4
         ip_protocol_fallback: false
         query_response:
           - expect: "^220 "
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]SIZE"
+          - send: "QUIT\r"
+
+    smtps_ehlo:
+      ## Port 465 (submissions, implicit TLS) — the path user MUAs actually
+      ## send through; it was DOWN 63min on 2026-08-20 with no probe on it.
+      ## TLS handshake validates the mail cert against system roots (same
+      ## as imaps_starttls); expecting an AUTH capability proves the smtpd
+      ## + SASL layer, not just a listener.
+      prober: tcp
+      timeout: 15s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        tls: true
+        query_response:
+          - expect: "^220 "
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]AUTH"
+          - send: "QUIT\r"
+
+    smtp_starttls_ehlo:
+      ## Port 587 (submission, STARTTLS upgrade) — official blackbox
+      ## smtp_starttls pattern: EHLO, upgrade, EHLO again expecting AUTH
+      ## (postfix only advertises AUTH on 587 after TLS).
+      prober: tcp
+      timeout: 15s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        query_response:
+          - expect: "^220 "
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]STARTTLS"
+          - send: "STARTTLS\r"
+          - expect: "^220"
+          - starttls: true
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]AUTH"
+          - send: "QUIT\r"
 
     imaps_starttls:
       ## IMAPS on port 993 — TLS handshake then capability check
