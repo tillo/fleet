@@ -118,6 +118,33 @@ spec:
         team: mdapi
         probe: webmail
 
+# ====== Management plane ======
+## rancher-mgmt UI/API reachability (2026-08-20): the mgmt-2 memory stall
+## served fast 503s for ~15min and was only noticed by accident — no probe
+## watched the management plane. component=Platform rides the generic
+## SyntheticProbeFailing rule (8m). LE cert, so http_2xx strict TLS is fine.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: rancher-mgmt-ui
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: rancher-mgmt-ui
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://rancher-mgmt.home.tillo.ch/ping
+      labels:
+        component: Platform
+        team: mdapi
+        probe: rancher-mgmt
+---
 # ====== Identity ======
 ---
 apiVersion: monitoring.coreos.com/v1
