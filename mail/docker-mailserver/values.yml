@@ -59,7 +59,17 @@ deployment:
     ENABLE_SASLAUTHD: 1
     SASLAUTHD_MECHANISMS: rimap
     SASLAUTHD_MECH_OPTIONS: "127.0.0.1"
-    LDAP_SERVER_HOST: null
+    # Explicit values, NOT null: helm v3 removed null-valued keys from the
+    # merged values (so envFrom / the ES secret provided them), but helm v4
+    # (fleet-agent >= v0.15) KEEPS them and renders empty-value env vars,
+    # which override envFrom — empty LDAP_SERVER_HOST wrote `server_host =`
+    # into every postfix ldap-*.cf and hard-fataled smtpd/trivial-rewrite
+    # (inbound mail down 2026-08-20 07:19-10:4xZ). The value is not secret
+    # (in-cluster DNS); the ES still also provides it via envFrom.
+    LDAP_SERVER_HOST: ldap://openldap.openldap.svc.cluster.local
+    # Chart default is null -> empty env under helm v4; postfix ldap maps
+    # would fatal on an empty start_tls the same way. Pin the intended value.
+    LDAP_START_TLS: "no"
     SPAM_SUBJECT: ""
   secretEnvironments:
   - docker-mailserver-env-secret
