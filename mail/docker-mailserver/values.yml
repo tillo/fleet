@@ -476,6 +476,24 @@ configMaps:
       CAMACEOF
       chown root:docker /usr/lib/dovecot/sieve-pipe/camac-webhook.sh
       chmod 750 /usr/lib/dovecot/sieve-pipe/camac-webhook.sh
+# postfix_exporter sidecar (2026-08-20): queue-depth/delivery metrics — the
+# last unprobed layer after the helm-v4 incidents (stuck deferred queue with
+# healthy listeners; today's 7-message LMTP backlog was invisible to every
+# synthetic probe). Chart wires: sidecar reading the showq socket
+# (/var/mail-state/spool-postfix/public/showq) + mail.log, `metrics` port on
+# the svc, ServiceMonitor picked up by the default {} selector. Image is the
+# chart's digest-pinned default (lane B).
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    scrapeInterval: 30s
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
 extraDeploy:
 - apiVersion: v1
   kind: ServiceAccount
