@@ -217,6 +217,115 @@ configMaps:
         }
         {{- end -}}
       {{- end -}}
+  # Dovecot version gate (2026-08-20): upstream DMS is migrating to Dovecot 2.4
+  # (v16). The 2.3 config dialect (plugin{} blocks) is a config-parser FATAL on
+  # 2.4 — it took prod IMAP down 2026-08-20 03:51-06:02Z — and the 2.4 dialect
+  # is equally fatal on 2.3. The chart-default 10-plugin.conf (2.3 FTS syntax,
+  # subPath-mounted read-only) is therefore overridden to a comment stub, and
+  # user-patches.sh installs the dialect that matches the RUNNING dovecot from
+  # the three payload files below. This keeps one fleet state valid across the
+  # frozen 2.3 base (src/docker-mailserver Dockerfile pin) AND the future v16
+  # unfreeze. The 2.4 files were validated 2026-08-20 in a sandbox pod on the
+  # broken edge image: doveconf parse, dovecot start, and against the real
+  # openldap: passdb lookup, userdb lookup (uid/gid/home), doveadm -A iteration.
+  # NOTE: the chart-default entry for this is keyed "fts-xapian-plugin.conf"
+  # but mounts at /etc/dovecot/conf.d/10-plugin.conf — override THAT key (a
+  # sibling "10-plugin.conf" entry would duplicate-mount the same path).
+  fts-xapian-plugin.conf:
+    create: true
+    path: /etc/dovecot/conf.d/10-plugin.conf
+    data: |
+      # Intentionally empty (chart default overridden): FTS config is installed
+      # by user-patches.sh as /etc/dovecot/conf.d/90-mdapi-fts.conf, gated on
+      # the running dovecot version (2.3 vs 2.4 dialects are mutually fatal).
+  dovecot-fts-23.conf:
+    create: true
+    path: dovecot-fts-23.conf
+    data: |
+      mail_plugins = $mail_plugins fts fts_xapian
+
+      plugin {
+          fts = xapian
+          fts_xapian = partial=3 full=20 verbose=0
+
+          fts_autoindex = yes
+          fts_enforced = yes
+
+          # Index attachements
+          fts_decoder = decode2text
+      }
+
+      service indexer-worker {
+          # limit size of indexer-worker RAM usage, ex: 512MB, 1GB, 2GB
+          vsz_limit = 2GB
+      }
+  dovecot-fts-24.conf:
+    create: true
+    path: dovecot-fts-24.conf
+    data: |
+      mail_plugins {
+        fts = yes
+        fts_xapian = yes
+      }
+
+      # Mandatory in 2.4 for fts (no default language is defined)
+      language en {
+        default = yes
+      }
+
+      fts xapian {
+        partial = 3
+        verbose = 0
+      }
+
+      fts_autoindex = yes
+      # 2.3 "fts_enforced = yes" equivalents
+      fts_search_add_missing = yes
+      fts_search_read_fallback = no
+
+      # 2.3 "fts_decoder = decode2text" equivalent
+      fts_decoder_driver = script
+      fts_decoder_script_socket_path = decode2text
+
+      service indexer-worker {
+          # limit size of indexer-worker RAM usage, ex: 512MB, 1GB, 2GB
+          vsz_limit = 2GB
+      }
+  dovecot-ldap-24-override.conf:
+    create: true
+    path: dovecot-ldap-24-override.conf
+    data: |
+      # mdapi overrides on top of DMS's auth-ldap.conf.ext (Dovecot 2.4 format).
+      # Loaded after 10-auth.conf's !include — later assignments win; fields
+      # blocks MERGE with the DMS defaults, so absent-attribute references from
+      # the stock file must be explicitly overridden here.
+      passdb ldap {
+        fields {
+          # DMS default rewrites the session user to %{ldap:uniqueIdentifier};
+          # our posixAccounts have no such attribute — keep the login user.
+          user = %{user}
+          password = %{ldap:userPassword}
+        }
+      }
+      userdb ldap {
+        fields {
+          uid = 5000
+          gid = 5000
+          # room-entry `description` holds "<domain>/<localpart>/"
+          home = /var/mail/%{ldap:description}
+          # Clear DMS's mail_path (%{ldap:mailStorageDirectory} — attribute
+          # absent in our schema, and merged fields keep it): empty falls back
+          # to the global mail_path (/var/mail/<domain>/<user>), correct for us.
+          mail_path =
+        }
+      }
+      passdb_ldap_filter = (&(objectClass=posixAccount)(mail=%{user})(ou:dn:=People))
+      userdb_ldap_filter = (&(objectClass=room)(cn=%{user})(ou:dn:=People))
+      # doveadm -A iteration (was iterate_attrs/iterate_filter in 2.3)
+      userdb_ldap_iterate_filter = (&(objectClass=room)(ou:dn:=People))
+      userdb_ldap_iterate_fields {
+        user = %{ldap:cn}
+      }
   user-patches.sh:
     create: true
     path: user-patches.sh
@@ -271,8 +380,18 @@ configMaps:
       apt -y update
       apt -y install --no-install-recommends poppler-utils catdoc antiword unzip
 
-      # Necessary for doveadm -A
-      echo -e "iterate_attrs = cn=user\niterate_filter = (&(objectClass=room)(ou:dn:=People))" >> /etc/dovecot/dovecot-ldap.conf.ext
+      # --- Dovecot version gate (2026-08-20) --------------------------------
+      # Install the FTS config (and on 2.4 the LDAP overrides for our schema)
+      # matching the RUNNING dovecot — the 2.3 and 2.4 config dialects are
+      # mutually fatal. See the configMaps comment above for background.
+      if dovecot --version | grep -q "^2\.4"; then
+        cp /tmp/docker-mailserver/dovecot-fts-24.conf /etc/dovecot/conf.d/90-mdapi-fts.conf
+        cp /tmp/docker-mailserver/dovecot-ldap-24-override.conf /etc/dovecot/conf.d/95-mdapi-ldap-override.conf
+      else
+        cp /tmp/docker-mailserver/dovecot-fts-23.conf /etc/dovecot/conf.d/90-mdapi-fts.conf
+        # Necessary for doveadm -A (2.3 dialect; this file is unread by 2.4)
+        echo -e "iterate_attrs = cn=user\niterate_filter = (&(objectClass=room)(ou:dn:=People))" >> /etc/dovecot/dovecot-ldap.conf.ext
+      fi
 
       {{- if .Values.proxyProtocol.enabled }}
       # NOTE: Keep in sync with upstream advice:
