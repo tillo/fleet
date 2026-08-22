@@ -174,7 +174,7 @@ cephClusterSpec:
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c8ca34f6d3c380d351b39  # was sde
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001cfc16df93311e0d258612  # was sdf
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2607847a6fd845932500  # bay5 (ex-HARV_LH_DEFAULT/Longhorn defaultdisk; freed to Ceph 2026-06-17 via fio-default re-arch)
-          - fullpath: /dev/fioa3   # 15G FusionIO partition -> CephFS metadata-pool OSD (deviceClass=fio). /dev/fioa is the STABLE iomemory device name (single card/node, no SCSI re-enum); no by-partuuid symlink is created by udev for fio partitions.
+          - fullpath: /dev/disk/by-partlabel/ceph-fio-meta   # 15G FusionIO partition (ORIGINAL card p3) -> CephFS metadata-pool OSD (deviceClass=fio). Was /dev/fioa3 — that name is NOT stable with 2 cards (proven on quo 2026-08-21: the new card enumerated first); by-partlabel resolves via the 68-iomemory-partlinks udev rule (oem 95_fio_udev.yaml, installed on all 3 nodes 2026-08-22).
             config:
               deviceClass: "fio"
       - name: quo   # 5 × ~1.8T (bay5 added 2026-06-17 after freeing it from Longhorn/defaultdisk)
@@ -184,7 +184,10 @@ cephClusterSpec:
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c557ca8f9276a418c3b5f  # was sde
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2442949fc101a9ad2bd0  # was sdf
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c6fd46d8ed96335934351  # bay5 (ex-HARV_LH_DEFAULT/Longhorn defaultdisk; freed to Ceph 2026-06-17 via fio-default re-arch)
-          - fullpath: /dev/fioa3   # 15G FusionIO partition -> CephFS metadata-pool OSD (deviceClass=fio); stable iomemory device name
+          - fullpath: /dev/disk/by-partlabel/ceph-fio-meta   # 15G FusionIO partition (ORIGINAL card p3, now /dev/fiob3 after the 2026-08-21 two-card enumeration flip) -> CephFS metadata-pool OSD (deviceClass=fio)
+            config:
+              deviceClass: "fio"
+          - fullpath: /dev/disk/by-partlabel/quo-ceph-fio2   # 100G partition on the NEW card (HP 2.6TB LE, SN 3UN511X011) — added 2026-08-22 after the CRUSH class-scoping fix; sized to survive stray bulk PGs; old 15G fio OSDs stay until all three 100G replacements are proven
             config:
               deviceClass: "fio"
       - name: qua   # 5 × ~1.8T (bay5 added 2026-06-17 after freeing it from Longhorn/defaultdisk)
@@ -194,7 +197,7 @@ cephClusterSpec:
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2bac499b979768746436  # bay3 SanDisk SSD PLUS (kept — best of the 3)
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c5ab0133ebea425c6f55e  # bay4 TEAM (replaced SanDisk SSD PLUS, 2026-06-14)
           - fullpath: /dev/disk/by-id/wwn-0x600508b1001c6f122eccaa0ee20628b8  # bay5 (ex-HARV_LH_DEFAULT/Longhorn defaultdisk; freed to Ceph 2026-06-17 via fio-default re-arch)
-          - fullpath: /dev/fioa3   # 15G FusionIO partition -> CephFS metadata-pool OSD (deviceClass=fio); stable iomemory device name
+          - fullpath: /dev/disk/by-partlabel/ceph-fio-meta   # 15G FusionIO partition (ORIGINAL card p3) -> CephFS metadata-pool OSD (deviceClass=fio); by-partlabel (udev rule) — fioaN is NOT flip-proof once the 2nd card arrives
             config:
               deviceClass: "fio"
 
