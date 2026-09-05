@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: joplin
+  namespace: joplin
+  ## Lane-B since 2026-08-06: pinned tag, Renovate-owned (minor+patch automerge
+  ## per the trailing renovate.json rule; majors MR-only). Keel removed after a
+  ## 2026-05-18 auto-update jumped several versions at once and ran 4 pending
+  ## schema migrations (incl. split_changes) unannounced — a contributing factor
+  ## to the 2026-08-06 stale-client-sync note corruption. A stateful SYNC server
+  ## must change versions deliberately.
+spec:
+  selector:
+    matchLabels:
+      app: joplin
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: joplin
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: joplin
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+      - name: zot-pull
+      containers:
+      - name: joplin
+        image: joplin/server:3.7.1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 22300
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: APP_PORT
+          value: "22300"
+        - name: APP_BASE_URL
+          value: https://notes.mdapi.ch
+        - name: DB_CLIENT
+          value: pg
+        - name: POSTGRES_DATABASE
+          value: joplin
+        - name: POSTGRES_USER
+          value: joplin
+        - name: POSTGRES_PORT
+          value: "5432"
+        - name: POSTGRES_HOST
+          value: postgres.joplin.svc.cluster.local
+        - name: MAILER_ENABLED
+          value: "1"
+        - name: MAILER_HOST
+          value: mail.mdapi.ch
+        - name: MAILER_PORT
+          value: "25"
+        - name: MAILER_SECURITY
+          value: none
+        - name: MAILER_NOREPLY_NAME
+          value: Joplin
+        - name: MAILER_NOREPLY_EMAIL
+          value: joplin@notes.mdapi.ch
+        # LDAP SSO against the shared OpenLDAP directory (same one mail/Keycloak use).
+        # Any mdapi account-holder can log in; account auto-created on first login.
+        # Local accounts (admin@localhost, existing users) keep working alongside this.
+        - name: LDAP_1_ENABLED
+          value: "1"
+        - name: LDAP_1_USER_AUTO_CREATION
+          value: "1"
+        - name: LDAP_1_HOST
+          value: ldap://openldap.openldap.svc.cluster.local:389
+        - name: LDAP_1_BASE_DN
+          value: ou=People,dc=mdapi,dc=ch
+        - name: LDAP_1_BIND_DN
+          value: cn=admin,dc=mdapi,dc=ch
+        - name: LDAP_1_MAIL_ATTRIBUTE
+          value: mail
+        - name: LDAP_1_FULLNAME_ATTRIBUTE
+          value: cn
+        envFrom:
+        - secretRef:
+            name: joplin-env-secret
+        resources:
+          requests:
+            cpu: 50m
+            memory: 384Mi
+          limits:
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /api/ping
+            port: 22300
+            httpHeaders:
+            - name: Host
+              value: notes.mdapi.ch
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 4
+        readinessProbe:
+          httpGet:
+            path: /api/ping
+            port: 22300
+            httpHeaders:
+            - name: Host
+              value: notes.mdapi.ch
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 4

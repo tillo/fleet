@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openobserve
+  namespace: openobserve
+  annotations:
+    reloader.stakater.com/auto: "true"
+    # Keel annotations removed with the digest pin (approved 2026-08-12,
+    # ext:o2-search-topk-blind): a 24h force-poll on latest-amd64 was a silent
+    # upgrade path — o2 version changes are now deliberate git edits here.
+spec:
+  serviceName: openobserve
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openobserve
+  template:
+    metadata:
+      labels:
+        app: openobserve
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+      - name: openobserve
+        # Use the non-SIMD amd64 variant; the SIMD build SIGILLs on Xeon nodes
+        # without AVX2. Pinned by digest (approved 2026-08-12, infra-health
+        # ext:o2-search-topk-blind): unpinned latest-amd64 + pullPolicy Always
+        # meant any pod recreation could silently change the o2 version —
+        # observed across the 08-10 08:45Z restart while diagnosing the
+        # search-layer blindness. Digest = the build running since that
+        # restart (resolved from the live pod's imageID on 2026-08-12).
+        # To upgrade: resolve the new digest deliberately and edit here.
+        #
+        # ENTERPRISE EDITION since 2026-09-01 (user decision). EE is free for
+        # self-hosted use up to 50 GB/day ingestion - no licence key, no
+        # registration, nothing to renew. Measured ingestion at the time of the
+        # switch: 17.7 GB/day, a 2.8x margin. That margin only exists because
+        # the pod_logs re-parse (infra-l8x9) took the estate from ~46.9 GB/day;
+        # BEFORE that fix this would NOT have fitted. The ceiling is per
+        # 24-hour UTC day, so hourly peaks do not breach it - but if daily
+        # ingestion approaches 50 GB, filter in Cribl rather than let it lapse.
+        #
+        # ⭐ This is a BUILD-FLAG swap, not an upgrade. EE v0.92.0 reports the
+        # SAME commit hash as the OSS image it replaces
+        # (30af70fdfc8c42fa672b28cbba78a1a8930745b6, verified by running both
+        # and comparing /config), so there is no version bump and no metadata
+        # migration. Rollback = restore the OSS digest on the line below.
+        #
+        # ⚠️ Still the non-SIMD `-amd64` variant - the SIGILL hazard above is
+        # unchanged and none of qui/quo/qua have AVX2 (checked 2026-09-01).
+        # Verified by running this exact digest on a prod node before the
+        # switch: it booted and served HTTP, which a SIMD build would not.
+        #
+        # Enterprise features this turns on (from the EE build's own /config):
+        # anomaly detection, workflows, online evals, streaming aggregation,
+        # model pricing, service accounts. NOT enabled: ai_enabled, sso_enabled
+        # and rbac_enabled all report false - those need the separate
+        # o2-sre-agent / Dex / OpenFGA components, which are NOT deployed here.
+        image: public.ecr.aws/zinclabs/openobserve-enterprise@sha256:0e9abced022fb004103acc38ae2cb9b5fa041bcb3d96b5f9a054de04d6b2d3d5
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: openobserve-config
+        - secretRef:
+            name: openobserve-admin
+        env:
+        - name: ZO_S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: garage-openobserve-s3-creds
+              key: access_key
+        - name: ZO_S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: garage-openobserve-s3-creds
+              key: secret_key
+        ports:
+        - { name: http, containerPort: 5080 }
+        - { name: grpc, containerPort: 5081 }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /data }
+        resources:
+          requests: { cpu: 200m, memory: 512Mi }
+          limits:   { cpu: "2",  memory: 4Gi }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 20Gi } }

@@ -1,0 +1,91 @@
+## prometheus-pushgateway values
+##
+## Receives metrics pushed by short-lived jobs (Windmill scripts, GitLab CI
+## tasks, cron jobs) and exposes them for the rancher-monitoring Prometheus
+## to scrape. Lives in `monitoring` ns alongside other supplemental
+## observability bits.
+
+fullnameOverride: pushgateway
+
+resources:
+  requests:
+    cpu: 5m
+    memory: 16Mi
+  limits:
+    ## Working set grows ~4Mi/day from pushed-series accumulation; 64Mi
+    ## was a ~10-day OOM fuse (exit-137 rolls 07-28, 08-16). Persistence
+    ## makes the restart itself harmless, but each OOM still fails the
+    ## scheduled pushes in flight for ~1h. 128Mi stretches the fuse well
+    ## past the pod's natural roll cadence (chart bumps). 2026-08-18,
+    ## user-approved.
+    memory: 128Mi
+
+## Persist pushed metrics across pod restarts (small PVC).
+## Without this, every pod restart loses all currently-stored values.
+persistentVolume:
+  enabled: true
+  storageClass: longhorn
+  size: 1Gi
+  accessModes:
+    - ReadWriteOnce
+
+## The chart mounts the PVC at /data but does NOT pass the persistence
+## flag by itself — without it pushgateway stays purely in-memory and the
+## volume is dead weight. Found 2026-07-30 (user-approved fix): the five
+## pod generations of 07-28/29 each wiped every pushed metric, causing an
+## alert cascade + dead-series false positives (KeelUpdatesSilent,
+## FleetBundlesNotReady, NamespaceWithCriticalCves flapping "resolved").
+## interval 5m bounds the loss window on a hard kill (OOM) to one flush.
+extraArgs:
+  - --persistence.file=/data/pushgateway.data
+  - --persistence.interval=5m
+
+## Tell rancher-monitoring's Prometheus to scrape us.
+serviceMonitor:
+  enabled: true
+  ## Default selector ({}) on the Prometheus CRD picks any SM. No release
+  ## label needed.
+  ##
+  ## Drop pod-identity target labels from everything scraped off the
+  ## pushgateway. Pushed series describe their SOURCE (bpi_r4, storage
+  ## probes, batch jobs), not the pushgateway pod that happens to relay
+  ## them — but the scrape attaches pod/container/endpoint, so every pod
+  ## replacement (chart bump, OOM, node move) turned each pushed series
+  ## into a "new" series and increase()/changes() counted its first value
+  ## as a delta-from-0. 2026-08-03 03:28Z: a Renovate chart-bump roll
+  ## fired six false BpiR4 alerts (crash/WAN-drop/PPPoE) that way; the
+  ## 07-28/29 OOM rolls did the same. instance/job already come from the
+  ## push (honorLabels), so after this drop series identity is fully
+  ## pod-independent. Applies to pushgateway self-metrics too (single
+  ## replica; the service label still identifies it).
+  metricRelabelings:
+    - action: labeldrop
+      regex: "pod|container|endpoint"
+
+## Expose Pushgateway to off-cluster pushers (BPI-R4 router, future devices)
+## via an internal-only ingress. Hostname is LAN-resolved via BPI-R4 dnsmasq
+## (list address '/pushgateway.mdapi.ch/192.168.1.191') so it never leaves
+## the home network. Source range whitelist enforces that at the ingress.
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.0.0/16,10.0.0.0/8"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+  hosts:
+    - pushgateway.mdapi.ch
+  path: /
+  pathType: Prefix
+  tls:
+    - hosts:
+        - pushgateway.mdapi.ch
+      secretName: pushgateway-mdapi-ch-tls
+
+## NetworkPolicy is intentionally NOT set. The chart's template renders
+## a NetworkPolicy whenever `.Values.networkPolicy` is truthy in Go-template
+## terms — i.e., a non-empty dict. The chart's default is `{}` which is
+## falsy, so leaving the key absent here lets the chart skip NP rendering.
+## Setting `networkPolicy.enabled: false` would actually ENABLE the
+## template (dict has one key → truthy) and then fail because neither
+## `allowAll` nor `customSelectors` is set. Counter-intuitive, hence this note.

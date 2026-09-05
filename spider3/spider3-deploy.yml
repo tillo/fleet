@@ -1,0 +1,187 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    reloader.stakater.com/auto: "true"
+    keel.sh/match-tag: 'true'
+    keel.sh/policy: force
+    keel.sh/pollSchedule: "@every 4h"
+    keel.sh/trigger: poll
+  name: spider3
+  namespace: spider3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spider3
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: spider3
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      # Pod-level k8s admission defaults — written explicitly so Fleet drift
+      # detection doesn't flag the bundle Modified after every Keel rollout.
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      initContainers:
+      - name: sftpgo-host-keys
+        image: alpine:latest
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        resources: {}
+        command: ["sh", "-c"]
+        args:
+        - |
+          set -e
+          apk add --no-cache openssh-keygen >/dev/null 2>&1
+          mkdir -p /data/.sftpgo
+          [ -f /data/.sftpgo/host_key_ed25519 ] || ssh-keygen -q -t ed25519     -N '' -f /data/.sftpgo/host_key_ed25519
+          [ -f /data/.sftpgo/host_key_rsa     ] || ssh-keygen -q -t rsa -b 3072 -N '' -f /data/.sftpgo/host_key_rsa
+          chown -R 10006:33 /data/.sftpgo
+          chmod 700 /data/.sftpgo
+          chmod 600 /data/.sftpgo/host_key_*
+          chmod 644 /data/.sftpgo/host_key_*.pub
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - { mountPath: /data, name: spider3-data }
+      containers:
+      - name: spider3
+        image: registry.mdapi.ch/mdapi/spider3:latest
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        resources:
+          limits:
+            memory: 384Mi
+          requests:
+            cpu: 50m
+            memory: 256Mi
+        volumeMounts:
+        - mountPath: /var/www/spider3
+          name: spider3-data
+        - mountPath: /etc/msmtprc
+          name: msmtp-config
+          subPath: msmtprc
+      - name: sftpgo
+        image: drakkan/sftpgo:v2-alpine
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        args: ["sftpgo", "serve", "--config-file", "/etc/sftpgo/sftpgo.json"]
+        env:
+        - { name: SFTPGO_DEFAULT_ADMIN_USERNAME, value: "admin" }
+        - name: SFTPGO_DEFAULT_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: sftpgo-keycloak, key: SFTPGO_DEFAULT_ADMIN_PASSWORD }
+        securityContext:
+          runAsUser: 10006
+          runAsGroup: 33
+        ports:
+        - { containerPort: 2022, name: sftp,  protocol: TCP }
+        - { containerPort: 2121, name: ftp,   protocol: TCP }
+        - { containerPort: 8080, name: web,   protocol: TCP }
+        - { containerPort: 22150, name: pasv0, protocol: TCP }
+        - { containerPort: 22151, name: pasv1, protocol: TCP }
+        - { containerPort: 22152, name: pasv2, protocol: TCP }
+        - { containerPort: 22153, name: pasv3, protocol: TCP }
+        - { containerPort: 22154, name: pasv4, protocol: TCP }
+        - { containerPort: 22155, name: pasv5, protocol: TCP }
+        - { containerPort: 22156, name: pasv6, protocol: TCP }
+        - { containerPort: 22157, name: pasv7, protocol: TCP }
+        - { containerPort: 22158, name: pasv8, protocol: TCP }
+        - { containerPort: 22159, name: pasv9, protocol: TCP }
+        resources:
+          limits:
+            memory: 256Mi
+          requests:
+            cpu: 20m
+            memory: 64Mi
+        volumeMounts:
+        - mountPath: /data
+          name: spider3-data
+        - mountPath: /etc/sftpgo/sftpgo.json
+          name: sftpgo-config
+          subPath: sftpgo.json
+          readOnly: true
+        - mountPath: /usr/share/sftpgo/static/disclaimer.html
+          name: sftpgo-config
+          subPath: disclaimer.html
+          readOnly: true
+        - mountPath: /usr/share/sftpgo/static/disclaimer.css
+          name: sftpgo-config
+          subPath: disclaimer.css
+          readOnly: true
+        - mountPath: /etc/sftpgo/oidc
+          name: sftpgo-oidc-secret
+          readOnly: true
+      - name: sftpgo-auth
+        # Floating major-3 alpine tag; Keel watches digest, no explicit version pin.
+        image: library/python:3-alpine
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        command: ["python3", "/app/auth_server.py"]
+        env:
+        - { name: KC_ISSUER,     value: "https://idp.mdapi.ch/realms/tilloch" }
+        - { name: KC_CLIENT_ID,  value: "sftpgo" }
+        - name: KC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef: { name: sftpgo-keycloak, key: KC_CLIENT_SECRET }
+        - { name: REQUIRED_ROLE, value: "mdapi-spider3" }
+        - { name: HOME_DIR,      value: "/data" }
+        - { name: HOME_UID,      value: "10006" }
+        - { name: HOME_GID,      value: "33" }
+        resources:
+          limits:
+            memory: 64Mi
+          requests:
+            cpu: 5m
+            memory: 16Mi
+        volumeMounts:
+        - mountPath: /app/auth_server.py
+          name: sftpgo-config
+          subPath: auth_server.py
+          readOnly: true
+      volumes:
+      - name: spider3-data
+        persistentVolumeClaim:
+          claimName: spider3-data-ceph
+      - name: msmtp-config
+        configMap:
+          name: msmtp-config
+          defaultMode: 420
+      - name: sftpgo-config
+        configMap:
+          name: sftpgo-config
+          defaultMode: 420
+      - name: sftpgo-oidc-secret
+        secret:
+          secretName: sftpgo-keycloak
+          defaultMode: 420
+          items:
+          - key: KC_CLIENT_SECRET
+            path: client_secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spider3
+  namespace: spider3
+spec:
+  selector:
+    app: spider3
+  ports:
+  - port: 80
+    targetPort: 80

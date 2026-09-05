@@ -1,0 +1,63 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: home-assistant
+  namespace: home-assistant
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecDebugLog /tmp/modsec_debug.log
+      # HA REST API uses DELETE (config_entries removal), PUT, PATCH.
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # Frigate notification clip/snapshot playback uses an HA-signed, time-limited
+      # authSig JWT (query param). The base64 signature is high-entropy and can
+      # coincidentally contain a substring matched by CRS lfi-os-files.data on
+      # rule 930120 (observed 2026-08-21 to 08-24: 4 blocks, all from the HA
+      # internal backend 10.52.0.43). The JWT itself gates access (short exp,
+      # signed by HA), so this path does not depend on WAF LFI checks for auth.
+      # Placed before Include and using ruleRemoveByTag, not ruleRemoveById:
+      # a phase-1 ctl:ruleRemoveById after Include does not reliably deregister
+      # a phase-2 rule loaded by that Include (probe-verified 2026-08-24 -
+      # same gotcha as the 911100/920420/930xxx family, see /modsec-exception).
+      # First trigger + carveout: waf-audit 2026-08-24 (approved).
+      SecRule REQUEST_URI "@beginsWith /api/frigate/notifications/" \
+        "id:1001,\
+        phase:1,\
+        pass,\
+        t:none,\
+        nolog,\
+        ctl:ruleRemoveByTag=attack-lfi"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      SecRule REQUEST_URI "@beginsWith /auth/login_flow" \
+        "id:1000,\
+        phase:1,\
+        pass,\
+        t:none,\
+        nolog,\
+        ctl:ruleRemoveById=949110"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: home.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: home-assistant
+                port:
+                  number: 8123
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - home.mdapi.ch
+      secretName: home-assistant-cert

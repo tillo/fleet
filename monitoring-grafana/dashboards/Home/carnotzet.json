@@ -1,0 +1,150 @@
+{
+  "title": "Carnotzet — rack, intake & fan",
+  "uid": "mdapi-carnotzet",
+  "tags": ["mdapi", "ha", "carnotzet"],
+  "schemaVersion": 40,
+  "timezone": "Europe/Zurich",
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "T_room (rack)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null},
+            {"color": "green", "value": 22},
+            {"color": "yellow", "value": 25},
+            {"color": "orange", "value": 26},
+            {"color": "red", "value": 28}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "targets": [{"refId": "A", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.rack_temperature' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1"}]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "T_intake (garage)",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null},
+            {"color": "green", "value": 20},
+            {"color": "yellow", "value": 24}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "targets": [{"refId": "A", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.shelly_temperature' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Fan target",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "min": 0, "max": 100,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 60},
+            {"color": "red", "value": 90}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "targets": [{"refId": "A", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.server_room_fan_target' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Cave-rack delta",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 1,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red", "value": null},
+            {"color": "yellow", "value": 2},
+            {"color": "green", "value": 4}
+          ]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "auto", "colorMode": "background", "graphMode": "area"},
+      "targets": [{"refId": "A", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "WITH r AS (SELECT s.state::float v FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.rack_temperature' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1), i AS (SELECT s.state::float v FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.shelly_temperature' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1) SELECT NOW() AS time, (r.v - i.v) AS value FROM r, i"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Temperatures",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 4},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "lineWidth": 2, "spanNulls": true}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Rack"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#d9534f"}}]},
+          {"matcher": {"id": "byName", "options": "Intake (garage)"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#5bc0de"}}]},
+          {"matcher": {"id": "byName", "options": "Intake (cave fallback)"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#3a8db0"}}, {"id": "custom.fillOpacity", "value": 0}]},
+          {"matcher": {"id": "byName", "options": "Freezer (room fallback)"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#999999"}}, {"id": "custom.fillOpacity", "value": 0}]}
+        ]
+      },
+      "options": {"legend": {"showLegend": true, "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Rack\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.rack_temperature' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts"},
+        {"refId": "B", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Intake (garage)\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.shelly_temperature' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts"},
+        {"refId": "C", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Intake (cave fallback)\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.carnotzetruuvi_temperature' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts"},
+        {"refId": "D", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.start_ts) AS time, s.mean AS \"Freezer (room fallback)\" FROM statistics s JOIN statistics_meta sm ON s.metadata_id = sm.id WHERE sm.statistic_id = 'sensor.freezer_temperature' AND $__unixEpochFilter(s.start_ts) ORDER BY s.start_ts"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Fan target vs actual",
+      "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 14},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0, "max": 100,
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 0, "lineWidth": 2, "spanNulls": true}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Target"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#5cb85c"}}, {"id": "custom.lineWidth", "value": 3}]},
+          {"matcher": {"id": "byName", "options": "Actual"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#5cb85c"}}, {"id": "custom.fillOpacity", "value": 15}]}
+        ]
+      },
+      "options": {"legend": {"showLegend": true, "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"refId": "A", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS \"Target\" FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.server_room_fan_target' AND s.state ~ '^[0-9.]+$' AND $__unixEpochFilter(s.last_updated_ts) ORDER BY s.last_updated_ts"},
+        {"refId": "B", "format": "time_series", "datasource": {"type": "grafana-postgresql-datasource", "uid": "ha-postgres"}, "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, COALESCE((sa.shared_attrs::jsonb->>'percentage')::float, 0) AS \"Actual\" FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id JOIN state_attributes sa ON s.attributes_id = sa.attributes_id WHERE sm.entity_id = 'fan.fanspeed_fanspeed_server_room_exhaust' AND $__unixEpochFilter(s.last_updated_ts) AND sa.shared_attrs::jsonb->>'percentage' IS NOT NULL ORDER BY s.last_updated_ts"}
+      ]
+    }
+  ]
+}

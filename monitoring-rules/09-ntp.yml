@@ -1,0 +1,154 @@
+## chrony NTP server in the ntppool ns — the router (BPI-R4) and every
+## host that asks ntp.mdapi.ch for time syncs here. Stratum 1 when the
+## GPS refclock is healthy, stratum 2 from upstream NTP otherwise.
+##
+## Coverage:
+##   1. Deployment availability (kube-state-metrics) — effective now
+##      that chrony has a readiness probe (chronyc tracking): a dead
+##      chronyd drops the pod out of Ready, replicas_available falls,
+##      and NtpChronyUnavailable fires.
+##   2. Crashloop detection.
+##   3. Functional NTP probe — f/probe/ntp_health sends a real
+##      NTP client request to the chrony LB IP every 5 min and pushes
+##      ntp_probe_* to Pushgateway. Catches "answers but unsynchronised"
+##      and "unreachable on the LB IP" — blackbox-exporter's tcp prober
+##      can't do UDP/NTP, hence the Windmill probe. This closed the gap
+##      that let chrony sit dead ~9h on 2026-05-21 while the pod still
+##      read 1/1 Running (no readiness probe at the time).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ntp
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-ntp.workload
+    rules:
+    - alert: NtpChronyUnavailable
+      expr: |
+        max by (namespace) (
+          ( kube_deployment_spec_replicas{
+              namespace="ntppool", deployment="chrony"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="ntppool", deployment="chrony"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "chrony stratum-1 server down"
+        description: |
+          ntp.mdapi.ch (chrony) is unavailable. Every host syncing
+          against it (router, NAS) will drift. Watch for
+          chrony-side time-source loss too if this is a USB-GPS issue
+          — see f/probe/bpir4_health.py + akri usb-drift watch.
+
+    - alert: NtpChronyCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="ntppool", pod=~"chrony-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "ntppool/{{ $labels.pod }} crash-looping"
+
+    - alert: NtpChronyNotServing
+      expr: ntp_probe_success == 0
+      for: 10m
+      labels:
+        severity: critical
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "chrony NTP server not answering"
+        description: |
+          The ntppool chrony server (192.168.1.58) did not answer an
+          NTP client request from f/probe/ntp_health. Hosts
+          syncing against it will drift. Catches the "pod Running but
+          chronyd dead / unreachable on the LB IP" case the
+          deployment-availability alert above can miss.
+
+    - alert: NtsKeNotServing
+      # warning (not critical): NTS down degrades the time service but plain
+      # NTP keeps working, so the NTP statuspage component shows degraded, not
+      # major outage. component: NTP reuses the existing statuspage component so
+      # users see it at mdapi.statuspage.io via the alertmanager adapter.
+      expr: nts_ke_probe_success == 0
+      for: 10m
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "chrony NTS-KE not serving (TCP 4460)"
+        description: |
+          The NTS-KE TLS handshake to the chrony server
+          (192.168.1.58:4460, ALPN ntske/1, SNI mirror.mdapi.ch) failed —
+          NTS clients (e.g. the nts-servers monitor) cannot establish keys,
+          though plain NTP may still work. Most likely the chrony image was
+          built without NTS (the Alpine pkg drops it; mdapi/chrony now compiles
+          chronyd +NTS from source and guards it) or the TLS cert broke.
+          Verify: `chronyc serverstats | grep NTS-KE` and
+          `openssl s_client -connect 192.168.1.58:4460 -alpn ntske/1`.
+
+    - alert: NtpChronyUnsynced
+      expr: ntp_probe_stratum >= 16
+      for: 30m
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "chrony is unsynchronised (stratum {{ $value }})"
+        description: |
+          chrony answers NTP but reports stratum >= 16 — it has lost
+          all time sources (GPS refclock and upstream NTP). Clients
+          will reject it as unsynchronised.
+
+    - alert: NtpChronyGpsRefclockLost
+      ## The pool chrony serves stratum 1 from the GPS NMEA+PPS refclocks;
+      ## stratum 2-15 means it silently fell back to network sources. On
+      ## 2026-07-04 gpsd's TIOCMGET PPS thread died on a transient tty EIO and
+      ## the pool sat at stratum 2 for ~3h — only the >=16 rule existed, so
+      ## nobody was paged. `for: 1h` rides out pod restarts (PPS re-locks in
+      ## ~3 minutes after a clean start).
+      expr: ntp_probe_stratum > 1 and ntp_probe_stratum < 16
+      for: 1h
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "pool chrony degraded to stratum {{ $value }} (GPS refclock lost)"
+        description: |
+          chrony (ntppool ns, LB 192.168.1.58) is serving from network NTP
+          instead of GPS. Check `chronyc sources` in the pod: if PPS reach
+          is 0 while /sys/class/pps/pps0/assert on qui still ticks, gpsd's
+          PPS thread died — restart the chrony deployment.
+
+    - alert: NtpProbeStale
+      expr: time() - ntp_probe_last_run_timestamp_seconds > 1800
+      for: 5m
+      labels:
+        severity: warning
+        component: NTP
+        team: mdapi
+      annotations:
+        summary: "NTP functional probe is stale"
+        description: |
+          f/probe/ntp_health has not reported to Pushgateway in
+          over 30 min — the NTP functional monitor itself may be down.

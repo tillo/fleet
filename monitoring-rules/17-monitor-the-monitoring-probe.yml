@@ -1,0 +1,26 @@
+## Synthetic probe for the statuspage adapter's /healthz so we have a
+## non-kube-state-metrics signal that the adapter is actually serving.
+
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: monitoring-statuspage-adapter
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: monitoring-statuspage-adapter
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  # http_any_redirect, not http_2xx, because the adapter is a tiny python
+  # http.server that responds with HTTP/1.0 — http_2xx requires HTTP/1.1+
+  # and fails with "Invalid HTTP version number".
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - http://statuspage-adapter.monitoring.svc.cluster.local:8080/healthz
+      labels:
+        component: Platform
+        team: mdapi
+        probe: statuspage_adapter

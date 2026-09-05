@@ -1,0 +1,50 @@
+## Exposes RKE2 etcd's metrics (bound to 127.0.0.1:2381 on each server node)
+## to the in-cluster scraper. A hostNetwork pod shares the node netns, so it
+## can reach 127.0.0.1:2381; socat re-publishes it on :2382 (node IP) where
+## vmagent can scrape it. Enables the EtcdMemberMissing / quorum alerts
+## (24-etcd-quorum.yml) -- the early warning that was missing for the
+## 2026-06-10 "member removed -> 2-member etcd" collapse.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: etcd-metrics-proxy
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: etcd-metrics-proxy
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: etcd-metrics-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: etcd-metrics-proxy
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        node-role.kubernetes.io/etcd: "true"
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      containers:
+        - name: socat
+          image: alpine/socat:1.8.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-d"
+            - "TCP-LISTEN:9381,fork,reuseaddr"
+            - "TCP:127.0.0.1:2381"
+          ports:
+            - name: metrics
+              containerPort: 9381
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

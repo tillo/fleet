@@ -1,0 +1,87 @@
+## PV reclaim-policy backup-coverage alarm.
+##
+## ⛔ BOTH RULES HERE WERE DEAD UNTIL 2026-08-31. The header used to describe a
+## gauge `pv_reclaim_policy_violation{namespace,pvc,reason}` combining Delete-policy
+## with SAFE_DELETE patterns, Longhorn recurring-job labels and a BACKED_UP_BY_WINDMILL
+## allowlist. None of that existed: f/probe/pv_reclaim_policy_analysis computed a
+## verdict, printed it and returned WITHOUT pushing anything, so the metric had zero
+## series for its entire life — and PVReclaimPolicyAuditStale, which exists precisely
+## to notice this rule going blind, was dead the same way. A guard and the thing it
+## guards, both silent. Found by the 2026-08-29 alert audit (beads infra-3rm.4).
+##
+## ⭐ THE REWRITE COMPOSES TWO PROBES INSTEAD OF DUPLICATING ONE.
+## f/probe/pvc_backup_coverage already decides "has a backup story" properly —
+## Longhorn recurring-job groups, VolSync, CNPG barman, app-level, exemptions — and
+## publishes pvc_backup_uncovered{pvc="ns/name"}. Re-implementing that here would have
+## produced a tenth duplicate alert pair on top of the nine the audit found. So the
+## reclaim probe now emits only the fact it owns, pv_reclaim_policy_delete, with a
+## matching `pvc` label, and the alert intersects them.
+##
+## Either fact alone is tolerable. Delete-policy with a backup is fine; no backup on a
+## Retain volume still leaves the data on disk. The INTERSECTION is what is not
+## survivable: the data has no copy AND vanishes when the PVC goes.
+##
+## Verified live at rewrite time: 87 Delete-policy PVs, 1 PVC with no backup story, and
+## the join returns exactly that 1 — with the inverse returning 86, which is what
+## proves the join discriminates rather than matching everything.
+##
+## 24h `for:` deliberately wide so transient catalog gaps during
+## namespace creation / chart upgrades don't fire — and aligns with
+## the daily audit cadence (one missed run shouldn't page).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-pv-reclaim-policy
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-pv-reclaim-policy.coverage
+    rules:
+    - alert: PVMissingBackupStrategy
+      expr: pv_reclaim_policy_delete and on (pvc) pvc_backup_uncovered
+      for: 24h
+      labels:
+        severity: warning
+        team: mdapi
+        component: Backups
+      annotations:
+        summary: '{{ $labels.pvc }} has no backup AND its PV is reclaimPolicy: Delete'
+        description: |
+          This PVC has no backup story according to f/probe/pvc_backup_coverage — not
+          Longhorn-backed-up, no VolSync, no CNPG barman, not app-level, not exempt —
+          AND the PV bound to it uses reclaimPolicy: Delete. So the data has no copy
+          anywhere and the volume is destroyed when the PVC is removed.
+
+          Fix by removing either half:
+            * give it a backup — a Longhorn recurring-job-group label, a VolSync
+              ReplicationSource, or an entry in the coverage probe's exemptions if it
+              genuinely does not need one;
+            * or flip the PV to reclaimPolicy: Retain so a deleted PVC leaves the
+              volume behind and the data survives the mistake.
+
+          Advisory, NOT alerted on: pv_reclaim_policy_verdict carries this probe's
+          name-pattern guess (CHANGE-Retain / REVIEW / OK-delete) for every
+          Delete-policy PV. It is a heuristic on PVC names, useful for a sweep, and
+          deliberately not a paging condition.
+
+    - alert: PVReclaimPolicyAuditStale
+      ## Audit script not pushing fresh metrics: gauge stops updating.
+      ## Pushgateway keeps the last value forever; freshness lives in
+      ## the dedicated _last_run_timestamp_seconds gauge.
+      expr: |
+        (time() - pv_reclaim_policy_analysis_last_run_timestamp_seconds) > 36*3600
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Backups
+      annotations:
+        summary: 'PV reclaim policy audit stale (>36h since last successful run)'
+        description: |
+          f/probe/pv_reclaim_policy_analysis hasn't pushed a fresh
+          timestamp gauge in >36h. Daily schedule is broken or the
+          push to Pushgateway is failing — alert masks the data, fix the
+          probe.

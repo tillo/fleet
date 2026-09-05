@@ -1,0 +1,16 @@
+# Post-render overlay: add Keel annotations to the leader Deployment's METADATA.
+# The logstream-leader chart only exposes podAnnotations (pod template), which
+# Keel does not read - it watches the workload's own metadata.annotations. Without
+# this, Keel never watched logstream-leader (confirmed: it tracked sonarr but not
+# this). Strategic-merge on metadata.annotations merges these keys in. Matched by
+# name only (the chart renders no namespace field; Fleet's defaultNamespace places
+# it in cribl at apply time).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstream-leader
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 1h"

@@ -1,0 +1,35 @@
+## Custom replacement for the vendor LonghornDiskStorageWarning, which
+## fired at 70% capacity (too aggressive while the quo mirror-srv
+## resize work is in flight; see memory longhorn_pvc_resize_blocker_
+## analysis_mirror_project_sizing_2026_06_04). The vendor rule is
+## suppressed at the OLD AM level by fleet/monitoring-rancher-am-config/
+## (AlertmanagerConfig CR with drop route).
+##
+## This rule fires at 85%, routes through the new vmalertmanager via
+## the `team=mdapi` AlertmanagerConfig, then Pushover.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-longhorn-disk-capacity
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-longhorn-disk-capacity
+    rules:
+    - alert: LonghornDiskCapacityHigh
+      expr: (longhorn_disk_usage_bytes / longhorn_disk_capacity_bytes) * 100 > 85
+      for: 5m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "Longhorn disk {{ $labels.disk }} on {{ $labels.node }} at {{ $value | printf \"%.0f\" }}% capacity"
+        description: |
+          The Longhorn disk {{ $labels.disk }} on node {{ $labels.node }} has been above 85% capacity for >5 minutes (currently {{ $value | printf "%.1f" }}%). Replaces the vendor LonghornDiskStorageWarning which fires at 70%.
+
+          Investigate:
+            kubectl --context=mdapi-prod -n longhorn-system get nodes.longhorn.io {{ $labels.node }} -o yaml

@@ -1,0 +1,393 @@
+## Home-assistant + companions: home-assistant itself, appdaemon
+## (Python automations), esphome (device firmware), frigate (camera
+## NVR), eclipse-mosquitto (MQTT broker). All single-replica, RWO
+## storage, so deployment-unavailable is the only meaningful signal.
+## If MQTT is down, HA loses Zigbee/Z-Wave bridges; if HA is down,
+## the BPI-R4 storm/ONU/T2 self-heal automations stop reacting.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-home
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-home.workload
+    rules:
+    - alert: HomeAssistantUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="home-assistant", deployment="home-assistant"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="home-assistant", deployment="home-assistant"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "home-assistant down"
+        description: |
+          Home Assistant is unavailable. Router/ONU/T2 self-heal automations
+          stop reacting; Zigbee/MQTT integrations stop publishing state.
+
+    - alert: HomeStackPodCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace=~"home-assistant|appdaemon|esphome|frigate|mqtt"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} crash-looping"
+        description: "Container restart rate > 0.5/min for 10m. Check `kubectl -n {{ $labels.namespace }} logs {{ $labels.pod }} --previous`."
+
+    - alert: MqttBrokerUnavailable
+      expr: |
+        max by (namespace) (
+          ( kube_deployment_spec_replicas{
+              namespace="mqtt", deployment="eclipse-mosquitto"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="mqtt", deployment="eclipse-mosquitto"
+            }
+          ) > 0
+        )
+      for: 3m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "MQTT broker eclipse-mosquitto unavailable"
+        description: |
+          Without MQTT, HA loses devices that publish via MQTT (Zigbee2MQTT
+          bridge, esphome devices). Check pod logs and broker config.
+
+    - alert: FrigateUnavailable
+      expr: |
+        max by (namespace) (
+          ( kube_deployment_spec_replicas{
+              namespace="frigate", deployment="frigate"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="frigate", deployment="frigate"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "frigate camera NVR down"
+        description: "No recording / detection while down. Check GPU/coral, PVC space."
+
+    - alert: AppDaemonUnavailable
+      expr: |
+        max by (namespace) (
+          ( kube_deployment_spec_replicas{
+              namespace="appdaemon", deployment="appdaemon"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="appdaemon", deployment="appdaemon"
+            }
+          ) > 0
+        )
+      for: 10m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "appdaemon down"
+        description: "Python automations on top of HA stopped. HA-builtin automations continue working."
+
+    - alert: EsphomeUnavailable
+      expr: |
+        max by (namespace) (
+          ( kube_deployment_spec_replicas{
+              namespace="esphome", deployment="esphome"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="esphome", deployment="esphome"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        severity: info
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "esphome dashboard down"
+        description: "Device firmware editor unavailable. Devices keep running; this only blocks OTA updates."
+
+    ## Frigate / Nest camera silently offline — ffmpeg dies, the RTSP/WebRTC
+    ## stream stalls, or the upstream Nest device is unreachable. HA's
+    ## Frigate/Nest integration drops hass_entity_available for the camera.
+    ## Excludes camera.pwhtillo_guest (static QR-code "camera" — local file
+    ## sensor, never has a producer feeding it).
+    ## Re-tiered 2026-08-29. This was a flat warning at `for: 15m` and measured 29 episodes
+    ## in 30 days — the highest count of any warning — with a 20-minute median and 86%
+    ## resolving inside half an hour unaided. Cameras drop and come back; that is the
+    ## normal texture of this estate, not a call to action.
+    ## FrigateNestBounceStuck below already escalates, but ONLY for the Nest cameras
+    ## eligible for the auto-repair heal, so a flat downgrade here would leave every other
+    ## camera with no warning tier at all. Hence the same info/sustained split used for the
+    ## Ceph pairs, at 2h — well past both the 45m heal window and the observed 86% band.
+    ##
+    ## ⚠️ OPERATOR SEMANTICS (fixed 2026-09-04, broken by the 08-29 re-tier). On a 0/1
+    ## gauge, "offline for the WHOLE window" is max_over_time(...) == 0 — the maximum is
+    ## 0 only when every sample is 0. min_over_time(...) == 0 means "offline at least
+    ## ONCE in the window", which is a completely different question. The re-tier used
+    ## min_over_time in both places, with two consequences:
+    ##   * Sustained fired for any camera that blipped once, and kept firing for 2h
+    ##     AFTER it recovered (balconycam, 2026-09-04).
+    ##   * The `unless` below subtracted every currently-offline camera from itself
+    ##     (offline now ⇒ min over 2h is 0), so FrigateCameraOffline could NEVER fire.
+    ##     f/heal/frigate_nest_camera_bounce keys on that alertname, so the auto-bounce
+    ##     went blind for six days and garagecam sat dead 5h with no heal attempt.
+    ## Do not swap these back. The two tiers must stay mutually exclusive: `unless` uses
+    ## the SAME expression as Sustained, so a camera is in exactly one tier at a time.
+    - alert: FrigateCameraOffline
+      expr: |
+        max by (entity, friendly_name) (
+          hass_entity_available{
+            domain="camera",
+            entity!~"camera\\.(pwhtillo_guest|.*_qr|.*_static)"
+          } == 0
+        )
+        unless on (entity) (
+          max_over_time(hass_entity_available{domain="camera"}[2h:5m]) == 0
+        )
+      for: 15m
+      labels:
+        severity: info
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Camera offline: {{ $labels.friendly_name }}"
+        description: |
+          Camera has been unavailable for 15m. Most recover on their own — 86% of
+          these cleared inside 30 minutes over the last 30 days. If it does not,
+          FrigateCameraOfflineSustained escalates at 2h.
+
+    - alert: FrigateCameraOfflineSustained
+      expr: |
+        max by (entity, friendly_name) (
+          max_over_time(hass_entity_available{
+            domain="camera",
+            entity!~"camera\\.(pwhtillo_guest|.*_qr|.*_static)"
+          }[2h:5m]) == 0
+        )
+      for: 15m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Camera offline 2h+: {{ $labels.friendly_name }}"
+        description: |
+          Camera entity {{ $labels.entity }} has been continuously unavailable for
+          over two hours, so it is not coming back by itself. For a Nest camera the
+          auto-repair heal has already had its 45 minutes (see FrigateNestBounceStuck).
+          For Frigate cams: check go2rtc producers (`/api/streams?src=<name>`) and
+          ffmpeg logs. Read the RECEIVERS, not just the producer: a dead video track
+          (bytes 0) sitting next to a live one is normal — go2rtc's nest producer
+          always negotiates a first video track that never carries data, and the real
+          video lands ~2-4s later on a second one. The fault is when NO video receiver
+          is growing. That is a consumer-teardown livelock, not a stale session:
+          frigate's ffmpeg probes the dead track, exits, and its exit drops the last
+          consumer, so go2rtc destroys the producer whose video had just started
+          working. A pod bounce only re-rolls that race — the fix is to re-add the one
+          stream and hold a tolerant consumer open past the ~4s mark, which
+          f/heal/frigate_nest_camera_bounce does automatically for balconycam and
+          garagecam. For Nest cams: a Google SDM 500 on the device usually means the
+          Nest cam itself is offline — check the Google Home app.
+
+    ## f/heal/frigate_nest_camera_bounce (every 5 min): repairs balconycam or
+    ## garagecam when it is offline >=15m AND verified not streaming right now.
+    ## Tier 1 re-adds that ONE go2rtc stream and holds a tolerant RTSP consumer
+    ## ~20s, which costs nothing to the other cameras; the pod bounce is tier 2,
+    ## reached only after 3 failed repairs in one episode. Info while it acts;
+    ## warning only when the offline condition survives the heal for 45m.
+    ##
+    ## ⚠️ Both gauges below are pushed every run, so a rule that keys on the last
+    ## ACTION timestamp must union the two tiers — keying on the bounce alone
+    ## would go quiet exactly when the heal starts working properly, which is the
+    ## same class of bug as the 08-29 re-tier: a signal that reads "healthy"
+    ## because the thing it watches stopped being reachable.
+    - alert: FrigateNestBounceHealActive
+      expr: |
+        (time() - max by (job) (
+          {__name__=~"frigate_nest_camera_bounce_last_(bounce|repair)_timestamp_seconds",
+           job="frigate_nest_camera_bounce"}
+        )) < 3600
+      labels:
+        severity: info
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Frigate Nest camera auto-repair ran in the last hour"
+        description: "Nest camera auto-remediation ran. A tier-1 targeted stream repair touches one camera only and causes no blip; a tier-2 pod bounce blips all cameras ~90s. No action needed unless FrigateNestBounceStuck follows."
+
+    - alert: FrigateNestBounceStuck
+      expr: min_over_time(frigate_nest_camera_bounce_offline_cameras{job="frigate_nest_camera_bounce"}[45m]) > 0
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Nest camera still offline despite auto-repair heal"
+        description: "An eligible Nest camera (balconycam/garagecam) has been continuously offline for 45m+ — verified not streaming, not merely alerting — with the auto-repair heal running: the targeted stream repair and the pod bounce both failed, or a cooldown/latch is blocking. Check go2rtc receivers (is ANY video receiver growing?), the Google Home app, and heal runs at https://windmill.mdapi.ch/runs?path=f%2Fheal%2Ffrigate_nest_camera_bounce"
+
+    ## HA backup integration tracks last successful + last failed timestamps.
+    ## binary_sensor.auto_backup_backup_status: 0 healthy, 1 last attempt failed.
+    ## sensor.auto_backup_monitored_backups < expected count → retention regression.
+    - alert: HomeAssistantBackupFailed
+      expr: |
+        hass_binary_sensor_state{entity="binary_sensor.auto_backup_backup_status"} == 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA Auto Backup last attempt failed"
+        description: |
+          binary_sensor.auto_backup_backup_status reports failure for >30m.
+          Check sensor.auto_backup_last_failure for the error and verify
+          the rclone-backups-s3 sidecar push to Garage.
+
+    ## Same signal projected through the monitored-count: if HA suddenly
+    ## drops below 15 monitored backups, retention/rotation went wrong.
+    - alert: HomeAssistantBackupCountLow
+      expr: |
+        hass_sensor_state{entity="sensor.auto_backup_monitored_backups"} < 15
+      for: 1h
+      labels:
+        severity: info
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA Auto Backup monitored count {{ $value }} (<15)"
+        description: |
+          Expected ~20 daily/weekly/monthly retained backups. Current count
+          is unusually low — verify auto_backup add-on is purging correctly.
+
+    ## Battery-powered devices (Zigbee/Z-Wave/BLE). Project current discharge
+    ## rate forward 48h and warn if the device will hit 0% — earlier signal
+    ## than the bare 20% threshold.
+    - alert: BatteryLowPredictive
+      expr: |
+        predict_linear(hass_sensor_battery_percent[7d], 48 * 3600) < 0
+        and hass_sensor_battery_percent < 40
+      for: 1h
+      labels:
+        severity: info
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.friendly_name }} battery will deplete in <48h"
+        description: |
+          7d linear projection puts {{ $labels.entity }} below 0% within
+          48h (current {{ $value | printf "%.0f" }}%). Replace battery now.
+
+    ## Cross-namespace heartbeat: BPI-R4 router pushes sensor.bpi_r4_heartbeat
+    ## every minute (epoch seconds). >5 min stale = router lost network to HA,
+    ## or health-snapshot.sh died. Last-resort canary for the homelab uplink
+    ## that doesn't depend on the cluster-side Pushgateway path.
+    - alert: BpiR4HeartbeatStale
+      expr: |
+        time() - max(hass_sensor_state{entity="sensor.bpi_r4_heartbeat"}) > 300
+      for: 3m
+      labels:
+        severity: warning
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 sensor heartbeat stale (>5min)"
+        description: |
+          The BPI-R4 router has not pushed sensor.bpi_r4_heartbeat to HA
+          in >5 min. Either the router is unreachable, the script
+          health-snapshot.sh died, or HA stopped accepting writes.
+
+    ## Catch integration regressions hiding in HA's baseline of unavailable
+    ## entities. A large block of "dead" entities is normal here (devices
+    ## that are pending, seasonal, or not always on), so we alert on jumps
+    ## per domain rather than absolute counts. >10 newly-unavailable entities
+    ## in a single domain over 1h almost always means an integration/hub/
+    ## bridge dropped off, not a few stragglers powering down.
+    ## 2026-07-30 (infra-health, user-approved): for: 30m -> 1h. All five
+    ## firings since 07-15 were upstream-cloud polling blips (Garmin Connect
+    ## ~40min, similar cloud integrations) that self-resolved — nothing on
+    ## our side to fix. A real hub/bridge/integration failure stays
+    ## unavailable well past 1h and still fires.
+    - alert: HomeAssistantUnavailableEntitiesSpike
+      expr: |
+        (count by (domain) (hass_entity_available == 0))
+        - (count by (domain) ((hass_entity_available offset 1h) == 0))
+        > 10
+      for: 1h
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA domain '{{ $labels.domain }}' lost {{ $value }} entities in 1h"
+        description: |
+          {{ $value }} more entities in domain '{{ $labels.domain }}' became
+          unavailable compared to 1h ago. Probable causes: integration token
+          expired, hub/bridge offline, network segment down. Use the HA
+          Developer Tools → States filter `state:unavailable domain:{{ $labels.domain }}`
+          to identify the cluster of dropped entities.
+
+    ## SolarEdge inverter at 0W during solid daytime hours = inverter
+    ## or cloud-poll lost contact (not weather — even overcast produces).
+    ## Hour gate is UTC 09–16 (covers 10–18 CET / 11–18 CEST).
+    - alert: SolarEdgeInverterOfflineDaytime
+      expr: |
+        hass_sensor_state{entity="sensor.solaredge_m1_ac_power"} == 0
+        and on() (hour() >= 9)
+        and on() (hour() <= 16)
+      for: 2h
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "SolarEdge M1 at 0W mid-day"
+        description: |
+          Inverter has reported 0 W AC for 2h between 09–16 UTC.
+          Likely SolarEdge cloud API outage, modem offline, or
+          inverter fault. Check https://monitoring.solaredge.com.
+
+    ## Garage cluster degradation — fewer ok nodes than total. Each Garage
+    ## instance is single-node so any degradation is fatal for backup writes.
+    - alert: GarageClusterDegraded
+      expr: |
+        max by (namespace) (cluster_storage_nodes - cluster_storage_nodes_ok) > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Garage {{ $labels.namespace }} cluster degraded"
+        description: |
+          {{ $value }} Garage node(s) reporting not-ok in {{ $labels.namespace }}.
+          Backup writes will fail. Check pod status and disk health.

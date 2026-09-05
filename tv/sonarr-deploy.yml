@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonarr
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: sonarr
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: sonarr
+    spec:
+      priorityClassName: mdapi-low
+      containers:
+      - name: sonarr
+        image: lscr.io/linuxserver/sonarr:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8989
+        # Initial seed only -- VPA Auto rewrites requests/limits. The 1c
+        # CPU lid was throttling 27% of periods (sonarr's refresh/scan
+        # bursts go well above its 920m steady-state, and the throttle
+        # made seerr's Download Tracker queue-fetch time out every 1-2
+        # minutes). Bumped to 3c.
+        resources:
+          requests:
+            cpu: 500m
+            memory: 4Gi
+          limits:
+            cpu: 3
+            memory: 5Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        volumeMounts:
+        - name: sonarr-config
+          mountPath: /config
+        - name: tv
+          mountPath: /downloads/complete
+          subPath: Torrents/Finish
+
+        ## Phase-2 split: tv-finish-{film,serie} sub-mounts shadow
+
+        ## /downloads/complete/Film and /Serie inside the tv subPath.
+
+        - name: tv-finish-film
+
+          mountPath: /downloads/complete/Film
+
+        - name: tv-finish-serie
+
+          mountPath: /downloads/complete/Serie
+        - name: tv
+          mountPath: /downloads/incomplete
+          subPath: Torrents/Temp
+        - name: tv
+          mountPath: /tv
+      volumes:
+      - name: sonarr-config
+        persistentVolumeClaim:
+          claimName: sonarr-config
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph
+
+      - name: tv-finish-film
+
+        persistentVolumeClaim:
+
+          claimName: tv-finish-film-ceph
+
+      - name: tv-finish-serie
+
+        persistentVolumeClaim:
+
+          claimName: tv-finish-serie-ceph

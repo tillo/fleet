@@ -1,0 +1,47 @@
+## VolSync backup of owncloud-data-ceph (Ceph RBD, ~172 GiB user files).
+## copyMethod Snapshot -> crash-consistent CSI snapshot via the ceph-block
+## VolumeSnapshotClass, then restic to the external Garage ceph-backup bucket
+## (off-site replicated to B2/SFTP by garage_offsite_backup). Daily 02:30 UTC,
+## finishing well before the 04:00 offsite sync. Retain 7 daily / 4 weekly /
+## 3 monthly; prune weekly. owncloud's Postgres lives on Longhorn and is
+## covered by the Longhorn recurring backups, so only the file data is here.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: owncloud-data-ceph
+spec:
+  sourcePVC: owncloud-data-ceph
+  # RESUMED 2026-06-18 (user request). Config was verified end-to-end while paused
+  # (data flowed, 0 errors). First full ~172 GiB seed runs at the next 02:30 UTC
+  # window; if the off-site Garage (salt/pepper TrueNAS) write path is still
+  # ~2-4 MiB/s it takes ~24h (GET ~21 MiB/s). Daily incrementals afterwards are
+  # tiny so the cap is a non-issue. Off-site write-throughput fix tracked as #77.
+  paused: false
+  trigger:
+    schedule: "30 2 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    # Run the restic mover as www-data (uid/gid 33) — the user that OWNS
+    # owncloud's data, incl. the transient PHP session files (mode 600) under
+    # /data/sessions/*. Running as root does NOT work here: VolSync's restic
+    # container hardcodes `capabilities: { drop: [ALL] }`, which strips
+    # CAP_DAC_OVERRIDE, so root-without-dac-override still gets "permission
+    # denied" on mode-600 files owned by 33 -> restic exit 3 -> VolSync marks
+    # the sync Failed (loops every retry) even though the snapshot saved.
+    # Reading as the owning uid (33) sidesteps the cap entirely. No fsGroup —
+    # 33 reads its own files directly, avoiding a slow recursive chown of the
+    # ~159 GiB snapshot clone.
+    moverSecurityContext:
+      runAsUser: 33
+      runAsGroup: 33
+      runAsNonRoot: true
+    cacheCapacity: 8Gi
+    # restic cache (index) on fast Longhorn/fio, not the P420i Ceph tier we back up.
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

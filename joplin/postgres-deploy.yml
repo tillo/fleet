@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: postgres
+          image: zot.mdapi.ch/library/postgres:17
+          imagePullPolicy: IfNotPresent
+          # Tuned for the Joplin events table (~50 k rows steady-state
+          # after the 2026-05-14 cleanup of 17 months of unvacuumed audit
+          # rows). Postgres defaults of shared_buffers=128MB and
+          # work_mem=4MB couldn't hold the events GROUP BY in memory, so
+          # every TaskService #11 ("Process shared items") tick spilled
+          # to disk and starved the MCP path.
+          args:
+            - -c
+            - shared_buffers=256MB
+            - -c
+            - work_mem=16MB
+            - -c
+            - maintenance_work_mem=128MB
+            - -c
+            - effective_cache_size=512MB
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: POSTGRES_USER
+              value: joplin
+            - name: POSTGRES_DB
+              value: joplin
+          envFrom:
+            - secretRef:
+                name: postgres-env-secret
+          resources:
+            requests:
+              cpu: 25m
+              memory: 512Mi
+            limits:
+              memory: 768Mi
+          ports:
+            - name: postgres
+              containerPort: 5432
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: wants_an_empty_folder
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data

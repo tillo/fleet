@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: owncloud
+  annotations:
+    # Floating major-track tag (owncloud/server:10) + keel force: a Fleet
+    # re-apply rewrites the same tag, so it cannot downgrade the server.
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: owncloud
+  template:
+    metadata:
+      labels:
+        app: owncloud
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+        - name: owncloud
+          image: owncloud/server:10
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: OWNCLOUD_DOMAIN
+              value: cloud.mdapi.ch
+            - name: OWNCLOUD_TRUSTED_DOMAINS
+              value: cloud.mdapi.ch,share.mdapi.org,share.mdapi.ch
+            - name: OWNCLOUD_TRUSTED_PROXIES
+              value: 10.0.0.0/8
+            - name: OWNCLOUD_OVERWRITE_PROTOCOL
+              value: https
+            - name: OWNCLOUD_OVERWRITE_HOST
+              value: cloud.mdapi.ch
+            - name: OWNCLOUD_DB_TYPE
+              value: pgsql
+            - name: OWNCLOUD_DB_HOST
+              value: postgres.owncloud.svc.cluster.local
+            - name: OWNCLOUD_DB_NAME
+              value: owncloud
+            - name: OWNCLOUD_DB_USERNAME
+              value: owncloud
+            - name: OWNCLOUD_DB_PREFIX
+              value: oc_
+            - name: OWNCLOUD_REDIS_ENABLED
+              value: "true"
+            - name: OWNCLOUD_REDIS_HOST
+              value: redis.owncloud.svc.cluster.local
+            - name: OWNCLOUD_MAIL_SMTP_HOST
+              value: mail.mdapi.ch
+            - name: OWNCLOUD_MAIL_SMTP_PORT
+              value: "25"
+            - name: OWNCLOUD_MAIL_SMTP_MODE
+              value: smtp
+            - name: OWNCLOUD_MAIL_DOMAIN
+              value: cloud.mdapi.ch
+            - name: OWNCLOUD_MAIL_FROM_ADDRESS
+              value: owncloud
+            - name: OWNCLOUD_ADMIN_USERNAME
+              value: admin
+            - name: OWNCLOUD_VOLUME_FILES
+              value: /mnt/data/files
+            - name: OWNCLOUD_SKIP_CHMOD
+              value: "true"
+            - name: OWNCLOUD_SKIP_CHOWN
+              value: "true"
+            - name: OWNCLOUD_SUB_URL
+              value: /
+          envFrom:
+            - secretRef:
+                name: owncloud-env-secret
+          resources:
+            # VPA (owncloud VPA, controlledValues: RequestsOnly) manages the
+            # request; it does NOT scale this limit, so this is the real hard
+            # ceiling. Headroom for concurrent recursive folder MOVE ops.
+            requests:
+              cpu: 100m
+              memory: 350Mi
+            limits:
+              memory: 1536Mi
+          livenessProbe:
+            httpGet:
+              path: /status.php
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /status.php
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: owncloud-data
+              mountPath: /mnt/data
+      volumes:
+        - name: owncloud-data
+          persistentVolumeClaim:
+            claimName: owncloud-data-ceph

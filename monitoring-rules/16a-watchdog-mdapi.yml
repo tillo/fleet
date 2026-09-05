@@ -1,0 +1,43 @@
+## Dead-man's switch: always-firing Watchdog evaluated by vmalert, routed
+## by vmAM to healthchecks.io. Replaces the prior design where the
+## kube-prometheus-stack `Watchdog` rule was evaluated by bundled Prom
+## and routed by bundled Alertmanager (which mixed a custom destination
+## into the vendor stack — see monitoring-alertmanager-config bundle
+## deletion in the same commit).
+##
+## SEMANTICS: if vmalert, vmAM, or the in-cluster network to hc-ping.com
+## is broken, hc.io will stop receiving pings and fire its own
+## independent email/Pushover alert. That covers OUR alert stack's
+## liveness — exactly what we want, since vmAM owns all team=mdapi
+## delivery.
+##
+## Vendor stack failure (bundled Prom / bundled AM) does NOT trip this
+## dead-man — it now flows entirely through the custom stack. Bundled
+## stack health is observable via other rules (KubePodCrashLooping,
+## KubeContainerWaiting on cattle-monitoring-system).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mdapi-watchdog-deadman
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: watchdog-mdapi
+      interval: 1m
+      rules:
+        - alert: WatchdogMdapi
+          expr: vector(1)
+          labels:
+            severity: none
+            team: mdapi-watchdog
+          annotations:
+            summary: "vmalert+vmAM dead-man heartbeat (always firing)"
+            description: |
+              Always-firing alert. Routed by vmAlertmanager to healthchecks.io
+              every 4 minutes. If pings stop arriving at hc.io for the
+              configured grace period, healthchecks.io fires its own
+              independent alert (email / Pushover) — meaning our custom
+              alert stack (vmalert / vmAM / cluster network to hc-ping.com)
+              is broken.

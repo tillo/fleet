@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nameserver
+  namespace: nameserver
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: nameserver
+  replicas: 1
+  ## Recreate is REQUIRED here, not a leftover — do not "fix" it to RollingUpdate.
+  ## Two reasons, either one sufficient:
+  ##  1. nameserver-zones is a ReadWriteOnce Longhorn PVC. A surge pod cannot
+  ##     attach it while the old pod holds it, so a rolling update with
+  ##     maxSurge>0 does not roll — it parks the new pod in Pending forever.
+  ##  2. BIND accepts dynamic updates on the public reverse zones (!70) and
+  ##     writes journals into that volume. Two live instances would be two
+  ##     writers over one zone journal.
+  ## The cost is a real gap on every image bump: measured 2026-09-03,
+  ## ~30s from pod creation to Ready plus the Longhorn detach/attach before it.
+  ## That gap is survivable because the zones have external secondaries
+  ## (puck.nether.net, ns2.afraid.org) and NOTHING in-cluster resolves through
+  ## here any more — CoreDNS forwards to 192.168.1.1 (the split-horizon unbound).
+  ## The proper fix for the gap is a second, read-only BIND running as an
+  ## in-cluster secondary behind the same Service, not a rollout strategy change.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: nameserver
+    spec:
+      priorityClassName: mdapi-critical
+      imagePullSecrets:
+        - name: mdapi-registry
+      initContainers:
+        - name: fix-permissions
+          image: busybox
+          command: ["sh", "-c", "chown -R 100:101 /var/lib/bind"]
+          volumeMounts:
+            - name: zones
+              mountPath: /var/lib/bind
+      containers:
+        - name: nameserver
+          image: registry.mdapi.ch/mdapi/nameserver:9.20.23-mdapi.707
+          ## Default Always means every pod restart waits on a fresh pull
+          ## against registry.mdapi.ch → gitlab.mdapi.ch JWT auth. On
+          ## 2026-05-18 a Valkey/Longhorn outage made GitLab JWT return
+          ## 502, blocking the registry pull, and the resulting nameserver
+          ## restart took BIND9 down with it — and, AT THE TIME, in-cluster DNS
+          ## with it. That second part is no longer true: since the 2026-07-26
+          ## internal-first change CoreDNS forwards to 192.168.1.1 (split-horizon
+          ## unbound), not here, so a restart now costs only the public
+          ## authoritative view. Keeping IfNotPresent regardless — it still
+          ## breaks the registry dependency loop on cold start. The cached
+          ## image on each node is enough to restart the pod when GitLab
+          ## is unavailable. Lane B (2026-06-12): the tag is now PINNED (was
+          ## :latest) and keel removed; Renovate bumps the pinned X.Y.Z-mdapi.N
+          ## tag via MR, so updates land through GitOps rather than a live pull.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: webmin
+              containerPort: 10000
+              protocol: TCP
+          volumeMounts:
+            - name: zones
+              mountPath: /var/lib/bind
+            - name: named-conf
+              mountPath: /etc/bind/named.conf
+              subPath: named.conf
+            - name: tsig-key
+              mountPath: /etc/bind/tsig.key
+              subPath: named-key
+            - name: webmin-secret
+              mountPath: /run/secrets/webmin
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+          # timeoutSeconds was UNSET (= the API default of 1s) until 2026-08-29. One
+          # second to fork dig and complete a query is very tight on a 1-core-limited
+          # container, and on this cluster /var/lib/kubelet shares /dev/sda5 with
+          # containerd's snapshotter, so GitLab CI runner IO drives node IO stall to
+          # 20-28% and starves the probe. Three misses then restart a HEALTHY
+          # authoritative nameserver -- and a restart taken during that same IO stall
+          # wedges in CreateContainerError for ~12 min (containerd leaks the container
+          # name when CreateContainer times out, and every retry reuses the same restart
+          # ordinal). So a probe miss is far more expensive than a slow answer here.
+          # 5s leaves the probe able to detect a genuinely dead BIND while surviving a
+          # transient stall. Do NOT lower this without re-reading ledger
+          # restart:nameserver/nameserver.
+          livenessProbe:
+            exec:
+              command:
+                - /usr/bin/dig
+                - "@127.0.0.1"
+                - "-p"
+                - "53"
+                - "tillo.ch"
+                - "SOA"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          ## initialDelaySeconds was 10 and timeoutSeconds unset (1s default).
+          ## BIND binds :53 in about a second, so a 10s floor added ~8-10s of
+          ## endpoint-less time to every Recreate for no benefit — on a 1-replica
+          ## Recreate deployment that IS the outage. Dropped to 2.
+          ## periodSeconds/failureThreshold deliberately UNCHANGED (10s x 3 = 30s
+          ## before the only endpoint is withdrawn): the node suffers 20-28% IO
+          ## stall under GitLab CI load, and a tighter readiness window would
+          ## yank the LoadBalancer endpoint off a perfectly healthy nameserver.
+          ## timeoutSeconds raised to 5 for the same reason the liveness probe
+          ## carries it — a slow answer must not read as a dead one.
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: zones
+          persistentVolumeClaim:
+            claimName: nameserver-zones
+        - name: named-conf
+          configMap:
+            name: named-conf
+        - name: tsig-key
+          secret:
+            secretName: tsig-secret
+            defaultMode: 0444
+        - name: webmin-secret
+          secret:
+            secretName: webmin-secret
+            defaultMode: 0444

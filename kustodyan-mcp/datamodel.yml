@@ -1,0 +1,42 @@
+# Operator data-model manifest for the MCP. The RPS runtime has no catalog endpoint, so
+# the MCP surfaces this (via KUSTODYAN_DATA_MODEL) through list_data_model + light validation
+# and agent hints. It MUST mirror the live `PaperlessOPE` configuration the client is bound to
+# — the image's built-in default describes a generic ch.kyos.Contact demo, which would make an
+# agent call protect with the wrong className/role and get "Undefined Rights context".
+# stakater reloader (auto:true on the Deployment) restarts the pod when this ConfigMap changes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kustodyan-mcp-datamodel
+data:
+  datamodel.json: |
+    {
+      "configuration": "PaperlessOPE",
+      "defaultClassName": "ch.tillo.paperless.OpeDocument",
+      "defaultRole": "DATA_STEWARD",
+      "roleEvidenceName": "Role",
+      "actionEvidenceName": "Action",
+      "protectAction": "Protect",
+      "unprotectAction": "Unprotect",
+      "searchAction": "Search",
+      "classes": [
+        {
+          "className": "ch.tillo.paperless.OpeDocument",
+          "description": "Paperless-ngx document fields protected by the live PaperlessOPE configuration.",
+          "properties": [
+            { "propertyName": "content", "technique": "deterministic AES word tokenization (reversible); equality-searchable full text" },
+            { "propertyName": "title_full", "technique": "probabilistic AES full-fidelity display copy (reversible)" },
+            { "propertyName": "title_search", "technique": "PROPE non-deterministic tokens; Search returns a [min,max] band for equality + begins-with (write via Protect, query via Search)" },
+            { "propertyName": "correspondent", "technique": "probabilistic AES full-fidelity display copy (reversible)" },
+            { "propertyName": "correspondent_search", "technique": "PROPE non-deterministic tokens; Search returns a [min,max] band for equality + begins-with" },
+            { "propertyName": "tag", "technique": "deterministic AES word tokenization (reversible); equality-searchable" },
+            { "propertyName": "customfield", "technique": "probabilistic AES full-fidelity display copy (reversible)" }
+          ]
+        }
+      ],
+      "roles": [
+        { "role": "DATA_STEWARD", "summary": "Transform: protects on write and unprotects to full cleartext on read." },
+        { "role": "CASE_WORKER", "summary": "Unprotect-then-mask: sees the first few characters then a masked suffix, not the full value." },
+        { "role": "STAFF", "summary": "Read: receives the stored protected display token only, cannot unprotect." }
+      ]
+    }

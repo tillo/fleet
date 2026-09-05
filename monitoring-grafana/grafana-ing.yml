@@ -1,0 +1,42 @@
+## Owns grafana.mdapi.ch (self-hosted Grafana 12, this bundle). The legacy
+## Rancher-embedded Grafana (rancher-grafana.mdapi.ch / grafana-ingress bundle)
+## was retired 2026-06-29 — self-hosted Grafana is now the only Grafana surface.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-response-headers: Authorization
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/admin/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-admin.oauth2-proxy.svc.cluster.local/admin/oauth2/auth
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecDebugLog /tmp/modsec_debug.log
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: grafana
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - grafana.mdapi.ch
+      secretName: grafana-cert

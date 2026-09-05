@@ -1,0 +1,72 @@
+## Availability for the `tv` workloads that nothing else watches.
+##
+## Found 2026-08-29 the expensive way: a flaresolverr cutover crash-looped for an
+## hour, sixteen restarts, and NOTHING fired. Tracing why turned up a real gap
+## rather than a one-off.
+##
+## The `tv` namespace looked covered — it is named in every selector in
+## 04-files.yml — but those rules match on DEPLOYMENT name, and of the thirteen
+## deployments in `tv` exactly ONE (sftpgo) matches. The namespace being listed
+## created the appearance of coverage while twelve workloads had none.
+##
+## The user-facing web UIs are genuinely covered, just from the other direction:
+## bazarr, prowlarr, radarr, seerr and autobrr have blackbox probes in
+## 10-blackbox-probes.yml (jobName infra-media) feeding SyntheticProbeFailing. So
+## this rule deliberately does NOT duplicate them — it covers the workloads with
+## no ingress to probe, which is precisely the set that can fail invisibly.
+##
+## flaresolverr is the motivating case and the sharpest example: it is ClusterIP
+## only, so no probe can reach it, and its failure mode is silent by nature — when
+## it dies prowlarr simply starts failing on Cloudflare-gated indexers, which reads
+## as an indexer problem or a flaky tracker rather than a dead dependency.
+##
+## Scaling to zero is safe here: tv-pvc-offline.sh deliberately scales these down
+## for maintenance, and spec 0 minus available 0 is 0, so a planned shutdown does
+## not alert.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: media-internal-workloads
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-media.internal-workloads
+    rules:
+    - alert: MediaInternalWorkloadUnavailable
+      ## 15m rather than 5: these are best-effort media components on
+      ## priorityClassName mdapi-low, so eviction and reschedule are normal and
+      ## expected. A quarter of an hour below spec means stuck, not moving.
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="tv",
+            deployment=~"flaresolverr|pms-docker|sonarr|tdarr|threadfin|transmission-pia|rsync"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="tv",
+            deployment=~"flaresolverr|pms-docker|sonarr|tdarr|threadfin|transmission-pia|rsync"
+          }
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Media
+        team: mdapi
+      annotations:
+        summary: "tv/{{ $labels.deployment }}: {{ $value }} replica(s) unavailable for 15m"
+        description: |
+          A `tv` workload with no external probe has been below its replica count
+          for fifteen minutes. These fail quietly — flaresolverr in particular is
+          ClusterIP-only, and when it is down prowlarr just starts failing on
+          Cloudflare-gated indexers, which looks like a tracker problem.
+
+          Check: kubectl -n tv describe deploy {{ $labels.deployment }}
+          If it is crash-looping, the container log is the fast answer:
+            kubectl -n tv logs deploy/{{ $labels.deployment }} --tail=40
+
+          Precedent worth knowing for flaresolverr specifically: it pairs a
+          Chromium with a matching ChromeDriver, and a mismatch kills it at startup
+          with "This version of ChromeDriver only supports Chrome version N". The
+          mdapi/flaresolverr build now asserts the majors match, so that should not
+          recur — but it is the first thing to check in that log.

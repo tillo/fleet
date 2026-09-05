@@ -1,0 +1,28 @@
+## Least-privilege RBAC for the Grafana dashboard sidecar: get/list/watch on
+## ConfigMaps in cattle-dashboards only (namespaced Role, not a cluster-wide
+## ClusterRole). The sidecar runs in the monitoring/grafana pod under the
+## `grafana` ServiceAccount (created in the monitoring-grafana bundle) and is
+## configured with NAMESPACE=cattle-dashboards, so this is the only access it needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: grafana-dashboard-sidecar
+  namespace: cattle-dashboards
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: grafana-dashboard-sidecar
+  namespace: cattle-dashboards
+subjects:
+- kind: ServiceAccount
+  name: grafana
+  namespace: monitoring
+roleRef:
+  kind: Role
+  name: grafana-dashboard-sidecar
+  apiGroup: rbac.authorization.k8s.io

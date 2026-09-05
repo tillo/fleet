@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      priorityClassName: mdapi-critical
+      # Pod-level k8s admission defaults written explicitly so Fleet
+      # drift detection doesn't flag the bundle Modified after admission
+      # fills them in on the live state.
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - name: redis
+          image: mirror.gcr.io/redis:7
+          imagePullPolicy: IfNotPresent
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          # `resources: {}` is here so Fleet's comparePatches `op:remove`
+          # on /containers/0/resources finds the path and succeeds.
+          resources: {}
+          ports:
+            - containerPort: 6379
+              protocol: TCP

@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: technitium-dns
+  namespace: technitium
+spec:
+  selector:
+    role: dns
+  ports:
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+    targetPort: 53
+  - name: dns-udp
+    port: 53
+    protocol: UDP
+    targetPort: 53
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.54
+  # externalTrafficPolicy: Local (was Cluster until 2026-08-23) -- under Cluster
+  # the MetalLB L2 announcer is INDEPENDENT of pod placement, so this VIP could
+  # be announced from a node running no Technitium pod at all (observed: .54 sat
+  # on qui, which runs neither instance). Powering that node off blackholes LAN
+  # DNS until client ARP caches expire, and it forced a manual
+  # node.kubernetes.io/exclude-from-external-load-balancers label on every node
+  # maintenance window.
+  #
+  # PRE-REQ THAT BLOCKED THIS UNTIL 2026-08-23: under Local every query lands on
+  # whichever single node announces, and the SECONDARY had no
+  # "Query Logs (Sqlite)" DNS app installed -- so queries hitting it would have
+  # been resolved but NEVER logged, by f/probe/technitium_query_log_to_o2 or
+  # locally. The app is now installed on the secondary (v9.1.1, enableLogging
+  # true, config mirrored from the primary) and the shipper reads BOTH instances
+  # -- verified shipping primary=855 / secondary=41 before this flip.
+  #
+  # Invariant to keep: BOTH technitium pods must stay on different nodes and both
+  # must keep the query-log app, or this VIP loses either redundancy or logging.
+  externalTrafficPolicy: Local

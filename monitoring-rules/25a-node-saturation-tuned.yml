@@ -1,0 +1,63 @@
+## Tuned replacements for two kube-prometheus-stack default rules that
+## we disabled in rancher-monitoring-config/ for being too aggressive
+## against Harvester-host workload profiles:
+##
+##   NodeSystemSaturation     -- chart default load1/cores > 2 for 15m
+##                               is normal on Harvester hosts running
+##                               VMs (VM-start spikes routinely exceed
+##                               2 load/core). We want to know when the
+##                               box is *genuinely* saturated, not when
+##                               a VM is booting.
+##
+##   NodeDiskIOSaturation     -- chart default I/O wait queue rate > 10
+##                               for 30m fires routinely during qua's
+##                               background Longhorn rebalance. Tripled
+##                               threshold + doubled duration filters
+##                               the rebalance noise while still
+##                               catching a real I/O wedge.
+##
+## Both routed via team=mdapi -> new vmAM -> Pushover.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-node-saturation-tuned
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-node-saturation-tuned.system
+    rules:
+    - alert: NodeSystemSaturationHigh
+      expr: |
+        node_load1{job="node-exporter"}
+        / count without (cpu, mode) (node_cpu_seconds_total{job="node-exporter",mode="idle"})
+        > 5
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Node {{ $labels.instance }} system saturated (load1/cores={{ $value | printf \"%.2f\" }})"
+        description: |
+          System load per core at {{ $labels.instance }} has been above 5 for 15 minutes (currently {{ $value | printf "%.2f" }}). This is the tuned replacement for the disabled chart-default NodeSystemSaturation rule (which fired at >2 and was too noisy on Harvester hosts running VMs).
+
+  - name: app-node-saturation-tuned.disk-io
+    rules:
+    - alert: NodeDiskIOSaturationHigh
+      expr: |
+        rate(node_disk_io_time_weighted_seconds_total{
+          job="node-exporter",
+          device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|dasd.+)"
+        }[5m]) > 30
+      for: 60m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Disk {{ $labels.device }} on {{ $labels.instance }} I/O-saturated (weighted-io rate={{ $value | printf \"%.1f\" }})"
+        description: |
+          Disk {{ $labels.device }} on {{ $labels.instance }} has a sustained I/O queue weighted-time rate above 30 for the last hour (currently {{ $value | printf "%.1f" }}). The tuned replacement for the disabled chart-default NodeDiskIOSaturation rule (>10 for 30m), which fired routinely on qua during background Longhorn rebalance work.

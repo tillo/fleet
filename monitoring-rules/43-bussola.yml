@@ -1,0 +1,155 @@
+## Bussola — l'app di bilancio familiare multi-tenant (bussola.mdapi.ch).
+##
+## PERCHÉ ESISTE QUESTO FILE. Bussola è andata in produzione il 2026-08-29 e
+## fino al 2026-09-02 non aveva NESSUNA copertura di disponibilità: la sonda
+## f/probe/alert_coverage_check la classificava `probe_only` (bussola,
+## oauth2-proxy-bussola) e `none` (bussola-narratore, il redis-ha). `none`
+## vuol dire che nessuna regola la seleziona; `probe_only` vuol dire che se ne
+## accorge solo la sonda sintetica, e solo per quello che scarica — che per un
+## ingress protetto da oauth2-proxy è un 302 verso auth.mdapi.ch, cioè prova
+## che il BORDO è in piedi, non che l'app risponda.
+##
+## È l'app su cui la famiglia guarda i soldi, con il suo database CNPG: l'ultimo
+## carico dell'infrastruttura che dovrebbe stare scoperto. La lacuna non è
+## emersa da un guasto ma dalla sonda di copertura — cioè ha funzionato il
+## meccanismo giusto, prima che servisse.
+##
+## LEVA PIÙ ALTA — ✅ CHIUSA il 2026-09-05, dopo che formbricks-kustodyan è nata
+## scoperta come terza (45-formbricks-kustodyan.yml). La copertura è ora un
+## requisito al momento del deploy: la skill `fleet-bundle-new` mette
+## `monitoring-rules/NN-<nome>.yml` nel set di file standard e nello stesso commit
+## del bundle, con il contratto delle label, il template per namespace (entrambi i
+## rami) e le sonde blackbox ricavate dagli Ingress. Bussola era la seconda app che
+## nasceva scoperta; la sonda giornaliera resta la rete di sicurezza, non più il
+## primo modo in cui lo scopriamo.
+##
+## ⚠️ component: Websites, non "Bussola". La sonda in 10-blackbox-probes.yml usa
+## `component: Bussola`, che NON è mappato in monitoring-statuspage-adapter
+## (né pubblico in components.json né interno in INTERNAL_COMPONENTS): l'adapter
+## lo scarta con "unknown component". Qui si usa un component mappato perché una
+## copertura che non arriva da nessuna parte non è copertura. La sonda va
+## allineata a parte — è un cambiamento di ciò che il pubblico vede.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-bussola
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-bussola.workload
+    rules:
+    ## Giù del tutto: nessuna replica disponibile su 2. Nessuno può aprire
+    ## l'app. `critical` come per gli altri servizi rivolti agli utenti
+    ## (JoplinUnavailable, mail): non è un allarme che si auto-risolve.
+    - alert: BussolaUnavailable
+      expr: |
+        kube_deployment_status_replicas_available{namespace="bussola", deployment="bussola"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "bussola/bussola: nessuna replica disponibile"
+        description: |
+          bussola.mdapi.ch non risponde più: zero repliche disponibili.
+          Controllare prima il database (Cluster CNPG bussola-pg nello stesso
+          namespace) e poi i pod:
+            kubectl -n bussola describe deploy bussola
+
+    ## Degradata: sotto le repliche previste ma non a zero — si serve ancora,
+    ## senza margine. `for: 15m` lascia passare un rollout normale (l'immagine
+    ## è pinnata e si aggiorna solo con un bump esplicito in fleet).
+    - alert: BussolaDegraded
+      expr: |
+        ( kube_deployment_spec_replicas{namespace="bussola", deployment="bussola"}
+          - kube_deployment_status_replicas_available{namespace="bussola", deployment="bussola"}
+        ) > 0
+        and kube_deployment_status_replicas_available{namespace="bussola", deployment="bussola"} > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "bussola/bussola: {{ $value }} repliche non disponibili (servizio ancora attivo)"
+        description: |
+          Bussola sta servendo senza ridondanza da oltre 15 minuti: un rollout
+          non dura così tanto, quindi qualcosa è bloccato (scheduling, pull,
+          probe di readiness che non passa).
+
+    ## Il narratore è opzionale per costruzione — la sua assenza degrada una
+    ## funzione, non l'app — quindi warning, non critical, coerente con il
+    ## commento della sonda in 10-blackbox-probes.yml.
+    - alert: BussolaNarratoreUnavailable
+      expr: |
+        kube_deployment_status_replicas_available{namespace="bussola", deployment="bussola-narratore"} == 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "bussola/bussola-narratore: nessuna replica disponibile"
+        description: |
+          Il narratore (i commenti generati sul bilancio) è giù. Bussola resta
+          usabile: è una funzione in meno, non un guasto del servizio.
+
+    - alert: BussolaPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{namespace="bussola"}[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} riparte di continuo"
+        description: "Container {{ $labels.container }} in crash loop."
+
+  ## COPERTURA DI FAMIGLIA, non della sola Bussola. I quattro oauth2-proxy
+  ## (admin, portal, tv, bussola) e i loro StatefulSet redis-ha erano TUTTI
+  ## scoperti: `probe_only` i proxy, `none` i redis. Sono il cancello davanti a
+  ## ogni app protetta da SSO — se cade il proxy, l'app dietro è irraggiungibile
+  ## anche se sta benissimo, e la sonda sintetica dell'app vede comunque un 302.
+  ## Selezionare la famiglia per prefisso invece che elencare i nomi: un quinto
+  ## proxy nasce coperto, che è esattamente il modo in cui le altre lacune di
+  ## questo tipo si sono create (un selettore che fissa un nome, e il nome si
+  ## sposta — cfr. 40-alert-coverage.yml).
+  - name: app-bussola.oauth2-proxy-family
+    rules:
+    - alert: Oauth2ProxyUnavailable
+      expr: |
+        kube_deployment_status_replicas_available{namespace="oauth2-proxy", deployment=~"oauth2-proxy-.+"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "oauth2-proxy/{{ $labels.deployment }}: nessuna replica disponibile"
+        description: |
+          Il proxy SSO è giù: ogni app dietro questo cancello è irraggiungibile,
+          indipendentemente dal suo stato. Le sonde sintetiche di quelle app
+          NON se ne accorgono (vedono comunque un redirect).
+
+    - alert: Oauth2ProxyRedisDegraded
+      expr: |
+        ( kube_statefulset_replicas{namespace="oauth2-proxy", statefulset=~"oauth2-proxy-.+-redis-ha-server"}
+          - kube_statefulset_status_replicas_ready{namespace="oauth2-proxy", statefulset=~"oauth2-proxy-.+-redis-ha-server"}
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "oauth2-proxy/{{ $labels.statefulset }}: {{ $value }} repliche redis non pronte"
+        description: |
+          Il backing store delle sessioni ha perso repliche. Le sessioni già
+          aperte reggono; il rischio è la perdita del quorum, che sloggerebbe
+          tutti insieme dalle app protette.

@@ -1,0 +1,195 @@
+## Il narratore: llama.cpp su CPU, dentro al cluster, senza ingress.
+##
+## MODELLO DA VERIFICARE, NON DA DARE PER BUONO. Il file GGUF è scelto in un
+## ConfigMap apposta: la qualità dell'italiano di un modello da 4 miliardi di
+## parametri è la cosa che cede per prima, e va MISURATA. Lo strumento è
+## `tools/eval_narratore.py` nel repo dell'applicazione: gira una batteria di
+## blocchi di fatti, conta quante frasi passano la guardia e perché quelle
+## bocciate sono state bocciate. Se il tasso non regge, si cambia la riga
+## MODEL_URL qui sotto — non il codice.
+##
+## ⚠ L'immagine si prende da ghcr.io e NON dal mirror zot, deliberatamente: il
+## sync di zot accetta solo i tag che passano
+##   ^(latest|stable|main|master|v?\d+(\.\d+){0,3}(-[a-zA-Z0-9.-]+)?)$
+## e `server-b10680` non lo passa (comincia per lettera). Per farlo passare da
+## zot servirebbe sia un prefisso ggml-org/llama.cpp sia un allargamento di
+## quella regex — una modifica al registro di tutti, per un consumatore solo.
+##
+## PERCHÉ UN MODELLO NUOVO E NON QUELLI CHE CI SONO GIÀ. I gruppi "locali" di
+## litellm (local-only, local-small) vivono in LM Studio SUL PORTATILE,
+## raggiunto via cavo, WiFi o WireGuard. Per questa applicazione è
+## squalificante su due fronti: il cervello sparisce quando il portatile è
+## chiuso o via, e qwen3-coder-30b è un modello da codice. Qui serve una cosa
+## piccola, sempre accesa e che non esce dal cluster.
+##
+## NON È SUL PERCORSO CRITICO. L'applicazione chiede la frase in una seconda
+## richiesta, dopo che la pagina è già a schermo. Se questo Deployment è a
+## zero repliche, Bussola funziona per intero con i suoi testi fissi — ed è il
+## modo giusto di spegnerlo se un giorno dà fastidio.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bussola-narratore
+  namespace: bussola
+spec:
+  replicas: 1
+  ## Il PVC del modello è RWO: due pod non devono contenderselo, e un rolling
+  ## update ci proverebbe.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bussola-narratore
+  template:
+    metadata:
+      labels:
+        app: bussola-narratore
+    spec:
+      priorityClassName: mdapi-low
+      ## Serve anche qui, non solo sul Deployment dell'applicazione:
+      ## l'initContainer prende curl dal mirror zot, che è protetto da htpasswd.
+      ## Senza, il pod resta in Init:ImagePullBackOff con un messaggio di
+      ## autorizzazione che sembra un problema di registry inesistente.
+      imagePullSecrets:
+        - name: zot-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      ## Scarica il GGUF una volta sola e lo tiene sul volume. Il modello NON è
+      ## nell'immagine: così si può cambiare senza ricostruire niente, e la
+      ## scelta va misurata sull'italiano, che è dove i modelli piccoli cedono
+      ## per primi.
+      ## python:3-alpine e NON curlimages/curl: il sync di zot ammette solo i
+      ## prefissi elencati nella sua config, e `curlimages/**` non è fra questi
+      ## (`library/python` sì). Un'immagine non ammessa dà "not found" dopo aver
+      ## superato l'autenticazione — sembra un errore di registry, è il filtro.
+      - name: scarica-modello
+        image: zot.mdapi.ch/library/python:3-alpine
+        command: ["python3", "-c"]
+        args:
+          - |
+            import os, sys, urllib.request
+            dst = "/modelli/" + os.environ["MODEL_FILE"]
+            if os.path.exists(dst) and os.path.getsize(dst) > 1 << 30:
+                print("modello già presente:", dst, os.path.getsize(dst), "byte")
+                sys.exit(0)
+            tmp = dst + ".parziale"
+            print("scarico", os.environ["MODEL_URL"], flush=True)
+            urllib.request.urlretrieve(os.environ["MODEL_URL"], tmp)
+            n = os.path.getsize(tmp)
+            # Un GGUF troncato fa fallire llama.cpp con un errore illeggibile:
+            # meglio accorgersene qui, dove si vede che è un download andato male.
+            if n < 1 << 30:
+                sys.exit(f"scaricato troppo piccolo: {n} byte")
+            os.replace(tmp, dst)
+            print("scaricato", n, "byte")
+        envFrom:
+        - configMapRef:
+            name: bussola-narratore-modello
+        volumeMounts:
+        - name: modelli
+          mountPath: /modelli
+      containers:
+      - name: llama
+        image: ghcr.io/ggml-org/llama.cpp:server-b10680
+        args:
+          - "-m"
+          - "/modelli/$(MODEL_FILE)"
+          ## --alias fissa il nome che il server dichiara: l'applicazione
+          ## chiede il modello "bussola" e non deve sapere quale file è.
+          - "--alias"
+          - "bussola"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "8080"
+          ## Il contesto serve per un blocco di fatti e due frasi, non per una
+          ## conversazione: 4096 basta e tiene bassa la memoria.
+          - "-c"
+          - "4096"
+          - "-t"
+          - "8"
+          - "--no-warmup"
+        envFrom:
+        - configMapRef:
+            name: bussola-narratore-modello
+        ports:
+        - containerPort: 8080
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        ## Il caricamento del modello su CPU richiede decine di secondi: senza
+        ## startupProbe la liveness lo ucciderebbe prima che finisca.
+        startupProbe:
+          httpGet: {path: /health, port: 8080}
+          periodSeconds: 10
+          failureThreshold: 30
+        livenessProbe:
+          httpGet: {path: /health, port: 8080}
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+          limits:
+            ## Nessuna GPU in questo cluster: sono 32 core per nodo e il
+            ## throughput viene tutto da lì. 8 thread, 12 core di tetto per
+            ## lasciare respiro al resto.
+            cpu: "12"
+            memory: 6Gi
+        volumeMounts:
+        - name: modelli
+          mountPath: /modelli
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: modelli
+        persistentVolumeClaim:
+          claimName: bussola-modelli
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bussola-modelli
+  namespace: bussola
+spec:
+  ## Ceph e non Longhorn: è un file grosso e riscaricabile, cioè esattamente
+  ## la definizione di dato "bulk" della politica di tiering. Longhorn resta
+  ## per quello che sta sulle fio.
+  storageClassName: ceph-block
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 12Gi
+---
+## Quale modello. Separato dal Deployment perché è la cosa che cambierà: la
+## scelta va verificata sull'italiano prima di fidarsene, e cambiarla deve
+## costare una riga, non una ricostruzione.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bussola-narratore-modello
+  namespace: bussola
+data:
+  MODEL_FILE: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+  MODEL_URL: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bussola-narratore
+  namespace: bussola
+spec:
+  selector:
+    app: bussola-narratore
+  ports:
+  - port: 8080
+    targetPort: 8080

@@ -1,0 +1,47 @@
+## TLS certificate for the nginx terminator that fronts Garage on salt and pepper.
+##
+## Garage has no TLS listener of its own (upstream: "This endpoint does not
+## support TLS: a reverse proxy should be used to provide it"), so `garage-tls`
+## -- an nginx custom app on each Garage host, :30288 -> :30188 -- is what makes
+## a backup encrypted on the wire. Before it existed, https://api.garage only
+## reached the ingress, which terminated TLS and re-emitted PLAINTEXT to
+## 192.168.1.207/.219.
+##
+## ⭐ Issued by the house PKI (Horizon CLM -> MDAPI Issuing CA 01), NOT by a
+## one-off CA, so it auto-renews on the estate's 47-day Evertrust cycle like
+## every other internal cert. The trust anchor clients need is the **MDAPI Root
+## CA** (cert-manager puts it in the secret's ca.crt); tls.crt already carries
+## leaf + MDAPI Issuing CA 01, which is the full chain nginx must serve.
+##
+## ⭐ commonName/dnsNames include the SERVICE name. That is the whole design:
+## in-cluster clients dial https://garage.transit.svc.cluster.local:30288 and
+## verify the name of a selector-less Service whose endpoints are two bare-metal
+## LAN hosts -- no ingress, no split-horizon record, and kube-proxy keeps the
+## load balancing and failover. The same name is recreated as a Service on the
+## mgmt and Harvester clusters so this one certificate covers them too.
+##
+## ⛔ NO ipAddresses here, deliberately. The Horizon profile SILENTLY DROPS IP
+## SANs -- verified 2026-09-05 by requesting 192.168.1.207 + .219 and getting a
+## certificate with zero IP SANs and no error anywhere. So a client must reach
+## this terminator BY NAME; salt.home.tillo.ch / pepper.home.tillo.ch are here
+## for anything that needs to pin a single node.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: garage-tls
+  namespace: transit
+spec:
+  secretName: garage-tls
+  commonName: garage.transit.svc.cluster.local
+  dnsNames:
+    - garage.transit.svc.cluster.local
+    - salt.home.tillo.ch
+    - pepper.home.tillo.ch
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    group: horizon.evertrust.io
+    kind: ClusterIssuer
+    name: horizon-private

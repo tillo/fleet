@@ -1,0 +1,129 @@
+## CipherTrust Manager / Akeyless gateway VM — adopted into Fleet 2026-09-03.
+##
+## This is cm.mdapi.ch: the KMS appliance that also serves the Akeyless gateway
+## every ExternalSecret in this repo depends on. Pre-existing, RUNNING, and
+## adopted exactly as it stands — `kubectl diff` against the live object is
+## empty, so nothing is recreated and the VM is not restarted.
+##
+## ⚠ Do NOT blind-restart this VM. A cold boot can leave the appliance up at the
+## OS level but with its crypto stack unstarted, needing a console unseal; see
+## memory akeyless_cm_gateway_topology_and_reboot_unseal_caveat_2026_06_08.
+## Fleet only ever applies this manifest, which matches what is already running.
+##
+## No image pin: the 200Gi boot disk is a restored volume (`cm-disk-restored`)
+## on harvester-longhorn-2replicas with no `harvesterhci.io/imageId`, so there is
+## no `lh-<uid>` StorageClass to track.
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cm
+  namespace: ciphertrust
+  labels:
+    harvesterhci.io/creator: harvester
+    harvesterhci.io/os: linux
+  annotations:
+    harvesterhci.io/volumeClaimTemplates: '[{"metadata":{"name":"cm-disk-0-restore"},"spec":{"accessModes":["ReadWriteMany"],"resources":{"requests":{"storage":"200Gi"}},"volumeMode":"Block","storageClassName":"harvester-longhorn-2replicas"}}]'
+    ## Pinned so a recreate keeps the L2 identity the DMZ firewall rules and the
+    ## haproxy backend (192.168.7.221) are written against.
+    harvesterhci.io/mac-address: '{"default":"7e:f1:ba:47:ba:30"}'
+    network.harvesterhci.io/ips: '[]'
+spec:
+  ## Always, and it IS running. A Halted VM would hold this bundle NotReady
+  ## forever — Fleet reads "no VMI" as unavailable, which comparePatches cannot
+  ## fix because that is readiness, not drift.
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        harvesterhci.io/vmName: cm
+      annotations:
+        harvesterhci.io/sshNames: '["default/tillo-exion"]'
+    spec:
+      architecture: amd64
+      hostname: cm
+      evictionStrategy: LiveMigrateIfPossible
+      terminationGracePeriodSeconds: 120
+
+      ## mgmt for the network NAD, cpumanager because of dedicatedCpuPlacement.
+      ## The empty podAffinity/podAntiAffinity objects are present on the live
+      ## object and are declared so they do not read as drift.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: network.harvesterhci.io/mgmt
+                    operator: In
+                    values:
+                      - "true"
+                  - key: cpumanager
+                    operator: In
+                    values:
+                      - "true"
+        podAffinity: {}
+        podAntiAffinity: {}
+
+      domain:
+        cpu:
+          cores: 4
+          sockets: 1
+          threads: 1
+          maxSockets: 1
+          ## Pinned CPUs, so the overcommit webhook does not apply and the
+          ## requests below are genuine desired state rather than derived.
+          dedicatedCpuPlacement: true
+        memory:
+          guest: 12Gi
+        resources:
+          limits:
+            cpu: "4"
+            memory: 12Gi
+          requests:
+            cpu: "4"
+            memory: 12Gi
+        firmware:
+          uuid: 2bfb244a-1683-5a6d-943d-2241fb9f9713
+        features:
+          acpi:
+            enabled: true
+        machine:
+          type: q35
+        devices:
+          inputs:
+            - name: tablet
+              type: tablet
+              bus: usb
+          disks:
+            - name: disk-0
+              bootOrder: 1
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              model: virtio
+              macAddress: "7e:f1:ba:47:ba:30"
+              bridge: {}
+
+      ## The interface is called "default" but attaches to the DMZ NAD — the
+      ## appliance lives on 192.168.7.0/24, reached via haproxy on bpi-r4.
+      networks:
+        - name: default
+          multus:
+            networkName: default/dmz
+
+      volumes:
+        - name: disk-0
+          persistentVolumeClaim:
+            claimName: cm-disk-0-restore
+        ## Pre-existing cloud-init Secret, deliberately not declared: its
+        ## user-data carries authorized_keys and this repo is mirrored publicly.
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            secretRef:
+              name: cm-9nsoo
+            networkDataSecretRef:
+              name: cm-9nsoo

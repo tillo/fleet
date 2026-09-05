@@ -1,0 +1,630 @@
+## RIPE Atlas outside-in dashboard.
+##
+## The measurements our probe's credits pay for, rendered. Source metrics come
+## from f/probe/ripe_atlas_measurements; design and costing are in
+## ~/ripe-atlas-measurements-plan.md.
+##
+## Two deliberate shape choices, both to avoid the usual dashboard mistakes:
+##
+## ⭐ The attribution pair (panels 5 and 6) is TWO panels, not one overlay. A
+## reachability ratio (0-1) and a count of failing probes are different scales,
+## and a dual-axis chart is the single most misread form there is. They sit side
+## by side on the same time range instead, with the truth table for reading them
+## in the text panel.
+##
+## ⭐ The headline figures are stat tiles and the per-measurement state is a
+## table, because "what is the number" and "which rows are bad" are not
+## change-over-time questions and a chart answers them worse.
+##
+## Reachability sits near 0.98 rather than 1.00 — single-probe failures are
+## ordinary Internet weather — so the ratio thresholds are 0.5/0.9, matching the
+## alert rules rather than inventing a second opinion.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ripe-atlas-dashboard
+  namespace: cattle-dashboards
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: Network
+data:
+  ripe-atlas-outside-in.json: |
+    {
+      "title": "RIPE Atlas / outside-in",
+      "uid": "ripe-atlas-outside-in",
+      "tags": [
+        "ripe-atlas",
+        "external",
+        "mdapi"
+      ],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "5m",
+      "time": {
+        "from": "now-24h",
+        "to": "now"
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Live measurements",
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "ripe_atlas_msm_count",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "description": "Measurements tagged mdapi-selfmon that RIPE is still running. Stopped ones are excluded, so retiring one never looks like a fault."
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Reachability now",
+          "gridPos": {
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.5
+                  },
+                  {
+                    "color": "green",
+                    "value": 0.9
+                  }
+                ]
+              },
+              "decimals": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "avg(ripe_atlas_msm_success_ratio)",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "description": "Mean fraction of reporting probes that reached the target, across every measurement. Single-probe failures are ordinary Internet weather \u2014 this sits near 0.98, not 1.00."
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Our probe",
+          "gridPos": {
+            "x": 12,
+            "y": 0,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              },
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "Not connected",
+                      "index": 0
+                    },
+                    "1": {
+                      "text": "Connected",
+                      "index": 1
+                    }
+                  }
+                }
+              ]
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "max(ripe_atlas_connected)",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "description": "RIPE's own view of probe 1017332. Text, not just colour."
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Probe uptime",
+          "gridPos": {
+            "x": 18,
+            "y": 0,
+            "w": 6,
+            "h": 4
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "max(ripe_atlas_uptime_seconds)",
+              "refId": "A",
+              "instant": true
+            }
+          ],
+          "description": "Total connected time RIPE has recorded for our probe."
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Outside \u2192 in: can the Internet reach our edge?",
+          "gridPos": {
+            "x": 0,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 8,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0,
+              "max": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "min"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "mdapi:atlas_edge_reachable:ratio",
+              "legendFormat": "IPv{{af}}",
+              "refId": "A"
+            }
+          ],
+          "description": "RIPE Atlas probes worldwide pinging mdapi.ch (\u2192 .50 \u2192 the prod ingress). This is the half no internal probe can measure."
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Inside \u2192 out: internal synthetic probes failing",
+          "gridPos": {
+            "x": 12,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 8,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "min"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "mdapi:synthetic_probes_failing:count",
+              "legendFormat": "failing probes",
+              "refId": "A"
+            }
+          ],
+          "description": "Count of blackbox probes currently unhealthy, using the same expression as SyntheticProbeFailing. Read together with the panel on the left \u2014 see the note below."
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Reachability by target",
+          "gridPos": {
+            "x": 0,
+            "y": 12,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 8,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0,
+              "max": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "min"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "ripe_atlas_msm_success_ratio{type=\"ping\"}",
+              "legendFormat": "{{target}} v{{af}}",
+              "refId": "A"
+            }
+          ],
+          "description": "Ping measurements only, so the series count stays readable. DNS and TLS are in the table below."
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Median RTT from probes worldwide",
+          "gridPos": {
+            "x": 12,
+            "y": 12,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "fillOpacity": 8,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": true
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "min"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "ripe_atlas_msm_rtt_median_ms",
+              "legendFormat": "{{target}} {{type}} v{{af}}",
+              "refId": "A"
+            }
+          ],
+          "description": "Median across reporting probes. A step change with reachability intact means a routing change, not a server problem."
+        },
+        {
+          "id": 9,
+          "type": "table",
+          "title": "Every measurement, right now",
+          "gridPos": {
+            "x": 0,
+            "y": 20,
+            "w": 16,
+            "h": 9
+          },
+          "description": "One row per live measurement. probes_reporting = 0 for longer than three of its own intervals is what AtlasMeasurementStalled fires on.",
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "align": "auto"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "success ratio"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percentunit"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-text"
+                    }
+                  },
+                  {
+                    "id": "thresholds",
+                    "value": {
+                      "mode": "absolute",
+                      "steps": [
+                        {
+                          "color": "red",
+                          "value": null
+                        },
+                        {
+                          "color": "orange",
+                          "value": 0.5
+                        },
+                        {
+                          "color": "green",
+                          "value": 0.9
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "median RTT"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "ms"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "success ratio",
+                "desc": false
+              }
+            ]
+          },
+          "targets": [
+            {
+              "expr": "ripe_atlas_msm_success_ratio",
+              "refId": "A",
+              "instant": true,
+              "format": "table"
+            },
+            {
+              "expr": "ripe_atlas_msm_probes_reporting",
+              "refId": "B",
+              "instant": true,
+              "format": "table"
+            },
+            {
+              "expr": "ripe_atlas_msm_rtt_median_ms",
+              "refId": "C",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "joinByField",
+              "options": {
+                "byField": "msm_id",
+                "mode": "outer"
+              }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "Time 1": true,
+                  "Time 2": true,
+                  "Time 3": true,
+                  "__name__": true,
+                  "__name__ 1": true,
+                  "__name__ 2": true,
+                  "__name__ 3": true,
+                  "job": true,
+                  "job 1": true,
+                  "job 2": true,
+                  "job 3": true,
+                  "instance": true,
+                  "instance 1": true,
+                  "instance 2": true,
+                  "instance 3": true,
+                  "namespace": true,
+                  "namespace 1": true,
+                  "namespace 2": true,
+                  "namespace 3": true,
+                  "prometheus": true,
+                  "prometheus 1": true,
+                  "prometheus 2": true,
+                  "prometheus 3": true,
+                  "service": true,
+                  "service 1": true,
+                  "service 2": true,
+                  "service 3": true,
+                  "exported_job": true,
+                  "exported_job 1": true,
+                  "exported_job 2": true,
+                  "exported_job 3": true,
+                  "type 2": true,
+                  "type 3": true,
+                  "target 2": true,
+                  "target 3": true,
+                  "af 2": true,
+                  "af 3": true
+                },
+                "renameByName": {
+                  "msm_id": "measurement",
+                  "target 1": "target",
+                  "type 1": "type",
+                  "af 1": "af",
+                  "Value #A": "success ratio",
+                  "Value #B": "probes reporting",
+                  "Value #C": "median RTT"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": 10,
+          "type": "text",
+          "title": "How to read the two panels above",
+          "gridPos": {
+            "x": 16,
+            "y": 20,
+            "w": 8,
+            "h": 9
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "Internal probes run **inside** the estate, so on their own they cannot tell a broken\nservice from a broken path. Crossing them with the outside-in view can:\n\n| internal | external | means |\n|---|---|---|\n| failing | failing | genuine service outage |\n| **healthy** | **failing** | routing / upstream \u2014 invisible to every other signal here |\n| failing | healthy | the service or the monitoring path, **not** connectivity |\n\nThe second row is what `EdgeUnreachableFromInternetOnly` alerts on.\n\n`dns_external_google` already covers the *outbound* direction; these measurements\ncover the *inbound* one.\n\n---\n\nReachability sits near **0.98**, not 1.00 \u2014 single-probe failures are ordinary\nInternet weather. That is why the alert threshold is 0.5.\n\nSource: `f/probe/ripe_atlas_measurements` \u00b7 design & costing:\n`~/ripe-atlas-measurements-plan.md`"
+          }
+        }
+      ]
+    }

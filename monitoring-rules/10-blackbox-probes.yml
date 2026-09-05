@@ -1,0 +1,909 @@
+## Probe CRDs — one per statuspage component, plus the non-statuspage
+## wan-icmp-latency trending probe at the bottom.
+##
+## Probes MUST carry the `release: rancher-monitoring` label because the
+## existing Prometheus's `probeSelector` is `matchLabels: {release: rancher-monitoring}`
+## (unlike its other selectors which are `{}`).
+##
+## Each Probe sets `targetLabels: { component, team }` so the resulting
+## probe_success metric carries those labels and our PrometheusRules can
+## key on them.
+
+# ====== Mail ======
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-smtp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-smtp
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: smtp_banner
+  targets:
+    staticConfig:
+      static:
+        - mail.mdapi.ch:25
+      labels:
+        component: Mail
+        team: mdapi
+        probe: smtp
+---
+## Submission paths (added 2026-08-20 after the helm-v4 empty-env incident:
+## 465/587 — the ports user MUAs send through — were down 63min unprobed;
+## component=Mail puts these on the 4m-critical Mail rule automatically).
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-submissions
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-submissions
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: smtps_ehlo
+  targets:
+    staticConfig:
+      static:
+        - mail.mdapi.ch:465
+      labels:
+        component: Mail
+        team: mdapi
+        probe: submissions
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-submission
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-submission
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: smtp_starttls_ehlo
+  targets:
+    staticConfig:
+      static:
+        - mail.mdapi.ch:587
+      labels:
+        component: Mail
+        team: mdapi
+        probe: submission
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-imaps
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-imaps
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: imaps_starttls
+  targets:
+    staticConfig:
+      static:
+        - mail.mdapi.ch:993
+      labels:
+        component: Mail
+        team: mdapi
+        probe: imaps
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: mail-webmail
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: mail-webmail
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://webmail.mdapi.ch
+      labels:
+        component: Mail
+        team: mdapi
+        probe: webmail
+
+# ====== Management plane ======
+## rancher-mgmt UI/API reachability (2026-08-20): the mgmt-2 memory stall
+## served fast 503s for ~15min and was only noticed by accident — no probe
+## watched the management plane. component=Platform rides the generic
+## SyntheticProbeFailing rule (8m). LE cert, so http_2xx strict TLS is fine.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: rancher-mgmt-ui
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: rancher-mgmt-ui
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://rancher-mgmt.home.tillo.ch/ping
+      labels:
+        component: Platform
+        team: mdapi
+        probe: rancher-mgmt
+---
+# ====== Identity ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: identity-keycloak
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: identity-keycloak
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        ## Keycloak doesn't expose /health/ready on the user-facing
+        ## ingress in this version. /realms/master returns the realm
+        ## metadata JSON with a 200 when the server is up.
+        - https://idp.mdapi.ch/realms/master
+      labels:
+        component: Sign-in (SSO)
+        team: mdapi
+        probe: keycloak
+
+# ====== Evertrust Stream PKI ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: pki-stream
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: pki-stream
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        ## Root 301s to the login app; any HTTP response proves the stream
+        ## deployment is serving. Added 2026-07-13 after the 07-12 27.5h
+        ## REPLICA_SET_GHOST outage that no availability signal caught
+        ## (only hourly wmfails of f/probe/stream_license_usage).
+        - https://stream.mdapi.ch/
+      labels:
+        component: Platform
+        team: mdapi
+        probe: stream-pki
+
+# ====== GitLab ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: gitlab-webservice
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: gitlab-webservice
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://gitlab.mdapi.ch/-/readiness
+      labels:
+        component: Platform
+        team: mdapi
+        probe: webservice
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: gitlab-registry
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: gitlab-registry
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://registry.mdapi.ch/v2/
+      labels:
+        component: Platform
+        team: mdapi
+        probe: registry
+
+# ====== Files ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: files
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: files
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://cloud.mdapi.ch/status.php
+        # 2026-08-15 (infra-ka2/xdm): both Nextclouds behind the ingress —
+        # end-to-end synthetic coverage catches the whole 503-class
+        # (service/endpoint/controller) that bit during the re-route night.
+        - https://cloud.envuassu.ch/status.php
+        - https://spider3.files.mdapi.ch
+        - https://tv.files.mdapi.ch
+      labels:
+        component: Files & Documents
+        team: mdapi
+
+# ====== Notes ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: notes-joplin
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: notes-joplin
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://notes.mdapi.ch/api/ping
+      labels:
+        component: Files & Documents
+        team: mdapi
+        probe: joplin
+
+# ====== Paperless DMS ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: files-paperless
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: files-paperless
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://documents.mdapi.ch
+      labels:
+        component: Files & Documents
+        team: mdapi
+        probe: paperless
+
+# ====== Debian/Ubuntu mirror ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: files-mirror
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: files-mirror
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://mirror.mdapi.ch
+      labels:
+        component: Files & Documents
+        team: mdapi
+        probe: mirror
+
+# ====== Tools ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: tools-meshcentral
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: tools-meshcentral
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://help.mdapi.ch
+      labels:
+        component: Platform
+        team: mdapi
+        probe: meshcentral
+
+# ====== Websites ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: websites
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: websites
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://spider3.ch
+        - https://www.spider3.ch
+        - https://coiffuredreams.ch
+        - https://dellambrogio.ch
+        - https://ivodellambrogio.ch
+        - https://mdapi.org
+        - https://tillo.ch
+        - https://mdapi.ch
+      labels:
+        component: Websites
+        team: mdapi
+
+# ====== DNS ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-public
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-public
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_mdapi
+  targets:
+    staticConfig:
+      static:
+        ## ns.mdapi.ch (192.168.1.53) is BIND9's authoritative LB. The
+        ## A record was fixed in zone 2026-05-18; ns-mdapi-ch-{udp,tcp,
+        ## dnssec} probes below give us the full K-integration coverage
+        ## (UDP+TCP+DNSSEC-AD+SOA-serial). This dns_mdapi probe stays
+        ## for historical compatibility with the dns_authoritative alert.
+        - 192.168.1.53:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: dns_authoritative
+---
+## K-integration (DNS audit 2026-05-17): blackbox probe for
+## ns.mdapi.ch covering UDP + TCP + DNSSEC. Catches a DNSSEC chain break
+## from outside the cluster.
+##
+## ⚠️ CORRECTED 2026-08-29: this comment used to also claim it "catches secondary
+## NS desync (puck.nether.net / ns2.afraid.org)". It does NOT and never did. The
+## dns_ns_mdapi_* modules query ONE server for `mdapi.ch SOA` and assert only that
+## the SOA MNAME matches `ns\.mdapi\.ch\.` — they never query a secondary and never
+## compare serials, so a secondary could serve month-old data with these all green.
+## The claim made the gap invisible: it read as covered.
+## Secondary desync is now genuinely checked by Windmill
+## f/probe/bind_zone_transfer_check -> alert group app-dns.bind-replication in
+## 07-dns.yml, which compares SOA serials across every delegated nameserver.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ns-mdapi-ch-udp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-ns-mdapi
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_ns_mdapi_udp
+  targets:
+    staticConfig:
+      static:
+        - ns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: ns_mdapi_ch_udp
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ns-mdapi-ch-tcp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-ns-mdapi
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_ns_mdapi_tcp
+  targets:
+    staticConfig:
+      static:
+        - ns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: ns_mdapi_ch_tcp
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ns-mdapi-ch-dnssec
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-ns-mdapi
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_ns_mdapi_dnssec
+  targets:
+    staticConfig:
+      static:
+        - ns.mdapi.ch:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: ns_mdapi_ch_dnssec
+---
+## External-internet view: arbitrary recursive resolvers must be able
+## to resolve mdapi.ch A. Verifies the full delegation chain (registrar
+## → public NS → authoritative response) is reachable from outside.
+## Two independent resolvers so a single Cloudflare/Google outage
+## doesn't false-fire — alert only fires if both consecutive probes
+## fail.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-external-cloudflare
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-external
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_mdapi
+  targets:
+    staticConfig:
+      static:
+        - 1.1.1.1:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: dns_external_cloudflare
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-external-google
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-external
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_mdapi
+  targets:
+    staticConfig:
+      static:
+        - 8.8.8.8:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: dns_external_google
+
+# ====== Technitium ======
+## Three probes against the home.tillo.ch zone:
+## * vip — the LoadBalancer ExternalIP 192.168.1.54 as clients see it
+## * primary-pod / secondary-pod — direct ClusterIP probes that catch the
+##   externalTrafficPolicy=Local routing skew (secondary gets no client
+##   traffic via the VIP until kube-vip moves it; per-pod probes ensure
+##   both replicas actually answer).
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-technitium-vip
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-technitium
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_home_tillo
+  targets:
+    staticConfig:
+      static:
+        - 192.168.1.54:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: technitium_vip
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-technitium-primary-pod
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-technitium
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_home_tillo
+  targets:
+    staticConfig:
+      static:
+        - technitium-primary.technitium.svc.cluster.local:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: technitium_primary_pod
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dns-technitium-secondary-pod
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: dns-technitium
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: dns_home_tillo
+  targets:
+    staticConfig:
+      static:
+        - technitium-secondary.technitium.svc.cluster.local:53
+      labels:
+        component: DNS
+        team: mdapi
+        probe: technitium_secondary_pod
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Infrastructure / management plane — TLS cert-expiry coverage (added 2026-06-05
+# to close the gap that let rancher.home.tillo.ch silently expire 2026-06-02).
+# Probes are scraped purely for `probe_ssl_earliest_cert_expiry`; some endpoints
+# (oauth2-proxy gated, redirect to /sign_in) will fail probe_success but the
+# TLS handshake — and thus cert validity — is what we care about here.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-platform
+  namespace: monitoring
+spec:
+  jobName: infra-platform
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://harvester.mdapi.ch
+        ## /admin is the only mounted oauth2-proxy ingress path at
+        ## auth.mdapi.ch (the other being /tv). Probing the bare host
+        ## returns 404 because no ingress rule matches /.
+        - https://auth.mdapi.ch/admin
+      labels:
+        component: Platform
+        team: mdapi
+---
+## Management-plane probes. Split out of infra-platform 2026-07-26: the
+## management plane being down showed the PUBLIC statuspage "Platform"
+## component as major_outage for 3 days while every public service was fine.
+## `statuspage: exclude` keeps these out of the public page (the adapter's
+## derive_status skips the label — the mechanism built for internal signals)
+## while alerting/Pushover behavior stays identical.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-mgmt
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: infra-mgmt
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        ## rancher-mgmt = the ACTIVE in-cluster Rancher since 2026-08-10
+        ## (agents + automation connect to it directly); rancher.mdapi.ch =
+        ## external path, transiting to the mgmt Rancher.
+        ##
+        ## https://rancher.home.tillo.ch (the standby Rancher UI) was removed
+        ## 2026-08-10 when that standby was parked cold, and the host carrying
+        ## it was retired permanently on 2026-09-01. ⛔ Do NOT restore that
+        ## target — there is no standby behind the name any more. If a second
+        ## Rancher is ever stood up, probe it under its OWN name: the target
+        ## existed to catch a cert silently expiring (the 2026-06-02 incident),
+        ## so a replacement needs the same cover, not this dead one.
+        - https://rancher-mgmt.home.tillo.ch
+        - https://rancher.mdapi.ch
+        ## /healthz added 2026-08-24 after the mgmt Rancher restart storm
+        ## (24 liveness kills in one day, exit 137) went completely unnoticed:
+        ## the root URL keeps redirecting happily while Rancher itself is
+        ## stalled, and prod's Prometheus can only see the mgmt cluster as
+        ## KubeVirt VMs, never its pods — so no pod-restart rule is possible.
+        ## This target closes that gap with rules that already exist: Rancher's
+        ## own livenessProbe kills the container after 5 failures of a
+        ## /healthz check, so SyntheticProbeSlowResponse (probe_duration_seconds
+        ## > 5 for 10m) fires on exactly the precursor, and
+        ## SyntheticProbeFailing catches the hard hang.
+        - https://rancher-mgmt.home.tillo.ch/healthz
+      labels:
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-observability
+  namespace: monitoring
+spec:
+  jobName: infra-observability
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://grafana.mdapi.ch
+        - https://logs.mdapi.ch
+        - https://vmalert.mdapi.ch
+        - https://vmalertmanager.mdapi.ch
+        - https://pushgateway.mdapi.ch
+        - https://cribl.mdapi.ch
+      labels:
+        component: Observability
+        team: mdapi
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-home
+  namespace: monitoring
+spec:
+  jobName: infra-home
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://home.mdapi.ch
+        - https://frigate.mdapi.ch
+        - https://esphome.mdapi.ch
+      labels:
+        component: Home Assistant
+        team: mdapi
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: infra-media
+  namespace: monitoring
+spec:
+  jobName: infra-media
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://bazarr.mdapi.ch
+        - https://prowlarr.mdapi.ch
+        - https://radarr.mdapi.ch
+        - https://seerr.mdapi.ch
+        - https://autobrr.mdapi.ch
+      labels:
+        component: Media
+        team: mdapi
+---
+# ====== WAN latency trending (NOT a statuspage component) ======
+# Continuous ICMP RTT/loss between the 6h wan_speedtest runs. Targets carry
+# NO component/team labels ON PURPOSE: SyntheticProbeFailing matches
+# probe_success{component!="", team="mdapi"} and would page critical +
+# flip a statuspage component — these are trend series, not availability.
+#   185.71.139.251 — PPPoE BNG first hop (ptp peer; if the ISP renumbers the
+#                    BNG this target goes dark — update, don't page).
+#   45.90.28.16    — NextDNS anycast, stable internet reference (~4.8ms).
+# (The router LAN VIP 192.168.1.1 filters ICMP — verified 2026-08-03 — so
+# there is no LAN-side baseline target here.)
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: wan-icmp-latency
+  namespace: monitoring
+spec:
+  jobName: wan-icmp-latency
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: icmp
+  targets:
+    staticConfig:
+      static:
+        - 185.71.139.251
+        - 45.90.28.16
+      labels:
+        probe: icmp
+        purpose: wan-latency
+
+# ====== User portal (start.mdapi.ch) ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: portal-start
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: portal-start
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  ## SSO-gated by oauth2-proxy-portal, so an unauthenticated probe is a 302 to
+  ## auth.mdapi.ch — same module as auth.mdapi.ch/admin and chat.mdapi.ch.
+  ## Added 2026-08-27: this is the front door every other family-facing service
+  ## hangs off (its tile board IS how they find things), and it was the only
+  ## public entrypoint with no probe at all — an outage would have been reported
+  ## by a family member rather than by an alert.
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://start.mdapi.ch
+      labels:
+        component: Platform
+        team: mdapi
+        probe: portal
+
+# ====== Open WebUI chat (chat.mdapi.ch) ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: chat-openwebui
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: chat-openwebui
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  ## SSO-gated by oauth2-proxy-portal: an unauthenticated probe gets a 302 to
+  ## auth.mdapi.ch, so http_any_redirect (not http_2xx) is the honest module —
+  ## same treatment as auth.mdapi.ch/admin above. This checks the edge is up
+  ## (DNS, TLS, ingress, oauth2-proxy), not that LiteLLM is answering.
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://chat.mdapi.ch
+      labels:
+        component: Chat
+        team: mdapi
+        probe: openwebui
+
+# ====== Bussola (bussola.mdapi.ch) ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: bussola
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: bussola
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  ## Protetta da oauth2-proxy-bussola: una sonda non autenticata riceve un 302
+  ## verso auth.mdapi.ch, quindi http_any_redirect è il modulo onesto — stesso
+  ## trattamento di chat.mdapi.ch qui sopra. Verifica che il bordo sia in piedi
+  ## (DNS, TLS, ingress, oauth2-proxy), non che il narratore risponda: quello è
+  ## opzionale per costruzione e la sua assenza non è un guasto.
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://bussola.mdapi.ch
+      labels:
+        component: Bussola
+        team: mdapi
+        probe: bussola
+
+# ====== Rack status screen (bone) ======
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: rack-kiosk-bone
+  namespace: monitoring
+spec:
+  jobName: rack-kiosk-bone
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  ## bone (Pi 3B+, 192.168.1.185) drives the Carnotzet rack display. It hangs
+  ## off the un-scraped PoE switch, so it has no ifOperStatus on the C9300 and
+  ## until now NOTHING observed it: the screen could go dark and no alert would
+  ## fire — only a human walking into the cellar would notice. ICMP is the only
+  ## honest check here; it serves no port worth probing.
+  module: icmp
+  targets:
+    staticConfig:
+      static:
+        - 192.168.1.185
+      ## ⛔ Deliberately NO `component`/`team` label. SyntheticProbeFailing
+      ## matches component!="" and is CRITICAL + statuspage-coupled — a rack
+      ## display must page nobody at 3am and must never appear on the public
+      ## status page. The dedicated warning rule RackKioskUnreachable in
+      ## 11-blackbox-alerts.yml selects on `probe` and sets its own labels.
+      labels:
+        probe: rack-kiosk
+        purpose: rack-display

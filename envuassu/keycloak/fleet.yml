@@ -1,0 +1,29 @@
+defaultNamespace: envuassu
+namespace: envuassu
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+# Sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running
+#      pods after start.
+#   2. Keel (`keel.sh/policy: minor`) auto-bumps the image tag and
+#      writes keel.sh/update-time onto the pod template.
+#   3. Manual `kubectl rollout restart` writes kubectl.kubernetes.io/
+#      restartedAt onto the pod template.
+# All four paths are listed as jsonPointers: when a comparePatch entry has
+# both `operations` and `jsonPointers`, Fleet honours only the jsonPointers
+# and silently drops the operations -- so the image strip was dead and
+# Keel's tag bump showed as drift. jsonPointers also tolerates absent paths.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: postgres
+    namespace: envuassu
+    jsonPointers:
+    - "/spec/template/spec/containers/0/resources"
+    - "/spec/template/spec/containers/0/image"
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"

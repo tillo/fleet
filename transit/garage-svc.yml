@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: transit
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 30188
+      targetPort: 30188
+    ## TLS-terminating nginx running ON salt and pepper (custom TrueNAS app
+    ## `garage-tls`, added 2026-09-04). Garage itself has no TLS listener --
+    ## upstream: "This endpoint does not support TLS: a reverse proxy should
+    ## be used to provide it" -- so before this, any client whose payload was
+    ## not already ciphertext crossed the LAN in the clear, INCLUDING clients
+    ## that used https://api.garage.home.tillo.ch, because the ingress
+    ## terminated TLS and re-emitted plaintext on this very hop.
+    ## The cert is issued by our own "mdapi Garage Transit CA" and carries
+    ## garage.transit.svc.cluster.local as a SAN, so clients can verify the
+    ## Service name directly. :30188 is deliberately left in place: restic
+    ## and age clients already ship ciphertext and have no reason to pay for
+    ## a second layer. See garage_s3_client_tls_dividing_line.
+    - name: api-tls
+      port: 30288
+      targetPort: 30288
+    - name: console
+      port: 30186
+      targetPort: 30186

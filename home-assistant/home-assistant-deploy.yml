@@ -1,0 +1,155 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: home-assistant
+  namespace: home-assistant
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: home-assistant
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: home-assistant
+    spec:
+      # Home's control plane — evicted last among user workloads (N-1 program).
+      priorityClassName: mdapi-critical
+      # Pinned to the node that physically hosts the Zigbee USB stick.
+      # Pod is privileged, so /dev access is granted unconditionally —
+      # no device plugin needed. Edit this if the stick is moved.
+      nodeSelector:
+        kubernetes.io/hostname: qui
+      initContainers:
+      # Bootstrap initContainer (2026-05-14 migration):
+      # If a /config/configuration.yaml.bootstrap exists on the PVC AND the
+      # real configuration.yaml is missing OR empty (0 bytes — happened on the
+      # initial migration because the PVC had a 0-byte stub from pre-CM-mount
+      # days), promote .bootstrap to configuration.yaml. On normal restarts,
+      # this is a no-op because configuration.yaml is present and non-empty.
+      - name: bootstrap-configuration
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          if [ -f /config/configuration.yaml.bootstrap ] && [ ! -s /config/configuration.yaml ]; then
+            mv -f /config/configuration.yaml.bootstrap /config/configuration.yaml
+            echo "bootstrap-configuration: installed configuration.yaml from .bootstrap (target was missing or empty)"
+          else
+            echo "bootstrap-configuration: nothing to do (target=$( [ -s /config/configuration.yaml ] && echo non-empty || echo missing-or-empty ), bootstrap=$( [ -f /config/configuration.yaml.bootstrap ] && echo present || echo absent ))"
+          fi
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+      containers:
+      - name: home-assistant
+        image: ghcr.io/home-assistant/home-assistant:latest
+        securityContext:
+          privileged: true
+        ports:
+        - containerPort: 8123
+#        command: ['/bin/sh']
+#        args:
+#        - '+x'
+#        - '-c'
+#        - >-
+#          udevd -d
+#          && sleep 20
+#          && [ -c "/dev/ttyUSB0" ]
+#          && /run/s6/legacy-services/home-assistant/run
+#          || apk add --no-cache eudev
+#          ; /run/s6/legacy-services/home-assistant/run
+#          ; sleep infinity
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        envFrom:
+        - secretRef:
+            name: home-assistant-env-secret
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+        # configuration.yaml lives on the PVC (home-assistant-data) since
+        # 2026-05-14 — see bootstrap-configuration initContainer above and the
+        # home-assistant-bootstrap ConfigMap (kept as DR seed, not mounted).
+        - name: home-assistant-secrets
+          mountPath: /config/secrets.yaml
+          subPath: secrets.yaml
+        # /dev/ttyUSB* re-enumerate across reboots (a node reboot moved the Zigbee
+        # ZBT-1 from ttyUSB1->ttyUSB0, breaking ZHA which was pinned to ttyUSB1).
+        # Mount the udev /dev/serial/by-id symlinks so ZHA can use the stable
+        # by-id path (privileged already exposes the underlying ttyUSB* nodes).
+        - name: dev-serial
+          mountPath: /dev/serial
+          readOnly: true
+        # Honest request = observed steady-state (~2.4Gi). The main container was
+        # BestEffort ({}), so HA was first against the wall on node-memory
+        # eviction/OOM — unacceptable for the home's control plane (2026-07-05
+        # N-1 program). Limit left generous for recorder/history spikes; this
+        # only makes the scheduler account for memory HA already uses.
+        resources:
+          requests:
+            cpu: 200m
+            memory: 2560Mi
+          limits:
+            memory: 4Gi
+      # Sidecar: hourly off-site sync of /config/backups → Garage S3.
+      # Local retention is unchanged (auto_backup keeps the rolling window).
+      - name: rclone-backups-s3
+        image: rclone/rclone:latest
+        imagePullPolicy: Always
+        command:
+        - sh
+        - -c
+        - |
+          set -u
+          : "${BUCKET:?BUCKET env required}"
+          while true; do
+            rclone copy --min-age 1h --transfers 4 --s3-no-check-bucket \
+              /config/backups "garage:${BUCKET}" 2>&1 || true
+            sleep 3600
+          done
+        envFrom:
+        - secretRef:
+            name: garage-ha-backup-s3
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+          readOnly: true
+        ## CA for the Garage TLS terminator on salt/pepper; rclone reads it
+        ## via RCLONE_CA_CERT, set in the garage-ha-backup-s3 secret.
+        - name: garage-transit-ca
+          mountPath: /etc/garage-tls
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      volumes:
+      - name: home-assistant-data
+        persistentVolumeClaim:
+          claimName: home-assistant-data
+      - name: garage-transit-ca
+        secret:
+          secretName: garage-transit-ca
+      # home-assistant-config volume removed 2026-05-14 (configuration.yaml on PVC).
+      # The home-assistant-bootstrap ConfigMap still exists in fleet as a DR seed.
+      - name: home-assistant-secrets
+        secret:
+          secretName: home-assistant-secrets
+      - name: dev-serial
+        hostPath:
+          path: /dev/serial
+          type: Directory      # exists while the ZBT-1 (permanently installed) is present on qui

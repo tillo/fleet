@@ -1,0 +1,16 @@
+# Cluster-scoped ValidatingAdmissionPolicies (native admission control — this
+# cluster deliberately runs no Kyverno/Gatekeeper).
+#
+# These live in their own bundle because a policy is cluster-scoped while the
+# namespace it guards is not: a tenant bundle like tenant-1/ pins `namespace:`
+# so nothing it ships can escape that namespace, and Fleet rightly refuses a
+# cluster-scoped object there ("invalid cluster scoped object ... your config
+# uses targetNamespace or namespace"). Keeping the tenant bundle hard-scoped is
+# worth more than co-locating the policy, so the policies live here instead and
+# each binding selects its target namespace by label.
+defaultNamespace: kube-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25

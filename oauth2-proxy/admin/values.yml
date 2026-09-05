@@ -1,0 +1,74 @@
+replicaCount: 2
+
+config:
+  provider: keycloak-oidc
+  cookieName: mdapi-admin
+  existingSecret: oauth2-proxy-admin-credentials 
+  configFile: |-
+    provider="keycloak-oidc"
+    provider_display_name="MDAPI"
+    proxy_prefix="/admin/oauth2"
+    redirect_url="https://auth.mdapi.ch/admin/oauth2/callback"
+    oidc_issuer_url="https://idp.mdapi.ch/realms/tilloch"
+    skip_provider_button=true
+    cookie_domains=["mdapi.ch"]
+    whitelist_domains=[".mdapi.ch"]
+    email_domains=["*"]
+    allowed_roles=["mdapi-admin"]
+sessionStorage:
+  type: redis
+  redis:
+    clientType: sentinel
+    sentinel:
+      masterName: mymaster
+      connectionUrls:
+        - redis://oauth2-proxy-admin-redis-ha:26379
+redis-ha:
+  enabled: true
+  persistentVolume:
+    enabled: false
+  image:
+    repository: zot.mdapi.ch/library/redis
+    tag: 8.2.4-alpine
+    pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: zot-pull
+ingress:
+  enabled: true
+  path: /admin
+  hosts:
+    - auth.mdapi.ch
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      SecRule REQUEST_URI "@rx ^/admin/oauth2/(?:start|auth)" \
+        "id:1000,\
+        phase:1,\
+        pass,\
+        t:none,\
+        nolog,\
+        ctl:ruleRemoveById=949110"
+  tls:
+    - secretName: auth-cert
+      hosts:
+        - auth.mdapi.ch
+image:
+  registry: zot.mdapi.ch
+  repository: oauth2-proxy/oauth2-proxy
+  tag: v7.15.2
+  pullPolicy: IfNotPresent
+imagePullSecrets:
+  - name: zot-pull
+      
+# SSO path underpins the portal + gated apps (2026-07-04 N-1 program)
+priorityClassName: mdapi-critical

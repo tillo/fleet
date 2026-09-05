@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openobserve-config
+  namespace: openobserve
+data:
+  # Single-node mode, writes Parquet to Ceph RGW S3 (migrated off the in-cluster
+  # Garage 2026-06-17 — RGW benchmarked ~3-7x faster). Metadata = local SQLite on
+  # PVC. WAL + cache also on PVC. ZO_S3_FORCE_PATH_STYLE is required (RGW user is
+  # addressed path-style here).
+  ZO_HTTP_PORT: "5080"
+  ZO_GRPC_PORT: "5081"
+  ZO_DATA_DIR: "/data/"
+  ZO_LOCAL_MODE: "true"
+  ZO_LOCAL_MODE_STORAGE: "s3"
+  ZO_S3_PROVIDER: "s3"
+  ZO_S3_SERVER_URL: "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:80"
+  ZO_S3_REGION_NAME: "us-east-1"
+  ZO_S3_BUCKET_NAME: "openobserve"
+  ZO_S3_FORCE_PATH_STYLE: "true"
+  ZO_TELEMETRY: "false"
+  # Default per-stream retention. Per-stream override can set 0 (this default) or
+  # a different value via PUT /api/<org>/streams/<stream>/settings.
+  ZO_DATA_RETENTION_DAYS: "7"
+  # AI assistant (EE only), 2026-09-01. These two are ALL OpenObserve itself
+  # needs — the model provider, model name and API key live on the o2-sre-agent
+  # Deployment, so no LLM credential is held by the log store. Without
+  # O2_AGENT_URL the chat endpoint answers 400 "AI agent URL is not set" even
+  # with O2_AI_ENABLED=true, because OpenObserve only proxies to the agent.
+  O2_AI_ENABLED: "true"
+  O2_AGENT_URL: "http://o2-sre-agent.openobserve.svc.cluster.local:8000"

@@ -1,0 +1,224 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transmission-pia
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: transmission-pia
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: transmission-pia
+    spec:
+      priorityClassName: mdapi-low
+      initContainers:
+      - name: disable-ipv6
+        command:
+        - /bin/sysctl
+        args:
+        - -w
+        - net.ipv6.conf.all.disable_ipv6=1
+        image: docker.io/busybox
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+      containers:
+      - name: transmission
+        image: lscr.io/linuxserver/transmission:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 9091
+        # Initial seed only — VPA Auto (vpa-objects/vpa-auto.yaml)
+        # rewrites requests/limits per actual usage. 5 GiB matches the
+        # observed steady-state of the swarm (~3 GiB) + 60 % headroom
+        # so the first replay after a Fleet bump doesn't kick the OOM
+        # cycle that hit radarr on 2026-06-04.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 5Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        volumeMounts:
+        - name: transmission-config
+          mountPath: /config
+        - name: tv
+          mountPath: /downloads/complete
+          subPath: Torrents/Finish
+
+        ## Phase-2 split: tv-finish-{film,serie} sub-mounts shadow
+
+        ## /downloads/complete/Film and /Serie inside the tv subPath.
+
+        - name: tv-finish-film
+
+          mountPath: /downloads/complete/Film
+
+        - name: tv-finish-serie
+
+          mountPath: /downloads/complete/Serie
+        ## Phase-1 of the tv/tv split: incomplete-dir moved off the shared
+        ## tv volume onto its own PVC. Keeps Transmission's high-churn
+        ## .part writes off the big RWX share + lets us snapshot it on a
+        ## different cadence (none, vs the library's daily).
+        - name: tv-incomplete
+          mountPath: /downloads/incomplete
+        - name: tv
+          mountPath: /watch
+          subPath: Torrents/Start
+      - name: pia
+        image: thrnz/docker-wireguard-pia:latest
+        imagePullPolicy: Always
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: LOC
+          value: swiss
+        - name: LOCAL_NETWORK
+          value: '10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/22'
+        - name: VPNDNS
+          value: '45.90.28.16, 45.90.30.16'
+        - name: KEEPALIVE
+          value: '25'
+        - name: PORT_FORWARDING
+          value: '1'
+        - name: PORT_PERSIST
+          value: '1'
+        - name: PORT_FATAL
+          value: '1'
+        ## EXIT_ON_FATAL=0 (was 1) — phase-2 change. Previously a single PIA
+        ## auth failure killed the container and looped the whole pod, taking
+        ## transmission offline. The port-manager sidecar now detects PIA
+        ## health (wg0 + recent handshake) and falls transmission over to the
+        ## static router-forwarded port. Let PIA keep retrying in-place instead
+        ## of bouncing the pod.
+        - name: EXIT_ON_FATAL
+          value: '0'
+        - name: ACTIVE_HEALTHCHECKS
+          value: '1'
+        - name: HEALTHCHECK_PING_TARGET
+          value: '31.3.128.49, test-ipv6.alpinedc.ch'
+        - name: RECONNECT
+          value: '1'
+        # Reset /etc/resolv.conf before the run script reads original_nameserver.
+        # openresolv (run by wg-quick) overwrites this file with VPN DNS, and the
+        # file is a host bind-mount that survives container restarts — without
+        # this, a restart locks DNS bootstrap behind a not-yet-up wg0.
+        - name: PRE_UP
+          value: 'printf "nameserver 10.53.0.10\n" > /etc/resolv.conf'
+        ## POST_UP/POST_RECONNECT used to call transmission-remote -p here.
+        ## That responsibility moved to the port-manager sidecar, which reads
+        ## /pia-shared/port.dat (PIA writes it itself) and sets the port via
+        ## the same RPC. Leaving these hooks in would race the manager.
+        envFrom:
+          - secretRef:
+              name: pia-env-secret
+        securityContext:
+          capabilities:
+            add:
+              - NET_ADMIN
+        volumeMounts:
+        - name: pia-shared
+          mountPath: /pia-shared
+      ## port-manager — arbitrates between PIA port and static fallback.
+      ## See ConfigMap transmission-port-manager for the script + state machine.
+      - name: port-manager
+        ## alpine:3, not :latest — `3` is bounded to the Alpine 3.x line, while
+        ## `latest` will silently cross into Alpine 4.x. Same digest today (both
+        ## resolve to 3.24.1). Lane A: `3` is a major-line tag, so Keel follows
+        ## 3.x minors on its own and cannot dead-end. Always is REQUIRED here:
+        ## a non-latest tag would otherwise default to IfNotPresent and the
+        ## kubelet would serve a cached digest, so Keel's restart would be a
+        ## silent no-op.
+        image: alpine:3
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # apk-add through the same netns as the pia container. As soon as
+          # pia runs `wg-quick up wg0` it installs an iptables drop for all
+          # untunnelled traffic, then sets wg0 as the default route — so the
+          # first ~10s after pod start the alpine CDN is unreachable, then
+          # it's reachable again via the tunnel. Retry until success.
+          i=0
+          while ! apk add --no-cache transmission-remote wireguard-tools openssh-client >/dev/null 2>&1; do
+            i=$((i + 1))
+            [ "$i" -ge 60 ] && { echo "FATAL: apk add did not succeed in 5 min"; exit 1; }
+            echo "apk add: try $i/60 failed, sleeping 5s (waiting for PIA tunnel)"
+            sleep 5
+          done
+          echo "apk add: tools installed"
+          install -m 0600 /etc/probe-ssh-raw/key /tmp/probe.key
+          install -m 0644 /etc/probe-ssh-raw/known_hosts /tmp/known_hosts
+          # Manager reads its key/known_hosts from /etc/probe-ssh; symlink to /tmp copies.
+          mkdir -p /etc/probe-ssh
+          ln -sf /tmp/probe.key /etc/probe-ssh/key
+          ln -sf /tmp/known_hosts /etc/probe-ssh/known_hosts
+          exec /bin/sh /script/manage.sh
+        securityContext:
+          # NET_ADMIN: `wg show` reads wireguard interface state via netlink.
+          capabilities:
+            add:
+              - NET_ADMIN
+        volumeMounts:
+        - name: pia-shared
+          mountPath: /pia-shared
+          readOnly: true
+        - name: port-manager-script
+          mountPath: /script
+          readOnly: true
+        - name: probe-ssh
+          mountPath: /etc/probe-ssh-raw
+          readOnly: true
+      volumes:
+      - name: transmission-config
+        persistentVolumeClaim:
+          claimName: transmission-config
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph
+
+      - name: tv-finish-film
+
+        persistentVolumeClaim:
+
+          claimName: tv-finish-film-ceph
+
+      - name: tv-finish-serie
+
+        persistentVolumeClaim:
+
+          claimName: tv-finish-serie-ceph
+      - name: tv-incomplete
+        persistentVolumeClaim:
+          claimName: tv-incomplete-ceph
+      ## Shared IPC between pia (writer) and port-manager (reader). Holds
+      ## /pia-shared/port.dat — the PIA-forwarded port number.
+      - name: pia-shared
+        emptyDir: {}
+      - name: port-manager-script
+        configMap:
+          name: transmission-port-manager
+          defaultMode: 0755
+      - name: probe-ssh
+        secret:
+          secretName: transmission-probe-ssh
+          defaultMode: 0400

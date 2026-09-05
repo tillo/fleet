@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      priorityClassName: mdapi-critical
+      serviceAccountName: keycloak
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: keycloak
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: keycloak
+          image: zot.mdapi.ch/mdapi/keycloak:latest
+          imagePullPolicy: Always
+          args: ["start", "--optimized"]
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: KC_HOSTNAME
+              value: https://idp.mdapi.ch
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://postgres.keycloak.svc.cluster.local/keycloak
+            - name: KC_DB_USERNAME
+              value: keycloak
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+          envFrom:
+            - secretRef:
+                name: keycloak-env-secret
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1024Mi
+            limits:
+              memory: 1536Mi
+          # Custom login theme "mdapi" — adds the "request an account" link to the
+          # login page without enabling Keycloak self-registration. A theme is a
+          # plain resource directory, NOT a provider jar, so it needs no `kc.sh
+          # build` and is compatible with `start --optimized` above. Keycloak
+          # caches themes: editing the ConfigMap needs a pod restart to show up.
+          volumeMounts:
+            - name: theme-mdapi
+              mountPath: /opt/keycloak/themes/mdapi
+              readOnly: true
+      volumes:
+        # Each item path carries the subdirectory, which is what gives the theme
+        # its required <theme>/<type>/ layout from one flat ConfigMap.
+        - name: theme-mdapi
+          configMap:
+            name: keycloak-theme-mdapi
+            items:
+              - key: theme.properties
+                path: login/theme.properties
+              - key: footer.ftl
+                path: login/footer.ftl
+              - key: messages_en.properties
+                path: login/messages/messages_en.properties
+              - key: messages_it.properties
+                path: login/messages/messages_it.properties
+              - key: messages_de.properties
+                path: login/messages/messages_de.properties
+              - key: messages_fr.properties
+                path: login/messages/messages_fr.properties
+              - key: messages_pl.properties
+                path: login/messages/messages_pl.properties

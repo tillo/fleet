@@ -1,0 +1,55 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecAction "id:900200,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      ## External clients (Azure-hosted oauth proxies, older SDKs) emit RFC 2109
+      ## V1 cookies on the OIDC auth redirect. That trips two CRS rules:
+      ##   921250 (Old Cookies V1 usage) matches $Version: 1 in REQUEST_COOKIES
+      ##   932160 (Unix Shell Code Found) substring-matches $PATH against the
+      ##          cookie attribute name $Path
+      ## Both are known low-signal CRS over-matches. Scope-disable them only on
+      ## the OIDC authorize endpoint; the rest of Keycloak (admin, account,
+      ## token, userinfo) keeps the full ruleset.
+      ## We use ctl:ruleRemoveByTag=OWASP_CRS rather than ctl:ruleRemoveById=NNN
+      ## because in libmodsecurity-nginx v3 a phase-1 ctl:ruleRemoveById set
+      ## before the CRS Include does not reliably propagate to phase-2 rules
+      ## like 921250. ruleRemoveByTag is processed at rule-registration time
+      ## and works regardless of phase. See CRS CHANGES.md and the parallel
+      ## carveouts in fleet/owncloud/owncloud-ing.yml. Scope is the OIDC
+      ## authorize endpoint -- a narrow, server-implemented Keycloak surface
+      ## where broad CRS removal is acceptable.
+      SecRule REQUEST_URI "@rx ^/realms/[^/]+/protocol/openid-connect/auth" \
+        "id:1003,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+    nginx.ingress.kubernetes.io/proxy-buffers-number: "4"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: idp.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: keycloak
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - idp.mdapi.ch
+      secretName: keycloak-cert

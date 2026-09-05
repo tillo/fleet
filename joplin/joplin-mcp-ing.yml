@@ -1,0 +1,52 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: joplin-mcp
+  namespace: joplin
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecDebugLog /tmp/modsec_debug.log
+      # MCP JSON-RPC endpoint receives arbitrary technical content (notes, code,
+      # log excerpts, command history) that routinely trips CRS body checks.
+      # Endpoint is bearer-token authenticated; auth is the protection layer.
+      # First trigger: 921110 false-matched the phrase "apply_patch returned http/2"
+      # inside a note body (2026-05-31).
+      SecRule REQUEST_URI "@beginsWith /mcp" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # 921110 binds REQUEST_LINE (phase 1) plus REQUEST_BODY (phase 2) and the
+      # phase-1 ctl above does not catch it reliably. Probe verified 2026-05-31:
+      # SQLi + RCE patterns pass through to 401, the 921110 trigger phrase still
+      # 403d until removed by ID here. This ingress only serves /mcp so the
+      # unconditional removal is in scope.
+      SecRuleRemoveById 921110
+    # SSE requires disabling proxy buffering
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: notes-mcp.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: joplin-mcp
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - notes-mcp.mdapi.ch
+      secretName: joplin-mcp-cert

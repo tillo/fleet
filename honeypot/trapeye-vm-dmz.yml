@@ -1,0 +1,110 @@
+## TrapEye honeypot VM (trapeye-vm-dmz) — adopted into Fleet 2026-09-02.
+##
+## Pre-existing hand-built VM, RUNNING. This manifest describes what is already
+## running so the existing honeypot bundle can own it; nothing is recreated and
+## the VM is not restarted (`kubectl diff` against the live object is empty).
+##
+## Boot disk comes from Harvester image honeypot/image-26md6 via the OLDER
+## StorageClass naming convention `longhorn-<image name>` (newer imports use
+## `lh-<image uid>`). Both conventions are live on this cluster.
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: trapeye-vm-dmz
+  namespace: honeypot
+  labels:
+    harvesterhci.io/creator: harvester
+    harvesterhci.io/os: linux
+  annotations:
+    harvesterhci.io/volumeClaimTemplates: '[{"metadata":{"name":"trapeye-vm-dmz-disk-0-tswgq","annotations":{"harvesterhci.io/imageId":"honeypot/image-26md6"}},"spec":{"accessModes":["ReadWriteMany"],"resources":{"requests":{"storage":"10Gi"}},"volumeMode":"Block","storageClassName":"longhorn-image-26md6"}}]'
+    ## Pinned so a Fleet-driven recreate keeps the L2 identity on dmz.
+    harvesterhci.io/mac-address: '{"dmz":"7e:a9:94:f6:2a:20"}'
+    network.harvesterhci.io/ips: '[]'
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        harvesterhci.io/vmName: trapeye-vm-dmz
+      annotations:
+        harvesterhci.io/sshNames: '["default/tillo-exion","mdapirancher/martino.dellambrogio-mdambp"]'
+    spec:
+      architecture: amd64
+      hostname: trapeye-vm-dmz
+      evictionStrategy: LiveMigrateIfPossible
+      terminationGracePeriodSeconds: 120
+
+      ## Injected by the Harvester network controller for VMs on a mgmt-network
+      ## NAD; declared so git matches what actually lands.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: network.harvesterhci.io/mgmt
+                    operator: In
+                    values:
+                      - "true"
+
+      domain:
+        cpu:
+          cores: 2
+          sockets: 1
+          threads: 1
+          maxSockets: 1
+        memory:
+          guest: 4Gi
+        ## Limits only. Harvester's overcommit webhook derives the requests
+        ## (125m / 2730Mi here) from cluster-wide ratios, so those are excluded
+        ## from the diff in fleet.yaml rather than hard-coded.
+        resources:
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        ## Only a uuid exists on the live object; no serial is generated here.
+        firmware:
+          uuid: 1842d9d7-4008-5027-87a7-c7cf99cab900
+        features:
+          acpi:
+            enabled: true
+        machine:
+          type: q35
+        devices:
+          inputs:
+            - name: tablet
+              type: tablet
+              bus: usb
+          disks:
+            - name: disk-0
+              bootOrder: 1
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: dmz
+              model: virtio
+              macAddress: "7e:a9:94:f6:2a:20"
+              bridge: {}
+
+      networks:
+        - name: dmz
+          multus:
+            networkName: default/dmz
+
+      volumes:
+        - name: disk-0
+          persistentVolumeClaim:
+            claimName: trapeye-vm-dmz-disk-0-tswgq
+        ## Secret trapeye-vm-dmz-hqlge is pre-existing and deliberately NOT declared: its
+        ## user-data carries authorized_keys, which this publicly mirrored repo
+        ## must not hold. Bringing it under Fleet means an ExternalSecret
+        ## sourcing the keys from Akeyless, as ripe-atlas does.
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            secretRef:
+              name: trapeye-vm-dmz-hqlge
+            networkDataSecretRef:
+              name: trapeye-vm-dmz-hqlge

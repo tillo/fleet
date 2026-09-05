@@ -1,0 +1,158 @@
+# Mail stack + GitLab core VPA objects
+# docker-mailserver: Off — single replica, mail availability risk on eviction
+# gitlab-webservice/sidekiq: memory-only — CPU managed by HPA
+# gitaly/redis: Off — StatefulSets
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: docker-mailserver
+  namespace: mail
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: docker-mailserver
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 500m
+        memory: 1Gi
+      maxAllowed:
+        cpu: "4"
+        memory: 6Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: roundcube
+  namespace: mail
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: roundcube
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 5m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: roundcube-mariadb
+  namespace: mail
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: roundcube-mariadb
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 1Gi
+---
+# gitlab-webservice: memory only — CPU managed by HPA
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: gitlab-webservice-default
+  namespace: bootstrap
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gitlab-webservice-default
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      controlledResources: ["memory"]
+      minAllowed:
+        memory: 2Gi
+      maxAllowed:
+        memory: 8Gi
+---
+# gitlab-sidekiq: memory only — CPU managed by HPA
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: gitlab-sidekiq-all-in-1-v2
+  namespace: bootstrap
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gitlab-sidekiq-all-in-1-v2
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      controlledResources: ["memory"]
+      minAllowed:
+        memory: 1Gi
+      maxAllowed:
+        memory: 4Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: gitlab-gitaly
+  namespace: bootstrap
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: gitlab-gitaly
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 256Mi
+      maxAllowed:
+        cpu: "1"
+        memory: 2Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: gitlab-redis-master
+  namespace: bootstrap
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: gitlab-redis-master
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi

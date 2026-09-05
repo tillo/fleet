@@ -1,0 +1,292 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claude-shim-app
+  namespace: litellm
+data:
+  server.js: |
+    // claude-shim: OpenAI-compatible /v1/chat/completions backed by headless
+    // Claude Code (subscription OAuth via CLAUDE_CODE_OAUTH_TOKEN). No npm deps.
+    'use strict';
+    const http = require('http');
+    const { spawn } = require('child_process');
+    const { randomUUID } = require('crypto');
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+
+    const PORT = parseInt(process.env.PORT || '8085', 10);
+    const API_KEY = process.env.SHIM_API_KEY || ''; // empty = no auth (ClusterIP only)
+    const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+    const TIMEOUT_MS = parseInt(process.env.SHIM_TIMEOUT_MS || '300000', 10);
+    const MAX_CONCURRENT = parseInt(process.env.SHIM_MAX_CONCURRENT || '2', 10);
+    const MAX_QUEUE = parseInt(process.env.SHIM_MAX_QUEUE || '10', 10);
+    const MODELS = (process.env.SHIM_MODELS ||
+      'claude-fable-5,claude-opus-5,claude-sonnet-5,claude-haiku-4-5')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const DEFAULT_SYSTEM = process.env.SHIM_DEFAULT_SYSTEM || 'You are a helpful assistant.';
+
+    let active = 0;
+    const queue = [];
+    function acquire() {
+      return new Promise((resolve, reject) => {
+        if (active < MAX_CONCURRENT) { active++; resolve(); }
+        else if (queue.length >= MAX_QUEUE) reject(Object.assign(new Error('server busy'), { code: 429 }));
+        else queue.push(resolve);
+      });
+    }
+    function release() {
+      const next = queue.shift();
+      if (next) next(); else active--;
+    }
+
+    function textOf(content) {
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) {
+        return content.filter(p => p.type === 'text').map(p => p.text).join('\n');
+      }
+      return content == null ? '' : String(content);
+    }
+
+    // Collect OpenAI image_url parts (data: URLs) as anthropic image blocks.
+    function imagesOf(content) {
+      if (!Array.isArray(content)) return [];
+      const out = [];
+      for (const p of content) {
+        if (p.type !== 'image_url') continue;
+        const url = typeof p.image_url === 'string' ? p.image_url : (p.image_url || {}).url || '';
+        const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(url);
+        if (!m) throw Object.assign(new Error('only data: base64 image URLs are supported'), { code: 400 });
+        out.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } });
+      }
+      return out;
+    }
+
+    function buildTurn(messages) {
+      const sys = messages.filter(m => m.role === 'system' || m.role === 'developer')
+        .map(m => textOf(m.content)).join('\n\n');
+      const convo = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
+      if (convo.length === 0) throw Object.assign(new Error('no user messages'), { code: 400 });
+      let images = [];
+      for (const m of convo) if (m.role === 'user') images = images.concat(imagesOf(m.content));
+      let prompt;
+      if (convo.length === 1 && convo[0].role === 'user') {
+        prompt = textOf(convo[0].content);
+      } else {
+        prompt = convo.map(m =>
+          `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${textOf(m.content)}`).join('\n\n') +
+          '\n\nAssistant:';
+      }
+      const blocks = images.concat([{ type: 'text', text: prompt || '(empty)' }]);
+      return { system: sys || DEFAULT_SYSTEM, blocks };
+    }
+
+    function runClaude(model, system, blocks, onAssistantText) {
+      return new Promise((resolve, reject) => {
+        const sysFile = path.join(os.tmpdir(), `shim-sys-${randomUUID()}.txt`);
+        fs.writeFileSync(sysFile, system);
+        const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'shim-cwd-'));
+        const args = ['-p', '--verbose',
+          '--input-format', 'stream-json', '--output-format', 'stream-json',
+          '--model', model, '--tools', '', '--no-session-persistence',
+          '--strict-mcp-config', '--system-prompt-file', sysFile,
+          '--exclude-dynamic-system-prompt-sections'];
+        const child = spawn(CLAUDE_BIN, args, {
+          cwd, env: { ...process.env, DISABLE_AUTOUPDATER: '1', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        const killTimer = setTimeout(() => { child.kill('SIGKILL'); }, TIMEOUT_MS);
+        let stderr = '', buf = '', result = null, emitted = '';
+        child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: blocks } }) + '\n');
+        child.stdin.end();
+        child.stderr.on('data', d => { stderr += d; });
+        child.stdout.on('data', d => {
+          buf += d;
+          let idx;
+          while ((idx = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+            let ev; try { ev = JSON.parse(line); } catch { continue; }
+            if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+              for (const b of ev.message.content) {
+                if (b.type === 'text' && b.text) { emitted += b.text; if (onAssistantText) onAssistantText(b.text); }
+              }
+            } else if (ev.type === 'result') result = ev;
+          }
+        });
+        child.on('error', e => { clearTimeout(killTimer); cleanup(); reject(e); });
+        child.on('close', code => {
+          clearTimeout(killTimer); cleanup();
+          if (!result) {
+            const msg = code === null || code === 137
+              ? `claude timed out after ${TIMEOUT_MS} ms`
+              : `claude exited ${code} without result: ${stderr.slice(0, 400)}`;
+            return reject(Object.assign(new Error(msg), { code: code === 137 ? 504 : 500 }));
+          }
+          if (result.is_error) return reject(Object.assign(
+            new Error(`claude error: ${String(result.result || '').slice(0, 400)}`), { code: 500 }));
+          resolve({ text: result.result || emitted, emitted, usage: result.usage || {} });
+        });
+        function cleanup() { try { fs.unlinkSync(sysFile); } catch {} try { fs.rmSync(cwd, { recursive: true, force: true }); } catch {} }
+      });
+    }
+
+    function usageOut(u) {
+      const prompt = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+      return { prompt_tokens: prompt, completion_tokens: u.output_tokens || 0, total_tokens: prompt + (u.output_tokens || 0) };
+    }
+
+    // Map OpenAI Responses API input to chat-completions-style messages.
+    function responsesToMessages(payload) {
+      const messages = [];
+      if (payload.instructions) messages.push({ role: 'system', content: String(payload.instructions) });
+      const input = payload.input;
+      if (typeof input === 'string') { messages.push({ role: 'user', content: input }); return messages; }
+      if (!Array.isArray(input)) throw Object.assign(new Error('unsupported input'), { code: 400 });
+      for (const item of input) {
+        const role = item.role || (item.type === 'message' ? 'user' : null);
+        if (!role) continue; // skip non-message items (tool calls etc.)
+        let content = item.content;
+        if (Array.isArray(content)) {
+          content = content.map(p => {
+            if (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text') return { type: 'text', text: p.text || '' };
+            if (p.type === 'input_image') {
+              const url = typeof p.image_url === 'string' ? p.image_url : (p.image_url || {}).url || '';
+              return { type: 'image_url', image_url: { url } };
+            }
+            return { type: 'text', text: `[${p.type}]` };
+          });
+        }
+        messages.push({ role, content });
+      }
+      return messages;
+    }
+
+    function responseObj(id, created, model, status, text, usage) {
+      return {
+        id, object: 'response', created_at: created, status, model,
+        error: null, incomplete_details: null, instructions: null, metadata: {},
+        parallel_tool_calls: false, tool_choice: 'none', tools: [],
+        output: status === 'completed' ? [{
+          type: 'message', id: `msg_${id}`, status: 'completed', role: 'assistant',
+          content: [{ type: 'output_text', text, annotations: [] }],
+        }] : [],
+        usage: usage ? {
+          input_tokens: usage.prompt_tokens, output_tokens: usage.completion_tokens,
+          total_tokens: usage.total_tokens,
+          input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+        } : null,
+      };
+    }
+
+    function send(res, code, obj) {
+      const body = JSON.stringify(obj);
+      res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+      res.end(body);
+    }
+    function oaiError(res, code, message) {
+      send(res, code, { error: { message, type: 'shim_error', code } });
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const url = req.url.split('?')[0];
+      if (req.method === 'GET' && (url === '/health' || url === '/health/liveliness')) {
+        return send(res, 200, { status: 'ok', active, queued: queue.length });
+      }
+      if (API_KEY) {
+        const auth = req.headers.authorization || '';
+        if (auth !== `Bearer ${API_KEY}`) return oaiError(res, 401, 'invalid api key');
+      }
+      if (req.method === 'GET' && url === '/v1/models') {
+        return send(res, 200, { object: 'list', data: MODELS.map(id => ({ id, object: 'model', owned_by: 'claude-shim' })) });
+      }
+      if (req.method === 'POST' && url === '/v1/responses') {
+        let rbody = '';
+        req.on('data', d => { rbody += d; if (rbody.length > 64 * 1024 * 1024) req.destroy(); });
+        req.on('end', async () => {
+          let payload;
+          try { payload = JSON.parse(rbody); } catch { return oaiError(res, 400, 'invalid JSON'); }
+          const model = payload.model || MODELS[0];
+          if (!MODELS.includes(model)) return oaiError(res, 404, `model '${model}' not in [${MODELS.join(', ')}]`);
+          let turn;
+          try { turn = buildTurn(responsesToMessages(payload)); } catch (e) { return oaiError(res, e.code || 400, e.message); }
+          try { await acquire(); } catch { return oaiError(res, 429, 'shim at capacity, retry later'); }
+          const id = `resp_${randomUUID().replace(/-/g, '')}`;
+          const created = Math.floor(Date.now() / 1000);
+          try {
+            if (payload.stream) {
+              res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+              let seq = 0;
+              const ev = (type, extra) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: seq++, ...extra })}\n\n`);
+              const itemId = `msg_${id}`;
+              ev('response.created', { response: responseObj(id, created, model, 'in_progress', '', null) });
+              ev('response.output_item.added', { output_index: 0, item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] } });
+              ev('response.content_part.added', { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+              const r = await runClaude(model, turn.system, turn.blocks,
+                t => ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: t }));
+              if (!r.emitted && r.text) ev('response.output_text.delta', { item_id: itemId, output_index: 0, content_index: 0, delta: r.text });
+              ev('response.output_text.done', { item_id: itemId, output_index: 0, content_index: 0, text: r.text });
+              ev('response.content_part.done', { item_id: itemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: r.text, annotations: [] } });
+              ev('response.output_item.done', { output_index: 0, item: { type: 'message', id: itemId, status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: r.text, annotations: [] }] } });
+              ev('response.completed', { response: responseObj(id, created, model, 'completed', r.text, usageOut(r.usage)) });
+              res.end();
+            } else {
+              const r = await runClaude(model, turn.system, turn.blocks, null);
+              send(res, 200, responseObj(id, created, model, 'completed', r.text, usageOut(r.usage)));
+            }
+          } catch (e) {
+            if (!res.headersSent) oaiError(res, e.code || 500, e.message);
+            else { try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', message: e.message })}\n\n`); res.end(); } catch {} }
+          } finally { release(); }
+        });
+        return;
+      }
+      if (req.method !== 'POST' || url !== '/v1/chat/completions') {
+        console.log(`404 ${req.method} ${url}`);
+        return oaiError(res, 404, 'not found');
+      }
+
+      let body = '';
+      req.on('data', d => { body += d; if (body.length > 64 * 1024 * 1024) req.destroy(); });
+      req.on('end', async () => {
+        let payload;
+        try { payload = JSON.parse(body); } catch { return oaiError(res, 400, 'invalid JSON'); }
+        const model = payload.model || MODELS[0];
+        if (!MODELS.includes(model)) return oaiError(res, 404, `model '${model}' not in [${MODELS.join(', ')}]`);
+        let turn;
+        try { turn = buildTurn(payload.messages || []); } catch (e) { return oaiError(res, e.code || 400, e.message); }
+        try { await acquire(); } catch (e) { return oaiError(res, 429, 'shim at capacity, retry later'); }
+        const id = `chatcmpl-${randomUUID()}`;
+        const created = Math.floor(Date.now() / 1000);
+        try {
+          if (payload.stream) {
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+            const chunk = (delta, finish) => res.write('data: ' + JSON.stringify({
+              id, object: 'chat.completion.chunk', created, model,
+              choices: [{ index: 0, delta, finish_reason: finish || null }],
+            }) + '\n\n');
+            chunk({ role: 'assistant' });
+            const r = await runClaude(model, turn.system, turn.blocks, t => chunk({ content: t }));
+            if (!r.emitted && r.text) chunk({ content: r.text });
+            chunk({}, 'stop');
+            res.write('data: ' + JSON.stringify({
+              id, object: 'chat.completion.chunk', created, model,
+              choices: [], usage: usageOut(r.usage),
+            }) + '\n\n');
+            res.write('data: [DONE]\n\n');
+            res.end();
+          } else {
+            const r = await runClaude(model, turn.system, turn.blocks, null);
+            send(res, 200, {
+              id, object: 'chat.completion', created, model,
+              choices: [{ index: 0, message: { role: 'assistant', content: r.text }, finish_reason: 'stop' }],
+              usage: usageOut(r.usage),
+            });
+          }
+        } catch (e) {
+          if (!res.headersSent) oaiError(res, e.code || 500, e.message);
+          else { try { res.write('data: ' + JSON.stringify({ error: { message: e.message } }) + '\n\n'); res.end(); } catch {} }
+        } finally { release(); }
+      });
+    });
+
+    server.listen(PORT, () => console.log(`claude-shim listening on :${PORT}, models=[${MODELS.join(', ')}], max_concurrent=${MAX_CONCURRENT}`));

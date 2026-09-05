@@ -1,0 +1,72 @@
+## Restic repo secret for the VolSync backup of spider3-data-ceph (PVC-audit G4,
+## beads infra-jjb). Shared /mdapi/volsync/ceph-backup creds, per-PVC subpath
+## in the offsite-swept external-Garage ceph-backup bucket.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: spider3
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that hostname
+        ## resolves to the shared ingress VIP, so every backup hairpinned through
+        ## ingress-nginx and would fail exactly when the front door is degraded --
+        ## which is when a backup matters most. restic encrypts client-side and S3
+        ## auth is a SigV4 signature, so losing the ingress TLS costs no
+        ## confidentiality: Garage has no TLS listener of its own, and the ingress
+        ## already re-emitted plaintext to these same LAN hosts. Same bucket and
+        ## path, so the existing restic repository is untouched.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/spider3-data-ceph"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+## spider3 user file storage (web + SFTPGo double-mount) — data is owned by
+## the sftpgo uid 10006 / gid 33 (www-data), incl. 0700/0640 entries, so the
+## mover MUST run as that identity to read everything.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: spider3-data-ceph
+  namespace: spider3
+spec:
+  sourcePVC: spider3-data-ceph
+  trigger:
+    schedule: "30 3 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    moverSecurityContext:
+      runAsUser: 10006
+      runAsGroup: 33
+      # fsGroup keeps the restic cache volume accessible if the mover uid
+      # ever changes again (the uid-1000 seed left a root-y cache behind)
+      fsGroup: 33
+      runAsNonRoot: true
+    cacheCapacity: 2Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

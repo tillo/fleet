@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-mcp-caddy
+data:
+  Caddyfile: |
+    :8080 {
+      @authed query token={$AUTH_TOKEN}
+      handle @authed {
+        reverse_proxy localhost:9090 {
+          header_up Host "localhost"
+          header_up Origin "http://localhost"
+          header_up -Sec-Fetch-Site
+          header_up -Sec-Fetch-Mode
+          header_up -Sec-Fetch-Dest
+        }
+      }
+      respond "Unauthorized" 401
+    }

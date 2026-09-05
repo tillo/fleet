@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openldap
+  namespace: openldap
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: openldap
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: openldap
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+      - name: openldap
+        image: nfrastack/openldap:latest
+        resources: {}
+        ports:
+        - containerPort: 389
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: DOMAIN
+          value: mdapi.ch
+        - name: BASE_DN
+          value: dc=mdapi,dc=ch
+        - name: ORGANIZATION
+          value: MDAPI
+        - name: BACKUP_RETENTION
+          value: '43200'
+        - name: ENABLE_TLS
+          value: 'false'
+        # Image default is 1024, which client connection leaks can exhaust
+        # (2026-07-02: Joplin LDAP SSO leaked ~1000 sockets -> postfix 451s).
+        - name: ULIMIT_N
+          value: '8192'
+        - name: CONTAINER_INIT_POST_COMMAND
+          value: 'ldapadd -c -H ldapi:/// -D cn=admin,${BASE_DN} -w ${ADMIN_PASS} -f /container/data/openldap/config/bootstrap/import/import.ldif'
+        envFrom:
+          - secretRef:
+              name: openldap-env-secret
+        volumeMounts:
+        - name: openldap-data
+          mountPath: /data
+        - name: openldap-import
+          mountPath: /container/data/openldap/config/bootstrap/import/import.ldif
+          subPath: import.ldif
+      volumes:
+      - name: openldap-data
+        persistentVolumeClaim:
+          claimName: openldap-data
+      - name: openldap-import
+        secret:
+          secretName: openldap-import

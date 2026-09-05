@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: threadfin
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: threadfin
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: threadfin
+    spec:
+      priorityClassName: mdapi-low
+      containers:
+      - name: threadfin
+        image: registry.mdapi.ch/mdapi/threadfin:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 34400
+        resources:
+          requests:
+            cpu: 100m
+            memory: 2Gi
+          # Bumped 3Gi → 6Gi on 2026-05-15 after OOMKilled crashloop
+          # (26 restarts in 2h). XMLTV parse pass loads 15 k channels +
+          # 40 k+ programs into memory at peak; 3 Gi was sometimes
+          # enough but not always. 6 Gi gives generous headroom for
+          # provider feed growth.
+          limits:
+            cpu: 1
+            memory: 6Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1001'
+        - name: PGID
+          value: '1001'
+        - name: THREADFIN_PORT
+          value: '34400'
+        volumeMounts:
+        - name: threadfin-config
+          mountPath: /home/threadfin/conf
+      volumes:
+      - name: threadfin-config
+        persistentVolumeClaim:
+          claimName: threadfin-config
+      imagePullSecrets:
+      - name: mdapi-registry

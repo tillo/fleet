@@ -1,0 +1,287 @@
+# mdapi family portal — static Basecoat front-end (repo mdapi/portal, web/)
+# over the Windmill portal endpoints. Served at start.mdapi.ch behind the
+# oauth2-proxy-portal instance (any tilloch-realm user); the ingress forwards
+# the authenticated X-Auth-Request-Email and the pod's nginx injects it
+# server-side into every Windmill call (see web/nginx.conf.template in the
+# repo). Replaced the Lowcoder board (bundle retired at the 2026-07-03
+# cutover, after preview sign-off at panel.mdapi.ch).
+#
+# ── TILE BOARD — THE SOURCE IS mdapi/portal, NOT THIS FILE AND NOT WINDMILL ─
+# The board is the Windmill variable `f/portal/catalogue` (a JSON array), read
+# by f/portal/resolve_board.py via wmill.get_variable(). It is flagged secret,
+# so `wmill sync pull` SKIPS it and the ~/windmill mirror has no copy either.
+#
+# ⛔ But that variable is NOT the source — it is a DEPLOY TARGET. `catalogue.json`
+# in the mdapi/portal repo is the source; deploy_catalogue.py writes it into the
+# variable from a GitLab pipeline SCHEDULE (id 38, `12 */4 * * *` UTC), so the
+# variable is rewritten out of git every four hours whether or not anyone pushed.
+#
+# ⇒ HAND-EDITING THE VARIABLE IS FUTILE: any manual fix survives at most 4 hours.
+#   Change catalogue.json and let the schedule carry it.
+#
+# Read / write it:
+#   GET|POST {WINDMILL}/api/w/mdapi/variables/{get_value,update}/f/portal/catalogue
+# ⚠ SIZE CAP: the value is close to Windmill's per-field limit. At 57 tiles the
+#   compact JSON is 10,857 bytes; writing it with json.dumps() DEFAULT separators
+#   inflates it to ~11.6 KB and the API rejects it with "A field exceeds its
+#   maximum length". Always dump with separators=(',',':'). Descriptions are the
+#   only real slack left.
+#
+# Tile schema:
+#   {name, url, icon (material-design-icons), group, seen_by[], if_locked, kind, desc}
+#   seen_by  : "everyone", a Keycloak group (Family/Friends/Home/mdapi-admin/
+#              mdapi-tv), or an individual username
+#   if_locked: HIDE (default) | REQUEST
+#   kind     : app (default) | request_product | request_help
+#
+# Snapshot 2026-08-28 (desc omitted — cosmetic; url + seen_by are what matter):
+##   [Apps]
+##     MDAPI Docs           https://docs.mdapi.ch                          seen_by=everyone
+##     MDAPI Home           https://mdapi.ch                               seen_by=everyone
+##     Tillo                https://tillo.ch                               seen_by=mdellambrogio
+##     Coiffure Dreams      https://coiffuredreams.ch                      seen_by=ldellambrogio
+##     Dell'Ambrogio        https://dellambrogio.ch                        seen_by=mdapi-admin
+##     Ivo Dell'Ambrogio    https://ivodellambrogio.ch                     seen_by=idellambrogio
+##     Spider3              https://spider3.ch                             seen_by=mmorinini
+##     Spider3 Files        https://spider3.files.mdapi.ch                 seen_by=mmorinini
+##     New Website          (request)                                      seen_by=Family,Friends  kind=request_product  if_locked=REQUEST
+##   [Comms & Docs]
+##     Documents            https://documents.mdapi.ch                     seen_by=Home
+##     Chat                 https://chat.mdapi.ch                          seen_by=everyone
+##     Notes                https://notes.mdapi.ch                         seen_by=everyone
+##     Notes MCP            https://notes-mcp.mdapi.ch                     seen_by=mdapi-admin
+##     Spam Filter          https://rspamd.mdapi.ch                        seen_by=mdapi-admin
+##   [Home & IoT]
+##     AppDaemon            https://appdaemon.mdapi.ch                     seen_by=mdapi-admin
+##     ESPHome              https://esphome.mdapi.ch                       seen_by=mdapi-admin
+##     Home Assistant       https://home.mdapi.ch                          seen_by=Home
+##     NVR                  https://frigate.mdapi.ch                       seen_by=mdapi-admin
+##     Scrypted             https://scrypted.mdapi.ch                      seen_by=mdapi-admin
+##   [Infrastructure]
+##     Harvester            https://harvester.home.tillo.ch                seen_by=mdapi-admin
+##     Rancher              https://rancher-mgmt.home.tillo.ch             seen_by=mdapi-admin
+##     Account (MDAPI)      https://idp.mdapi.ch/realms/tilloch/account/   seen_by=everyone
+##     Account (master)     https://idp.mdapi.ch/realms/master/account/    seen_by=mdapi-admin
+##     IDP                  https://idp.mdapi.ch                           seen_by=mdapi-admin
+##     LAM                  https://lam.mdapi.ch                           seen_by=mdapi-admin
+##     Whoami (admin)       https://auth.mdapi.ch/admin/oauth2/userinfo    seen_by=mdapi-admin
+##     Whoami (tv)          https://auth.mdapi.ch/tv/oauth2/userinfo       seen_by=mdapi-admin
+##     Grafana              https://grafana.mdapi.ch                       seen_by=mdapi-admin
+##     OpenObserve          https://logs.mdapi.ch                          seen_by=mdapi-admin
+##     vmalert              https://vmalert.mdapi.ch                       seen_by=mdapi-admin
+##     vmalertmanager       https://vmalertmanager.mdapi.ch                seen_by=mdapi-admin
+##     DNS Admin            https://nsadmin.mdapi.ch                       seen_by=mdapi-admin
+##     FTTH                 https://ftth.mdapi.ch                          seen_by=mdapi-admin
+##     Honeypot             https://shop.mdapi.ch                          seen_by=mdapi-admin
+##     Technitium DNS       https://dns.mdapi.ch                           seen_by=mdapi-admin
+##     Cribl                https://cribl.mdapi.ch/                        seen_by=mdapi-admin
+##     GitLab               https://gitlab.mdapi.ch                        seen_by=mdapi-admin
+##     MeshCentral          https://help.mdapi.ch                          seen_by=Family,Friends  kind=request_help  if_locked=REQUEST
+##     Windmill             https://windmill.mdapi.ch/                     seen_by=mdapi-admin
+##     Zot                  https://zot.mdapi.ch                           seen_by=mdapi-admin
+##     Ceph                 https://ceph.mdapi.ch                          seen_by=mdapi-admin
+##     CipherTrust          https://cm.home.tillo.ch                       seen_by=mdapi-admin
+##     Nextcloud            https://cloud.mdapi.ch                         seen_by=Family,Friends  if_locked=REQUEST
+##     Santillo             https://santillo.tillo.ch                      seen_by=mdapi-admin
+##   [Media]
+##     Film                 https://radarr.mdapi.ch                        seen_by=mdapi-tv
+##     Serie                https://sonarr.mdapi.ch                        seen_by=mdapi-tv
+##     Sub                  https://bazarr.mdapi.ch                        seen_by=mdapi-admin
+##     TV Files             https://tv.files.mdapi.ch                      seen_by=mdapi-tv
+##     Transcoding          https://tdarr.mdapi.ch                         seen_by=mdapi-admin
+##     Player               https://app.plex.tv/web/app/                   seen_by=mdapi-tv  if_locked=REQUEST
+##     Requests             https://seerr.mdapi.ch                         seen_by=mdapi-tv  if_locked=REQUEST
+##     Announcements        https://autobrr.mdapi.ch                       seen_by=mdapi-admin
+##     BitTorrent           https://transmission.mdapi.ch                  seen_by=mdapi-admin
+##     Source               https://prowlarr.mdapi.ch                      seen_by=mdapi-admin
+##     WebTV Tuner          https://threadfin.mdapi.ch/web                 seen_by=mdapi-admin
+#
+# Corrections applied 2026-08-27 — do NOT reintroduce these from an old backup:
+#   - added Chat (chat.mdapi.ch) — the board had no tile for it at all
+#   - removed Test Cluster (test.mdapi.ch) — decommissioned 2026-07-06, dead
+#   - Rancher repointed to rancher-mgmt.home.tillo.ch — it pointed at the
+#     mbptillo standby, parked cold since 2026-08-10
+#   - OwnCloud renamed Nextcloud — cloud.mdapi.ch has served Nextcloud since
+#     2026-08-17 (verified: status.php reports Nextcloud 33.0.7)
+#
+# ⚠️ Second pass, later the same day: THIS SNAPSHOT AND THE LIVE VARIABLE HAD
+# DRIFTED APART IN BOTH DIRECTIONS. The corrections above were written here but
+# never applied to Windmill (live still had OwnCloud, Rancher on the alias, and
+# no Chat tile), while the live board had meanwhile lost tiles this file still
+# listed. A disaster-recovery snapshot that silently becomes MORE current than
+# the thing it snapshots is worse than none — restoring it would have rolled
+# real fixes back. Reconciled 2026-08-27: live is now 55 tiles, this table
+# matches, and BlueTV Tuner was dropped from both (threadfin-bis.mdapi.ch has no
+# vhost — it 302s to /dashboard/, i.e. the tile reached nothing; retired in the
+# 2026-08-11 Live TV rebuild). Test Cluster likewise removed from live.
+#
+# 🔥 THIRD PASS, 2026-08-28 — the live variable was reverted wholesale: every one
+# of the four corrections above was gone, live read 57 tiles. Re-applied by hand.
+#
+# ✅ FOURTH PASS, 2026-08-28 — reverted AGAIN, and this time the cause was found.
+# It was never a backup restore. `catalogue.json` in mdapi/portal is the source,
+# and pipeline schedule 38 redeploys it every 4 h — so each hand-fix to the
+# variable was simply overwritten by the next scheduled run. Proof: the live value
+# was BYTE-IDENTICAL (10,706 B) to what catalogue.json deploys, and its edited_at
+# 08:14:00Z was 53 s after scheduled pipeline 28116 started at 08:13:07Z.
+# Fixed properly in catalogue.json (mdapi/portal), which the schedule now carries:
+# +Chat, -Test Cluster, -BlueTV Tuner, Rancher → rancher-mgmt, OwnCloud → Nextcloud.
+# 55 tiles / 10,541 B. The two removed URLs were confirmed dead (curl → 000).
+#
+# ⚠️ THE LESSON: three sessions "fixed" this by writing to the variable, and the
+# diagnosis "someone restored a stale backup" was invented to explain why the fix
+# kept vanishing. Nobody checked what WRITES the variable. When a change will not
+# stick, find the writer before theorising about the reverter.
+#
+# ⚠️ This snapshot is therefore a THIRD copy of a list git already owns, and it has
+# now drifted twice. It is kept only as an at-a-glance table; catalogue.json is
+# authoritative and is what a rebuild should restore from. Do not "restore" the
+# variable from this file. Consider deleting the table (beads infra-vv0o — the
+# service inventory already exists in four places).
+#
+# ⚠️ The drift checks did NOT catch any of this: `catalogue_tiles_reach_something`
+# would have flagged the two dead tiles, but nothing alerts on a tile going MISSING
+# or on a URL quietly reverting to a parked-cold alias.
+#
+# ⭐ Drift here is now CHECKED: f/probe/fact_integrity_check fact
+# `catalogue_tiles_reach_something` fails when a tile resolves to the ingress VIP
+# with no vhost behind it, and `service_catalogue` snapshots the tile names so an
+# add/removal shows up. Neither watches THIS file, though — if you edit the
+# snapshot, apply the same change to the variable in the same sitting.
+# ───────────────────────────────────────────────────────────────────────────
+---
+# Scoped Windmill token (resolve_board + the three request runnables only).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: portal-windmill-token
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: portal-windmill-token
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/portal/windmill-token/token
+      secretKey: token
+---
+# Pull secret for zot.mdapi.ch, templated from the zot htpasswd password.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-pull
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-pull
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    template:
+      type: kubernetes.io/dockerconfigjson
+      engineVersion: v2
+      mergePolicy: Replace
+      data:
+        .dockerconfigjson: |
+          {"auths":{"zot.mdapi.ch":{"username":"zot","password":"{{ .password }}","auth":"{{ printf "zot:%s" .password | b64enc }}"}}}
+  data:
+    - remoteRef:
+        key: /mdapi/zot/zot-auth/password
+      secretKey: password
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal
+  # Floating :latest tracked by Keel; reloader restarts on token rotation.
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: portal
+  template:
+    metadata:
+      labels:
+        app: portal
+    spec:
+      priorityClassName: mdapi-critical
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: portal
+          image: zot.mdapi.ch/mdapi/portal:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          env:
+            # Consumed by the nginx entrypoint's envsubst into the /api proxies'
+            # Authorization header (see web/nginx.conf.template in the repo).
+            - name: WINDMILL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: portal-windmill-token
+                  key: token
+          startupProbe:
+            httpGet: { path: /, port: 80 }
+            failureThreshold: 20
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal
+spec:
+  selector:
+    app: portal
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: portal
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-portal.oauth2-proxy.svc.cluster.local/portal/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/portal/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-Email
+    # ModSec OFF — the /api JSON POSTs trip CRS false positives (per
+    # kustodyan-mcp/envuassu precedent); the surface is SSO-gated anyway.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - start.mdapi.ch
+      secretName: portal-tls
+  rules:
+    - host: start.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: portal
+                port:
+                  number: 80

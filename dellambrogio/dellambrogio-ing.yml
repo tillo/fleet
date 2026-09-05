@@ -1,0 +1,156 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dellambrogio
+  namespace: dellambrogio
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # ── THE FRONT DOOR MOVED ────────────────────────────────────────────────
+    # Every dellambrogio.* host now sends visitors to the neutral request page.
+    # mdapi.ch users are not all Dell'Ambrogios, and the page at the target says
+    # plainly what family members can have and that everyone else has to know
+    # tillo personally -- so the family-branded domain is no longer the right
+    # name to hand a friend. The target page is language-negotiated (it/fr/en).
+    #
+    # 302, NOT 301, deliberately: browsers cache a 301 essentially forever, and
+    # this estate iterates. There is no SEO stake on a private family domain, so
+    # reversibility is worth more than link-equity consolidation. Promote it to
+    # `permanent-redirect` once the arrangement has settled.
+    #
+    # The path is DISCARDED by design (the annotation emits a bare `return 302
+    # <target>`): every old URL here led to the same one-page form, so there is
+    # nothing to preserve. html/index.html is kept in the image, unreachable, so
+    # removing this annotation restores the old site exactly.
+    nginx.ingress.kubernetes.io/temporal-redirect: https://start.mdapi.ch/request/
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # CRS 933160 ("PHP Injection Attack: High-Risk PHP Function Call") scores 5
+      # on its own, which is the whole inbound anomaly threshold -- so it blocks
+      # by itself. It matches a PHP function name followed by "(", and "file(" is
+      # one. On a form whose entire subject is FILE SYNC, written in Italian, that
+      # is a false positive waiting to happen: "mi servono i file (le foto)" was
+      # rejected with a raw nginx 403 and the request was lost. Confirmed by
+      # differential test 2026-08-27 -- "pesci (le foto)" passes, "file (le foto)"
+      # and "system (x)" do not.
+      #
+      # Excluded ONLY for the four free-prose fields, and ONLY for this one rule.
+      # Those values are never evaluated as PHP: they are validated, JSON-POSTed to
+      # a Windmill flow, put in a mail body, and written to LDAP attributes.
+      # email / username / indirizzo deliberately keep full CRS -- they are strictly
+      # pattern-validated and have no business containing this.
+      #
+      # This APPENDS to the CRS include above; it does not replace it, and the
+      # engine stays On (never DetectionOnly on a public host).
+      SecRuleUpdateTargetById 933160 "!ARGS:request"
+      SecRuleUpdateTargetById 933160 "!ARGS:name"
+      SecRuleUpdateTargetById 933160 "!ARGS:city"
+      SecRuleUpdateTargetById 933160 "!ARGS:/^wants/"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: dellambrogio.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: www.dellambrogio.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: dellambrogio.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: www.dellambrogio.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: dellambrogio.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: www.dellambrogio.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: dellambrogio.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+    - host: www.dellambrogio.net
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - dellambrogio.ch
+        - www.dellambrogio.ch
+      secretName: dellambrogio-ch-cert
+    - hosts:
+        - dellambrogio.com
+        - www.dellambrogio.com
+      secretName: dellambrogio-com-cert
+    - hosts:
+        - dellambrogio.org
+        - www.dellambrogio.org
+      secretName: dellambrogio-org-cert
+    - hosts:
+        - dellambrogio.net
+        - www.dellambrogio.net
+      secretName: dellambrogio-net-cert

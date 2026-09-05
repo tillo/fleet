@@ -1,0 +1,80 @@
+## Dedicated CNPG Postgres for the LiteLLM proxy's own state (2026-08-26).
+##
+## WHY IT EXISTS: the admin UI at llm.mdapi.ch/ui answered every action with
+## "Authentication Error, Not connected to DB!". That string comes from
+## litellm/proxy/management_endpoints/*.py, guarded by `if prisma_client is
+## None`, and prisma_client is built only when DATABASE_URL is set
+## (proxy_server.py:999-1001). No config flag or CLI switch substitutes for a
+## database -- LiteLLM keeps virtual keys, teams, budgets and SpendLogs in
+## Postgres, so the UI is inert without one.
+##
+## It also unlocks the thing the chat frontend needs: a VIRTUAL KEY. Open WebUI
+## must not hold LITELLM_MASTER_KEY (that key is proxy-admin: it can mint keys
+## and read every other consumer's spend). With a DB we issue it a scoped,
+## revocable sk-... instead.
+##
+## Sizing: keys + spend rows only, tens of MB. No barman here -- unlike
+## grafana-pg/guac-pg (G6, 2026-08-15) this DB holds nothing that cannot be
+## reconstructed by re-minting keys, and the model routing lives in
+## litellm-cm.yml under git. Durability = Longhorn 2-replica + the recurring
+## backup groups the label enforcer applies automatically.
+## FOLLOW-UP if that judgement changes: add a barmanObjectStore +
+## ScheduledBackup exactly as grafana-pg does (needs a Garage bucket and an
+## Akeyless-backed s3 ExternalSecret first).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: litellm-pg
+  namespace: litellm
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  ## Same lesson as ha-recorder-pg (2026-06-15) and grafana-pg: soft
+  ## anti-affinity lets both instances co-locate. `required` is always
+  ## satisfiable at 2 instances on 3 nodes and is what actually survives a
+  ## node loss -- and litellm is on the critical path for every LLM door.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    ## Lossless failover, preferred keeps availability when the standby is down
+    ## (same shape as grafana-pg / ha-recorder-pg).
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: litellm
+      owner: litellm
+      ## No `secret:` -- CNPG generates the litellm-pg-app secret itself, which
+      ## carries a ready-made `uri` key. litellm-deploy.yml consumes that
+      ## directly as DATABASE_URL. This is the jump/guacamole.yml pattern: the
+      ## password is only ever needed in-cluster, so routing it through Akeyless
+      ## would add a rotation coupling for nothing.
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int renders
+      # as a perpetual Fleet "Modified" diff (1 vs "1").
+      cpu: "1"
+      memory: 1Gi

@@ -1,0 +1,161 @@
+apiVersion: v1
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    # In-cluster SSH/mosh bastion entrypoint.
+    # Since 2026-07-26 the Deployment runs the pre-baked mdapi/jump-bastion image
+    # (everything below pre-installed), so the apt step is a guarded no-op kept as
+    # a fallback for running this entrypoint on a stock debian image in a pinch.
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    log() { echo "[jump-entrypoint] $*"; }
+
+    TLS_BACKEND="${TLS_BACKEND:-ingress-expose.kube-system.svc.cluster.local:443}"
+    # Empty = no OpenVPN backend, and sslh starts exactly as before. Set by the
+    # Deployment to openvpn.jump.svc.cluster.local:1194 (2026-09-02), so a single
+    # public 443 carries ssh, TLS and OpenVPN — which is the whole point for a
+    # network that only allows 443/tcp egress.
+    OVPN_BACKEND="${OVPN_BACKEND:-}"
+    MOSH_PORT="${MOSH_PORT:-443}"
+    SSLH_PORT="${SSLH_PORT:-4443}"
+    # Local time, the same Europe/Zurich every other workload in this repo runs on.
+    # Deliberately defaulted HERE rather than as a Deployment env var: env is a pod
+    # TEMPLATE field, and with strategy Recreate that would make the commit that sets
+    # it roll the bastion and drop the live session (~/jump-roll-procedure.md §2).
+    # An env var would also not reach ssh logins — see the /etc/localtime note below.
+    TZ="${TZ:-Europe/Zurich}"; export TZ
+
+    # 1. Tools (idempotent: only when missing) --------------------------------
+    if ! command -v sslh >/dev/null 2>&1; then
+      log "installing tools (interim apt path)…"
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        openssh-server openssh-client mosh sslh byobu tmux libcap2-bin \
+        ca-certificates iproute2 iputils-ping less vim-tiny bash-completion \
+        authbind psmisc locales \
+        git curl wget jq python3 rsync procps dnsutils unzip xz-utils nano
+      apt-get clean; rm -rf /var/lib/apt/lists/*
+    fi
+
+    # mosh refuses to run without a UTF-8 locale. C.UTF-8 ships with glibc; pam_env
+    # loads /etc/environment into the ssh session, so mosh-server (exec'd
+    # non-interactively by the mosh client) inherits it.
+    echo 'LANG=C.UTF-8'  > /etc/environment
+    echo 'LC_ALL=C.UTF-8' >> /etc/environment
+    echo "TZ=$TZ"         >> /etc/environment
+    # Timezone. The symlink is what actually does the work: glibc reads
+    # /etc/localtime whenever TZ is unset, and sshd hands login sessions a CLEAN
+    # environment (verified: an ssh shell here sees none of the container's env,
+    # not even KUBERNETES_*), so a container env var alone would leave every
+    # interactive shell on UTC. The /etc/environment line above is what pam_env
+    # then puts in those sessions explicitly, belt and braces.
+    if [ -e "/usr/share/zoneinfo/$TZ" ]; then
+      ln -sf "/usr/share/zoneinfo/$TZ" /etc/localtime
+      printf '%s\n' "$TZ" > /etc/timezone
+      log "timezone: $TZ ($(date +%Z%z))"
+    else
+      log "WARN: unknown timezone '$TZ' — keeping $(readlink -f /etc/localtime)"
+    fi
+    # Also generate en_US.UTF-8 (the mbptillo default the user's mosh command asks
+    # for via `-l LANG=en_US.UTF-8`).
+    grep -q '^en_US.UTF-8' /etc/locale.gen 2>/dev/null || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+    locale-gen >/dev/null 2>&1 || true
+    # authbind for port 443 — NOT needed by mosh-server (it has cap_net_bind_service
+    # via setcap below), but present so the mbptillo-style `authbind mosh-server -p 443`
+    # command also works.
+    mkdir -p /etc/authbind/byport && : > /etc/authbind/byport/443 && chmod 755 /etc/authbind/byport/443
+
+    # 2. Login user (home is the mounted PVC) ---------------------------------
+    if ! id tillo >/dev/null 2>&1; then
+      useradd -M -s /bin/bash -d /home/tillo -u 1000 tillo
+    fi
+    # PVC may be empty on first boot; populate skeleton without clobbering.
+    mkdir -p /home/tillo/.ssh
+    [ -f /home/tillo/.bashrc ] || cp /etc/skel/.bashrc /home/tillo/.bashrc 2>/dev/null || true
+    grep -q 'C.UTF-8' /home/tillo/.bashrc 2>/dev/null || \
+      printf '\n# mosh/byobu need a UTF-8 locale\nexport LANG=C.UTF-8 LC_ALL=C.UTF-8\n' >> /home/tillo/.bashrc
+    [ -f /home/tillo/.profile ] || cp /etc/skel/.profile /home/tillo/.profile 2>/dev/null || true
+    install -m 600 /etc/ssh/authorized_keys.d/authorized_keys /home/tillo/.ssh/authorized_keys
+    chown -R tillo:tillo /home/tillo
+    chmod 700 /home/tillo/.ssh
+
+    # 3. Host keys from the mounted Secret (stable identity across restarts) ---
+    # Akeyless round-trips STRIP the trailing newline; libcrypto then rejects
+    # the PEM ("error in libcrypto") and sshd silently falls back to the
+    # image-baked ecdsa key, which churns on every image rebuild (found
+    # 2026-08-11: the stable keys had never actually loaded). Normalize the
+    # trailing newline on install and verify each key parses.
+    STABLE_KEYS_OK=1
+    for k in ssh_host_ed25519_key ssh_host_rsa_key; do
+      if [ -f "/etc/ssh/keys/$k" ]; then
+        cp "/etc/ssh/keys/$k" "/etc/ssh/$k"
+        [ "$(tail -c 1 "/etc/ssh/$k" | od -An -tx1 | tr -d ' ')" = "0a" ] || echo >> "/etc/ssh/$k"
+        chmod 600 "/etc/ssh/$k"
+        install -m 644 "/etc/ssh/keys/$k.pub"  "/etc/ssh/$k.pub"
+        if ! ssh-keygen -lf "/etc/ssh/$k" >/dev/null 2>&1; then
+          log "WARN: $k from Secret does not parse — keeping baked fallback keys"
+          STABLE_KEYS_OK=0
+        fi
+      else
+        STABLE_KEYS_OK=0
+      fi
+    done
+    # Only when the stable pair is usable, drop the baked key types so the
+    # host identity clients see survives pod rolls AND image bumps. If not,
+    # keep the baked ecdsa — unstable identity beats an unreachable bastion.
+    if [ "$STABLE_KEYS_OK" = 1 ]; then
+      rm -f /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub \
+            /etc/ssh/ssh_host_dsa_key /etc/ssh/ssh_host_dsa_key.pub
+    else
+      log "WARN: baked host keys kept as fallback — host identity NOT stable"
+    fi
+
+    # 4. sshd — listens only on loopback; sslh is the front door -------------
+    mkdir -p /run/sshd /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/jump.conf <<EOF
+    Port 22
+    ListenAddress 127.0.0.1
+    AddressFamily inet
+    PermitRootLogin no
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PubkeyAuthentication yes
+    AllowUsers tillo
+    X11Forwarding no
+    AllowAgentForwarding yes
+    AllowTcpForwarding yes
+    PermitTunnel no
+    ClientAliveInterval 60
+    ClientAliveCountMax 3
+    AcceptEnv LANG LC_* COLORTERM TERM
+    EOF
+
+    # mosh-server runs as the (non-root) login user but must bind udp/${MOSH_PORT}
+    # (<1024). Grant the file capability so it can, without running mosh as root.
+    if command -v setcap >/dev/null 2>&1; then
+      setcap cap_net_bind_service=+ep "$(command -v mosh-server)" || \
+        log "WARN: setcap on mosh-server failed; mosh on ${MOSH_PORT} may not bind"
+    fi
+
+    log "starting sshd (127.0.0.1:22)…"
+    # -E: sshd daemonizes and drops stderr, so without a log file auth activity is
+    # invisible in pod logs.
+    /usr/sbin/sshd -e -E /var/log/sshd.log
+
+    # 5. sslh front door: tcp/${SSLH_PORT} -> ssh(22) | openvpn | tls(ingress) --
+    # Silent clients (SSH sends no banner first) fall through to ssh after timeout.
+    # Probe ORDER matters and mirrors mbptillo's proven /etc/default/sslh:
+    # ssh, then openvpn, then tls. Built as an array rather than string
+    # interpolation so an unset OVPN_BACKEND cannot inject an empty argument.
+    SSLH_ARGS=(--foreground --listen "0.0.0.0:${SSLH_PORT}" --ssh "127.0.0.1:22")
+    if [ -n "${OVPN_BACKEND}" ]; then
+      SSLH_ARGS+=(--openvpn "${OVPN_BACKEND}")
+    fi
+    SSLH_ARGS+=(--tls "${TLS_BACKEND}" --timeout 2 --on-timeout ssh)
+    log "starting sslh on 0.0.0.0:${SSLH_PORT} (ssh->127.0.0.1:22, openvpn->${OVPN_BACKEND:-none}, tls->${TLS_BACKEND})"
+    exec sslh "${SSLH_ARGS[@]}"
+kind: ConfigMap
+metadata:
+  name: jump-entrypoint
+  namespace: jump

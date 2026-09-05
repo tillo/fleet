@@ -1,0 +1,444 @@
+## Tiny relay: receive Cribl webhook POSTs (which have content-length /
+## end-of-body bugs in 4.17.1), re-POST cleanly to Alertmanager v2.
+##
+## Reads body via Transfer-Encoding-tolerant loop, fixes truncated JSON
+## arrays by appending a trailing `]` if the parse fails on `unexpected
+## EOF`, then forwards to AM. Returns 200 immediately so Cribl moves on.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cribl-am-relay-code
+  namespace: cribl
+data:
+  server.py: |
+    import json
+    import re
+    import urllib.request
+    import urllib.error
+    from datetime import datetime, timezone, timedelta
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    ## Repointed 2026-06-04 from the old rancher-monitoring AM to the
+    ## new VictoriaMetrics-stack alertmanager (also in-cluster, port
+    ## 9093 too). Both expose the AM v2 API; payload shape is
+    ## identical. Old AM still runs but is now paging-silent.
+    AM_URL = "http://vmalertmanager-mdapi.monitoring.svc.cluster.local:9093/api/v2/alerts"
+
+    def forward_to_am(payload_bytes):
+        req = urllib.request.Request(
+            AM_URL, data=payload_bytes, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read()[:200]
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()[:200]
+        except Exception as e:
+            return 0, str(e).encode()[:200]
+
+    def host_to_component(host):
+        # Component names track the 2026-05-25 statuspage restructure
+        # (adapter components.json: Mail / Sign-in (SSO) / Platform /
+        # Files & Documents / Backups / Websites / DNS / Smart Home /
+        # Internet / NTP). Legacy labels (GitLab/Identity/Files/Notes/
+        # Home/General) are no longer in the adapter map.
+        h = (host or "").lower()
+        if any(s in h for s in ("gitlab", "registry")): return "Platform"
+        if any(s in h for s in ("mail", "rspamd", "roundcube")): return "Mail"
+        if any(s in h for s in ("idp", "auth", "keycloak", "lam")): return "Sign-in (SSO)"
+        if any(s in h for s in ("spider3", "dellambrogio", "coiffuredreams")): return "Websites"
+        if any(s in h for s in ("files", "sftp", "cloud", "owncloud")): return "Files & Documents"
+        if any(s in h for s in ("notes", "joplin")): return "Files & Documents"
+        if any(s in h for s in ("home", "frigate", "appdaemon")): return "Smart Home"
+        return "Platform"
+
+    TRUSTED_IP_RE = re.compile(
+        r"^(?:192\.168\.|10\.|100\.(?:6[4-9]|[7-9]\d|1[0-2]\d)\.)"
+    )
+
+    ## Jool NAT64 splits its v4 egress by source-v6 mark:
+    ##   192.168.164.2 = external IPv6 clients (untrusted, blocks are real)
+    ##   192.168.164.3 = internal LAN IPv6 clients (trusted, blocks are FP)
+    ## Both fall inside 192.168.0.0/16, so the TRUSTED_IP_RE above matches
+    ## them. We explicitly subtract .2 here so external NAT64-translated
+    ## blocks do NOT generate "trusted source" false-positive alerts.
+    UNTRUSTED_NAT64_EGRESS = {"192.168.164.2"}
+
+    MODSEC_RE = re.compile(r"ModSecurity: Access denied")
+
+    def extract_modsec_fields(line):
+        """Pull client/host/uri/id/method/msg/score from a nginx-ingress
+        ModSec error.log line. Returns None if line isn't a ModSec
+        block."""
+        if "ModSecurity: Access denied" not in line:
+            return None
+        def grab(pat):
+            m = re.search(pat, line)
+            return m.group(1) if m else ""
+        return {
+            "client_ip": grab(r"\[client ([\d.]+)\]"),
+            "host":      grab(r'\[hostname "([^"]+)"\]'),
+            "uri":       grab(r'\[uri "([^"]+)"\]'),
+            "rule_id":   grab(r'\[id "(\d+)"\]'),
+            "method":    grab(r'request: "(\w+) '),
+            "msg":       grab(r'\[msg "([^"]+)"\]'),
+            "score":     grab(r"Total Score: (\d+)"),
+        }
+
+    def build_modsec_alert(fields):
+        host = fields.get("host") or "unknown"
+        ip   = fields.get("client_ip") or "unknown"
+        rule = fields.get("rule_id") or "unknown"
+        meth = fields.get("method") or "unknown"
+        uri  = (fields.get("uri") or "")[:80]
+        msg  = (fields.get("msg") or "")[:100]
+        score = fields.get("score") or "?"
+        return {
+            "labels": {
+                "alertname": "ModSecBlockLikelyFalsePositive",
+                "team":      "mdapi",
+                "component": host_to_component(host),
+                "severity":  "warning",
+                "signal":    "modsec_block",
+                "host":      host,
+                "client_ip": ip,
+                "rule_id":   rule,
+                "method":    meth,
+            },
+            "annotations": {
+                "summary": f"WAF blocked {meth} {host} from {ip} (trusted source)",
+                "description": (
+                    f"OWASP CRS rule {rule} blocked {meth} {host}{uri} from {ip}. "
+                    f"Anomaly score {score}. ModSec msg: {msg}. "
+                    f"Source is in a trusted CIDR (LAN/cluster/Tailscale) — "
+                    f"likely false positive."
+                ),
+            },
+            "endsAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+        }
+
+    def enrich_modsec_signal(sig):
+        """Legacy: Cribl-built short signal dict → full AM alert.
+        Kept for backwards compatibility with the cribl_blocks_to_am
+        pipeline, which doesn't see the full log line."""
+        return build_modsec_alert({
+            "client_ip": sig.get("client_ip", ""),
+            "host":      sig.get("host", ""),
+            "rule_id":   sig.get("rule_id", ""),
+            "method":    sig.get("method", ""),
+            "uri":       sig.get("uri", ""),
+        })
+
+    ## ─── pod I/O errors ─────────────────────────────────────────────
+    ## Patterns we want to alert on. Keep aligned with the grep filter in
+    ## monitoring-rules/14a-logging-flow-pod-io.yml (too narrow there =
+    ## false negatives; too wide = relay buffer overflow on the way in).
+    POD_IO_RE = re.compile(
+        r"\[Errno 5\] Input/output error"
+        r"|blk_update_request.*I/O error"             # kernel block layer
+        r"|EXT4-fs.*I/O error"                        # ext4 filesystem
+        r"|XFS.*(?:metadata I/O error|writeback error)"  # xfs filesystem
+        r"|buffer_io_error"                           # lost async page write
+        r"|\bEIO\b.*(?:read|write)"
+        r"|stale file handle"
+        r"|transport endpoint is not connected"
+        r"|pcfg_openfile:.*Permission denied"
+        , re.I,
+    )
+
+    def ns_to_component(ns):
+        # Component names track the 2026-05-25 statuspage restructure;
+        # see host_to_component() above. Mechanical rename of the prior
+        # map onto the current adapter component set.
+        m = {
+            "mail":      "Mail",
+            "bootstrap": "Platform",
+            "envuassu":  "Files & Documents",
+            "owncloud":  "Files & Documents",
+            "joplin":    "Files & Documents",
+            "tv":        "Files & Documents",
+            "spider3":         "Websites",
+            "dellambrogio":    "Websites",
+            "ivodellambrogio": "Websites",
+            "coiffuredreams":  "Websites",
+            "home-assistant": "Smart Home",
+            "frigate":   "Smart Home",
+            "appdaemon": "Smart Home",
+            "windmill":  "Platform",
+            "keycloak":  "Sign-in (SSO)",
+        }
+        return m.get(ns or "", "Platform")
+
+    ## Pods whose logs are routed through am-relay for other reasons
+    ## (ingress-nginx for ModSec, etc.) but proxy arbitrary user content
+    ## in their HTTP bodies. Skip pod_io_error detection for them — they
+    ## don't own PVCs, and a POST body containing "stale file handle" or
+    ## "Permission denied" is not a real I/O error. 2026-06-03: false
+    ## positive on rke2-ingress-nginx triggered by a webhook payload.
+    POD_IO_EXCLUDE_PODS = re.compile(r"^rke2-ingress-nginx-controller-")
+
+    def detect_pod_io(ev):
+        line = (ev.get("log") or ev.get("message") or "").strip()
+        if not line or not POD_IO_RE.search(line):
+            return None
+        k = ev.get("kubernetes") or {}
+        ns  = k.get("namespace_name") or "?"
+        pod = k.get("pod_name") or "?"
+        cnt = k.get("container_name") or "?"
+        if POD_IO_EXCLUDE_PODS.match(pod):
+            return None
+        return {
+            "labels": {
+                "alertname": "PodIOError",
+                "team":      "mdapi",
+                "component": ns_to_component(ns),
+                "severity":  "warning",
+                "signal":    "pod_io_error",
+                "namespace": ns,
+                "pod":       pod,
+                "container": cnt,
+            },
+            "annotations": {
+                "summary":     f"{ns}/{pod}: I/O error in container {cnt}",
+                "description": f"Longhorn/PVC I/O error pattern detected. Log: {line[:200]}",
+            },
+            "endsAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+        }
+
+    ## ─── postfix delivery failures ──────────────────────────────────
+    POSTFIX_RE = re.compile(
+        r"\bstatus=(?:bounced|deferred)\b"
+        r"|loops back to myself"
+        r"|relay=none, .*Connection refused"
+        , re.I,
+    )
+
+    def detect_postfix_failure(ev):
+        line = (ev.get("log") or ev.get("message") or "").strip()
+        if not line:
+            return None
+        k = ev.get("kubernetes") or {}
+        # only mail namespace docker-mailserver pods
+        if k.get("namespace_name") != "mail":
+            return None
+        labels = (k.get("labels") or {})
+        if labels.get("app.kubernetes.io/name") != "docker-mailserver":
+            return None
+        if not POSTFIX_RE.search(line):
+            return None
+        pod = k.get("pod_name") or "?"
+        return {
+            "labels": {
+                "alertname": "PostfixDeliveryFailure",
+                "team":      "mdapi",
+                "component": "Mail",
+                "severity":  "warning",
+                "signal":    "postfix_failure",
+                "namespace": "mail",
+                "pod":       pod,
+            },
+            "annotations": {
+                "summary":     f"postfix delivery issue on {pod}",
+                "description": f"Postfix log pattern (bounced/deferred/loop/relay-refused) matched. Log: {line[:200]}",
+            },
+            "endsAt": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+        }
+
+    ## ─── Redis BGSAVE / RDB save failure ────────────────────────────
+    REDIS_BGSAVE_RE = re.compile(
+        r"Background saving error"
+        r"|Failed opening the temp RDB file"
+        r"|Error saving DB on disk"
+        , re.I,
+    )
+
+    def detect_redis_bgsave(ev):
+        line = (ev.get("log") or ev.get("message") or "").strip()
+        if not line or not REDIS_BGSAVE_RE.search(line):
+            return None
+        k = ev.get("kubernetes") or {}
+        ns  = k.get("namespace_name") or "?"
+        pod = k.get("pod_name") or "?"
+        return {
+            "labels": {
+                "alertname": "RedisBGSAVEFailure",
+                "team":      "mdapi",
+                "component": ns_to_component(ns),
+                "severity":  "warning",
+                "signal":    "redis_bgsave_failure",
+                "namespace": ns,
+                "pod":       pod,
+            },
+            "annotations": {
+                "summary":     f"{ns}/{pod}: Redis BGSAVE/RDB save failing",
+                "description": f"Redis cannot persist to disk — often a stale Longhorn mount. Try restarting the pod. Log: {line[:160]}",
+            },
+            "endsAt": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+        }
+
+    ## ─── ModSec false-positive (existing) ───────────────────────────
+    def detect_modsec(ev):
+        line = ev.get("log") or ev.get("message") or ev.get("_raw") or ""
+        line = line if isinstance(line, str) else str(line)
+        fields = extract_modsec_fields(line)
+        if not fields:
+            return None
+        ip = fields.get("client_ip", "")
+        if ip in UNTRUSTED_NAT64_EGRESS:
+            return None
+        if not TRUSTED_IP_RE.match(ip):
+            return None
+        return build_modsec_alert(fields)
+
+    DETECTORS = [detect_modsec, detect_pod_io, detect_postfix_failure, detect_redis_bgsave]
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            cl = int(self.headers.get("Content-Length", 0))
+            # Read whatever's available — Cribl lies about Content-Length.
+            try:
+                self.rfile._sock.settimeout(2)
+            except Exception:
+                pass
+            chunks = []
+            while True:
+                try:
+                    c = self.rfile.read1(8192) if cl == 0 else self.rfile.read(cl)
+                    if not c: break
+                    chunks.append(c)
+                    if cl: break
+                except Exception:
+                    break
+            body = b"".join(chunks)
+            actual = len(body)
+
+            # Decode explicitly with errors="replace" BEFORE parsing.
+            # json.loads(bytes) decodes the WHOLE buffer as UTF-8 and raises
+            # UnicodeDecodeError -- which is a ValueError but NOT a
+            # JSONDecodeError, so it escaped the handler below, killed the
+            # request, and took every event in the batch with it. On 2026-08-06
+            # a 0x8b gzip magic byte ~96 KB into a body did exactly that: 173
+            # batches discarded between 15:00 and 21:00, alert-worthy lines
+            # included, with nothing but a traceback to show for it. One bad
+            # byte from one pod must not be able to silence the alert path.
+            text = body.decode("utf-8", errors="replace")
+            n_bad = text.count("�")
+            if n_bad:
+                print(f"  LOSSY DECODE: {n_bad} undecodable byte(s) replaced "
+                      f"(body={actual} B) -- batch still processed", flush=True)
+
+            # Try to parse as JSON. If unterminated, append `]` and try again.
+            # Catch ValueError, not just JSONDecodeError, so any future decode
+            # surprise degrades to the recovery path instead of a 500.
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                try:
+                    parsed = json.loads(text + "]")
+                    print(f"  RECOVERED truncated JSON ({actual}->good)", flush=True)
+                except Exception as e2:
+                    # Bounded: a 500 KB body in a log line was its own problem.
+                    print(f"  PARSE FAILED: {e2!r} body[:400]={body[:400]!r}", flush=True)
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
+            # Two ingestion paths:
+            # 1) /ingest — fluentd ships a JSON array of records, each with
+            #    a `log` field. We do our own ModSec detection + extraction
+            #    on the full untruncated log line. Skips Cribl entirely.
+            # 2) any other path — legacy Cribl short-signal format.
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+
+            # /ingest is the only supported path. Legacy Cribl webhook
+            # (POST /) is dropped because Cribl 4.17.1 truncates events
+            # and we get back garbage host=? alerts — the fluentd direct
+            # path supersedes it.
+            if self.path != "/ingest":
+                self.send_response(204); self.end_headers(); return
+
+            alerts = []
+            for ev in parsed:
+                if not isinstance(ev, dict):
+                    continue
+                for det in DETECTORS:
+                    a = det(ev)
+                    if a is not None:
+                        alerts.append(a)
+                        break
+
+            if not alerts:
+                self.send_response(204); self.end_headers(); return
+
+            payload = json.dumps(alerts).encode()
+
+            status, resp = forward_to_am(payload)
+            print(f"  cl={cl} actual={actual} -> AM HTTP {status} ({resp[:80]!r})", flush=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"ok":true}')
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *a, **kw): pass
+
+    print(f"relay listening on :9999 → {AM_URL}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", 9999), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cribl-am-relay
+  namespace: cribl
+  annotations:
+    reloader.stakater.com/auto: "true"
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cribl-am-relay
+  template:
+    metadata:
+      labels:
+        app: cribl-am-relay
+    spec:
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: relay
+          image: zot.mdapi.ch/library/python:3-alpine
+          imagePullPolicy: Always
+          command: [python3, /code/server.py]
+          ports:
+            - containerPort: 9999
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - name: code
+              mountPath: /code
+      volumes:
+        - name: code
+          configMap:
+            name: cribl-am-relay-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cribl-am-relay
+  namespace: cribl
+spec:
+  selector:
+    app: cribl-am-relay
+  ports:
+    - port: 9999
+      targetPort: 9999

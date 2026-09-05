@@ -1,0 +1,38 @@
+defaultNamespace: ctf
+namespace: ctf
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  # The kali VM and its 100Gi PVC were hand-built in Harvester long before this
+  # bundle existed and carry no Helm ownership metadata, so the first reconcile
+  # fails without this. Same reason and remedy as jump/ and ripe-atlas/.
+  takeOwnership: true
+
+# Second Fleet-owned VirtualMachine in this repo, after ripe-atlas/atlas-probe.
+# Everything KubeVirt or Harvester would otherwise generate is pinned in
+# kali-vm.yml (firmware uuid, both MACs, maxSockets, architecture, machine type,
+# node affinity, and — because dedicatedCpuPlacement disables the overcommit
+# webhook — the resource requests too). `kubectl diff` against the live object
+# is empty, so this list is the measured remainder, not a guess.
+diff:
+  comparePatches:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    name: kali
+    namespace: ctf
+    jsonPointers:
+    # Serialised as an explicit null on the pod template.
+    - /spec/template/metadata/creationTimestamp
+    # Harvester rewrites this on every edit of the VM.
+    - /metadata/annotations/harvesterhci.io~1timestamp
+    # Harvester's memory of which run strategy to use when the VM is started.
+    # The VM is deliberately Halted; this annotation is not the desired state.
+    - /metadata/annotations/harvesterhci.io~1vmRunStrategy
+    # Controller bookkeeping written after creation.
+    - /metadata/annotations/kubevirt.io~1latest-observed-api-version
+    - /metadata/annotations/kubevirt.io~1storage-observed-api-version
+    # Defensive: not present today (the VM has never been kubectl-applied), but
+    # it appears the moment anyone does, and would then read as permanent drift.
+    - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration

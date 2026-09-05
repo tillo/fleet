@@ -1,0 +1,17 @@
+## VolSync operator — scheduled CSI-snapshot + restic backup of Ceph (RBD + CephFS)
+## PVCs to the external Garage `ceph-backup` bucket (salt/pepper), which the daily
+## garage_offsite_backup job then replicates to B2 + SFTP — mirroring how Longhorn
+## backs up to harvester-backup. ReplicationSources (per-PVC) are added separately,
+## with the restic secret rendered from Akeyless (/mdapi/volsync/ceph-backup/*) via
+## ExternalSecret. Needs the snapshot-controller (present) + the ceph
+## VolumeSnapshotClasses (rook-ceph-csi-drivers/volumesnapshotclasses.yml).
+defaultNamespace: volsync-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  releaseName: volsync
+  repo: https://backube.github.io/helm-charts/
+  chart: volsync
+  version: 0.16.0
+  maxHistory: 25

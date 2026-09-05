@@ -1,0 +1,2336 @@
+## Rules for metrics published by Windmill batch scripts via Pushgateway.
+##
+## Convention for any pushed batch job:
+##   1. PUT to http://pushgateway.monitoring.svc.cluster.local:9091/metrics/job/<name>
+##   2. Always include `<name>_last_run_timestamp_seconds` (epoch seconds)
+##   3. Optionally include `<name>_last_run_success` (1=ok, 0=failed)
+##   4. Optionally include any business-specific gauges; add per-script
+##      rules in their own group below.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-batch-jobs
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-batch-jobs.staleness
+    rules:
+    ## Single per-job staleness rule, replacing the previous two-tier
+    ## BatchJobStale + BatchJobStaleWeekly which relied on a hand-edited
+    ## regex of weekly job names. The Windmill probe
+    ## `f/probe/schedule_cadence_map` publishes
+    ## `windmill_schedule_interval_seconds` per job (basename of script
+    ## path) every day; this rule joins on `job` and triggers when the
+    ## last-run timestamp is older than 2× that interval.
+    ##
+    ## 2× gives one missed run of grace before alerting:
+    ##   - daily jobs (interval 86400): stale at 48h
+    ##   - weekly jobs (interval 604800): stale at 14d
+    ##   - monthly jobs (interval 2678400): stale at 62d
+    ##   - 5-min probes (interval 300): stale at 10min
+    ## Adding a new scheduled probe needs no change here.
+    - alert: BatchJobStale
+      expr: |
+        (
+          time() - max by (job) (
+            {__name__=~".+_last_run_timestamp_seconds", job!=""}
+          )
+        )
+        >
+        on (job) group_left() (
+          max by (job) (windmill_schedule_interval_seconds) * 2
+        )
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Platform
+      annotations:
+        summary: "Batch job {{ $labels.job }} hasn't pushed metrics in {{ $value | humanizeDuration }}"
+        description: |
+          A scheduled job has stopped pushing its `*_last_run_timestamp_seconds`
+          for more than 2× its scheduled interval (one missed run of grace).
+          Threshold is read live from `windmill_schedule_interval_seconds`,
+          which f/probe/schedule_cadence_map publishes daily from the
+          Windmill schedule list.
+
+          Either the job is broken, its schedule was disabled, or its
+          basename(script_path) doesn't match the pushgateway job label.
+
+          Check Windmill (https://windmill.mdapi.ch) or the cron source.
+
+    - alert: BatchJobLastRunFailed
+      ## Convention: scripts also push <name>_last_run_success gauge.
+      expr: |
+        max by (job) (
+          {__name__=~".+_last_run_success", job!=""}
+        ) == 0
+      for: 10m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Platform
+        ## statuspage: exclude — ADDED 2026-09-03, and the reason is the
+        ## GAUGE'S LIFETIME, not the failure's importance.
+        ##
+        ## This gauge only changes when the job next RUNS, so a failure holds
+        ## the public page in degraded_performance for a whole scheduling
+        ## period. Two weekly jobs proved it: chassis_log_backup (Mon 05:35)
+        ## failed 2026-08-31 and ingress_worker_flush (Sun 04:10) failed
+        ## 2026-08-30, together pinning Platform yellow until 09-07 / 09-06
+        ## with nothing a visitor could observe being wrong.
+        ##
+        ## Shortening `for:` cannot fix that — the gauge, not the alert, is
+        ## what persists. And the rule is deliberately scope-blind (it matches
+        ## EVERY *_last_run_success), so it can never know whether the failed
+        ## job is customer-visible. The domain-specific rules carry that
+        ## signal with the right component instead: ConfigBackupTargetFailed,
+        ## RancherBackupErrored, GitlabBackupStale, the DNS/cert families.
+        ##
+        ## Paging is unchanged: severity stays warning and Pushover still
+        ## fires until the job is fixed. Only the public page is spared.
+        statuspage: exclude
+      annotations:
+        summary: "Batch job {{ $labels.job }} reported a failed last run"
+        description: |
+          The script's `*_last_run_success` gauge is 0. Check its logs in Windmill.
+
+          Note the gauge only clears on the job's NEXT run, so for a weekly
+          job this stays firing for up to a week. Re-run it by hand to clear
+          it rather than waiting.
+
+  - name: app-batch-jobs.rancher-backup
+    rules:
+    - alert: RancherBackupErrored
+      expr: rancher_backup_in_error == 1
+      for: 10m
+      labels:
+        severity: critical
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Rancher backup {{ $labels.backup }} is in error state"
+        description: "Most recent reconcile of Rancher Backup CR {{ $labels.backup }} reported an error condition. Check `kubectl get backup {{ $labels.backup }} -o yaml`."
+
+    - alert: RancherBackupStale
+      expr: rancher_backup_last_snapshot_age_seconds > 26 * 3600
+      for: 30m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Rancher backup {{ $labels.backup }} last snapshot {{ $value | humanizeDuration }} ago"
+        description: "Backup is configured for daily snapshots; last successful snapshot is older than 26h."
+
+    - alert: RancherBackupNeverSnapshotted
+      expr: rancher_backup_last_snapshot_age_seconds == -1
+      for: 1h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Rancher backup {{ $labels.backup }} has no snapshot"
+        description: "Backup CR exists but no snapshot has ever been recorded. Check schedule and storage location."
+
+  - name: app-batch-jobs.config-backup
+    rules:
+    - alert: ConfigBackupTargetFailed
+      expr: config_backup_target_success == 0
+      for: 10m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Config backup of {{ $labels.target }} failed"
+        description: "The daily config_backup job could not capture or upload config for {{ $labels.target }}. Check Windmill run logs."
+
+  - name: app-batch-jobs.garage-offsite-backup
+    rules:
+    - alert: GarageOffsiteBackupFailing
+      ## The job pushes success=0 when any (bucket × destination) pair
+      ## fails. 30h dampening so a single missed nightly doesn't alert
+      ## but two consecutive nights do.
+      expr: garage_offsite_backup_success == 0
+      for: 30h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Garage offsite backup: {{ with query \"garage_offsite_backup_pairs_failed\" }}{{ . | first | value }}{{ end }} of {{ with query \"garage_offsite_backup_pairs_ok + garage_offsite_backup_pairs_failed\" }}{{ . | first | value }}{{ end }} pairs failing for >30h"
+        description: |
+          One or more bucket -> destination pairs are failing on the nightly
+          f/config_backup/garage_offsite_backup job (Windmill). Inspect the
+          latest run for the failed-pair list and root cause; the typical
+          culprit is harvester-backup -> b2 hitting the per-rclone timeout.
+
+    - alert: GarageOffsiteBackupStale
+      ## Catches the case where the script itself doesn't reach the
+      ## Pushgateway push at all (e.g. worker OOMKilled mid-loop, or
+      ## subprocess.TimeoutExpired propagating before the never-raise
+      ## helper landed). Without this, the success/pairs gauges look
+      ## fine because Pushgateway holds the last value forever.
+      ## Nightly schedule is 02:00 UTC; 30h covers any single missed run
+      ## plus normal clock drift without flapping.
+      expr: time() - garage_offsite_backup_last_run_timestamp_seconds > 30 * 3600
+      for: 1h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Garage offsite backup hasn't pushed metrics in >30h"
+        description: |
+          The garage_offsite_backup_last_run_timestamp_seconds gauge is older
+          than 30 hours. Either the Windmill job is no longer being scheduled,
+          or it's aborting before the Pushgateway PUT (worker OOM, unhandled
+          exception, network failure to pushgateway). The Pushgateway holds
+          stale gauges indefinitely, so the success/pairs gauges may LIE about
+          recent state — trust this alert, not them.
+
+  - name: app-batch-jobs.storage-health
+    rules:
+    - alert: StoragePoolUnhealthy
+      expr: storage_pool_healthy == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "TrueNAS pool {{ $labels.nas }}/{{ $labels.pool }} is unhealthy"
+        description: "ZFS pool {{ $labels.pool }} on {{ $labels.nas }} reports !healthy or status != ONLINE. Run midclt call pool.query on the host."
+
+    - alert: StoragePoolNearFull
+      expr: storage_pool_used_pct > 85
+      for: 1h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "TrueNAS pool {{ $labels.nas }}/{{ $labels.pool }} is {{ $value | printf \"%.0f\" }}% full"
+        description: "ZFS pool capacity threshold reached. Prune snapshots or add disks."
+
+    - alert: SynologyArrayDegraded
+      expr: storage_synology_array_healthy == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Synology {{ $labels.nas }}/{{ $labels.array }} mdraid degraded"
+        description: "Linux mdraid array reports a missing/failed disk. Check /proc/mdstat on {{ $labels.nas }}."
+
+    - alert: SynologyVolumeNearFull
+      expr: storage_synology_volume_used_pct > 85
+      for: 1h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Synology {{ $labels.nas }}{{ $labels.mount }} is {{ $value }}% full"
+        description: "Synology data volume capacity threshold reached."
+
+  - name: app-batch-jobs.bpir4
+    rules:
+    - alert: Bpir4WanDown
+      expr: bpir4_wan_up == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 WAN is down"
+        description: "PPPoE WAN reports no IP. HA storm/PON automations may already be acting; this is the slow-cron-side confirmation."
+    - alert: Bpir4OverlayNearFull
+      expr: bpir4_overlay_used_pct > 80
+      for: 1h
+      labels:
+        severity: warning
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 /overlay is {{ $value }}% full"
+        description: "Router overlay filesystem near full — config writes may fail."
+    - alert: Bpir4LoadHigh
+      expr: bpir4_load_1m > 2
+      for: 1h
+      labels:
+        severity: warning
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 load1 is {{ $value }}"
+        description: "Sustained load on the router. Check page-pool / SFP storm sensors."
+    - alert: Bpir4KernelErrors
+      expr: bpir4_kernel_errors_count > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "BPI-R4 has {{ $value }} kernel error(s) in logread"
+        description: "Recent logread output contains kernel error/oom/panic/oops lines. Inspect via boot-reason.sh / pstore."
+
+  ## bone = the Carnotzet rack kiosk (Pi 3B+), fed by f/probe/bone_health (5-minutely).
+  ##
+  ## ⭐ Every rule here is `severity: warning` + component `Automation`, and that
+  ## is deliberate, not laziness. `Automation` is in INTERNAL_COMPONENTS, so the
+  ## statuspage adapter skips it and mdapi.statuspage.io never learns this host
+  ## exists; warning routes to Pushover at priority -1 with a 7d repeat. Losing
+  ## the rack screen costs visibility, not service. Same reasoning as
+  ## RackKioskUnreachable in 11-blackbox-alerts.yml — which covers "is it up";
+  ## these cover "is it about to stop being up".
+  - name: app-batch-jobs.bone
+    rules:
+    - alert: BoneUnderVoltage
+      ## THE fault to catch on this board: under-voltage silently corrupted ~40%
+      ## of SD writes in 2026-08 with zero I/O errors logged, and was only found
+      ## by reading this bit by hand.
+      ##
+      ## ⭐ Fires on the LATCHED bit (16), not the live one (0), because a
+      ## brownout lasts milliseconds and a 5-minutely probe would essentially
+      ## never sample `_now` true. The cost is that this stays firing until a
+      ## reboot clears the bit — accepted: the PSU is genuinely suspect until
+      ## proven otherwise, and warning severity keeps that cheap. If a reboot
+      ## clears it and it comes straight back, the supply is failing for real.
+      expr: bone_undervoltage_occurred == 1
+      for: 15m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "bone has seen under-voltage since its last boot"
+        description: |
+          vcgencmd get_throttled bit 16 is set on the rack kiosk Pi. This is the
+          failure mode that corrupted the previous SD card with NO I/O errors in
+          dmesg, so do not wait for the filesystem to complain.
+          Check the PSU and the cable before suspecting the card:
+            ssh bone 'vcgencmd get_throttled'   # re-read live
+          Raw word is in bone_throttled_flags. Memory:
+          rack_status_screen_kiosk_bone_reflash_2026_08_28.
+    - alert: BoneOverheating
+      ## Pi 3B+ soft-throttles at 60C and hard-throttles at 85C. Measured
+      ## baseline with the kiosk up is 51-69C in a 29C room, and the board has
+      ## no heatsink — so 70C sustained means it got materially worse, not that
+      ## it is merely warm. Below that it would fire on the status quo.
+      expr: bone_temp_celsius > 70
+      for: 15m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "bone is at {{ $value | printf \"%.0f\" }}C"
+        description: |
+          The rack kiosk Pi has been above 70C for 15m (soft limit 60C, hard 85C,
+          no heatsink fitted). It throttles rather than dying, so the visible
+          symptom is a sluggish or stuck dashboard.
+          Check the room: bone_temp_celsius tracks the rack ambient closely, so
+          look at the exhaust fan before touching the Pi.
+    - alert: BoneMemoryCritical
+      ## 905 MB total, chromium's summed RSS already exceeds RAM (shared pages),
+      ## and ~130 MB of swap is normal here. Baseline available is ~390 MB, so
+      ## 100 MB means the browser has genuinely run away.
+      expr: bone_mem_available_bytes < 100e6
+      for: 15m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "bone has {{ $value | humanize1024 }}B of memory available"
+        description: |
+          Memory pressure on the rack kiosk Pi (905 MB total; baseline available
+          is ~390 MB). Almost certainly the kiosk browser growing:
+            ssh bone 'ps -eo rss,comm --sort=-rss | head'
+            ssh bone 'sudo systemctl restart lightdm'   # relaunches the kiosk
+          Cheap headroom if this recurs: comment out pcmanfm-pi in
+          /etc/xdg/labwc/autostart (desktop icons behind a full-screen kiosk).
+    - alert: BoneWifiSignalDegraded
+      ## bone has NO cable: eth0 is down with 0 bytes ever, and it reaches the
+      ## LAN over 5 GHz from inside a metal rack, associated to the ground-floor
+      ## AP one floor up. Baseline is -71..-73 dBm, so -78 catches real
+      ## degradation rather than the status quo. 2h because this is a "go run a
+      ## cable" nudge, never an incident.
+      ## The C9300 stack is two rack units away with 40+ free ports.
+      expr: bone_wifi_signal_dbm < -78 and bone_eth_carrier == 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "bone's wifi is down to {{ $value | printf \"%.0f\" }} dBm"
+        description: |
+          The rack kiosk has been at a worse-than-baseline signal for 2h. It has
+          no ethernet cable (bone_eth_carrier == 0), so this is its only path and
+          it shows up as ICMP loss and a flaky dashboard long before it fully
+          drops. The real fix is a patch cable to the C9300 in the same rack;
+          this alert disappears on its own once bone_eth_carrier reads 1.
+    - alert: BoneProbeFailing
+      ## Distinct from RackKioskUnreachable: that one is ICMP. This fires when
+      ## bone still answers pings but the ssh collection does not work — sshd
+      ## gone, filesystem read-only, key removed, vcgencmd broken by an upgrade.
+      ## Without it that whole class is silent, because BatchJobStale only sees
+      ## the job failing to RUN, and this job runs fine and reports 0.
+      expr: bone_probe_success == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "bone_health cannot collect from bone (ssh, not ping)"
+        description: |
+          f/probe/bone_health ran and could not read bone over ssh for >30m. If
+          RackKioskUnreachable is also firing the host is simply down; if it is
+          NOT, the host is up and something specific is broken — sshd, the
+          rootfs, the windmill@mdapi key in ~tillo/.ssh/authorized_keys, or
+          vcgencmd. The job log carries the exact ssh error.
+
+  - name: app-batch-jobs.gitlab-backups
+    rules:
+    - alert: GitlabBackupStale
+      expr: gitlab_backup_age_days > 1.1
+      for: 30m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "GitLab backup is {{ $value }}d old"
+        description: "Newest object in gitlab-backups bucket is older than the 2-day threshold."
+    - alert: GitlabRunnerPodNotReady
+      expr: gitlab_runner_pod_ready < gitlab_runner_pod_desired
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab runner pod {{ $value }} of desired ready"
+        description: "Runner deployment in bootstrap ns not at full strength."
+    ## RESHAPED 2026-09-02 (was `gitlab_group_runners_offline > 0`), then
+    ## CORRECTED + RENAMED 2026-09-03 — the 09-02 reshape did not work.
+    ##
+    ## The original measured PRESENCE, not capacity: the group's runners were
+    ## laptop seats, off most of the time BY DESIGN, so it meant "a laptop is
+    ## closed" while pushing the PUBLIC statuspage into degraded_performance.
+    ## Moving to `online == 0` was meant to fix that.
+    ##
+    ## ⛔ It didn't, because `gitlab_group_runners_online` counts GROUP-SCOPED
+    ## runners ONLY — and the ONLY group-scoped runners on this instance ARE the
+    ## laptop seats. Proven 2026-09-03 via `glab api projects/26/runners`
+    ## (`runners/all` is admin-only, 403 for our token): id 156 tag `mbptillo`,
+    ## id 159 tag `mbpmda`, both group_type, both offline — while every other
+    ## runner is instance_type. So the reshape only made the same false alarm
+    ## rarer, and the retirement of that first seat then made group scope
+    ## structurally zero. It fired 2026-09-03T00:00:30Z and degraded
+    ## Platform while CI was entirely healthy: 8/8 pipelines green that morning,
+    ## the newest finished ~60s before the check, with live job pods in ns
+    ## bootstrap.
+    ##
+    ## ⭐ The description had ALREADY been rewritten to say "this is capacity,
+    ## not presence" while the expression still measured group presence. The
+    ## prose was fixed and the PromQL wasn't — verify the function, not the name.
+    ##
+    ## Real capacity is group seats PLUS the in-cluster instance runner, so
+    ## require BOTH to be empty. Renamed off "Group" because the group scope was
+    ## exactly the wrong thing to key on; no other file referenced the old name.
+    ##
+    ## Blind spot, accepted: if the gitlab_backup_health push stops, both series
+    ## go stale together and this cannot fire — BatchJobStale covers that job.
+    - alert: GitlabCiNoRunnerCapacity
+      expr: |
+        (gitlab_group_runners_online == 0)
+        and on ()
+        (gitlab_runner_pod_ready == 0)
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "No GitLab runner of any scope is online — CI has no capacity"
+        description: |
+          Both sources of CI capacity are gone at once: no group runner is
+          online AND the in-cluster runner has no ready pod. No pipeline can
+          be picked up.
+
+          The mbpmda seat/laptop runner going offline is expected and never
+          alerts on its own — it is the only group-scoped runner left, so group
+          scope reads 0 on most days.
+          The in-cluster instance runner in namespace bootstrap is what
+          actually carries CI; check it first (`gitlab_runner_pod_ready`, and
+          GitlabRunnerPodNotReady which watches it at full strength).
+
+  - name: app-batch-jobs.cve-scan
+    rules:
+    ## REPLACED 2026-08-29. This was NamespaceWithCriticalCves — one info alert per
+    ## namespace holding an image with a fixable critical CVE. Measured over 90 days it
+    ## fired 98% of the time and produced 26 simultaneous instances, roughly three
+    ## quarters of everything visible in the Alertmanager UI.
+    ##
+    ## The problem was never accuracy, it was SHAPE. Three things came out of the audit:
+    ##  - it notifies nothing (black-holed since 2026-07-13; the grype curator digest is
+    ##    the single CVE channel) so its only surface is the AM UI, which it swamped;
+    ##  - the standing set barely moves — 29 of 36 images were already flagged a week
+    ##    earlier, 34 of 36 two weeks earlier. That is inventory, not an event;
+    ##  - counting NAMESPACES gave every finding equal weight while one image,
+    ##    flaresolverr:latest, held 617 of the estate's 923 fixable criticals (67%). A
+    ##    namespace with one CVE looked identical to the one with six hundred, so the
+    ##    single thing worth knowing was the thing the alert hid. See beads infra-az8.3.
+    ##
+    ## So: alert on the DELTA, which is the actual news, and leave the standing list to
+    ## the digest and to PromQL. The metric is untouched — pod_image_cve_count still
+    ## carries everything for dashboards and drill-down.
+    ##
+    ## ⚠️ GAP GUARD, and it is load-bearing. pod_image_cve_count has real holes — it had
+    ## ZERO series at the 30d, 60d and 90d marks when this was written. Without the guard
+    ## a scrape gap in the lookback window makes EVERY image look new at once, turning a
+    ## quiet alert into a 36-instance storm that is pure artefact. The `count(...) > 10`
+    ## clause refuses to evaluate unless the history it compares against actually exists.
+    ## max_over_time over the whole window (not `offset 7d`, a single point) is the other
+    ## half of that: it tolerates holes inside the window.
+    ##
+    ## Verified before shipping: the `unless on (image)` join subtracts exactly (36 all
+    ## flagged, 7 with >10 CVEs, 36 unless 7 = 29); the guard reads 45 against its
+    ## threshold of 10; and the rule is correctly silent today because nothing has been
+    ## newly flagged this week.
+    - alert: NewImageWithCriticalCves
+      expr: |
+        (
+          count by (namespace, image) (
+            last_over_time(kube_pod_container_info[30m])
+            * on (image) group_left()
+            group by (image) (pod_image_cve_count{severity="critical",fix_state="fixed"} > 0)
+          )
+          unless on (image) (
+            max_over_time(pod_image_cve_count{severity="critical",fix_state="fixed"}[7d:1h] offset 6h) > 0
+          )
+        )
+        and on() (
+          count(max_over_time(pod_image_cve_count{severity="critical",fix_state="fixed"}[7d:1h] offset 6h) > 0) > 10
+        )
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "New image with fixable critical CVEs: {{ $labels.image }} in {{ $labels.namespace }}"
+        description: |
+          This image is running with at least one CRITICAL CVE whose upstream fix is
+          already released, and it was NOT flagged at any point in the previous 7 days —
+          so this is new, not part of the standing backlog.
+
+          How many, and which:
+            pod_image_cve_count{severity="critical",fix_state="fixed",image="{{ $labels.image }}"}
+
+          Usually a version bump pulled in a newly-disclosed CVE, or a new workload
+          arrived. Mitigations: bump the pin (Renovate usually has the MR), refresh
+          :latest via Keel, or bump the base image for our own builds. Unfixed criticals
+          are excluded by design — inspect them with fix_state="unfixed".
+
+          The full standing inventory is NOT here on purpose: it lives in the grype
+          curator digest and in the metric above. If you want the whole list rather than
+          what changed, query the metric.
+
+  - name: app-batch-jobs.cluster-waste
+    rules:
+    - alert: ClusterPendingPodsTooLong
+      expr: cluster_pending_pods_count > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} pod(s) Pending > 60min"
+        description: "User workloads stuck in Pending. Check scheduler events / resource pressure / PVC bind."
+    - alert: ClusterUnknownNodeAutoDeleted
+      ## info: the heal already removed the ghost node when this fires —
+      ## record of automation acting, not a pending problem. A node that
+      ## fails to re-join surfaces through the etcd-quorum / node alerts.
+      expr: cluster_unknown_nodes_deleted_this_run > 0
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Auto-deleted {{ $value }} Unknown-state node(s)"
+        description: "resource_waste.py removed nodes stuck in NotReady > 15min. New nodes should re-join automatically."
+    - alert: ClusterReleasedPVsOrphaned
+      ## A PVC was deleted but its PV stayed Released because
+      ## reclaimPolicy=Retain — the PV (and, for Longhorn, the backing
+      ## volume) keeps consuming disk. 1h `for:` rides out normal PVC churn.
+      expr: cluster_released_pvs_count > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} PV(s) orphaned in Released state"
+        description: |
+          PersistentVolume(s) left in Released phase — the bound PVC was
+          deleted but reclaimPolicy=Retain kept the PV, and for Longhorn the
+          backing volume too, which keeps consuming disk. See the
+          f/probe/daily_infra_health Windmill run log for the PV names
+          (counts moved there from the weekly f/heal/resource_waste
+          2026-08-18 for daily freshness).
+          Clean up: `kubectl delete pv <name>` and, for Longhorn,
+          `kubectl -n longhorn-system delete volumes.longhorn.io <name>`.
+
+  - name: app-batch-jobs.image-builder-health
+    rules:
+    - alert: GitlabImageBuilderSilent
+      ## Each non-archived mdapi/* image-builder is on a 4-hourly schedule
+      ## (6 pipelines / 24h). The detection script pushes the per-project
+      ## count daily; this fires when a project drops below 4 — late enough
+      ## that one missed run doesn't alert, early enough that two missed
+      ## runs do.
+      ## `unless schedule_recent`: a schedule created < 26h ago can't have
+      ## put 4 runs in the window yet — that recovery/warm-up phase fires
+      ## as the info tier below instead (mdapi/portal, 2026-07-08: fix
+      ## deployed at 22:00 but the warning kept firing ~20h more).
+      expr: gitlab_image_builder_pipelines_24h{job="gitlab_image_builder_health"} < 4 unless on(project) gitlab_image_builder_schedule_recent{job="gitlab_image_builder_health"} == 1
+      for: 30h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab project mdapi/{{ $labels.project }} only ran {{ $value }} pipelines in last 24h"
+        description: |
+          A 4-hourly image-builder schedule appears to have stopped firing.
+          Check https://gitlab.mdapi.ch/mdapi/{{ $labels.project }}/-/pipeline_schedules
+    - alert: GitlabImageBuilderSilent
+      ## Same low count but the active 4h schedule is < 26h old — it hasn't
+      ## had time to fire 4 times. Warming up, self-solving; once the
+      ## schedule ages past 26h the recent flag drops and, if the count is
+      ## still < 4 (scheduled pipelines failing/not firing), the warning
+      ## tier above takes over automatically.
+      expr: gitlab_image_builder_pipelines_24h{job="gitlab_image_builder_health"} < 4 and on(project) gitlab_image_builder_schedule_recent{job="gitlab_image_builder_health"} == 1
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab project mdapi/{{ $labels.project }} at {{ $value }} pipelines/24h — schedule freshly created, warming up"
+        description: |
+          The project's 4-hourly schedule was created less than 26h ago, so
+          the 24h pipeline window can't contain 4 runs yet. No action needed;
+          escalates to warning if the count is still low after the schedule
+          matures.
+          (full detection logic in Windmill: f/probe/gitlab_image_builder_health).
+
+    - alert: GitlabImageBuilderNoSchedule
+      ## A non-archived mdapi/* project with Dockerfile+.gitlab-ci.yml but
+      ## NO active 4-hourly pipeline schedule. Day-one signal for a newly
+      ## created builder repo: push activity during initial development
+      ## keeps pipelines_24h >= 4, masking the missing schedule from
+      ## GitlabImageBuilderSilent until development stops (mdapi/portal,
+      ## created 2026-06-30, only surfaced as "silent" on 07-06).
+      expr: gitlab_image_builder_projects_no_schedule{job="gitlab_image_builder_health"} > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab image-builder project(s) have no 4-hourly schedule"
+        description: |
+          The offending project list is the `no_schedule` field in the latest
+          Windmill run result of f/probe/gitlab_image_builder_health. Fix by
+          creating a pipeline schedule on the project: canonical description
+          'Every 4h at minute X hour-base Y', a cron minute/hour-base slot not
+          used by any other project (the probe log prints the full cron map),
+          ref=main, active. Or add the project to the probe's EXCLUDE set if
+          4-hourly rebuilds are genuinely not wanted.
+
+    - alert: GitlabImageBuilderScheduleCollision
+      ## Two image-builders sharing the same cron minute = unnecessary runner
+      ## contention. The detection script publishes the count of colliding
+      ## cron strings; >0 means at least one minute slot is over-subscribed.
+      expr: gitlab_image_builder_schedule_collisions{job="gitlab_image_builder_health"} > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab image-builder schedule(s) collide on the same cron minute"
+        description: |
+          Two or more mdapi/* projects use the same `<M> <H> * * *` schedule.
+          Inspect the latest Windmill run of f/probe/gitlab_image_builder_health
+          for the `schedule_collisions` field listing the offenders.
+
+    - alert: GitlabImageBuilderDescriptionDrift
+      ## A pipeline schedule's human-readable description has drifted from
+      ## its cron (e.g. cron moved to minute 25 but description still says
+      ## "minute 0"). The probe pushes the canonical-template comparison
+      ## per project; this aggregates and waits 1 day before alerting --
+      ## a same-day fix shouldn't trip it.
+      expr: gitlab_image_builder_description_drift_total{job="gitlab_image_builder_health"} > 0
+      for: 24h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} GitLab image-builder schedule(s) have stale descriptions"
+        description: |
+          One or more mdapi/* pipeline schedules have descriptions that no
+          longer match their cron expression. The canonical template is
+          'Every 4h at minute X hour-base Y'. Inspect the latest Windmill
+          run of f/probe/gitlab_image_builder_health for the full
+          drift list (project, current desc, expected desc).
+
+    - alert: GitlabCIBulkFailure
+      ## When a single root cause cascades to many CI pipelines (e.g. the
+      ## 2026-05-23 'secret-scan untagged -> stuck_or_timeout_failure' that
+      ## broke 25 unrelated mdapi/* projects), surface it as ONE alert keyed
+      ## on (job_name, failure_reason) instead of N look-alike per-project
+      ## warnings. Routed to General -> Pushover only; deliberately NOT
+      ## component=GitLab to avoid the statuspage-degrade trap (CI failures
+      ## don't always mean the GitLab service is degraded).
+      expr: gitlab_ci_failures_grouped{job="gitlab_ci_failure_groupby"} >= 5
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab CI: {{ $value }} mdapi/* projects failing at {{ $labels.job_name }} / {{ $labels.failure_reason }}"
+        description: |
+          A single root cause is cascading across multiple mdapi/* projects:
+          {{ $value }} projects failed in the last 24h at the same job
+          ({{ $labels.job_name }}) for the same reason ({{ $labels.failure_reason }}).
+          Inspect the latest Windmill run of f/probe/gitlab_ci_failure_groupby
+          for the full project list + a sample pipeline URL.
+
+  - name: app-batch-jobs.waf-audit
+    rules:
+    - alert: WafCarveoutRegression
+      ## A WAF rule that was carved out by a Fleet ingress
+      ## modsecurity-snippet (921250/932160 on idp OIDC, 934110/942290 on
+      ## the oc-legacy owncloud oauth2 + Graph APIs — re-scoped off
+      ## cloud.mdapi.ch after the 2026-08-17 Nextcloud cutover) registered
+      ## a 403 in the last 24h.  Either
+      ## the carveout regex no longer covers a new path variant, the
+      ## Fleet ingress drifted, or a novel attack matches the same rule
+      ## outside the carveout scope.  All three are worth a look.
+      expr: waf_carveout_blocks{job="waf_novelty_audit"} > 0
+      for: 0m
+      labels:
+        severity: warning
+        component: Platform
+        subsystem: waf
+        team: mdapi
+      annotations:
+        summary: "WAF carveout-protected rule {{ $labels.rule }} fired {{ $value }}x in 24h"
+        description: |
+          Run `/waf-audit` and check the live Ingress annotation against
+          the relevant fleet file (e.g. ~/fleet/keycloak/keycloak-ing.yml
+          for rules 921250/932160). Steady-state count is 0.
+
+    - alert: WafNoveltyDetected
+      ## Novelty surfaced by f/probe/waf_novelty_audit: a new
+      ## (host, matched_rules) combination, a new host in the WAF
+      ## top-20, or >=10x deviation on an existing combination.  Most
+      ## days this is zero; when it fires, a human needs to classify
+      ## the rows.
+      ##
+      ## 2026-07-13: the flap fix lives in the PROBE (v2 baselines:
+      ## persistent 90d known-hosts, 28d combo memory, COALESCE host
+      ## derivation) — the v1 baselines made ~half of all hourly runs
+      ## signal "novelty" (86 clean-classified episodes/13d). for: MUST
+      ## stay 0m: a signal lives only until the next hourly run merges it
+      ## into state (~60m), so any for: >= the run interval would mean the
+      ## alert can never fire at all.
+      expr: waf_novelty_signals{job="waf_novelty_audit"} > 0
+      for: 0m
+      labels:
+        severity: info
+        component: Platform
+        subsystem: waf
+        team: mdapi
+      annotations:
+        summary: "WAF novelty audit surfaced {{ $value }} new signal(s)"
+        description: |
+          Run `/waf-audit` to classify each row as scanner / attack /
+          false positive. The novelty list is in the latest Windmill
+          run output of f/probe/waf_novelty_audit.
+
+    - alert: WafNoveltyAuditStale
+      ## The cron is scheduled daily 06:00 UTC; 25h with no fresh
+      ## timestamp means the run silently failed or the schedule was
+      ## disabled.
+      expr: time() - waf_audit_last_run_timestamp_seconds{job="waf_novelty_audit"} > 90000
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        subsystem: waf
+        team: mdapi
+      annotations:
+        summary: "WAF novelty audit has not run in {{ $value | humanizeDuration }}"
+        description: |
+          Check the Windmill schedule f/probe/waf_novelty_audit
+          and the last job status.
+
+  - name: app-batch-jobs.upgrade
+    rules:
+    - alert: ComponentUpgradeAvailable
+      ## info-only — surfaces upgrade availability so it appears as an
+      ## AM-tracked alert (firing + resolved) rather than a one-shot
+      ## Monday-morning Pushover that needs manual triage.
+      expr: component_upgrade_available == 1
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }} upgrade available"
+        description: "{{ $labels.component }} has a newer same-minor release. Plan an upgrade window."
+
+  - name: app-batch-jobs.k8s-orphan-audit
+    rules:
+    - alert: K8sOrphanObjects
+      ## info-only housekeeping surface from f/probe/k8s_orphan_audit (daily,
+      ## prod + mgmt): Released/Failed PVs, service-less EndpointSlices, helm
+      ## releases stuck pending-* >24h, warning-event storms >=1000, VMs with
+      ## missing cloud-init secrets, PV-less Longhorn volumes. Classes from
+      ## the 2026-08-17 sweep — each had sat unnoticed for weeks-to-months.
+      expr: k8s_orphan_audit_findings{job="k8s_orphan_audit"} > 0
+      for: 90m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.cluster }}: {{ $value }} {{ $labels.class }} finding(s)"
+        description: "k8s_orphan_audit found {{ $value }} {{ $labels.class }} on {{ $labels.cluster }} — object names are in the probe's job log."
+    - alert: K8sFailedPodCorpses
+      ## a pile of Failed-phase pods = active node trouble (DiskPressure storm
+      ## class: 507 corpses on rancher-mgmt sat 5 days unnoticed 2026-08-12).
+      expr: k8s_orphan_audit_failed_pods{job="k8s_orphan_audit"} > 10
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.cluster }}: {{ $value }} Failed-phase pod corpses"
+        description: "Pod corpse pile-up on {{ $labels.cluster }} — check node conditions (DiskPressure?), then clean with: kubectl delete pods -A --field-selector=status.phase=Failed"
+
+  - name: app-batch-jobs.host-updates
+    rules:
+    - alert: HostUpdateAvailable
+      expr: host_update_available == 1
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.host }} ({{ $labels.kind }}) has updates available"
+        description: "Schedule an update window for {{ $labels.host }}."
+
+  - name: app-batch-jobs.longhorn-labels
+    rules:
+    - alert: LonghornLabelEnforcerPatched
+      ## Fires when a run actually patched labels — signals that a new
+      ## PVC appeared without the recurring-job labels. Tells you the
+      ## platform default is missing on a newly created workload.
+      expr: longhorn_label_enforcer_pvcs_patched > 0
+      labels:
+        severity: info
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn label enforcer patched {{ $value }} PVC(s)"
+        description: "New PVC(s) appeared without the standard recurring-job labels. The enforcer added them; consider where the default should live (Helm chart? Operator?)."
+    - alert: LonghornLabelEnforcerErrors
+      expr: longhorn_label_enforcer_pvcs_errors > 0
+      for: 10m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn label enforcer had {{ $value }} error(s)"
+        description: "Enforcer failed to patch labels on one or more PVCs. Check the Windmill run."
+
+  - name: app-batch-jobs.frigate-config
+    rules:
+    - alert: FrigateConfigMigrationPending
+      ## infra-0ga: Frigate's config.yaml is a read-only fleet ConfigMap, so
+      ## its startup config-migration is disabled — while the :stable image
+      ## auto-updates via Keel (4h force-poll). The daily probe
+      ## f/probe/frigate_config_version_check compares the ConfigMap's
+      ## version: against CURRENT_CONFIG_VERSION of the RUNNING release.
+      ## Not auto-solving (needs a hand migration commit) -> warning.
+      expr: frigate_config_version_mismatch == 1
+      for: 1h
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "Frigate is running with an unmigrated config (read-only ConfigMap)"
+        description: "The running Frigate release expects a newer config version than fleet/frigate/frigate-cm.yml pins. Apply the upstream config migration by hand in the ConfigMap and bump version: in the same commit (see probe log for versions)."
+
+  - name: app-batch-jobs.infra-health
+    rules:
+    - alert: FleetBundlesNotReady
+      ## Since 2026-07-03 the gauge is split per fleet cluster (daily_infra_health
+      ## emits cluster="mdapi"|"local"|...) so breakage on one cluster can't hide
+      ## new breakage on another. One alert fires per cluster.
+      ## (The c-rackspacetest2 exclusion was removed 2026-07-06 when that cluster
+      ## was decommissioned — it was only there to mute its terminal phantom
+      ## bundle state.)
+      ## 2026-07-30 (infra-health, user-approved): split into two tiers per
+      ## the severity policy. The gauge is pushed hourly; a single-cycle blip
+      ## (agent redeploy, transient Modified during rollout — 4 of the 5
+      ## episodes since 07-14) self-resolves and stays info. Warning needs
+      ## the gauge nonzero across >=2 consecutive pushes (min_over_time over
+      ## 75m covers two hourly pushes); the instant clause keeps it off dead
+      ## pushgateway-pod series.
+      expr: fleet_bundle_deployments_not_ready > 0
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }}"
+        description: "Names: query fleet_bundle_deployment_not_ready_info (same hourly push, works from the jump seat) or `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
+
+    - alert: FleetBundlesNotReadySustained
+      expr: |
+        fleet_bundle_deployments_not_ready > 0
+        and min_over_time(fleet_bundle_deployments_not_ready[75m]) > 0
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} Fleet BundleDeployment(s) not Ready on {{ $labels.cluster }} for >1h"
+        description: "Not-ready across two consecutive hourly pushes — not a rollout blip. Names: query fleet_bundle_deployment_not_ready_info (same hourly push, works from the jump seat) or `kubectl --context mdapi-mgmt get bundledeployments -A | grep -v Ready`."
+    - alert: InfraHealthCollectorDegraded
+      ## daily_infra_health degrades per collector since 2026-08-18
+      ## (infra-health, user-approved): a failing upstream (rancher-mgmt
+      ## proxy timeout during an upgrade, a transient 500 on one API group)
+      ## no longer kills the whole run — the collector reports 0 here and
+      ## its metric family is re-pushed from the last good values, so the
+      ## family's own alerts don't false-resolve. Blips self-clear on the
+      ## next hourly run; only a full 3h of consecutive failures is worth
+      ## eyes. collector="fleet" also reads 0 while the Rancher management
+      ## plane is deliberately skipped (fleet_mgmt_reachable=0 says why).
+      expr: max_over_time(infra_health_collector_up[3h]) == 0
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "infra-health collector {{ $labels.collector }} degraded >3h"
+        description: "daily_infra_health collector {{ $labels.collector }} has not succeeded for 3h+; its gauges are frozen at last-good values. Check the hourly run logs in Windmill (f/probe/daily_infra_health)."
+    - alert: CertExpiringSoon
+      ## Warning only when cert-manager has NO future renewalTime (or the
+      ## scheduled renewal has passed and the cert still hasn't rotated) —
+      ## i.e. nothing is going to fix this by itself. Until the probe pushes
+      ## cert_renewal_scheduled (deployed 2026-07-09), `unless` matches
+      ## nothing and this behaves like the old unconditional rule.
+      expr: cert_expiry_days < 30 unless on(namespace, cert) cert_renewal_scheduled == 1
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Cert {{ $labels.namespace }}/{{ $labels.cert }} expires in {{ $value }}d"
+        description: "cert-manager Certificate close to expiry with no future renewalTime; investigate renewal."
+    - alert: CertExpiringSoon
+      ## Same window but a future renewalTime exists — rotation is planned.
+      ## 47d horizon-private certs (aruba-apin*) renew ~16d before expiry, so
+      ## they spend ~14d of every cycle inside the 30d window. FYI only.
+      expr: cert_expiry_days < 30 and on(namespace, cert) cert_renewal_scheduled == 1
+      for: 1h
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Cert {{ $labels.namespace }}/{{ $labels.cert }} expires in {{ $value }}d (renewal scheduled)"
+        description: "cert-manager has a future renewalTime for this Certificate; rotation is planned. Escalates to warning automatically if the scheduled renewal passes without rotation."
+    - alert: LonghornBackupStale
+      # 40d (was 70d): the recurring `default` group backs up monthly (1st of
+      # month), so a healthy volume maxes ~31-35d before its next run. 70d only
+      # caught volumes that had already missed TWO cycles — when the May/June
+      # partial runs left ~37 volumes a full cycle behind, none of them alerted.
+      # 40d catches a single missed monthly cycle while leaving margin for a
+      # run that starts a few days late. (Weekly-group volumes are far tighter
+      # in practice; a per-group threshold needs the group label on the metric.)
+      expr: longhorn_backup_age_days > 40
+      for: 1h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn backup {{ $labels.namespace }}/{{ $labels.pvc }} is {{ $value }}d old"
+        description: "PVC backup older than the 40d staleness threshold (monthly policy)."
+    - alert: LonghornBackupMissing
+      expr: longhorn_backup_age_days == -1
+      for: 1d
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn backup {{ $labels.namespace }}/{{ $labels.pvc }} never recorded"
+        description: "BackupVolume exists but lastBackupAt is empty. Check Longhorn recurring jobs."
+    - alert: LonghornVolumeUnhealthy
+      expr: longhorn_volume_unhealthy == 1
+      for: 15m
+      labels:
+        severity: critical
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.namespace }}/{{ $labels.pvc }} unhealthy"
+        description: "Robustness != healthy or state in (faulted, error)."
+    - alert: LonghornRebuildLimitDrift
+      ## concurrent-replica-rebuild-per-node-limit hard ceiling is 2
+      ## (2026-06-07 rule; storms at 4 on 06-07 and 3 on 07-12 were both
+      ## found mid-incident). Gauge pushed hourly by f/probe/
+      ## daily_infra_health; -1 means the setting could not be read.
+      expr: longhorn_rebuild_limit != 2
+      for: 15m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn rebuild limit is {{ $value }} (must be 2)"
+        description: "concurrent-replica-rebuild-per-node-limit drifted from the hard max of 2 (or is unreadable, -1). Patch it back: kubectl -n longhorn-system patch setting.longhorn.io concurrent-replica-rebuild-per-node-limit --type=merge -p '{\"value\":\"2\"}'"
+    - alert: NodeDiskHigh
+      expr: node_disk_used_pct > 80
+      for: 1h
+      labels:
+        severity: warning
+        ## Storage (internal-only), NOT Backups: a node /opt filling with
+        ## container images is ops work — it was degrading the PUBLIC
+        ## statuspage Backups component (2026-08-07). Weekly
+        ## f/heal/node_opt_image_prune now keeps /opt down.
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.node }}:{{ $labels.mount }} is {{ $value }}% full"
+        description: "Node filesystem usage > 80%. Investigate growth source (usually containerd image accumulation on /opt — f/heal/node_opt_image_prune handles that weekly; if this fires, the prune failed or something else is growing)."
+
+  - name: app-batch-jobs.schedule-integrity
+    ## Gauges pushed by f/probe/schedule_integrity_check every hour
+    ## (cron 0 42 * * * * Europe/Zurich). The script holds an embedded
+    ## REQUIRED_SCHEDULES manifest; drift surfaces as schedule_integrity_*
+    ## gauges per offending schedule path.
+    ##
+    ## Built after the 2026-05-29 incident where `wmill sync push`
+    ## archived gitlab_ci_failure_groupby_schedule + waf_novelty_audit_schedule
+    ## silently — only discovered ~30h later via stale-data alerts firing on
+    ## the upstream metrics. See memory:
+    ## feedback-wmill-sync-push-deletes-orphans.
+    ##
+    ## Staleness of THIS check itself is already covered by the generic
+    ## BatchJobStale rule above (job=schedule_integrity_check joins with
+    ## windmill_schedule_interval_seconds).
+    rules:
+    - alert: WindmillRequiredScheduleMissing
+      expr: schedule_integrity_missing > 0
+      for: 10m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill required schedule {{ $labels.path }} is missing"
+        description: |
+          The schedule_integrity_check (f/probe/schedule_integrity_check)
+          asserts {{ $labels.path }} is required. It is absent from the
+          Windmill workspace — the classic `wmill sync push` orphan-archive
+          pattern.
+
+          Restore via Windmill UI or `mcp__windmill__createSchedule` using the
+          definition embedded in the script's REQUIRED_SCHEDULES list. Also
+          ensure `.schedule.yaml` exists locally under ~/windmill/ so the
+          next sync push does not re-orphan it.
+
+    - alert: WindmillRequiredScheduleDisabled
+      expr: schedule_integrity_disabled > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill required schedule {{ $labels.path }} is disabled"
+        description: |
+          The schedule exists but enabled=false. Either intentionally paused
+          (in which case remove from REQUIRED_SCHEDULES) or accidentally
+          toggled off in the UI.
+
+    ## Re-tiered 2026-08-29: this had the starkest measurement of the whole audit —
+    ## 7 episodes over 30 days and **100% of them resolved inside 30 minutes** with no
+    ## intervention, at a median exactly equal to its own `for:`. In other words it has
+    ## never once fired on something a human needed to do. A drift that clears itself is
+    ## the manifest and the schedule re-converging; a drift that persists is a real
+    ## mismatch someone has to reconcile, and only the second deserves attention.
+    - alert: WindmillRequiredScheduleDrifted
+      expr: |
+        (schedule_integrity_drifted > 0)
+        unless (min_over_time(schedule_integrity_drifted[6h:5m]) > 0)
+      for: 30m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill required schedule {{ $labels.path }} drifted: {{ $labels.reason }}"
+        description: |
+          The schedule exists and is enabled, but its script_path / cron /
+          timezone no longer matches the embedded manifest. Every occurrence so far
+          has re-converged on its own within half an hour; WindmillRequiredScheduleStuck
+          escalates if this one does not.
+
+    - alert: WindmillRequiredScheduleStuck
+      expr: min_over_time(schedule_integrity_drifted[6h:5m]) > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill schedule {{ $labels.path }} has been drifted for 6h+: {{ $labels.reason }}"
+        description: |
+          Six hours of continuous drift is not the manifest catching up. Either the
+          manifest is stale (an intentional change — update REQUIRED_SCHEDULES and
+          redeploy) or someone edited the wrong field in the UI. Reconcile one or the
+          other; nothing else will.
+
+  - name: app-batch-jobs.chassis-health
+    ## Gauges pushed by f/probe/chassis_health every 15 min. Reads
+    ## ipmitool chassis status + sel info + sdr elist over SSH on the 5
+    ## bare-metal hosts (qui/quo/qua HPE + salt/pepper IBM TrueNAS).
+    ##
+    ## Component=Platform on purpose: per the statuspage adapter map, the
+    ## Platform component now explicitly covers physical server hardware
+    ## (chassis health, IPMI sensors). See memory:
+    ## ipmi_sel_clearing_bmc_reset_operational_pattern_2026_05_28.
+    rules:
+    - alert: ChassisFault
+      expr: chassis_fault == 1
+      for: 10m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "chassis fault asserted on {{ $labels.host }} ({{ $labels.type }})"
+        description: |
+          ipmitool chassis status reports {{ $labels.type }} fault asserted on
+          {{ $labels.host }}. Investigate immediately — drive/cooling/power
+          faults are real hardware events. Note: HPE qui/quo/qua Sys. Health
+          LED is permanently amber from non-HP-authenticated drive; that
+          cosmetic state does NOT trigger this alert.
+    - alert: ChassisSelNearFull
+      expr: chassis_sel_pct >= 80
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Internal housekeeping signal (2026-07-30, user-approved): a
+        ## filling SEL is maintenance, not a user-visible Platform outage —
+        ## it was degrading the public statuspage after the 07-29 reboots.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.host }} IPMI SEL is {{ $value }}% full"
+        description: |
+          The IPMI System Event Log on {{ $labels.host }} is filling up. On
+          IBM IMM-class boards (salt/pepper), the SEL is capped at 512
+          entries and stops accepting new events at 100% — masking future
+          hardware faults. Clear with sudo ipmitool sel clear.
+    - alert: ChassisSdrAnomaly
+      expr: chassis_sdr_not_ok > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.host }} has {{ $value }} non-OK SDR sensor(s)"
+        description: |
+          ipmitool sdr elist reports at least one sensor whose state is not
+          "ok" or "ns/Disabled" on {{ $labels.host }}. Run `sudo ipmitool sdr
+          elist | grep -Ev '\| ok '` on the host to identify the sensor and
+          its current reading.
+    - alert: ChassisHostUnreachable
+      expr: chassis_unreachable == 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "chassis_health cannot reach {{ $labels.host }}"
+        description: |
+          SSH or ipmitool failed for {{ $labels.host }} for over 30m. Could be
+          host down, BMC wedged, SSH key drift, or sudo permission change.
+          Cross-check with node Ready and blackbox probes before assuming
+          hardware fault.
+    - alert: ChassisHealthStale
+      expr: time() - chassis_health_last_run_timestamp_seconds > 3600
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "f/probe/chassis_health has not run in over an hour"
+        description: |
+          The Windmill chassis_health job (every 15m) has not pushed metrics
+          for more than an hour. Check Windmill schedule and worker pods.
+
+  - name: app-batch-jobs.cert-discovery
+    ## f/probe/k8s_cert_discovery (hourly, 0 23 * * * * UTC) enumerates
+    ## every kubernetes.io/tls secret across local/prod/test (via the Rancher
+    ## proxy) and feeds each cert into Horizon's `kubernetes` discovery campaign
+    ## (POST /api/v1/discovery/feed; 201=new cert, 204=already known — both are
+    ## success, so steady-state errors=0). Complements the netscan network
+    ## CronJob (which sees served endpoints, not in-cluster Secrets).
+    ##
+    ## Staleness is already covered by the generic BatchJobStale rule above:
+    ## the pushed `k8s_cert_discovery_last_run_timestamp_seconds` (job label
+    ## `k8s_cert_discovery`, = basename of the script path) joins
+    ## `windmill_schedule_interval_seconds` (published daily by
+    ## schedule_cadence_map) and fires at 2× the interval (hourly → ~2h).
+    rules:
+    - alert: K8sCertDiscoveryFeedErrors
+      ## >0 only when feeds get non-2xx / exceptions (auth broken, cert
+      ## unparseable, or Horizon unreachable). 2h `for:` = two consecutive
+      ## hourly runs must fail, so a single transient run self-clears (the
+      ## next run overwrites the gauge to 0) without alerting.
+      expr: k8s_cert_discovery_errors{job="k8s_cert_discovery"} > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "k8s cert discovery: {{ $value }} cert(s) failed to feed into Horizon"
+        description: |
+          The hourly f/probe/k8s_cert_discovery job got non-2xx responses
+          (or exceptions) feeding certs into Horizon's `kubernetes` discovery
+          campaign for >2h (two runs). 201/204 are both success, so this is a
+          real fault — Horizon down/unreachable from the worker, the
+          horizon-discovery key rotated, or unparseable certs. Check the latest
+          run log at https://windmill.mdapi.ch (it prints the first 15 failing
+          cluster/namespace/secret + HTTP status).
+
+  - name: app-batch-jobs.horizon-license
+    ## f/probe/horizon_license_usage (hourly) publishes the total Horizon
+    ## certificate count vs the clm.<N> license cap (decoded live from the
+    ## horizon-license secret). The discovery jobs (netscan + k8s_cert_discovery)
+    ## keep growing the count, so warn BEFORE the cap blocks issuance/import.
+    ## Staleness is covered by the generic BatchJobStale rule (job label
+    ## horizon_license_usage = script basename).
+    rules:
+    - alert: HorizonCertCountApproachingLicense
+      expr: horizon_license_certificate_used_ratio{job="horizon_license_usage"} > 0.8
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon CLM license {{ $value | humanizePercentage }} used"
+        description: |
+          Horizon holds {{ with query "horizon_certificate_count{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }} of {{ with query "horizon_license_certificate_limit{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }} licensed CLM certificates (>80%).
+          The discovery jobs (netscan, k8s_cert_discovery) keep adding certs; at
+          100% Horizon refuses new issuance/import. Raise the license (clm.N) or
+          prune discovered certs. Source: f/probe/horizon_license_usage.
+    - alert: HorizonCertCountNearLicenseLimit
+      expr: horizon_license_certificate_used_ratio{job="horizon_license_usage"} > 0.95
+      for: 30m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon CLM license {{ $value | humanizePercentage }} used — near cap"
+        description: |
+          Horizon is within 5% of its CLM certificate cap
+          ({{ with query "horizon_certificate_count{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }}/{{ with query "horizon_license_certificate_limit{job='horizon_license_usage'}" }}{{ . | first | value }}{{ end }}).
+          Issuance/import is blocked at 100% — install a larger license (clm.N) or
+          prune certificates now.
+
+  - name: app-batch-jobs.horizon-lic001
+    ## f/heal/horizon_lic001_heal (every 10 min) probes GET /api/v1/licenses;
+    ## the recurring Pekko DCV-singleton wedge (LIC-001, AskTimeout on
+    ## dcv-policy-manager-proxy after in-place horizon-0 restarts; hit
+    ## 2026-07-02 and 2026-08-12→16) makes it hang 60s then 500. The heal
+    ## deletes horizon-0 after a 12-min dwell, max once per 6h. Severity per
+    ## the auto-solving policy: info while the heal handles it, warning when
+    ## the heal is demonstrably not working (suppressed re-wedge inside the
+    ## cooldown, or wedged 45+ min). Staleness covered by the generic
+    ## BatchJobStale rule (job label horizon_lic001_heal).
+    rules:
+    - alert: HorizonLic001Wedged
+      expr: horizon_lic001_wedged{job="horizon_lic001_heal"} == 1
+      for: 5m
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon LIC-001 DCV-singleton wedge detected (auto-heal engaged)"
+        description: |
+          GET /api/v1/licenses is hanging with the LIC-001 Pekko AskTimeout
+          signature. f/heal/horizon_lic001_heal will restart horizon-0 after its
+          12-min dwell; no action needed unless HorizonLic001HealIneffective fires.
+    - alert: HorizonLic001HealIneffective
+      expr: >-
+        horizon_lic001_heal_suppressed{job="horizon_lic001_heal"} == 1
+        or min_over_time(horizon_lic001_wedged{job="horizon_lic001_heal"}[45m]) == 1
+      for: 5m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon LIC-001 wedge persists — auto-heal not resolving it"
+        description: |
+          The LIC-001 wedge either re-appeared inside the 6h heal cooldown
+          (restart demonstrably not fixing it) or has persisted 45+ min without
+          a successful heal (pod gate blocking, or restart not clearing it).
+          Investigate horizon-0 by hand: kubectl -n horizon logs horizon-0 |
+          grep LIC-001. Source: f/heal/horizon_lic001_heal (beads infra-0pl).
+
+  - name: app-batch-jobs.stream-license
+    ## f/probe/stream_license_usage (hourly) publishes Stream's total X509
+    ## certificate count vs the stream-ca.<N> license cap (decoded live from the
+    ## stream-license secret). Mirrors the Horizon CLM alert. Staleness covered by
+    ## the generic BatchJobStale rule (job label stream_license_usage).
+    rules:
+    - alert: StreamCertCountApproachingLicense
+      expr: stream_license_certificate_used_ratio{job="stream_license_usage"} > 0.8
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Stream CA license {{ $value | humanizePercentage }} used"
+        description: |
+          Stream holds {{ with query "stream_certificate_count{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }} of {{ with query "stream_license_certificate_limit{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }} licensed certificates (stream-ca, >80%).
+          At 100% the CAs refuse new issuance. Raise the Stream license (stream-ca.N)
+          or revoke/prune certs. Source: f/probe/stream_license_usage.
+    - alert: StreamCertCountNearLicenseLimit
+      expr: stream_license_certificate_used_ratio{job="stream_license_usage"} > 0.95
+      for: 30m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Stream CA license {{ $value | humanizePercentage }} used — near cap"
+        description: |
+          Stream is within 5% of its stream-ca certificate cap
+          ({{ with query "stream_certificate_count{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }}/{{ with query "stream_license_certificate_limit{job='stream_license_usage'}" }}{{ . | first | value }}{{ end }}).
+          CA issuance is blocked at 100% — install a larger Stream license now.
+
+  - name: app-batch-jobs.image-policy
+    rules:
+    ## Source: f/probe/image_policy_lint (Windmill, daily 05:20 Zurich) —
+    ## the 2-lane pull-policy convention from the 2026-06-06 postmortem (A2).
+    ## Lane A = floating tag + Always + keel annotation (apps).
+    ## Lane B = pinned tag + IfNotPresent, Renovate-driven (bootstrap-critical).
+    ## The lint job group is fully replaced on every push, so a fixed violation
+    ## clears the alert on the next daily run.
+    - alert: ImagePolicyFail
+      expr: max(image_policy_fail_total) > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} image-policy FAIL violation(s) — bootstrap-critical off Lane B or un-updatable image"
+        description: |
+          The image-policy lint found FAIL-class violations: a bootstrap-critical
+          workload off Lane B (pinned+IfNotPresent), or floating+IfNotPresent
+          (can never update). This is the cold-bootstrap deadlock class from the
+          2026-06-06 postmortem.
+          Targets: {{ range query "image_policy_violation{severity='fail'} == 1" }}{{ .Labels.target }} ({{ .Labels.image }}); {{ end }}
+          Fix the fleet manifest per lane, or update the lint's CRITICAL/ALLOW sets.
+
+    - alert: ImagePolicyWarn
+      ## 50h = two daily lint runs must confirm, so a short-lived experiment or
+      ## a workload deployed minutes before the lint doesn't page.
+      expr: max(image_policy_warn_total) > 0
+      for: 50h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## statuspage: exclude — ADDED 2026-09-03. WARN class is "no updater is
+        ## driving this image": a deployment-hygiene backlog, not something a
+        ## visitor can observe. By construction it only fires after 50h of
+        ## persistence, i.e. exactly when it has become standing state — so it
+        ## parks the public Platform component in degraded_performance until
+        ## someone does housekeeping. It was doing that on 2026-09-03 over two
+        ## violations, one of which was the statuspage-adapter's own image.
+        ##
+        ## ImagePolicyFail deliberately stays PUBLIC: that class is the
+        ## cold-bootstrap deadlock from the 2026-06-06 postmortem (pinned
+        ## bootstrap-critical off Lane B, or floating+IfNotPresent that can
+        ## never update), which really can take the platform down.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $value }} image-policy WARN violation(s) for >2 days — workload with no updater driving it"
+        description: |
+          WARN-class lint violations persisting across daily runs: floating+Always
+          with NO keel annotation (nothing updates it — how the akeyless-pg-bridge
+          wireguard sat unnoticed), pinned+Always (boot-fragile), or unclassified.
+          Targets: {{ range query "image_policy_violation{severity='warn'} == 1" }}{{ .Labels.target }} ({{ .Labels.image }}); {{ end }}
+          Put each on a lane: add keel.sh annotations (Lane A) or pin + IfNotPresent
+          under Renovate (Lane B).
+
+    - alert: KeelUpdatesSilent
+      ## keel_updates_7d comes from f/probe/keel_update_log (weekly Mon
+      ## 07:55). Several keel-managed images rebuild at least weekly
+      ## (linuxserver), so 3+ weeks of zero audit events across the whole fleet
+      ## means keel itself is likely broken (registry polling, auth, approvals
+      ## stuck) even though every workload annotation looks correct. The second
+      ## clause gates on >=20 days of metric history so a freshly-created gauge
+      ## can't fire this prematurely.
+      ## 2026-07-30 (infra-health, user-approved): aggregate away all series
+      ## labels. The gauge reaches vmsingle with the pushgateway pod name as
+      ## a label, so every pushgateway pod recreation leaves a dead series
+      ## whose 22d range window keeps evaluating for three more weeks — that
+      ## dead series fired this as a false positive on 07-26/07-30 while the
+      ## live series showed keel perfectly healthy. max()/min() merge dead
+      ## and live series so only fleet-wide silence can fire.
+      expr: |
+        max(max_over_time(keel_updates_7d[22d])) == 0
+        and (time() - min(min_over_time(keel_update_log_last_run_timestamp_seconds[22d]))) > 20 * 86400
+      for: 6h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Keel has performed zero updates for 3+ weeks — updater likely dead"
+        description: |
+          No Keel audit events for three consecutive weekly reports. Lane-A
+          workloads (floating+Always+keel) silently stop updating when keel is
+          broken; the image-policy lint cannot see this (annotations still look
+          right). Check the keel pod logs, registry reachability (lscr.io,
+          docker.io), and any stuck approvals.
+  - name: app-batch-jobs.ha-stream-wedge
+    rules:
+    ## f/probe/ha_stream_wedge_check (15-min cadence, 65-min window) pushes
+    ## ha_stream_wedge_active{camera=...}=1 when a camera shows a sustained
+    ## stream_worker "Error opening stream" retry loop (>=3 errors spanning
+    ## >=25 min). Incident 2026-08-02→04: such a loop — spawned by a hung
+    ## camera.record, immune to automation kill — woke the battery Nest
+    ## doorbell every 10-19 min for 37.5 h and emptied its battery. The
+    ## Pushgateway group is fully replaced each run, so recovery (or an HA
+    ## restart, the only real fix) resolves the alert on the next probe run.
+    - alert: HAStreamWedge
+      expr: ha_stream_wedge_active == 1
+      for: 5m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+      annotations:
+        summary: "HA stream retry loop wedged on camera.{{ $labels.camera }}"
+        description: |
+          camera.{{ $labels.camera }} has had a sustained stream_worker
+          "Error opening stream" retry loop for the whole probe window. The
+          loop lives in HA's stream component: it survives killing the
+          automation that spawned it and keeps re-opening the go2rtc
+          restream, waking the camera (a battery Nest doorbell drains to
+          empty this way). Only an HA core restart reliably ends it —
+          restart HA core, then confirm the probe reports wedged=0.
+  - name: app-batch-jobs.ceph-campaign
+    rules:
+    ## f/heal/ceph_osd_recreate_campaign (10-min state machine): deep-scrub
+    ## verify sweep then staged recreation of every OSD under
+    ## bluestore_elastic_shared_blobs=false (Ceph #70390, user-approved
+    ## 2026-08-05). It halts itself — and sets this gauge — on any scrub
+    ## error (latent corruption found: repair before recreating!) or a step
+    ## stuck past its timeout. An actual inconsistency also drives Ceph to
+    ## HEALTH_ERR, which pages via the Ceph rules; this alert catches the
+    ## campaign-level stop either way. Stale-job coverage comes from the
+    ## generic BatchJobStale on the auto last_run gauge.
+    - alert: CephOsdRecreateCampaignHalted
+      expr: ceph_osd_recreate_campaign_halted == 1
+      for: 10m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "Ceph OSD-recreate campaign halted"
+        description: |
+          The #70390 remediation campaign stopped itself{{ range query "ceph_osd_recreate_campaign_halt_info" }} — latched at
+          step={{ .Labels.step }} osd.{{ .Labels.osd }}
+          ({{ .Labels.reason_class }}){{ end }}. The full halt_reason text is
+          in the last f/heal/ceph_osd_recreate_campaign run result:
+          scrub errors mean latent corruption was found (ceph health detail,
+          ceph pg repair — do NOT resume recreation until repaired); a stuck
+          step means drain/zap/re-provision didn't converge (check the zap
+          Job, the Rook operator log, and 'ceph status';
+          ..._drain_pgs_left / ..._misplaced_objects gauges show whether
+          data is actually moving). Resume by fixing
+          the cause and clearing 'phase: halted' in the schedule state.
+          NOTE the halt is LATCHED in that state — fixing the underlying
+          cause does NOT resume the campaign on its own, and the stuck
+          step's 'since' timestamp must be reset too or the timeout check
+          re-halts it immediately on the next tick.
+    ## Completion is actionable here, not just informational: the CRUSH
+    ## device-class fix (bulk pools can still land PGs on the three 15 GiB
+    ## fio OSDs, which is what stranded a backfill for two days on
+    ## 2026-08-14) is deliberately deferred until no OSD is being recreated,
+    ## because every recreated OSD re-applies its CRUSH location at start.
+    - alert: CephOsdRecreateCampaignComplete
+      expr: ceph_osd_recreate_campaign_phase == 2
+      for: 10m
+      labels:
+        severity: info
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "Ceph OSD-recreate campaign complete — deferred CRUSH fix can now run"
+        description: |
+          Every OSD has been recreated under bluestore_elastic_shared_blobs
+          =false, so the deferred fio-root CRUSH change is now safe to apply.
+          Runbook and apply script: ~/ceph-fio-root-fix/ (README.md explains
+          why the obvious device-class rule is the WRONG fix here — measured
+          75% PG remap versus 3 PGs for the root move). After it lands,
+          re-enable the Ceph balancer, which is currently OFF because it
+          prunes the manual upmap holding PG 6.12b off the full fio OSD.
+  - name: app-batch-jobs.joplin-canary
+    rules:
+    ## f/probe/joplin_note_canary (15-min): watches every Joplin note's
+    ## content_size in the server DB and fires when one shrinks >30% AND
+    ## >10KB between runs — the signature of the 2026-08-06 incident where
+    ## a stale mobile client overwrote the 334KB TODO/Backlog note with a
+    ## weeks-old 183KB copy. Restore sources: the canary's own shadow
+    ## copies (s3://config-backups/joplin-note-shadow/, written on every
+    ## TODO-note change, 14d) and the daily joplin_pg_backup dump. Gauge is
+    ## group-replaced each run, so the alert self-resolves once sizes are
+    ## re-baselined; act on it FAST (restore, then investigate which client
+    ## pushed — changes_2 table, user_id column).
+    - alert: JoplinNoteShrunk
+      expr: joplin_note_shrunk == 1
+      labels:
+        severity: warning
+        component: Joplin
+        team: mdapi
+      annotations:
+        summary: "Joplin note {{ $labels.note }} shrank sharply — possible stale-client overwrite"
+        description: |
+          A Joplin note lost >30% (>10KB) of its body between canary runs.
+          Likely a stale client sync clobbering newer content (2026-08-06
+          incident pattern). Restore from the newest shadow copy in
+          s3://config-backups/joplin-note-shadow/ (TODO note) or from the
+          daily joplin-pg dump; identify the writer via changes_2.user_id
+          in the joplin DB. NOTE: the gauge self-resolves next run (state
+          re-baselines) — the Pushover is the durable signal.
+  - name: app-batch-jobs.trapeye
+    rules:
+    ## f/probe/trapeye_decoy_health_check (daily). A honeypot that dies emits
+    ## nothing — absence is the only signal it was ever there. MDA-VM-LAN went
+    ## silent 2026-06-06 (guest died in the all-nodes-down outage) and that went
+    ## unnoticed for two months; this closes that gap. Fires per decoy so a
+    ## single dead one is named in the alert.
+    - alert: TrapeyeDecoyOffline
+      expr: trapeye_decoy_offline == 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "TrapEye decoy {{ $labels.decoy }} is not reporting"
+        description: |
+          The decoy has not checked in for over 30 minutes (see
+          trapeye_decoy_offline_minutes for how long). A silent decoy provides
+          no detection coverage. For container decoys check the honeypot ns
+          pods; for VM decoys check the KubeVirt VMI has an IPv4 lease and a
+          live guest agent (a dead guest shows only a MAC-derived IPv6 and
+          answers no NDP — that was the 2026-06-06 failure).
+    ## VM/appliance agents never self-update — they need a manual Update press
+    ## in the console (the public API exposes no trigger). Containers follow the
+    ## pinned image tag, so a version gap means the VM decoys drifted behind.
+    - alert: TrapeyeDecoyVersionBehind
+      expr: trapeye_decoy_version_behind == 1
+      for: 24h
+      labels:
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "TrapEye decoy {{ $labels.decoy }} runs old agent v{{ $labels.version }}"
+        description: |
+          This decoy is behind the newest agent version in the fleet. VM decoys
+          do NOT self-update: open trapeye.anantis.io -> the device -> Update,
+          and it upgrades on the next check-in. Container decoys instead need
+          their image tag bumped in fleet honeypot/trapeye-*.yml.
+
+  ## f/heal/esphome_firmware_sync — monthly change-detected OTA of the ESPHome
+  ## fleet. Staleness is already covered by the generic BatchJobStale rule via
+  ## esphome_firmware_sync_last_run_timestamp_seconds.
+  - name: app-batch-jobs.esphome-firmware-sync
+    rules:
+    ## The job stops at the first device that fails, so exactly one device is
+    ## flagged and the rest were left untouched — the fleet is not half-broken,
+    ## but nothing further will update until this one is resolved.
+    - alert: EsphomeFirmwareUpdateFailed
+      expr: esphome_firmware_update_failed == 1
+      for: 15m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "ESPHome firmware update failed for {{ $labels.device }}"
+        description: |
+          Compile or OTA failed, or the device did not come back within
+          settle_seconds after a successful upload. The run STOPPED at this
+          device, so later devices in the alphabet were skipped entirely.
+          Check the Windmill job log for the compile/upload output. If the
+          device is genuinely dead it needs a power cycle, and if that fails a
+          USB reflash — OTA cannot recover a device that will not boot.
+    ## Offline is not a failure (you cannot flash what is not there), but a
+    ## device offline across two monthly runs is a device nobody noticed died.
+    - alert: EsphomeDeviceOfflinePersistent
+      expr: esphome_device_offline == 1
+      for: 32d
+      labels:
+        severity: info
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "ESPHome device {{ $labels.device }} has been unreachable for over a month"
+        description: |
+          Skipped by the firmware sync as unreachable across consecutive runs.
+          Known offenders: carnotzetdoor is battery powered and may simply be
+          flat; skylightnorth periodically wedges its wireguard tunnel and is
+          still reachable on its LAN address (192.168.1.155) when 10.8.0.7 is
+          dead — that needs a power cycle, not a reflash.
+
+  ## Windmill worker pods ARE the automation plane — when one crash-loops,
+  ## every job on its tag dies invisibly: the job zombies (RestartLimit 3),
+  ## Windmill only schedules a schedule's NEXT tick when the current job
+  ## completes, and a zombie takes ZOMBIE_JOB_TIMEOUT (24h) to complete — so
+  ## one crash-loop silently swallows a whole day of that schedule. Seen on
+  ## wk-certs 08-07/08-08/08-09: aruba_aos6_cert_sync OOM-burst kills the
+  ## worker in <40s (too fast for the 30s scrape to show), the first signal
+  ## was the downstream Aos6CertSyncStale 2.5h later. This rule surfaces the
+  ## crash-loop itself within minutes, from kube-state-metrics restart counts.
+  - name: app-batch-jobs.workers
+    rules:
+    - alert: WindmillWorkerCrashLoop
+      expr: increase(kube_pod_container_status_restarts_total{namespace="windmill"}[15m]) >= 3
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill {{ $labels.pod }} crash-looping ({{ $value | humanize }} restarts in 15m)"
+        description: |
+          A windmill-namespace container restarted 3+ times in 15 minutes.
+          Jobs on that worker's tags are dying and will zombie for 24h,
+          which also delays their schedules' next ticks by a day. Check
+          `kubectl -n windmill get pod {{ $labels.pod }}` lastState (OOM
+          bursts can be faster than the scrape interval — trust the
+          termination reason, not the memory graph) and the affected
+          scripts' runs at https://windmill.mdapi.ch/runs. History:
+          wk-certs killed daily at 06:47Z by aruba_aos6_cert_sync since
+          2026-08-07 (infra-health ledger restart:windmill/windmill-workers-certs).
+
+    ## f/probe/windmill_worker_pool_health (every 15 min) — the OPPOSITE failure
+    ## to the crash-loop above: no restarts, pod Ready, and still not working.
+    - alert: WindmillWorkerPoolDegraded
+      expr: windmill_worker_missing > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Windmill {{ $labels.group }} pool degraded — {{ $value }} declared worker(s) not serving"
+        description: |
+          A worker pod is Running and Ready but executing nothing: the process
+          is alive (it still services DB notify events) while its worker loop
+          is dead. No readinessProbe can catch this — the container is Ready
+          because the process runs, not because it pulls jobs.
+
+          This is a CORRECTNESS problem, not just lost capacity. A chain of
+          depth D of blocking wmill.run_script*/run_script_by_path needs D
+          workers AT ONCE, so a silently shrunken pool turns "saturates the
+          pool" into "deadlocks forever holding every slot". Seen 2026-08-28:
+          default declared 3 and served 2 for days unnoticed, and a 3-deep
+          chain (f/marketplace/request_membership) then hung 27 minutes holding
+          both live workers, stalling every scheduled probe and heal behind it.
+
+          Confirm: compare `windmill_worker_declared` vs
+          `windmill_worker_serving` by group, then `kubectl -n windmill get
+          pods` — the culprit looks perfectly healthy. Fix: delete that pod;
+          the replacement registers in ~2 min. `windmill_worker_unknown` counts
+          pods whose log could not be read and is NOT counted as missing, so
+          this never fires on an RBAC or transport problem.
+  - name: app-batch-jobs.mail-retention
+    ## f/probe/orphaned_maildir_audit (weekly, Mon 06:20 Zurich) — mail on disk that
+    ## no longer belongs to anybody. Deleting the LDAP person + room does NOT remove
+    ## /var/mail/<domain>/<box>/, so offboarding leaves it there silently.
+    ##
+    ## Deliberately INFO and deliberately passive: an orphan is not automatically
+    ## safe to erase (a grace period is legitimate, and the mail may want exporting
+    ## first), so this exists to make the AGE visible, not to demand action. It is
+    ## the groundwork for a retention policy, not the policy.
+    ##
+    ## The metrics carry NO former-user identifiers on purpose — Prometheus series
+    ## live ~forever, and "who used to have an account" in a permanent store is the
+    ## same residue this is trying to reduce. The per-maildir list is in the job log.
+    rules:
+    ## ACKNOWLEDGED + DATED 2026-09-02. Was `> 0`, which fired continuously.
+    ##
+    ## The finding is real but it is not an infrastructure fault: offboarding
+    ## does not remove maildirs, and the GDPR retention programme that would
+    ## clear the residue has not been started. A permanently-firing alert for a
+    ## known, accepted, un-started programme is a to-do parked in the alerting
+    ## layer — it teaches the reader to ignore the channel and it counts as an
+    ## open infra warning forever.
+    ##
+    ## So: acknowledge the CURRENT residue (1 stale maildir of 8 orphans as of
+    ## 2026-09-02) and keep alerting on GROWTH, which is the part that would be
+    ## news — a fresh offboarding leaving new residue re-arms this immediately.
+    ## The acknowledgement is DATED, not permanent: after 2026-12-01 the alert
+    ## fires again regardless, so the programme cannot be forgotten silently.
+    ## When the cleanup runs, drop the `> 1` back to `> 0` and delete the date.
+    - alert: OrphanedMaildirsStale
+      ## NB `time() > <epoch>` on its own is a scalar-to-scalar comparison, which
+      ## Prometheus rejects ("comparisons between scalars must use BOOL
+      ## modifier") even though VictoriaMetrics evaluates it happily. Wrap it as
+      ## an instant vector and join with `on()`.
+      expr: |
+        mail_orphaned_maildirs_stale > 1
+        or (mail_orphaned_maildirs_stale > 0 and on() (vector(time()) > 1796083200))
+      for: 1h
+      labels:
+        severity: info
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} orphaned maildir(s) untouched for 180+ days"
+        description: |
+          Mail belonging to nobody has been sitting on disk for over six months.
+          Decide per maildir: export and erase, or record why it is being kept.
+
+          The names are NOT in these metrics by design. Get them from the probe's
+          own run at https://windmill.mdapi.ch/runs (script
+          f/probe/orphaned_maildir_audit) — the log lists each maildir with its
+          size and age.
+
+          ⚠️ Age is the DIRECTORY mtime, which is a proxy: a bulk migration or a
+          restore resets it, so a cluster of maildirs sharing an identical age is
+          probably the date of that event, not the date the mail was last used.
+          Treat such an age as a LOWER bound.
+
+          Reclaiming is manual and mail is priority 1: confirm 0 LDAP references
+          first (person, mail value AND room object), list the siblings before and
+          after so the blast radius is provable, then remove exactly one path.
+  - name: app-batch-jobs.pvc-backup-coverage
+    ## f/probe/pvc_backup_coverage (daily 07:35 UTC) — asserts every PVC has a
+    ## backup story and every external-Garage bucket an offsite disposition
+    ## (beads infra-jjb, born from the 2026-08-14 audit: 200Gi silently
+    ## unbacked for 11 days after a storage-class migration). The generic
+    ## BatchJobStale covers missed runs via the cadence map.
+    rules:
+    - alert: PvcBackupUncovered
+      expr: pvc_backup_uncovered_total > 0 or pvc_backup_cnpg_nobarman_total > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} PVC(s)/cluster(s) have NO backup story"
+        description: |
+          f/probe/pvc_backup_coverage found PVCs without any backup mechanism
+          (or CNPG clusters without barman). See the job log for the list;
+          either wire a backup (VolSync/Longhorn group/barman) or add a
+          documented entry to the probe's EXEMPT list.
+    - alert: GarageBucketUnswept
+      expr: garage_bucket_unswept_total > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} external-Garage bucket(s) missing from the offsite sweep"
+        description: |
+          A bucket exists on the salt/pepper Garage that is neither in
+          garage_offsite_backup's BUCKETS list nor in the probe's
+          BUCKET_EXEMPT. Data there does not reach B2/SFTP.
+  - name: app-batch-jobs.restic-freshness
+    rules:
+    - alert: ResticSnapshotStale
+      expr: restic_snapshot_age_hours > 30
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "restic repo {{ $labels.repo }} newest snapshot is {{ $value }}h old"
+        description: |
+          f/probe/restic_snapshot_freshness lists <repo>/snapshots/ directly on
+          the external Garage; the newest object exceeds 30h for this daily
+          source. VolSync may still be reporting success — check the mover job
+          and the repo (stale lock? mover writing nothing?).
+    - alert: ResticRepoEmptyOrDuplicate
+      expr: restic_snapshot_empty_total > 0 or restic_repo_duplicate_total > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "restic repo anomaly: empty repo or two sources sharing one repo"
+        description: |
+          Either a ReplicationSource's repo has ZERO snapshot objects (mover
+          lying about success) or two sources write the same repo URL
+          (retention poison). See the probe log for which.
+    - alert: ResticFreshnessCheckBroken
+      expr: restic_snapshot_check_ok == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "the restic freshness check itself is failing"
+        description: |
+          f/probe/restic_snapshot_freshness could not read a repo secret or
+          list a bucket — freshness assertion is blind, treat as failure
+          (same loud-soft-fail contract as the coverage probe).
+  - name: app-batch-jobs.fio-card-wear
+    ## f/probe/fio_card_wear, every 6h. Added 2026-08-23 when it turned out
+    ## NOTHING read fio-status. Context: quo fct1 (831737-B21 RI-2) is at
+    ## 17.42 PB written vs an 11 PB rating (-58.38% PBW remaining), reserves
+    ## 52.80%, active media 82.00%, mean 4310 erases/block — 6.1x the wear of
+    ## the IDENTICAL model in qua. User decision 2026-08-23: run it until it
+    ## actually degrades. These rules are what makes that a plan rather than a
+    ## gamble. Thresholds are set so NOTHING fires at today's values; each one
+    ## marks a real step change from the 2026-08-23 baseline.
+    rules:
+    - alert: FioCardReservesLow
+      expr: fio_card_reserves_pct < 25
+      for: 30m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "fio card {{ $labels.node }}/{{ $labels.card }} reserves down to {{ $value }}%"
+        description: |
+          Reserve space on {{ $labels.model }} SN {{ $labels.sn }} has fallen
+          below 25%. The card raises its OWN warning at 10%, so this is the
+          early page. Baseline 2026-08-23: quo fct1 52.80%, every other card
+          100%. Plan the replacement now — do not wait for 10%.
+    - alert: FioCardReservesCritical
+      expr: fio_card_reserves_pct < 12
+      for: 10m
+      labels:
+        severity: critical
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "fio card {{ $labels.node }}/{{ $labels.card }} reserves CRITICAL {{ $value }}%"
+        description: |
+          Approaching the card's own 10% warn threshold. Move workloads off
+          {{ $labels.node }} {{ $labels.card }} ({{ $labels.model }} SN
+          {{ $labels.sn }}) now. On quo that card carries prod etcd, the mon
+          store, an OSD and a Longhorn disk.
+    - alert: FioCardActiveMediaFalling
+      expr: delta(fio_card_active_media_pct[7d]) < -0.5
+      for: 1h
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "fio card {{ $labels.node }}/{{ $labels.card }} retiring NAND ({{ $value }}%/7d)"
+        description: |
+          Active media percentage is DROPPING — the controller is retiring
+          blocks. This is the onset signal for a worn card, and matters more
+          than the absolute level. Baseline 2026-08-23: quo fct1 82.00%
+          (stable), all others 100.00%.
+    - alert: FioCardWarningRaised
+      expr: fio_card_warning == 1
+      for: 5m
+      labels:
+        severity: critical
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "fio card {{ $labels.node }}/{{ $labels.card }} raised an ACTIVE WARNING"
+        description: |
+          `fio-status -a` reports an ACTIVE WARNINGS block on this card — the
+          card's own pre-failure banner (this is how the qui card announced
+          MINIMAL MODE). Run `fio-status -a` on {{ $labels.node }} and read it.
+    - alert: FioCardWearCheckBlind
+      expr: fio_card_collect_ok == 0
+      for: 6h
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "fio wear telemetry blind on {{ $labels.node }}"
+        description: |
+          f/probe/fio_card_wear could not collect from {{ $labels.node }} (SSH
+          or fio-util failure). Its previous series are re-pushed so the wear
+          alerts keep evaluating, but the data is FROZEN — treat the wear
+          numbers for that node as unverified until this clears.
+  - name: app-batch-jobs.request-form
+    ## f/probe/request_form_check, hourly :27. Added 2026-08-28 after every POST
+    ## to start.mdapi.ch/request/send.php died with a PHP fatal for hours and
+    ## NOTHING noticed: display_errors put the error in the response body while
+    ## Apache still answered HTTP 200, so the ingress log was clean, the uptime
+    ## probes were green, and the container log had no PHP lines at all. It was
+    ## reported by a family member who could not send the form.
+    ##
+    ## The readiness probe added the same day does NOT cover this — it GETs the
+    ## page, which was healthy throughout. Only a synthetic that SUBMITS can see
+    ## a broken handler, which is what this probe does.
+    ##
+    ## `for: 75m` on an hourly probe deliberately requires TWO consecutive
+    ## failures, so a single network blip from the worker cannot page.
+    rules:
+    - alert: RequestFormSubmitBroken
+      expr: request_form_submit_ok == 0
+      for: 75m
+      labels:
+        severity: critical
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "The public request form cannot accept submissions"
+        description: |
+          A solved-captcha submission to start.mdapi.ch/request did not reach
+          form validation on two consecutive hourly checks. Anyone trying to
+          request an account or a mailbox is being silently turned away, and
+          their message is LOST — send.php fails before both the hand-off to
+          f/marketplace/request_membership and the mail fallback.
+          Read the failure reason in the job log: `wmill job list` or the
+          Windmill UI, script f/probe/request_form_check. A `PHP diagnostic in
+          response` reason means a code fault reached production; check the
+          most recent deploy of mdapi/dellambrogio.
+    - alert: RequestFormPageDegraded
+      expr: request_form_page_locales_ok < 3
+      for: 75m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "The request page fails to render in {{ $value }}/3 languages"
+        description: |
+          One or more of it/fr/en no longer renders correctly — wrong `html
+          lang`, a missing form or captcha widget, a PHP diagnostic in the body,
+          or a non-200. The form may still accept submissions (see
+          RequestFormSubmitBroken), so this is the softer signal: usually a
+          broken lib/strings.php entry or a lost /var/www/lib layer.
+    - alert: RequestFormCaptchaSlow
+      expr: request_form_captcha_solve_seconds > 45
+      for: 3h
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+      annotations:
+        summary: "ALTCHA proof-of-work is taking {{ $value }}s to solve"
+        description: |
+          The probe's solve time is approaching the 120s challenge expiry set in
+          altcha-challenge.php. Visitors on slow phones will start failing the
+          captcha before real users complain. Either the cost was raised or the
+          workers are starved; check `cost` in the job log against 10000.
+
+  - name: app-batch-jobs.ripe-atlas
+    rules:
+    - alert: AtlasObjectDisconnected
+      ## The RIPE Atlas probe (VM atlas/atlas-probe, id 1017332) reports to
+      ## RIPE, not to us, so nothing here ever noticed if it stopped. This is
+      ## that signal.
+      ##
+      ## ⭐ Keyed on ripe_atlas_connected rather than on the absence of metrics:
+      ## a failed run of the probe collapses its Pushgateway group to
+      ## ripe_atlas_probe_success 0 and drops this series entirely, so an
+      ## unreachable RIPE API can never masquerade as a disconnected probe.
+      ## Staleness of the probe itself is already covered by the generic
+      ## BatchJobStale rule via ripe_atlas_health_last_run_timestamp_seconds.
+      ##
+      ## Baseline: connected continuously since 2026-09-02T14:20:39Z. 15m of
+      ## `for` rides out a live-migration or a brief RIPE-side blip without
+      ## firing, which a shorter window would not.
+      expr: ripe_atlas_connected == 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "RIPE Atlas {{ $labels.kind }} {{ $labels.probe_id }} is not connected"
+        description: |
+          RIPE reports this object as not Connected — decode the state from
+          ripe_atlas_status_id: 0 never-connected, 2 disconnected, 3 abandoned.
+          It measures nothing for the research network while in this state.
+          Check the VM and the daemon first:
+            kubectl --context mdapi-prod-direct get vmi -n atlas atlas-probe
+            ssh tillo@192.168.1.209 'systemctl status ripe-atlas.service'
+          Then https://atlas.ripe.net/probes/1017332/ for RIPE's own view.
+          warning + INTERNAL component on purpose: this is a volunteer
+          contribution, so losing it costs a vantage point and goodwill, never
+          customer service.
+    - alert: AtlasObjectIPv6Lost
+      ## The reason this probe is worth hosting at all: AS212865 had five
+      ## registered probes, two abandoned and only one with IPv6, while this
+      ## site is natively dual-stack. If v6 stops working the probe keeps
+      ## running and stays Connected, so the thing that made it valuable would
+      ## be lost silently.
+      ##
+      ## 2h of `for` because system-ipv6-works is RIPE's own periodic verdict,
+      ## not a live reading, and it can lag or flap across their measurement
+      ## cycle. Anything shorter alerts on their sampling, not on our network.
+      expr: ripe_atlas_ipv6_works == 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "RIPE Atlas {{ $labels.kind }} {{ $labels.probe_id }} has lost IPv6"
+        description: |
+          RIPE's system-ipv6-works tag is gone: the probe is connected but no
+          longer measuring over IPv6, which is the scarce capability we
+          contribute in AS212865.
+          Check the guest still holds a public v6 from 2a0d:d05:401:e901::/64
+          and that the router is still sending RAs on br-lan:
+            ssh tillo@192.168.1.209 'ip -6 addr show enp1s0'
+          See memory project_ripe_atlas_probe_and_anchor_2026_09_02.
+
+    - alert: AtlasTargetUnreachableWorldwide
+      ## The outside-in signal our internal blackbox checks cannot produce: they
+      ## run inside the estate, so a routing problem, an upstream outage or a
+      ## filtered path looks fine to them right up until someone external says
+      ## it is not. This is probes worldwide failing to reach one of our public
+      ## services.
+      ##
+      ## ⭐ Threshold set from the measured baseline, not from hope. First real
+      ## sample across the six measurements: 64/65 reachable (0.985), with one
+      ## probe of fourteen failing to reach mirror.mdapi.ch — ordinary Internet
+      ## weather. A rule at `< 1.0` would therefore fire on day one and teach
+      ## everyone to ignore it. 0.5 is far enough below the baseline that only a
+      ## real outage reaches it (a genuinely down service goes to ~0), and 30m
+      ## rides out a transient. Tighten once a week of data exists.
+      ##
+      ## Deliberately INTERNAL component: the authoritative public signal for
+      ## these services stays the existing blackbox checks, and double-reporting
+      ## the same outage to the status page from two sources helps nobody. This
+      ## rule's value is diagnostic — if it fires while the internal checks are
+      ## green, the problem is between us and the world, not in the service.
+      expr: ripe_atlas_msm_success_ratio < 0.5
+      for: 30m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "RIPE Atlas probes worldwide cannot reach {{ $labels.target }} ({{ $labels.type }}/v{{ $labels.af }})"
+        description: |
+          Fewer than half the reporting probes could reach this target. If the
+          internal blackbox checks are green at the same time, the fault is in
+          routing or upstream, not in the service.
+          Look at the measurement itself for which probes and where:
+            https://atlas.ripe.net/measurements/{{ $labels.msm_id }}/
+          Compare median RTT (ripe_atlas_msm_rtt_median_ms) — a step change with
+          reachability intact means a path change rather than an outage.
+    - alert: AtlasMeasurementStalled
+      ## A measurement that stops delivering is invisible otherwise: the alert
+      ## above keys on a ratio, and no results means no ratio to be low. Zero
+      ## reporting probes for an hour means it was stopped, ran out of credits,
+      ## or RIPE is not scheduling it.
+      ##
+      ## Credit exhaustion is unlikely by design — the plan spends ~46% of what
+      ## one probe earns (~10,020/day against 21,600) — but this is the rule
+      ## that would catch it, so it is worth having rather than assuming.
+      expr: ripe_atlas_msm_probes_reporting == 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "RIPE Atlas measurement {{ $labels.msm_id }} ({{ $labels.target }}) has stopped delivering"
+        description: |
+          No probe has returned a result for an hour. Check the measurement is
+          still running and that the credit balance is healthy:
+            https://atlas.ripe.net/measurements/{{ $labels.msm_id }}/
+          Design and costing: ~/ripe-atlas-measurements-plan.md
+  - name: app-batch-jobs.ldap-identity
+    ## f/probe/ldap_identity_health (half-hourly, read-only). The identity
+    ## invariant set on 2026-09-03: every human in OpenLDAP is gidNumber=Person,
+    ## memberUid of cn=Person, and of exactly ONE of cn=Family / cn=Friends.
+    ## /Person is the Keycloak group that "everyone human" application access is
+    ## granted through (portal and sftpgo gates), so a person outside it is a
+    ## person those gates cannot see. All warning + INTERNAL component Security:
+    ## directory hygiene is never a public-status event.
+    ##
+    ## Since 2026-09-04 the rule covers technical accounts too: System gid +
+    ## cn=System + no human group (contact, finance, paperless-bind, documents).
+    ##
+    ## ⭐ There are NO exemptions left, and the probe's EXEMPT map is empty. The
+    ## one entry used to be `documents`, pinned to the Person gid because
+    ## Nextcloud's user_ldap filter was (gidNumber=10003) — an app deciding access
+    ## from an identity attribute, which is what forced a service account to look
+    ## human. Nextcloud now selects on memberOf of cn=Nextcloud, an explicit
+    ## groupOfNames access group that ALSO carries the Keycloak mdapi-nextcloud
+    ## role, so one list drives both doors and nothing reads the gid. If an
+    ## exemption ever reappears here, the fix is usually in the app, not the
+    ## directory. ldap_identity_exempt_total is expected to be 0.
+    rules:
+    - alert: LdapIdentityCircleWithoutPerson
+      ## THE incident: agiamboni and isadellambrogio sat in Family without Person
+      ## for months, because group membership was a by-hand ldapmodify that the
+      ## provisioning scripts never did. The rollout baseline of 1 (`documents`,
+      ## a service mailbox parked in Family) was cleared on 2026-09-04 by taking
+      ## it out of Family: **the expected value is now 0**, so any firing is real
+      ## drift, not a known leftover. Still warning + a 30m hold — a missing
+      ## membership locks someone out, it does not break anything running.
+      expr: ldap_identity_violations{kind="circle_not_person"} > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} account(s) in Family/Friends but not in Person"
+        description: |
+          A member of cn=Family or cn=Friends is missing from cn=Person, so every
+          /Person-gated application will refuse them at the Keycloak door. The
+          last f/probe/ldap_identity_health job log names them:
+            grep 'FAIL kind=circle_not_person'
+          Fix in LDAP (inside the openldap pod, args only, no stdin):
+            ldapmodify: dn cn=Person,ou=group,dc=mdapi,dc=ch / add: memberUid
+          ⛔ Do not paper over it with a direct Keycloak role — LDAP is the truth.
+          Memory: feedback_ldap_person_invariant_gid_person_plus_family_or_friends.
+    - alert: LdapIdentityInvariantBroken
+      ## Every kind except circle_not_person (own rule above): Person without a
+      ## circle, in both circles, wrong gid, a memberUid that names no account,
+      ## a Person-gid account outside every human group, a System-gid account
+      ## inside one or outside cn=System, or a gid that is neither. Matching by
+      ## exclusion means a kind added to the probe is covered without touching
+      ## this rule. The rollout baseline of 1 (`ticebow`, the icebow.net Google
+      ## Workspace PoC account — Person with no circle) was cleared on 2026-09-04
+      ## by deleting that account: **the expected value is now 0**. A deliberate
+      ## exception belongs in the probe's EXEMPT map with its reason, never here
+      ## as a tolerated count.
+      expr: sum(ldap_identity_violations{kind!="circle_not_person"}) > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} OpenLDAP account(s) break the Person+circle invariant"
+        description: |
+          Someone is in Person but in neither Family nor Friends (or in both), has
+          a gidNumber other than Person's, or a group lists a uid that does not
+          exist. The job log of f/probe/ldap_identity_health says which and who:
+            grep 'FAIL kind='
+          Each is one ldapmodify on cn=<group>,ou=group,dc=mdapi,dc=ch.
+    - alert: LdapIdentityProbeFailed
+      ## The probe binds as the read-only paperless-bind account over the in-cluster
+      ## Service. Two consecutive half-hourly failures means OpenLDAP is unreadable
+      ## or that credential was rotated without updating Akeyless
+      ## (/mdapi/paperless/ldap-bind-password). While it fires, every other series
+      ## of this job is absent on purpose (whole-group PUT), so a stale "0
+      ## violations" cannot outlive the reading that produced it.
+      expr: ldap_identity_probe_success == 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "ldap_identity_health cannot read OpenLDAP"
+        description: |
+          The invariant is unmeasured, not necessarily broken. Check the last job
+          log (FAIL line carries the exception), that openldap.openldap.svc answers
+          on 389, and that uid=paperless-bind can still bind with the Akeyless
+          password.
+
+  - name: app-batch-jobs.gitlab-version
+    ## Published hourly by f/probe/gitlab_version_health, which asks GitLab's own
+    ## oracle (version.gitlab.com) about the RUNNING version — read from the GitLab
+    ## API, not from an image tag.
+    ##
+    ## Why this group exists at all (2026-09-04): GitLab is a hand-run, GitOps-exempt
+    ## Helm release in ~/bootstrap. Renovate's `fleet` manager only reads fleet.yaml
+    ## and its `kubernetes` manager only *-deploy.yaml, so neither ever saw it, and
+    ## weekly_version_check does not list it either. The estate's most exposed
+    ## service — internet-facing on gitlab.mdapi.ch — was therefore the one thing
+    ## with NO version tracking of any kind. It was found running 19.0.1 with a
+    ## critical vulnerability and seven missed patches.
+    ##
+    ## component: Security is deliberate and load-bearing. It is in the adapter's
+    ## INTERNAL_COMPONENTS, so these alerts reach Pushover but are NOT published to
+    ## mdapi.statuspage.io — announcing "our GitLab is unpatched" on a public status
+    ## page is exactly the wrong move.
+    rules:
+    - alert: GitLabCriticalVulnerability
+      ## The only rule here that pages. GitLab itself says a CRITICAL vulnerability
+      ## affects the running version, on a service reachable from the internet, and
+      ## it will not auto-resolve on its own — so `critical` (Pushover priority 1)
+      ## rather than the `info` used by ComponentUpgradeAvailable, which is
+      ## black-holed by the severity route and would be invisible.
+      expr: gitlab_version_critical_vulnerability == 1
+      for: 30m
+      labels:
+        severity: critical
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "GitLab {{ $labels.running }} has a CRITICAL vulnerability — {{ $labels.latest }} is out"
+        description: |
+          version.gitlab.com reports a critical vulnerability against the running
+          GitLab. gitlab.mdapi.ch is internet-facing, so treat this as time-bound.
+
+          Running / latest / target chart:
+            gitlab_version_info
+
+          Upgrade path is NOT "straight to latest": GitLab 19 has required stops at
+          19.2, 19.5, 19.8 and 19.11, and you must land on the stop after your
+          current version first, letting background migrations finish between hops.
+          Procedure, including the custom webservice/sidekiq images that must be
+          rebuilt to the same tag or the deployment ends up in an unsupported skew:
+            ~/bootstrap/gitlab-howto.txt
+
+    - alert: GitLabSecurityPatchAvailable
+      ## `unless` rather than a second condition so this never double-notifies
+      ## alongside the critical rule above — one situation, one page.
+      expr: gitlab_version_severity == 2 unless gitlab_version_critical_vulnerability == 1
+      for: 1h
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "GitLab security release available for {{ $labels.running }} (latest {{ $labels.latest }})"
+        description: |
+          GitLab publishes a SECURITY fix that applies to the running version.
+          Measured semantics: the oracle returns `danger` only when a fix exists for
+          the exact version running — a merely-older version with no known
+          vulnerability returns `warning` and is handled by GitLabVersionBehind.
+
+          Plan a window; see ~/bootstrap/gitlab-howto.txt for the required stops.
+
+    - alert: GitLabMinorUnsupported
+      ## The predictive one, and arguably the most useful. GitLab backports security
+      ## fixes to roughly the three most recent minors; when the running minor stops
+      ## appearing in the oracle's latest_stable_versions it has left that window, so
+      ## no future security fix will EVER be published for this line. That is a
+      ## standing condition rather than an event, hence the long `for:` — it should
+      ## not chatter, but it must not be invisible either (info would be
+      ## black-holed), so warning + quiet Pushover.
+      expr: gitlab_version_minor_supported == 0
+      for: 6h
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "GitLab {{ $labels.running }} is on a minor that no longer gets security backports"
+        description: |
+          The running minor has dropped out of GitLab's security-backport window.
+          From here on, a newly disclosed vulnerability will simply never be fixed
+          for this line — the only remedy is moving to a supported minor.
+
+          Which minors are still supported is in the probe's job log:
+            grep backported_minors
+
+    - alert: GitLabVersionBehind
+      ## Deliberately info, matching ComponentUpgradeAvailable: behind but with no
+      ## known vulnerability is inventory, not an event. info is black-holed by the
+      ## severity route, so this shows in the Alertmanager UI and nowhere else — on
+      ## purpose. The long `for:` keeps it out of the UI during an upgrade window,
+      ## when being briefly behind is the expected state.
+      expr: gitlab_version_severity == 1
+      for: 24h
+      labels:
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "GitLab {{ $labels.running }} is behind {{ $labels.latest }} (no known vulnerability)"
+        description: |
+          On the latest patch of its own minor with nothing security-relevant
+          outstanding. Upgrade at leisure; chart version to use is in the `chart`
+          label of gitlab_version_info.
+
+    - alert: GitLabVersionProbeFailed
+      ## This rule is what stops a broken probe from looking like good news. The
+      ## probe PUTs its whole group, so on failure every other series here is ABSENT
+      ## rather than stale — which means a firing GitLabCriticalVulnerability would
+      ## silently RESOLVE while GitLab stayed just as vulnerable. Absence of the
+      ## signal must therefore be its own alert. 2h = two consecutive hourly misses.
+      expr: gitlab_version_health_probe_success == 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "gitlab_version_health cannot determine GitLab's patch status"
+        description: |
+          Vulnerability status is UNKNOWN, not clean. The probe could not read
+          /api/v4/version from GitLab, or could not reach version.gitlab.com, or the
+          oracle changed its response shape (the probe treats an unrecognised
+          severity as a failure rather than publishing a reassuring zero).
+
+          The FAIL line in the last job log carries the exception.

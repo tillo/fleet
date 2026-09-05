@@ -1,0 +1,206 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-mail
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-mail.workload
+    rules:
+    - alert: MailDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{namespace="mail"}
+            - kube_deployment_status_replicas_available{namespace="mail"}
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: |
+          Mail deployment has unavailable replicas for >5m. Statuspage component
+          'Mail' will go to major_outage if not resolved.
+          Check: kubectl -n mail get pods, kubectl -n mail describe deployment {{ $labels.deployment }}
+
+    - alert: MailStatefulSetDegraded
+      expr: |
+        kube_statefulset_status_replicas_ready{namespace="mail"}
+          < kube_statefulset_status_replicas{namespace="mail"}
+      for: 5m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.statefulset }}: not all replicas ready"
+        description: |
+          Mail StatefulSet (roundcube-mariadb, etc.) has fewer ready than desired.
+          Webmail will be degraded.
+
+    - alert: MailPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{namespace="mail"}[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} restarting >0.5/min"
+        description: "Investigate with kubectl -n mail logs --previous {{ $labels.pod }} -c {{ $labels.container }}"
+
+    - alert: MailPodOOMKilled
+      expr: |
+        increase(kube_pod_container_status_last_terminated_reason{
+          namespace="mail", reason="OOMKilled"
+        }[1h]) > 0
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} OOMKilled"
+        description: "Bump memory limits or investigate the leak."
+
+  # Outlook SNDS reputation, gauges pushed by
+  # f/probe/snds_outlook_audit (every 6h).
+  # Migration note: Microsoft announced (2026-04-30) that SNDS would
+  # move to a REST API + MS-account auth in May 2026. As of 2026-06-04
+  # the legacy CSV/key endpoint still responds; SndsEndpointDead is the
+  # tripwire for when MS actually flips it. When that fires, rewrite
+  # the probe against the new REST endpoint.
+  - name: app-mail.snds-reputation
+    rules:
+    - alert: SndsIpListed
+      expr: snds_ipstatus_abnormal_total{job="snds_outlook_audit"} > 0
+      for: 10m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "Outlook SNDS: {{ $value }} mail IP(s) flagged abnormal"
+        description: |
+          One or more of our sending IPs is currently in Outlook SNDS
+          ipStatus (block/suspicious). Outlook delivery is likely
+          impacted.
+          Drill in:  snds_ipstatus_listed{job="snds_outlook_audit"}
+          Console: https://sendersupport.olc.protection.outlook.com/snds/
+
+    - alert: SndsFilterDegraded
+      expr: max by (ip) (snds_filter_result_severity{job="snds_outlook_audit"}) >= 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "Outlook SNDS: {{ $labels.ip }} filter result severity {{ $value }} (1=YELLOW 2=RED)"
+        description: |
+          Outlook is filtering more mail from {{ $labels.ip }} than usual.
+          Check complaint rate + spam-trap hits in the latest probe run
+          output (f/probe/snds_outlook_audit).
+
+    - alert: SndsEndpointDead
+      expr: snds_endpoint_alive{job="snds_outlook_audit"} == 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "SNDS endpoint not reachable / key invalid"
+        description: |
+          Both legacy SNDS URLs failed for >1h. If this coincides with
+          Microsoft's announced May-2026 migration, rewrite
+          f/probe/snds_outlook_audit against the new REST API
+          (auth via MS account, not the proxy key). Otherwise it's a
+          transient outage and will self-resolve.
+
+    - alert: SndsProbeStale
+      expr: |
+        time() - snds_last_run_timestamp_seconds{job="snds_outlook_audit"} > 60*60*12
+      for: 5m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "SNDS reputation probe last ran {{ $value | humanizeDuration }} ago"
+        description: |
+          f/probe/snds_outlook_audit is scheduled every 6h.
+          A 12h staleness window means at least one run was missed —
+          check Windmill job history.
+
+  ## Postfix queue depth (postfix_exporter sidecar, added 2026-08-20 after
+  ## the helm-v4 empty-env incident: 7 inbound messages sat deferred for
+  ## hours behind healthy listeners — invisible to every synthetic probe).
+  ## Age-bucket based, not raw count: 1-2 long-retry deferrals to dead
+  ## EXTERNAL destinations are normal background; a PILE of messages older
+  ## than the bucket boundary is not. Buckets: le=1000s (~17min),
+  ## le=10000s (~2.8h). Metric names verified against the live exporter.
+  - name: app-mail.queue
+    rules:
+    - alert: MailQueueBacklog
+      expr: |
+        ( postfix_showq_message_age_seconds_count{queue="deferred"}
+          - ignoring(le) postfix_showq_message_age_seconds_bucket{queue="deferred",le="1000"}
+        ) >= 5
+      for: 15m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} deferred mails older than ~17min in the postfix queue"
+        description: |
+          5+ messages have sat in the deferred queue past one retry cycle for
+          15m+. Local-delivery (LMTP) or relay problems look exactly like this
+          while every listener probe stays green (2026-08-20 incident: dovecot
+          LMTP deferrals). Check:
+            kubectl -n mail exec deploy/docker-mailserver -c docker-mailserver -- postqueue -p
+          The queue-file error text names the broken hop.
+
+    - alert: MailQueueStuck
+      expr: |
+        ( postfix_showq_message_age_seconds_count{queue="deferred"}
+          - ignoring(le) postfix_showq_message_age_seconds_bucket{queue="deferred",le="10000"}
+        ) >= 5
+      for: 15m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} deferred mails older than ~3h — delivery is stuck"
+        description: |
+          Sustained undelivered mail: 5+ messages deferred for close to 3 hours.
+          Users are missing mail even though SMTP/IMAP answer. postqueue -p for
+          the per-message error; postqueue -f to retry after fixing the cause.
+
+    - alert: MailQueueMetricsAbsent
+      ## Guard the guard (23-ha-recorder pattern): if the exporter sidecar
+      ## dies or the scrape breaks, the two rules above go silently blind.
+      expr: |
+        absent(postfix_showq_message_age_seconds_count{queue="deferred"})
+      for: 30m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "postfix queue metrics absent for 30m — queue alerts are blind"
+        description: |
+          The postfix_exporter sidecar (mail/docker-mailserver, port 9154) or
+          its ServiceMonitor scrape stopped producing metrics. MailQueueBacklog
+          and MailQueueStuck cannot fire while this is absent.
+          Check: kubectl -n mail get pods (2/2?), the metrics-exporter
+          container logs, and the docker-mailserver ServiceMonitor.

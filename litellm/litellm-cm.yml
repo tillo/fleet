@@ -1,0 +1,399 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: litellm
+data:
+  config.yaml: |
+    model_list:
+      # ⚠ THE LM STUDIO GROUPS USE hosted_vllm/ ON PURPOSE — DO NOT "CORRECT" IT TO
+      # openai/. That prefix is the fix for a real fault, not a typo.
+      #
+      # THE FAULT: Claude Code sends `thinking`. litellm bridges Anthropic
+      # /v1/messages to an openai/ backend over the RESPONSES API, emitting
+      # `reasoning: {effort: …}`. qwen3-coder is not a reasoning model, and that path
+      # corrupted the engine — measured on ONE loaded instance, transport the only
+      # variable:
+      #   direct /v1/chat/completions (stream or not)  16/16 clean
+      #   via the bridge WITH thinking                 word salad, empties, WEDGED
+      #   via the bridge WITHOUT thinking              clean but for truncation
+      #
+      # THE FIX (2026-08-25, verified at the wire). The routing lives in
+      # llms/anthropic/experimental_pass_through/adapters/handler.py ::
+      # _route_openai_thinking_to_responses_api_if_needed. Its FIRST guard is
+      #     if custom_llm_provider != "openai": return
+      # so any non-"openai" OpenAI-compatible prefix bypasses the bridge before the
+      # reasoning logic runs. Proven with two probe groups identical to local-only
+      # except the prefix, requests carrying `thinking` AND a tool definition:
+      #   openai/       -> POST /v1/responses         (x2, thinking on AND off)
+      #   hosted_vllm/  -> POST /v1/chat/completions  (x2)  + tool_use returned
+      #   openai_like/  -> HTTP 400, unusable: "Unmapped LLM provider for this
+      #                    endpoint" on /v1/messages, and it rejects reasoning_effort
+      # Tool calling was the acceptance criterion and survives: stop_reason=tool_use.
+      #
+      # NOT a total escape: `reasoning_effort` still reaches LM Studio, which logs
+      # "No valid custom reasoning fields found … cannot be converted to any custom
+      # KVs". Benign — it lands on /v1/chat/completions, the path measured clean.
+      #
+      # TWO EARLIER FIXES FAILED HERE (46a123e drop_params/additional_drop_params,
+      # b19f3e1 model_info.supports_reasoning:false; both reverted in 25e29f9). They
+      # targeted the LATER supports_reasoning guard, whose lookup runs against the
+      # UNDERLYING model name, not the group — so config-level model_info never
+      # reaches it. b19f3e1 is the cautionary one: its probe looked like a pass
+      # (bad=0, no junk, no wedge) while the wire showed 8/8 still on /v1/responses.
+      # JUDGE A FIX HERE AT THE WIRE, NEVER ON OUTPUT QUALITY.
+      #
+      # Separately: the MLX engine corrupted on its own under load, so mbp-mda moved
+      # to a GGUF/llama.cpp build on 2026-08-25. See memory
+      # lmstudio_maxtokens_reserved_from_context_and_mlx_batch_crash_2026_08_24.
+      #
+      # ═══════════════ SOURCE OF TRUTH FOR WHICH MODELS WE RUN ═══════════════
+      # Two semantic tiers. Clients ask for these names and NOTHING ELSE, so a model
+      # swap never touches a consumer:
+      #   veloce       — the small local companion: lookups, titles, summaries
+      #   approfondito — the local workhorse: real agentic turns
+      #
+      # Every other group below aliases these two anchors (*BIG_LOCAL / *SMALL_LOCAL)
+      # instead of repeating the model string, so swapping a model is a ONE-LINE edit
+      # on the `model:` line here. YAML resolves anchors before LiteLLM sees the
+      # document, so the groups still receive plain strings.
+      #
+      # An anchor must be DEFINED BEFORE it is aliased, which is why these two groups
+      # come first — do not reorder them below local-wifi.
+      #
+      # Swapping a model is NOT complete here: the identifier must match what mbpmda
+      # actually serves (~/.config/lmstudio/production-model on the laptop) and four
+      # direct-to-LM-Studio consumers that bypass this gateway — ~/.dsh/settings.yaml,
+      # ~/.dsh/doors/local.patch.yml, ~/.dsh/profiles/local/cordis.patch.yml,
+      # ~/lmstudio-tools/lm-doctor.sh. Full checklist:
+      # ~/lmstudio-tools/litellm-gemma-promotion.md on mbpmda.
+      - model_name: approfondito
+        litellm_params:
+          model: &BIG_LOCAL hosted_vllm/google/gemma-4-26b-a4b  # NOT openai/ — see note at top
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600   # SAME reasoning as `infra` below — read it there.
+                                 # This is that door under its tier name and it
+                                 # carries the same chain (-> local-wg -> opus),
+                                 # so on the 20s global fail-fast it leaked to
+                                 # Anthropic on every cold prefill (~400-600s).
+                                 # Unreachable hosts still fail in ~0s here, so
+                                 # this does not delay the tail when the laptop
+                                 # is off; it only waits when the model is UP
+                                 # BUT SLOW, which is the case that should wait.
+      - model_name: veloce
+        litellm_params:
+          model: &SMALL_LOCAL hosted_vllm/qwen3-4b
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900   # same reasoning as local-small: no cloud tail here,
+                                 # so the 20s global fail-fast buys nothing.
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # --- local: one LM Studio on the laptop, reached via two NICs.
+      #     api_base values are injected from Akeyless (see litellm-es.yml) so no
+      #     internal hostname lands in this public repo. os.environ/ refs in
+      #     api_base are resolved by LiteLLM (same as the documented Azure pattern).
+      - model_name: local-wifi
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WIFI_URL
+          api_key: os.environ/LMSTUDIO_API_KEY # real token since 2026-08-19 ("Require Authentication" on)
+          request_timeout: 900   # fail-closed door: no cloud tail, so the 20s
+                                 # global fail-fast buys nothing here. A cold GGUF
+                                 # prefill is ~400s (lean preamble) / ~600s (full).
+      # --- same LM Studio over its WireGuard road-warrior tunnel (2026-08-19):
+      #     reachable when the laptop is away from home. Two identical groups
+      #     because a fallback list is per-GROUP: a mid-stream failure on the WG
+      #     hop resolves the WG group's own fallbacks, so each cloud chain needs
+      #     a WG hop that tails into ITS cloud model to keep the tail correct.
+      #     request_timeout 60 (not the global 20s fail-fast): if the qwen pin
+      #     was lost (LM Studio restart), the first request JIT-loads the model
+      #     in ~40s — proven 2026-08-19 when the 20s cap knocked the WG hop out
+      #     of the chain mid-load. 60s still tails to the cloud within a minute.
+      - model_name: local-wg
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 60
+      - model_name: local-wg-fable
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 60
+      # --- Anthropic tails (directly selectable, and used as fallbacks) ---
+      #     Since 2026-08-18 these go through claude-shim (headless Claude Code
+      #     on the Max subscription) instead of the pay-per-token API. The
+      #     per-model request_timeout overrides the global 20s fail-fast, which
+      #     is sized for the local LM Studio hops, not a real Claude answer.
+      - model_name: opus
+        litellm_params:
+          model: openai/claude-opus-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+      - model_name: fable
+        litellm_params:
+          model: openai/claude-fable-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+      # --- drop-in aliases (2026-08-18): clients that already ask for a
+      #     claude-* model id (HA LLM Vision, people_inbox_curator) only have
+      #     to change endpoint+key, not model. All shim-backed = subscription.
+      - model_name: claude-fable-5
+        litellm_params:
+          model: openai/claude-fable-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+      - model_name: claude-opus-5
+        litellm_params:
+          model: openai/claude-opus-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+      - model_name: claude-sonnet-5
+        litellm_params:
+          model: openai/claude-sonnet-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+      - model_name: claude-haiku-4-5
+        litellm_params:
+          model: openai/claude-haiku-4-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+      # --- DeepSeek (2026-08-24): the cheap tier, reachable through the gateway
+      #     as well as direct. DELIBERATELY NO fallbacks entry for these two:
+      #     an implicit cross-operator hop moves the payload to a different
+      #     company under different law without a decision being made, which is
+      #     the same reason local-only is fail-closed. Ask for ds-* and you get
+      #     DeepSeek or an error.
+      #     request_timeout 300: the global 20s is the LM Studio fail-fast and
+      #     would guillotine a real agentic turn.
+      #     Caching needs no client flags — DeepSeek caches automatically on the
+      #     request prefix; litellm surfaces the counters as
+      #     usage.prompt_tokens_details.cached_tokens.
+      - model_name: ds-flash
+        litellm_params:
+          model: deepseek/deepseek-v4-flash
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+      - model_name: ds-pro
+        litellm_params:
+          model: deepseek/deepseek-v4-pro
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+
+      # --- small/fast companion (2026-08-25). Claude Code fires background calls
+      #     (session titles, auxiliary summaries) at ANTHROPIC_SMALL_FAST_MODEL, and
+      #     the door table pointed that at the door's OWN model -- so each one was a
+      #     full request against the 30B. Measured: one such call was 23,941 tokens.
+      #     Since the 30B now runs numParallelSessions=1 (its warm prefix cache is
+      #     the whole speed story: 176s cold -> 13s warm), a background call does not
+      #     evict that cache but it DOES queue ahead of your interactive turn and
+      #     draws on the shared 131,072-token KV pool.
+      #     A 4B in its own llama-server answers these for a fraction of the cost and
+      #     keeps the door FAIL-CLOSED -- still local, no cloud tail.
+      - model_name: local-small
+        litellm_params:
+          model: *SMALL_LOCAL
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900
+
+      # --- FAIL-CLOSED ROADS TO THE SAME LAPTOP (2026-09-03) ---------------
+      #
+      # The WireGuard hop added on 2026-08-19 was wired only into the chains
+      # that END IN THE CLOUD, because the only WG groups (`local-wg`,
+      # `local-wg-fable`) carry a cloud tail of their own. A fail-closed door
+      # therefore could not borrow one without silently gaining that tail —
+      # so `veloce`, `local-small` and `local-only` stayed LAN-only and simply
+      # BROKE whenever the laptop was away from home: a hard "Cannot connect to
+      # host ... No fallback model group found" from the WIRED address, while
+      # the laptop was up and serving happily over the tunnel.
+      #
+      # These three groups are the SAME roads as local-wifi/local-wg with the
+      # cloud tail removed: they deliberately have NO entry in `fallbacks`, so
+      # a chain that reaches one ENDS there. That is what keeps the doors
+      # fail-closed — the property being preserved is "never leaves the box",
+      # not "never leaves the LAN".
+      #
+      # Measured from inside the cluster on 2026-09-03, laptop away:
+      #   WIRED  -> no route in 0.5s | WIFI -> no route in 4.1s
+      #   WG     -> HTTP 200 in 0.1s, /v1/models = gemma-4-26b-a4b AND qwen3-4b
+      # Both models are served by the ONE LM Studio on :1234, so the WG road
+      # reaches the 4B exactly as it reaches the 30B. The dead LAN hops cost
+      # ~4.6s once, not per call: allowed_fails=1 puts them in a 30s cooldown.
+      #
+      # request_timeout 900 (not the 60 the cloud-tailed WG hops use): 60 exists
+      # only to reach Anthropic within a minute. With no tail there is nothing
+      # to hurry to, and a lost LM Studio pin JIT-loads the model in ~40s.
+      - model_name: local-small-wifi
+        litellm_params:
+          model: *SMALL_LOCAL
+          api_base: os.environ/LMSTUDIO_WIFI_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900
+      - model_name: local-small-wg
+        litellm_params:
+          model: *SMALL_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900
+      # The 30B twin of local-wg, minus the `["opus"]` tail — this is the hop
+      # `local-only` could not have. Do NOT give this group a fallbacks entry.
+      - model_name: local-wg-closed
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900
+
+      # --- public aliases: PRIMARY = wired; chain is defined in fallbacks ---
+      #
+      # ⭐ request_timeout 600 (2026-09-01, user decision) — WHY THIS DOES NOT
+      # BREAK FAILOVER, which is the objection it looks like it should have.
+      #
+      # Until now `infra` inherited the global 20s fail-fast, and that was
+      # leaking to the cloud: measured 2026-09-01, the FIRST request after an
+      # idle period took 43s and billed Anthropic, while every warm request ran
+      # 2-3s at zero cost. A cold GGUF prefill is ~400s (lean) / ~600s (full),
+      # so 20s could never cover one — the door silently became "opus with extra
+      # steps" exactly when the local model was cold. That is a fail-OPEN
+      # PRIVACY change, not merely a slow one.
+      #
+      # The fear is that a big timeout delays the cloud tail when the laptop is
+      # simply OFF. Measured, not assumed: on this network an unreachable
+      # destination fails in ~0s, not at the timeout — checked three ways from
+      # inside the cluster (no-route 10.255.255.1, TEST-NET 192.0.2.1 and
+      # 198.51.100.7, and a refused port). The LAN answers with ICMP/route
+      # errors rather than dropping, and a stopped LM Studio on a live host
+      # refuses instantly. So request_timeout governs only the case where the
+      # model is UP BUT SLOW — i.e. cold prefill — which is precisely the case
+      # that should wait rather than leak.
+      #
+      # ⚠️ The one case it does cost: LM Studio ACCEPTING the connection and then
+      # never answering (hung engine, not stopped). That now blocks for 600s
+      # before the chain moves on. Judged the better trade against shipping log
+      # content to Anthropic on every cold start.
+      #
+      # Not made unbounded: 900 (as on local-only) is for a door with NO cloud
+      # tail, where waiting forever is the whole point. 600 covers the
+      # documented worst-case prefill and still reaches the tail eventually.
+      #
+      # The two siblings that shared this leak — `approfondito` (the same door
+      # under its tier name) and `infra-fable` — were given the same 600 on
+      # 2026-09-02, so all three local-first doors now behave alike.
+      #
+      # ⭐ DERIVE THIS, DO NOT TRUST THIS COMMENT. The invariant worth keeping is
+      # "every group whose fallback chain ends in a cloud model has a
+      # request_timeout of its own"; a group added later without one silently
+      # reintroduces the leak. Check it, don't read it:
+      #   kubectl -n litellm get cm litellm-config -o jsonpath='{.data.config\.yaml}' \
+      #     | python3 -c 'import sys,yaml; c=yaml.safe_load(sys.stdin); \
+      #       fb={list(f)[0]:list(f.values())[0] for f in c["litellm_settings"]["fallbacks"]}; \
+      #       print([m["model_name"] for m in c["model_list"] \
+      #         if any(x in ("opus","fable") for x in fb.get(m["model_name"],[])) \
+      #         and not m["litellm_params"].get("request_timeout")])'
+      # An empty list is the healthy state.
+      - model_name: infra
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600
+      - model_name: infra-fable
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600   # same as `infra` above; its tail is Fable
+                                 # rather than Opus, but the cold-prefill leak
+                                 # and the reasoning are identical.
+      - model_name: local-only
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WIRED_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900   # fail-closed door: no cloud tail, so the 20s
+                                 # global fail-fast buys nothing here. A cold GGUF
+                                 # prefill is ~400s (lean preamble) / ~600s (full).
+
+    litellm_settings:
+      fallbacks:
+        # No local-wifi hop in the cloud chains: same physical box as wired, and a
+        # mid-stream failure on the hop ends the chain before the cloud tail
+        # (litellm resolves fallbacks for the FAILED group, not the original).
+        # The WG hop (laptop away from home) IS in the chains, and each WG group
+        # carries its own cloud tail so even a mid-stream WG failure still lands
+        # on the right cloud model.
+        # approfondito is the tier name for what `infra` does, and carries the same
+        # chain.
+        #
+        # ⭐ TWO KINDS OF CHAIN LIVE IN THIS LIST — read the tail, not the length.
+        # A chain ending in opus/fable is a CLOUD chain. A chain ending in a
+        # local-*-wifi / local-*-wg / local-wg-closed group is a FAIL-CLOSED
+        # chain: those groups have no entry here, so the chain stops at the
+        # laptop. `veloce` and `local-small` still MUST NOT gain a cloud tail —
+        # that would ship session titles and summaries off-box without a
+        # decision being made — but reaching the same laptop down a different
+        # road is not a leak, and until 2026-09-03 the absence of that road was
+        # the only reason these doors broke on VPN. See the block above
+        # local-small-wifi for the measurements.
+        - approfondito:   ["local-wg", "opus"]         # wired -> WG -> Opus
+        - infra:          ["local-wg", "opus"]         # wired -> WG -> Opus
+        - infra-fable:    ["local-wg-fable", "fable"]  # wired -> WG -> Fable
+        - local-wg:       ["opus"]
+        - local-wg-fable: ["fable"]
+        # --- fail-closed chains: wired -> wifi -> WG -> STOP. No cloud tail at
+        #     any hop, so the payload never leaves the laptop.
+        - local-only:     ["local-wifi", "local-wg-closed"]
+        - local-small:    ["local-small-wifi", "local-small-wg"]
+        - veloce:         ["local-small-wifi", "local-small-wg"]
+      num_retries: 0            # don't retry a dead endpoint; fall over immediately
+      request_timeout: 20
+      allowed_fails: 1          # one failure trips the cooldown
+      cooldown_time: 30         # skip a downed path for 30s instead of re-timing-out
+
+    general_settings:
+      # Background health checks removed 2026-08-18: each check is a real paid
+      # 1-token completion against the Anthropic deployments (~5k/day across
+      # 2 pods), and probes of the normally-asleep wifi backend hang 600 s
+      # (health checks ignore request_timeout). Failover is handled by
+      # allowed_fails/cooldown_time on real traffic instead.
+      master_key: os.environ/LITELLM_MASTER_KEY
+
+      # NOTE: there is no `ui:` key in general_settings -- an earlier attempt set
+      # `ui: true` here and it was inert. The admin UI at /ui is always served
+      # once master_key is set; it was failing with "Not connected to DB!"
+      # because DATABASE_URL was absent, which is now injected from the CNPG
+      # secret in litellm-deploy.yml (see litellm-pg.yml).
+
+      # The model_list in THIS FILE stays the single source of truth. With a DB
+      # attached, litellm would otherwise let the UI write model definitions
+      # into Postgres and merge them at runtime -- which would quietly outrank
+      # the hosted_vllm/ prefix fix and the fallback chains above. Default is
+      # already False; pinned explicitly because the cost of a silent flip here
+      # is a routing change nobody can find in git.
+      store_model_in_db: false
+
+      # SpendLogs grows one row per request and nothing prunes it by default.
+      # 90 days is plenty to answer "what did this month cost"; the sweep runs
+      # daily.
+      maximum_spend_logs_retention_period: "90d"
+      maximum_spend_logs_retention_interval: "1d"
+
+      # Attribute spend to the PERSON, not just the key. chat.mdapi.ch hands its
+      # whole household one shared virtual key, so without this every request in
+      # SpendLogs is the same anonymous blob and "who burned the ds-flash budget"
+      # is unanswerable. Open WebUI forwards the signed-in identity when
+      # ENABLE_FORWARD_USER_INFO_HEADERS=true (openwebui-deploy.yml) and litellm
+      # reads the header named here into the request's user field
+      # (litellm_pre_call_utils.py:935).
+      # Harmless for every other consumer: they simply do not send the header.
+      user_header_name: "X-OpenWebUI-User-Email"

@@ -1,0 +1,48 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tillo
+  namespace: tillo
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecDebugLog /tmp/modsec_debug.log
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    nginx.ingress.kubernetes.io/permanent-redirect: https://www.linkedin.com/in/martinodellambrogio/
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tillo.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: nonexistent
+                port:
+                  name: none
+            path: /
+            pathType: Prefix
+    - host: www.tillo.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: nonexistent
+                port:
+                  name: none
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - tillo.ch
+      - www.tillo.ch
+      secretName: tillo-cert

@@ -1,0 +1,73 @@
+# Public request page at https://start.mdapi.ch/request/ (beads infra-kgnp).
+#
+# ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+# Someone with no account who reaches mdapi.ch and wants a service is bounced to
+# idp.mdapi.ch to log in, where there is nothing at all for them: realm tilloch
+# has self-registration disabled on purpose (and Keycloak cannot create the LDAP
+# user anyway -- error 65, fails closed -- so any path must end in the LDAP-first
+# request_membership flow). This gives them somewhere to go, on a NEUTRAL host:
+# mdapi.ch users are not necessarily Dell'Ambrogios, so the front door is not the
+# family domain. Backend is the existing dellambrogio Deployment, serving a
+# second, neutral document root at html/request/ -- one ALTCHA implementation,
+# one send.php, one approval flow.
+#
+# ── WHY A SECOND INGRESS ────────────────────────────────────────────────────
+# start.mdapi.ch is served by portal/portal, whose single `path: /` carries
+# auth-url/auth-signin, so EVERY path on that host is SSO-gated. Auth annotations
+# are per-Ingress and therefore per-location, so a second Ingress with no auth
+# annotations makes exactly this one path public while / stays gated.
+# ingress-nginx merges both into one server block and sorts locations longest
+# first, so /request wins over /.
+#
+# ⚠️ NO `tls:` BLOCK ON PURPOSE. The host's certificate comes from portal/portal
+# (secret portal-tls, in the portal namespace); a TLS secret cannot be read
+# across namespaces and this Ingress must live here, next to the Service it
+# targets. Declaring a second cert for the same host would make two Ingresses
+# claim one server block's certificate -- ambiguous, and one silently wins.
+# Precedent in this cluster: webtunnel-bridge/webtunnel-bridge adds
+# /api/v1/proxy to mdapi.ch from another namespace with no tls: block, while
+# showcase/showcase holds the cert. Consequence to know: if portal/portal is
+# ever deleted, TLS for this host goes with it.
+#
+# ⚠️ THE MODSECURITY SNIPPET IS NOT DECORATION. It must stay identical to
+# dellambrogio-ing.yml. CRS 933160 ("PHP function name found") matches ordinary
+# Italian prose containing "file (" and returns a RAW 403 -- the visitor sees a
+# blank error and the request is LOST, not queued. The exclusions are per-ARG so
+# real payloads elsewhere are still blocked. Same form, same fields, same rule:
+# whatever protects dellambrogio.ch has to protect this door too.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: start-request
+  namespace: dellambrogio
+  annotations:
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      SecRuleUpdateTargetById 933160 "!ARGS:request"
+      SecRuleUpdateTargetById 933160 "!ARGS:name"
+      SecRuleUpdateTargetById 933160 "!ARGS:city"
+      SecRuleUpdateTargetById 933160 "!ARGS:/^wants/"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: start.mdapi.ch
+      http:
+        paths:
+          # Prefix, not /request/ -- a visitor typing the bare /request must
+          # reach the page, not fall through to the SSO-gated portal.
+          - path: /request
+            pathType: Prefix
+            backend:
+              service:
+                name: dellambrogio
+                port:
+                  number: 80

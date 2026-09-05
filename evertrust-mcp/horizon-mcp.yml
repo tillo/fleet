@@ -1,0 +1,123 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: horizon-mcp-secrets
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: horizon-mcp-secrets
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/evertrust-mcp/horizon-mcp-token
+      secretKey: AUTH_TOKEN
+    - remoteRef:
+        key: /mdapi/horizon/admin/password
+      secretKey: HORIZON_API_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: horizon-mcp
+  # Floating :latest tracked by Keel (poll every 4h); reloader restarts on secret rotation.
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: horizon-mcp
+  template:
+    metadata:
+      labels:
+        app: horizon-mcp
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        # Self-contained image: supergateway + @evertrust/horizon-mcp baked in, behind an
+        # nginx bearer-token gate (accepts Authorization: Bearer OR ?token=). The
+        # --stateful/--sessionTimeout flags, MCP_BIN and ports are baked into the image ENV.
+        - name: horizon-mcp
+          image: zot.mdapi.ch/mdapi/horizon-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: horizon-mcp-secrets
+                  key: AUTH_TOKEN
+            - name: HORIZON_URL
+              value: http://horizon.horizon.svc.cluster.local:9000
+            - name: HORIZON_API_ID
+              value: administrator
+            - name: HORIZON_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: horizon-mcp-secrets
+                  key: HORIZON_API_KEY
+          startupProbe:
+            tcpSocket: { port: 8080 }
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            # 1Gi OOMKilled (5 restarts by 2026-06-21); 2Gi OOMKilled again
+            # (6 restarts by 2026-07-02) — --stateful keeps a per-session
+            # API-auth cache that grows unbounded with concurrent clients.
+            # 4Gi buys headroom; real fix is cache eviction in horizon-mcp.
+            limits: { memory: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: horizon-mcp
+spec:
+  selector:
+    app: horizon-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: horizon-mcp
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # ModSec OFF — MCP JSON-RPC traffic trips CRS false positives (per k8s-mcp).
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    # streamable-HTTP/SSE needs no buffering + long timeouts (per k8s-mcp).
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [horizon-mcp.mdapi.ch]
+      secretName: horizon-mcp-tls
+  rules:
+    - host: horizon-mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: horizon-mcp
+                port:
+                  number: 8080

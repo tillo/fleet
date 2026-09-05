@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      priorityClassName: mdapi-critical
+      # Pod-level k8s admission defaults written explicitly so Fleet
+      # drift detection doesn't flag the bundle Modified after admission
+      # fills them in on the live state.
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - name: postgres
+          image: mirror.gcr.io/postgres:17
+          imagePullPolicy: IfNotPresent
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          # `resources: {}` is here so Fleet's comparePatches `op:remove`
+          # on /containers/0/resources finds the path and succeeds — JSON
+          # Patch is atomic, so a missing path failed both this remove AND
+          # the /image remove, leaving Keel-bumped image drift visible.
+          resources: {}
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: POSTGRES_USER
+              value: owncloud
+            - name: POSTGRES_DB
+              value: owncloud
+          envFrom:
+            - secretRef:
+                name: postgres-env-secret
+          ports:
+            - containerPort: 5432
+              protocol: TCP
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: wants_an_empty_folder
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data

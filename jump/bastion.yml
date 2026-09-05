@@ -1,0 +1,128 @@
+# In-cluster SSH/mosh bastion.
+# Secrets (jump-hostkeys, jump-authorized-keys) and the entrypoint ConfigMap
+# (jump-entrypoint) are created imperatively by apply.sh so no key material lives
+# in this file. This manifest is the parts safe to keep in Git / a Fleet bundle.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jump-bastion
+  namespace: jump
+  labels: { app: jump-bastion }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # RWO PVC — single attach
+  selector:
+    matchLabels: { app: jump-bastion }
+  template:
+    metadata:
+      labels: { app: jump-bastion }
+    spec:
+      hostname: jump                        # short prompt/title on phone-width terminals
+      automountServiceAccountToken: false   # network bastion, NOT a cluster console
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      imagePullSecrets:
+        - name: mdapi-registry            # see mdapi-registry-es.yml
+      containers:
+        - name: bastion
+          # Pre-baked image (mdapi/jump-bastion) — replaced the interim
+          # debian:trixie-slim + apt-at-entrypoint on 2026-07-26; the entrypoint's
+          # apt step is a no-op on it.
+          #
+          # Bumped .106 -> .287 on 2026-09-03 to pick up skopeo (needed by the
+          # Windmill job f/gitlab/upgrade_mirror_zot, which had no way to run
+          # without it) plus ~181 pipelines of accumulated base-image patching.
+          # ⛔ Changing this line is a POD TEMPLATE change: with strategy Recreate
+          # the push IS the roll and the live session dies. See
+          # ~/jump-roll-procedure.md before touching it.
+          image: registry.mdapi.ch/mdapi/jump-bastion:2.1.4-mdapi.287
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/opt/entrypoint/entrypoint.sh"]
+          env:
+            - { name: TLS_BACKEND, value: "ingress-expose.kube-system.svc.cluster.local:443" }
+            # sslh demuxes OpenVPN off the same public 443 (2026-09-02).
+            - { name: OVPN_BACKEND, value: "openvpn.jump.svc.cluster.local:1194" }
+            - { name: MOSH_PORT,   value: "443" }
+            - { name: SSLH_PORT,   value: "4443" }
+          securityContext:
+            runAsUser: 0                     # sshd needs root
+            allowPrivilegeEscalation: true   # setcap on mosh-server; su to tillo
+            capabilities:
+              drop: ["ALL"]
+              # NET_BIND_SERVICE: sslh/sshd/mosh bind low ports.
+              # SETFCAP: entrypoint setcap's mosh-server so non-root tillo binds udp/443.
+              # SYS_CHROOT: OpenSSH pre-auth privsep child chroots to /run/sshd (mandatory).
+              # SETUID/SETGID: sshd privsep + su to tillo. CHOWN/DAC_OVERRIDE/FOWNER: home/key setup.
+              # AUDIT_WRITE: sshd writes a login audit record when allocating a PTY —
+              # without it, interactive shells open then immediately close (no shell).
+              add: ["NET_BIND_SERVICE", "SETFCAP", "SYS_CHROOT", "SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "FOWNER", "AUDIT_WRITE"]
+          ports:
+            - { name: sslh, containerPort: 4443, protocol: TCP }
+            - { name: mosh, containerPort: 443,  protocol: UDP }
+          readinessProbe:
+            tcpSocket: { port: 4443 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 4443 }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { cpu: "4",    memory: "6Gi" }
+          volumeMounts:
+            - { name: entrypoint, mountPath: /opt/entrypoint, readOnly: true }
+            - { name: hostkeys,   mountPath: /etc/ssh/keys, readOnly: true }
+            - { name: authkeys,   mountPath: /etc/ssh/authorized_keys.d, readOnly: true }
+            - { name: home,       mountPath: /home/tillo }
+            # Regenerable caches, split onto jump-cache so they stay OUT of the
+            # hourly restic snapshot (see jump/cache-pvc.yml). Per-directory
+            # subPaths, NOT a mount of ~/.local/share or ~/.local/opt: those also
+            # hold ~/.local/share/claude, ~/.local/opt/node22 (dsh) and
+            # ~/.local/opt/wmill-cli, all of which must stay on jump-home.
+            # The entrypoint's `chown -R tillo:tillo /home/tillo` covers these
+            # mounts, so no extra ownership handling is needed.
+            - { name: cache, mountPath: /home/tillo/.cache,             subPath: cache }
+            - { name: cache, mountPath: /home/tillo/.npm,               subPath: npm }
+            - { name: cache, mountPath: /home/tillo/.kube/cache,        subPath: kube-cache }
+            - { name: cache, mountPath: /home/tillo/.local/share/pnpm,  subPath: pnpm }
+            - { name: cache, mountPath: /home/tillo/.venvs,             subPath: venvs }
+      volumes:
+        - name: entrypoint
+          configMap: { name: jump-entrypoint, defaultMode: 0555 }
+        - name: hostkeys
+          secret: { secretName: jump-hostkeys, defaultMode: 0600 }
+        - name: authkeys
+          secret: { secretName: jump-authorized-keys, defaultMode: 0644 }
+        # Flipped to jump-home-ceph 2026-09-02 (mbptillo retirement). The old 8Gi
+        # Longhorn jump-home PVC was kept unmounted as the rollback path and is
+        # RETIRED 2026-09-03: the new home has since survived a full pod roll
+        # (image .106 -> .287) plus a day of hourly restic snapshots, and a
+        # single-file restore was verified against sha256. Rolling back now would
+        # mean going back to a pre-migration home, which is not a thing we want.
+        - name: home
+          persistentVolumeClaim: { claimName: jump-home-ceph }
+        # Deliberately has NO VolSync ReplicationSource — see jump/cache-pvc.yml.
+        - name: cache
+          persistentVolumeClaim: { claimName: jump-cache }
+---
+# Single mixed-protocol LB service (tcp/443 sslh + udp/443 mosh), pinned via
+# spec.loadBalancerIP — the convention every working LB service here uses (cf.
+# technitium-dns), which this MetalLB build honors over the newer annotation.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jump
+  namespace: jump
+  labels: { app: jump-bastion }
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.62
+  externalTrafficPolicy: Cluster
+  selector: { app: jump-bastion }
+  ports:
+    - { name: sslh, port: 443, targetPort: 4443, protocol: TCP }
+    - { name: mosh, port: 443, targetPort: 443,  protocol: UDP }

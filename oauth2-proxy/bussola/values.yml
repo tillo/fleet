@@ -1,0 +1,90 @@
+## Istanza oauth2-proxy dedicata a bussola.mdapi.ch.
+##
+## Copia dell'istanza `admin`, con un ruolo proprio. Non riusa
+## oauth2-proxy-portal di proposito: quella ammette ogni account del realm, che
+## è la scelta giusta per la chat di famiglia e quella sbagliata qui.
+replicaCount: 2
+
+config:
+  provider: keycloak-oidc
+  cookieName: mdapi-bussola
+  existingSecret: oauth2-proxy-bussola-credentials 
+  configFile: |-
+    provider="keycloak-oidc"
+    provider_display_name="MDAPI"
+    proxy_prefix="/bussola/oauth2"
+    redirect_url="https://auth.mdapi.ch/bussola/oauth2/callback"
+    oidc_issuer_url="https://idp.mdapi.ch/realms/tilloch"
+    skip_provider_button=true
+    cookie_domains=["mdapi.ch"]
+    whitelist_domains=[".mdapi.ch"]
+    email_domains=["*"]
+    allowed_roles=["mdapi-bussola"]
+    ## Espone X-Auth-Request-Email / -Preferred-Username / -Groups sulla
+    ## risposta di auth: è l'unica identità che Bussola accetta. Senza questo
+    ## l'applicazione risponde 401 a tutti, ed è il verso giusto in cui
+    ## sbagliare.
+    set_xauthrequest=true
+    ## Difesa in profondità sul CSRF, insieme al controllo dell'origine che fa
+    ## l'applicazione: senza questa riga il SameSite del cookie di sessione
+    ## dipende dal browser di chi lo usa, e non tutti trattano l'assenza come
+    ## "lax". "lax" lascia funzionare l'arrivo dal redirect di Keycloak, che è
+    ## una navigazione GET.
+    cookie_samesite="lax"
+sessionStorage:
+  type: redis
+  redis:
+    clientType: sentinel
+    sentinel:
+      masterName: mymaster
+      connectionUrls:
+        - redis://oauth2-proxy-bussola-redis-ha:26379
+redis-ha:
+  enabled: true
+  persistentVolume:
+    enabled: false
+  image:
+    repository: zot.mdapi.ch/library/redis
+    tag: 8.2.4-alpine
+    pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: zot-pull
+ingress:
+  enabled: true
+  path: /bussola
+  hosts:
+    - auth.mdapi.ch
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      SecRule REQUEST_URI "@rx ^/bussola/oauth2/(?:start|auth)" \
+        "id:1000,\
+        phase:1,\
+        pass,\
+        t:none,\
+        nolog,\
+        ctl:ruleRemoveById=949110"
+  tls:
+    - secretName: auth-cert
+      hosts:
+        - auth.mdapi.ch
+image:
+  registry: zot.mdapi.ch
+  repository: oauth2-proxy/oauth2-proxy
+  tag: v7.15.2
+  pullPolicy: IfNotPresent
+imagePullSecrets:
+  - name: zot-pull
+      
+# SSO path underpins the portal + gated apps (2026-07-04 N-1 program)
+priorityClassName: mdapi-critical

@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak
+  labels:
+    app: keycloak
+spec:
+  serviceName: keycloak-discovery
+  replicas: 2
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      priorityClassName: mdapi-critical
+      volumes:
+        - name: providers-volume
+          emptyDir: { }
+      initContainers:
+        - name: download-plugins
+          image: alpine/curl:latest
+          imagePullPolicy: Always
+          command:
+            - sh
+            - -c
+            - |
+              curl -L -o keycloak-webhook-provider-core.jar https://github.com/vymalo/keycloak-webhook/releases/download/v0.10.0-rc.1/keycloak-webhook-provider-core-0.10.0-rc.1-all.jar
+              curl -L -o keycloak-webhook-provider-http.jar https://github.com/vymalo/keycloak-webhook/releases/download/v0.10.0-rc.1/keycloak-webhook-provider-http-0.10.0-rc.1-all.jar
+              cp *.jar /providers/
+          volumeMounts:
+            - name: providers-volume
+              mountPath: /providers
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.7.2  # S7 (infra-ka2): pinned to CVE-2026-18963 fix (reset-credentials bypass / account takeover, 2026-08-19); quay has no bare-major tag — :26 broke the roll 2026-08-15; lane B: Renovate manages bumps
+          imagePullPolicy: IfNotPresent
+          args: ["start"]
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: "admin"
+            - name: KC_PROXY_HEADERS
+              value: "xforwarded"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            # Pin the frontend hostname: without it Keycloak builds user-facing
+            # links (password action-tokens!) from the REQUEST base URL — an
+            # admin call via localhost/svc DNS produced localhost:8080 links in
+            # resident emails (2026-07-04). Backchannel stays dynamic so
+            # in-cluster admin/API calls keep working over plain HTTP.
+            - name: KC_HOSTNAME
+              value: "https://login.envuassu.ch"
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: 'KC_CACHE'
+              value: 'ispn'
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: status.podIP
+            - name: KC_CACHE_EMBEDDED_NETWORK_BIND_ADDRESS
+              value: '$(POD_IP)'
+            - name: 'KC_DB_URL_DATABASE'
+              value: 'keycloak'
+            - name: 'KC_DB_URL_HOST'
+              value: 'postgres'
+            - name: 'KC_DB'
+              value: 'postgres'
+            - name: 'KC_DB_USERNAME'
+              value: 'keycloak'
+            - name: WEBHOOK_HTTP_BASE_PATH
+              value: "http://logstream-leader.cribl.svc.cluster.local:8080"
+            - name: WEBHOOK_HTTP_AUTH_USERNAME
+              value: "keycloak"
+          envFrom:
+            - secretRef:
+                name: keycloak-env-secret
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: jgroups
+              containerPort: 7800
+            - name: jgroups-fd
+              containerPort: 57800
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: 9000
+            periodSeconds: 1
+            failureThreshold: 600              
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9000
+            periodSeconds: 10
+            failureThreshold: 3              
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9000
+            periodSeconds: 10
+            failureThreshold: 3              
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1Gi
+            limits:
+              memory: 1536Mi
+          volumeMounts:
+            - name: providers-volume
+              mountPath: /opt/keycloak/providers

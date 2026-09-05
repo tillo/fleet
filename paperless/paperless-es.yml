@@ -1,0 +1,97 @@
+## Application-level secrets for paperless-ngx.
+##
+## Akeyless keys:
+##   /mdapi/paperless/db-password           CNPG superuser pw (also paperless DB owner)
+##   /mdapi/paperless/secret-key            Django SECRET_KEY
+##   /mdapi/paperless/imap-password         LDAP userPassword of `documents@mdapi.ch`
+##                                           (paperless authenticates to dovecot with this)
+##   /mdapi/paperless/oidc-client-secret    Keycloak OIDC client secret
+##                                           (realm tilloch, client_id paperless)
+##
+## ldap-bind-password is retained in Akeyless but no longer wired here —
+## the paperless-ngx 2.18 image does not bundle python-ldap, so we use
+## django-allauth + Keycloak OIDC instead (Keycloak federates to LDAP,
+## so users still authenticate with their existing LDAP credentials).
+
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-env-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-env-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/paperless/secret-key
+      secretKey: PAPERLESS_SECRET_KEY
+    - remoteRef:
+        key: /mdapi/paperless/db-password
+      secretKey: PAPERLESS_DBPASS
+    - remoteRef:
+        key: /mdapi/paperless/imap-password
+      secretKey: PAPERLESS_MAIL_PASSWORD
+    ## Pre-obscured form of the same password, for the consume-puller rclone
+    ## sidecar's RCLONE_CONFIG_OWNCLOUD_PASS env var (rclone WebDAV requires
+    ## the password env var to be in obscured form; doing it at container
+    ## startup via `rclone obscure` and `export` proved fragile because the
+    ## runtime export was not visibly reaching the rclone subprocess).
+    ## If the plain password rotates, re-obscure (rclone obscure '<plain>')
+    ## and update BOTH /mdapi/paperless/imap-password and
+    ## /mdapi/paperless/imap-password-rclone-obscured in lockstep.
+    - remoteRef:
+        key: /mdapi/paperless/imap-password-rclone-obscured
+      secretKey: RCLONE_CONFIG_OWNCLOUD_PASS
+---
+## OIDC provider JSON for django-allauth. Rendered at sync time with the
+## Akeyless-managed client secret substituted in. Display name "MDAPI"
+## appears as the SSO button label on the paperless login page.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-oidc-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-oidc-secret
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        PAPERLESS_SOCIALACCOUNT_PROVIDERS: |
+          {"openid_connect":{"APPS":[{"provider_id":"keycloak","name":"MDAPI","client_id":"paperless","secret":"{{ .clientSecret }}","settings":{"server_url":"https://idp.mdapi.ch/realms/tilloch/.well-known/openid-configuration"}}]}}
+  data:
+    - remoteRef:
+        key: /mdapi/paperless/oidc-client-secret
+      secretKey: clientSecret
+---
+## CNPG bootstrap reads this Secret to set the `paperless` role password.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-pg-app-credentials
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-pg-app-credentials
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      data:
+        username: paperless
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/paperless/db-password
+      secretKey: password

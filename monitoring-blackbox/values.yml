@@ -1,0 +1,227 @@
+## prometheus-blackbox-exporter values
+##
+## Synthetic-probe sidecar for the existing rancher-monitoring Prometheus.
+## Probes are defined as separate Probe CRDs in probes.yml; this values
+## file only configures the prober modules they reference.
+
+fullnameOverride: blackbox
+
+replicas: 1
+
+## Unprivileged ICMP for the icmp module: the container securityContext
+## drops ALL caps (chart default), so the prober can't open raw sockets.
+## Datagram ICMP sockets are allowed for GIDs in ping_group_range — a
+## kubelet-safe sysctl — and blackbox falls back to them automatically.
+podSecurityContext:
+  sysctls:
+    - name: net.ipv4.ping_group_range
+      value: "0 65534"
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+## ServiceMonitor — let rancher-monitoring's Prometheus scrape blackbox's own
+## metrics (probe_duration etc. for self-health). Default selector ({}) on the
+## Prometheus CRD picks this up without label requirements.
+serviceMonitor:
+  enabled: true
+  defaults:
+    additionalMetricsRelabels: {}
+    labels: {}
+
+## Disable bundled prometheusRule generation; we ship our own in rules.yml
+## with consistent severity/component/team labels.
+prometheusRule:
+  enabled: false
+
+## Modules — only the ones our 7 component probes need.
+config:
+  modules:
+    http_2xx:
+      prober: http
+      timeout: 10s
+      http:
+        valid_status_codes: [200, 301, 302]
+        method: GET
+        follow_redirects: true
+        preferred_ip_protocol: ip4
+
+    http_any_redirect:
+      ## For services that redirect to login (oauth2-proxy / Keycloak) — any
+      ## HTTP response < 500 means the layer is up. 307 + 308 added 2026-06-05
+      ## after logs.mdapi.ch (308 -> /web/) was failing the probe.
+      prober: http
+      timeout: 10s
+      http:
+        valid_status_codes: [200, 301, 302, 307, 308, 401, 403]
+        method: GET
+        follow_redirects: false
+        preferred_ip_protocol: ip4
+
+    tcp_connect:
+      prober: tcp
+      timeout: 5s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+
+    icmp:
+      ## Continuous WAN latency/loss trending between the 6h speedtest runs
+      ## (Probe CRD wan-icmp-latency). Deliberately NOT statuspage-coupled —
+      ## its targets carry no component/team labels.
+      prober: icmp
+      timeout: 5s
+      icmp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+
+    smtp_banner:
+      ## Port 25 (MX). Deepened from banner-only to a full EHLO round-trip
+      ## 2026-08-20: postscreen can serve the 220 banner while every real
+      ## smtpd process is crash-looping (helm-v4 empty-env incident) — the
+      ## banner check alone only caught it because in-cluster probes are
+      ## permit_mynetworks and skip postscreen. EHLO + SIZE proves a real
+      ## smtpd answered; expect scans lines until the regex matches, so
+      ## multi-line EHLO replies are fine (official blackbox pattern).
+      prober: tcp
+      timeout: 15s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        query_response:
+          - expect: "^220 "
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]SIZE"
+          - send: "QUIT\r"
+
+    smtps_ehlo:
+      ## Port 465 (submissions, implicit TLS) — the path user MUAs actually
+      ## send through; it was DOWN 63min on 2026-08-20 with no probe on it.
+      ## TLS handshake validates the mail cert against system roots (same
+      ## as imaps_starttls); expecting an AUTH capability proves the smtpd
+      ## + SASL layer, not just a listener.
+      prober: tcp
+      timeout: 15s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        tls: true
+        query_response:
+          - expect: "^220 "
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]AUTH"
+          - send: "QUIT\r"
+
+    smtp_starttls_ehlo:
+      ## Port 587 (submission, STARTTLS upgrade) — official blackbox
+      ## smtp_starttls pattern: EHLO, upgrade, EHLO again expecting AUTH
+      ## (postfix only advertises AUTH on 587 after TLS).
+      prober: tcp
+      timeout: 15s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        query_response:
+          - expect: "^220 "
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]STARTTLS"
+          - send: "STARTTLS\r"
+          - expect: "^220"
+          - starttls: true
+          - send: "EHLO blackbox-probe.mdapi.ch\r"
+          - expect: "^250[- ]AUTH"
+          - send: "QUIT\r"
+
+    imaps_starttls:
+      ## IMAPS on port 993 — TLS handshake then capability check
+      prober: tcp
+      timeout: 10s
+      tcp:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        tls: true
+        query_response:
+          - expect: "^\\* OK"
+
+    dns_mdapi:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        query_name: "mdapi.ch"
+        query_type: "A"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - ".+"
+
+    dns_home_tillo:
+      ## Probes Technitium directly — queries for an A record we control
+      ## (technitium-dns.home.tillo.ch) and expects the LB VIP back.
+      ## Use against the LB VIP and against each pod service.
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        query_name: "technitium-dns.home.tillo.ch"
+        query_type: "A"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "192\\.168\\.1\\.54"
+
+    ## ns.mdapi.ch (BIND9 authoritative for mdapi.ch + 12 other owned zones)
+    ## modules. UDP path uses the default transport; TCP variant verifies
+    ## ns.mdapi.ch's TCP/53 listener (required for large DNSSEC responses);
+    ## DNSSEC variant turns on DO bit and the validating resolver's AD bit
+    ## so we catch a chain-of-trust break from outside the cluster.
+    dns_ns_mdapi_udp:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        transport_protocol: udp
+        query_name: "mdapi.ch"
+        query_type: "SOA"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "ns\\.mdapi\\.ch\\."
+
+    dns_ns_mdapi_tcp:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        transport_protocol: tcp
+        query_name: "mdapi.ch"
+        query_type: "SOA"
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "ns\\.mdapi\\.ch\\."
+
+    dns_ns_mdapi_dnssec:
+      prober: dns
+      timeout: 5s
+      dns:
+        preferred_ip_protocol: ip4
+        ip_protocol_fallback: false
+        # TCP rather than UDP — the mdapi.ch DNSKEY RRset (4096-bit KSK +
+        # 2048-bit ZSK + RRSIGs) exceeds the 1232-byte EDNS UDP bufsize
+        # blackbox-exporter uses, so UDP responses come back TC=1 with an
+        # empty answer section and the regex check fails. Switched on
+        # 2026-05-23 after the probe started failing once the response
+        # finally crossed the threshold.
+        transport_protocol: tcp
+        query_name: "mdapi.ch"
+        query_type: "DNSKEY"
+        # Require the DNSKEY RRset itself (validates the signed origin and
+        # that the EDNS DO bit yielded a usable answer).
+        validate_answer_rrs:
+          fail_if_not_matches_regexp:
+            - "DNSKEY"

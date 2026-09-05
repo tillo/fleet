@@ -1,0 +1,120 @@
+## Kokoro-FastAPI — server-side text-to-speech for chat.mdapi.ch.
+##
+## Private backend, one consumer, no ingress — same shape as searxng next door.
+##
+## WHY THIS EXISTS AT ALL. Open WebUI can speak replies three ways, and the two
+## that need no server both failed on the household's actual devices:
+##
+##   browser Web Speech  the browser's own voice. speechSynthesis.speak() is
+##                       only reliable when it is tied to a USER GESTURE. In
+##                       hands-free voice mode the speak happens in an async
+##                       loop seconds after the tap that opened the overlay --
+##                       past Chrome's transient-activation window -- so it is
+##                       refused. Silently: it does not even reach the console.
+##   browser-kokoro      Kokoro.js in the tab. Two separate faults (see the
+##                       block in openwebui-deploy.yml), and its bundled voice
+##                       list is af_*/am_*/bf_*/bm_* -- ENGLISH ONLY. It would
+##                       read Italian with an American accent even when working.
+##
+## Both are per-device and unverifiable from here. This one is neither: the
+## browser receives a plain mp3 and plays it through an <audio> element, which
+## Open WebUI starts muted and unmutes after play() resolves -- the standard
+## autoplay-policy dance. That path is DESIGNED to survive what killed the other
+## two, and `curl`-able from inside the cluster, so it can be proven rather than
+## hoped at.
+##
+## WHY KOKORO over Piper (openedai-speech): Kokoro v1.0 ships real Italian
+## voices (if_sara, im_nicola) and this household speaks Italian. Piper is far
+## lighter and was the honest alternative -- chosen against, knowingly, for
+## voice quality. If node pressure ever makes that the wrong trade, swapping is
+## a base_url + voice change, nothing structural.
+##
+## ⚠ COST, stated plainly: the image is ~1.5 GB compressed (models are baked in,
+## so there is no runtime download and no PVC -- confirm this holds on any major
+## bump). Synthesis is CPU-bound; there is deliberately NO cpu limit, because
+## throttling shows up directly as a pause before the reply is spoken. Nodes were
+## at 74-80% memory when this landed.
+##
+## IMAGE LANE — Lane-B, pinned, Renovate-owned (see the matching rule in
+## renovate.json; without it the kubernetes manager stays disabled by the
+## default-OFF rule and this pin would never move). Pinned rather than Keel'd
+## because the OpenAI-compatible surface is a contract Open WebUI depends on:
+## a floating tag could change a voice id or a response shape unattended, and
+## the failure mode is a household that silently stops talking.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kokoro-tts
+  namespace: openwebui
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kokoro-tts
+  template:
+    metadata:
+      labels:
+        app: kokoro-tts
+    spec:
+      containers:
+      - name: kokoro-tts
+        # renovate: datasource=docker depName=ghcr.io/remsky/kokoro-fastapi-cpu
+        image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.8.1
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8880
+          protocol: TCP
+        env:
+        # Already the image default; stated so a GPU variant cannot be swapped in
+        # by an image bump without this line becoming an obvious lie.
+        - name: USE_GPU
+          value: "false"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 1Gi
+          limits:
+            # No cpu limit on purpose -- see the header. Memory is capped because
+            # this shares nodes with the rest of prod.
+            memory: 3Gi
+        # Startup is a TCP check, not HTTP: the model is loaded into memory
+        # before the API binds, and how long that takes is a cold-cache
+        # question. Once it answers, /health governs.
+        startupProbe:
+          tcpSocket:
+            port: 8880
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8880
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8880
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kokoro-tts
+  namespace: openwebui
+spec:
+  selector:
+    app: kokoro-tts
+  ports:
+  - name: http
+    port: 8880
+    targetPort: 8880
+    protocol: TCP

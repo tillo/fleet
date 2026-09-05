@@ -1,0 +1,58 @@
+## Secrets for the chat frontend. Both must exist in Akeyless BEFORE this
+## bundle can go green (the deployment will not start without them).
+##
+## OPENAI_API_KEY is a LiteLLM VIRTUAL KEY, not LITELLM_MASTER_KEY. The master
+## key is proxy-admin — it can mint keys, read every consumer's spend and edit
+## the gateway. A browser-facing app gets a scoped, revocable key instead.
+##
+## Minting it (requires litellm-pg from litellm/litellm-pg.yml to be up first,
+## since virtual keys live in that database):
+##
+##   curl -sX POST https://llm.mdapi.ch/key/generate \
+##     -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+##     -H 'Content-Type: application/json' \
+##     -d '{"key_alias":"openwebui",
+##          "models":["local-only","local-small","ds-flash"],
+##          "max_budget":25,"budget_duration":"30d"}'
+##
+## `models` is the real control here: it decides what the household can reach.
+## Minted 2026-08-26 with exactly that list; enforcement verified at the wire —
+## /v1/models returns only those three and `fable` gets 403
+## key_model_access_denied.
+##
+## Deliberately NO `infra`/`infra-fable`: those silently fall through to the
+## cloud, which is a per-request privacy decision nobody at a chat prompt is
+## making consciously.
+##
+## Deliberately NO `fable`/`opus`/`claude-*` either (owner decision 2026-08-26).
+## Those tails are claude-shim on the Max subscription, and since the Feb 2026
+## Consumer Terms, subscription OAuth tokens driving a third-party product are
+## explicitly banned. Open WebUI handed to friends and family is that pattern at
+## its most visible. Use the ds-flash tier for cloud-quality answers here; keep
+## the subscription tails for first-party tooling.
+##
+##   akeyless create-secret -n /mdapi/openwebui/openwebui-secret/OPENAI_API_KEY  -v 'sk-...'
+##   akeyless create-secret -n /mdapi/openwebui/openwebui-secret/WEBUI_SECRET_KEY -v "$(openssl rand -hex 32)"
+##
+## WEBUI_SECRET_KEY signs session JWTs. Rotating it logs everyone out; losing it
+## is harmless beyond that (no data is encrypted with it by default).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openwebui-secret
+  namespace: openwebui
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openwebui-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/openwebui/openwebui-secret/OPENAI_API_KEY
+      secretKey: OPENAI_API_KEY
+    - remoteRef:
+        key: /mdapi/openwebui/openwebui-secret/WEBUI_SECRET_KEY
+      secretKey: WEBUI_SECRET_KEY

@@ -1,0 +1,24 @@
+## stakater/Reloader — watches ConfigMaps/Secrets and rolls the workloads
+## that reference them when their content changes.
+##
+## Opt-in: only workloads carrying `reloader.stakater.com/auto: "true"` are
+## reconciled (autoReloadAll stays false — the chart default). The annotation
+## is added per workload in its own bundle.
+##
+## NB: when Reloader triggers a rollout it patches the live workload, so
+## Fleet will briefly show that bundle as "Modified". Fleet correctDrift is
+## off, so it only reports — it does not fight Reloader.
+
+reloader:
+  deployment:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 96Mi
+      limits:
+        ## 128 MiB OOMKilled 20× over 37 h on 2026-05-28→29 (every
+        ## ExternalSecret cluster-wide is a Secret watch reloader has to
+        ## track; akeyless gateway flapping today produced bursts of
+        ## ExternalSecret updates that spiked reloader's memory above the
+        ## old 128 MiB ceiling). 256 MiB gives ~4× the steady-state.
+        memory: 256Mi

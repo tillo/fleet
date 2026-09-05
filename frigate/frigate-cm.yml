@@ -1,0 +1,340 @@
+## Frigate's config.yaml, authoritative here (2026-08-16). It used to live only
+## on the config PVC, where it could drift and was backed up nowhere.
+##
+## SECRETS ARE NOT IN THIS FILE and must never be: this repo is public. Every
+## credential is an Akeyless static secret under
+## /mdapi/frigate/frigate-env-secret/, delivered by frigate-es.yml and injected
+## with envFrom. Frigate substitutes {FRIGATE_*} placeholders — including inside
+## go2rtc.streams, which its create_config.py formats with the FRIGATE_* env
+## vars before handing the block to go2rtc.
+##
+## This ConfigMap is mounted read-only over /config/config.yaml, so the Frigate
+## UI's config editor cannot save. That is deliberate: git is the only source of
+## truth. Change flow is edit here -> push -> Fleet applies -> restart Frigate
+## (a subPath mount does not refresh in place).
+##
+## UPGRADE GOTCHA: Frigate logs "Config file is read-only, unable to migrate
+## config file." at every start. Harmless while `version:` below matches the
+## running Frigate (migrate_frigate_config() tests writability BEFORE deciding
+## whether a migration is even needed, so it bails out either way). It stops
+## being harmless the day a Frigate upgrade DOES need a config migration: it
+## will skip it silently. When bumping the Frigate image, apply the migration
+## here by hand and update `version:` in the same commit.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frigate-config-yaml
+data:
+  config.yaml: |
+    detectors:
+      coral:
+        type: edgetpu
+        device: usb
+
+    model:
+    # base: mobiledet	320x320	-	cpu	25/06/2025	2025.2
+    #  path: plus://b045554b6a851da2d6dfecb34f3bcd81
+    # custom: mobiledet	320x320	1991	cpu	01/09/2025	2025.2
+    #  path: plus://8b882bbf9a2c40e858d0c3d0c3680e68
+    # custom: mobiledet	320x320	2214	cpu	14/07/2026	2026.1
+    #  path: plus://0412b84fedf089429370cc4353f11376
+    # custom: mobiledet	320x320	2214	edgetpu	14/07/2026	2026.1
+      path: plus://520b90f459b93071944148b26466f5f6
+
+    mqtt:
+      enabled: true
+      host: eclipse-mosquitto.mqtt.svc.cluster.local
+      port: 1883
+
+    go2rtc:
+      streams:
+        cavecam: 
+          "{FRIGATE_CAVECAM_STREAM}"
+    #    doorbell:
+    #      - "ffmpeg:doorbell#audio=aac#width=960#height=1280"
+    #    balconycam:
+    #      - "ffmpeg:balconycam#audio=aac#width=1920#height=1080"
+    #    garagecam:
+    #      - "ffmpeg:garagecam#audio=aac#width=1920#height=1080"
+    # https://developers.google.com/nest/device-access/authorize
+    # https://geoffhudik.com/tech/2023/03/04/trying-google-nest-api-with-postman-and-python/
+    # https://developers.google.com/nest/device-access/api
+        balconycam: 
+          nest:?client_id={FRIGATE_NEST_CLIENT_ID}&client_secret={FRIGATE_NEST_CLIENT_SECRET}&refresh_token={FRIGATE_NEST_REFRESH_TOKEN_BALCONYCAM}&project_id={FRIGATE_NEST_PROJECT_ID}&device_id={FRIGATE_NEST_DEVICE_ID_BALCONYCAM}
+        doorbell: nest:?client_id={FRIGATE_NEST_CLIENT_ID}&client_secret={FRIGATE_NEST_CLIENT_SECRET}&refresh_token={FRIGATE_NEST_REFRESH_TOKEN_DOORBELL}&project_id={FRIGATE_NEST_PROJECT_ID}&device_id={FRIGATE_NEST_DEVICE_ID_DOORBELL}
+        garagecam: 
+          nest:?client_id={FRIGATE_NEST_CLIENT_ID}&client_secret={FRIGATE_NEST_CLIENT_SECRET}&refresh_token={FRIGATE_NEST_REFRESH_TOKEN_GARAGECAM}&project_id={FRIGATE_NEST_PROJECT_ID}&device_id={FRIGATE_NEST_DEVICE_ID_GARAGECAM}
+
+    cameras:
+      cavecam:
+        ffmpeg:
+          inputs:
+            - path: rtsp://127.0.0.1:8554/cavecam
+              roles:
+                - detect
+                - record
+        zones: {}
+        motion:
+          threshold: 60
+          contour_area: 10
+          improve_contrast: true
+        objects:
+          filters:
+            bicycle:
+              mask: 0,0.108,0.882,0.519,0.902,1,0,1
+            car:
+              mask: 0.37,0.018,0.392,0.64,1,0.929,1,0.027
+    #  gardencam:
+    #    onvif:
+    #      port: 888
+    #      user: tillo
+    #    ffmpeg:
+    #      inputs:
+    #          roles:
+    #            - audio
+    #            - detect
+    #            - record
+    #      output_args:
+    #        record: preset-record-generic-audio-aac
+    #    audio:
+    #      enabled: true
+    #      listen:
+    #        - fire_alarm
+    #        - scream
+    #        - yell
+    #        - whispering
+    #        - crying
+    #        - grunt
+    #        - pant
+    #        - cough
+    #        - breathing
+    #        - sneeze
+    #        - sniff
+    #        - run
+    #        - footsteps
+    #        - fire
+    #        - car_alarm
+    #        - power_tool
+    #        - drill
+    #        - gunshot
+    #        - glass
+    #        - smash
+    #        - breaking
+    #        - crushing
+    #    motion:
+    #      threshold: 200
+    #      contour_area: 50
+    #      improve_contrast: true
+    #    zones: {}
+    #    objects:
+    #      filters:
+    #        car:
+    #          mask: 0.907,0.484,0.792,0,1,0,1,1,0.77,1
+
+    #  doorbell:
+    #    ffmpeg:
+    #      inputs:
+    #        - path: rtsp://127.0.0.1:8554/doorbell
+    #          roles:
+    #            - audio
+    #            - detect
+    #      output_args:
+    #            - record
+    #          record: preset-record-generic-audio-aac
+    #    audio:
+    #      listen:
+    #      enabled: true
+    #        - fire_alarm
+    #        - scream
+    #        - yell
+    #        - whispering
+    #        - crying
+    #        - grunt
+    #        - pant
+    #        - cough
+    #        - breathing
+    #        - sneeze
+    #        - sniff
+    #        - run
+    #        - footsteps
+    #        - fire
+    #        - car_alarm
+    #        - power_tool
+    #        - drill
+    #        - gunshot
+    #        - glass
+    #        - smash
+    #        - breaking
+    #        - crushing
+
+      doorbell:
+        enabled: true
+        ffmpeg:
+          inputs:
+            - path: rtsp://127.0.0.1:8554/doorbell
+              roles:
+                - audio
+                - detect
+                - record
+          output_args:
+            record: preset-record-generic-audio-aac
+        audio:
+          enabled: true
+          listen:
+            - fire_alarm
+            - scream
+            - yell
+            - whispering
+            - crying
+            - grunt
+            - pant
+            - cough
+            - breathing
+            - sneeze
+            - sniff
+            - run
+            - footsteps
+            - fire
+            - car_alarm
+            - power_tool
+            - drill
+            - gunshot
+            - glass
+            - smash
+            - breaking
+            - crushing
+
+      balconycam:
+        ffmpeg:
+          inputs:
+            - path: rtsp://127.0.0.1:8554/balconycam
+              roles:
+                - audio
+                - detect
+          output_args:
+            record: preset-record-generic-audio-aac
+        audio:
+          enabled: true
+          listen:
+            - fire_alarm
+            - scream
+            - yell
+            - whispering
+            - crying
+            - grunt
+            - pant
+            - cough
+            - breathing
+            - sneeze
+            - sniff
+            - run
+            - footsteps
+            - fire
+            - car_alarm
+            - power_tool
+            - drill
+            - gunshot
+            - glass
+            - smash
+            - breaking
+            - crushing
+
+      garagecam:
+        ffmpeg:
+          inputs:
+            - path: rtsp://127.0.0.1:8554/garagecam
+              roles:
+                - audio
+                - detect
+          output_args:
+            record: preset-record-generic-audio-aac
+        audio:
+          enabled: true
+          listen:
+            - fire_alarm
+            - scream
+            - yell
+            - whispering
+            - crying
+            - grunt
+            - pant
+            - cough
+            - breathing
+            - sneeze
+            - sniff
+            - run
+            - footsteps
+            - fire
+            - car_alarm
+            - power_tool
+            - drill
+            - gunshot
+            - glass
+            - smash
+            - breaking
+            - crushing
+        objects:
+          filters:
+            # fast cyclists crossing the driveway score low per-frame; let weak
+            # frames start a track (event creation still gated by threshold 0.7)
+            person:
+              min_score: 0.4
+            bicycle:
+              min_score: 0.4
+
+    objects:
+      track:
+        - person
+        - bicycle
+        - car
+        - motorcycle
+        - bird
+        - cat
+        - hat
+        - backpack
+        - umbrella
+        - knife
+        - face
+        - package
+        - dog
+      filters:
+        umbrella:
+          threshold: 0.9
+        knife:
+          threshold: 0.9
+        bird:
+          threshold: 0.9
+        person:
+          threshold: 0.7
+        car:
+          threshold: 0.8
+        motorcycle:
+          threshold: 0.8
+
+    record:
+      enabled: true
+      alerts:
+        retain:
+          days: 42
+      detections:
+        retain:
+          days: 42
+    snapshots:
+      enabled: true
+      timestamp: false
+      bounding_box: true
+
+    birdseye:
+      enabled: true
+      mode: continuous
+      inactivity_threshold: 300
+    version: 0.17-0
+    semantic_search:
+      enabled: true
+      reindex: false
+      model_size: small
+    notifications:
+      enabled: true
+      email: 6a9vfiow4t@pomail.net
+    detect:
+      enabled: true

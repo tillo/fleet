@@ -1,0 +1,241 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "mdapi Renovate — Lane-B image bumps + ALL Fleet Helm chart versions. Lane-A floating app images stay on Keel. Minor+patch updates auto-merge after each package's soak window (every manager, incl. critical infra — owner decision 2026-06-29); majors stay MR-only; security fixes auto-merge via vulnerabilityAlerts. See operator ~/imagepolicy-study/PROPOSAL.md.",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled", "mergeConfidence:all-badges"],
+  "enabledManagers": ["kubernetes", "fleet", "custom.regex"],
+  "baseBranchPatterns": ["main"],
+  "automerge": false,
+  "platformAutomerge": true,
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "automerge": true,
+    "automergeSchedule": ["at any time"],
+    "minimumReleaseAge": "0 days",
+    "addLabels": ["security"]
+  },
+  "timezone": "Europe/Zurich",
+  "automergeSchedule": ["* 0-6 * * *"],
+  "gitLabIgnoreApprovals": true,
+  "configMigration": true,
+  "assignees": ["tillo"],
+  "prHourlyLimit": 2,
+  "prConcurrentLimit": 10,
+  "kubernetes": {
+    "managerFilePatterns": ["/-deploy\\.ya?ml$/"]
+  },
+  "fleet": {
+    "managerFilePatterns": ["/(^|/)fleet\\.ya?ml$/"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Lane-B pins living inside Helm values files, invisible to the kubernetes manager (Lane-B blind-spot closure 2026-07-15): stream ca-pub static-serving image.",
+      "managerFilePatterns": ["/^stream/values\\.yml$/"],
+      "matchStrings": ["image: (?<depName>nginxinc/nginx-unprivileged):(?<currentValue>\\S+)"],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Default OFF — do not touch Lane-A floating image refs (Keel owns them).",
+      "matchManagers": ["kubernetes"],
+      "enabled": false
+    },
+    {
+      "description": "Lane-B custom mdapi images — X.Y.Z-mdapi.N versioning (CI mints these). minor+patch auto-merge (trailing rule); only major upstream bumps need a human.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "registry.mdapi.ch/mdapi/unbound",
+        "registry.mdapi.ch/mdapi/nameserver"
+      ],
+      "enabled": true,
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "Lane-B custom mdapi images — auto-merge the contextless -mdapi.N rebuilds (classified as patch) + digests after CI green. NO soak, deliberately: both projects rebuild on a 4-hourly schedule, and Renovate only ever proposes the NEWEST tag, so any minimumReleaseAge longer than the build interval can never be satisfied — the candidate is replaced by a younger one before it matures. The 1-day soak added here on 2026-06-13 (54d24a1) did exactly that: it froze both pins on their 2026-06-13 tags for 82 days while ~490 builds went by, leaving the public authoritative nameserver on BIND 9.20.21 and unbound on 1.25.1. The torn-push risk that soak was meant to cover is already covered by the build pipeline having to go green before the tag exists.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "registry.mdapi.ch/mdapi/unbound",
+        "registry.mdapi.ch/mdapi/nameserver"
+      ],
+      "matchUpdateTypes": ["patch", "digest"],
+      "automerge": true,
+      "minimumReleaseAge": "0 days"
+    },
+    {
+      "description": "Lane-B upstream critical: zot. Manual review with release notes. NO soak, and MR-only via the trailing ghcr opt-out. Renovate's docker datasource returns no releaseTimestamp for ghcr.io tags, and the default minimumReleaseAgeBehaviour=timestamp-required marks timestamp-less releases pending FOREVER — a soak here is a silent permanent freeze, not a delay. Proven 2026-09-03: v2.1.17 sat 30+ days past its 3-day soak (v2.1.20 built 2026-08-04) and never once produced an MR.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/project-zot/zot-linux-amd64"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/project-zot/zot"
+    },
+    {
+      "description": "Lane-B upstream critical: Technitium DNS. Manual review with release notes + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["technitium/dns-server"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/TechnitiumSoftware/DnsServer",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Fleet Helm charts: every chart pinned in a fleet.yaml is Renovate-managed. MRs only (no automerge), manual review with a soak window. Bumps the `version:` in the bundle's fleet.yaml; the chart deploys on the next Fleet reconcile after merge.",
+      "matchManagers": ["fleet"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days",
+      "addLabels": ["helm-chart"]
+    },
+    {
+      "description": "Fleet Helm chart MAJOR bumps: longer soak + extra-review label. Chart majors routinely carry breaking values/CRD changes, so never fast-track them.",
+      "matchManagers": ["fleet"],
+      "matchUpdateTypes": ["major"],
+      "minimumReleaseAge": "7 days",
+      "addLabels": ["helm-chart", "major-upgrade"]
+    },
+    {
+      "description": "Lane-B: keel Helm chart (Fleet manager). Keel can't reliably self-update, so Renovate owns its chart-version bumps. Manual review + 3-day soak.",
+      "matchManagers": ["fleet"],
+      "matchDepNames": ["keel"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/keel-hq/keel",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream stock: nginxinc/nginx-unprivileged (showcase + cert-host + stream ca-pub static serving; ca-pub comes in via the custom.regex manager). Pinned tag, Renovate-owned (not Keel). Manual review + 3-day soak.",
+      "matchManagers": ["kubernetes", "custom.regex"],
+      "matchPackageNames": ["nginxinc/nginx-unprivileged"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream stock: alpine/k8s (mail-reconciler CronJob kubectl/helm toolbox). Pinned tag, Renovate-owned (not Keel); sat invisible at 1.31.1 for ~a year before the 2026-07-15 blind-spot closure. Manual review + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["alpine/k8s"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B: Lowcoder CE app images (api/node/frontend) — version-coupled, bump all three to the same tag together. Pinned, Renovate-owned. Manual review + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "lowcoderorg/lowcoder-ce-api-service",
+        "lowcoderorg/lowcoder-ce-node-service",
+        "lowcoderorg/lowcoder-ce-frontend"
+      ],
+      "enabled": true,
+      "groupName": "lowcoder-ce",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: Open WebUI (chat.mdapi.ch). Pinned tag rather than Keel on a floating tag, for the joplin/server reason: it runs Alembic schema migrations against its own DB at startup, so an unattended multi-version jump migrates the data before anyone reads the release notes. Renovate-owned but MR-only (trailing ghcr opt-out) — a human merges, which is what the 3-day soak was standing in for. NO soak, and MR-only via the trailing ghcr opt-out. Renovate's docker datasource returns no releaseTimestamp for ghcr.io tags, and the default minimumReleaseAgeBehaviour=timestamp-required marks timestamp-less releases pending FOREVER — a soak here is a silent permanent freeze, not a delay. Without this rule the kubernetes manager stays disabled by the default-OFF rule above and the pin would never move.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/open-webui/open-webui"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/open-webui/open-webui"
+    },
+    {
+      "description": "Lane-B: llama.cpp server, il narratore di bussola.mdapi.ch. Pinnato e non Keel su tag mobile perche' un salto di build puo' cambiare il template del prompt o le opzioni della riga di comando, e il fallimento sarebbe silenzioso: l'app degrada ai testi fissi senza che nessuno se ne accorga. Stessa avvertenza di Open WebUI sopra: senza questa regola il manager kubernetes resta spento dalla regola default-OFF e il pin non si muove mai. Niente soak e solo-MR (opt-out ghcr in coda): ghcr non fornisce releaseTimestamp, quindi un minimumReleaseAge qui congelerebbe il pin per sempre invece di ritardarlo. Un umano fa il merge.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/ggml-org/llama.cpp"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/ggml-org/llama.cpp"
+    },
+    {
+      "description": "Lane-B: l'immagine di Bussola, costruita in casa. Pinnata e non Keel perche' l'applicazione applica migrazioni di schema all'avvio contro un database che contiene l'unica copia dei dati di qualcuno; un aggiornamento non presidiato migrerebbe prima che qualcuno legga cosa e' cambiato. Il tag e' <versione>-mdapi.<pipeline>, generato da ci-templates/build.yml.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["zot.mdapi.ch/mdapi/bussola"],
+      "enabled": true,
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "Lane-B: Kokoro-FastAPI, the TTS backend for chat.mdapi.ch. Pinned rather than Keel'd because Open WebUI talks to it over an OpenAI-compatible contract — a floating tag could change a voice id or response shape unattended, and the failure mode is that the household silently stops being spoken to. Same default-OFF caveat as Open WebUI above: without this rule the pin never moves. NO soak, and MR-only via the trailing ghcr opt-out. Renovate's docker datasource returns no releaseTimestamp for ghcr.io tags, and the default minimumReleaseAgeBehaviour=timestamp-required marks timestamp-less releases pending FOREVER — a soak here is a silent permanent freeze, not a delay.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/remsky/kokoro-fastapi-cpu"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/remsky/Kokoro-FastAPI"
+    },
+    {
+      "description": "Group prometheus-community charts (pushgateway + blackbox-exporter) into one MR/automerge — shared upstream release cadence.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["prometheus-pushgateway", "prometheus-blackbox-exporter"],
+      "groupName": "prometheus-community"
+    },
+    {
+      "description": "Group Rook-Ceph operator + cluster charts so they ALWAYS bump together — a rook-ceph vs rook-ceph-cluster version skew is unsupported and risks the Ceph RGW store behind GitLab.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["rook-ceph", "rook-ceph-cluster"],
+      "groupName": "rook-ceph"
+    },
+    {
+      "description": "Group Evertrust charts (horizon, horizon-issuer, stream) — same vendor release train. Renovate skips them if it lacks repo.evertrust.io creds, in which case the group is a harmless no-op.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["horizon", "horizon-issuer", "stream"],
+      "groupName": "evertrust"
+    },
+    {
+      "description": "Lane-B upstream critical: Joplin Server (stateful sync server; moved off Keel 2026-08-06 after an unannounced multi-version jump ran 4 schema migrations — see joplin-deploy.yml). Pinned tag; minor+patch automerge via the trailing rule; majors MR-only. 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["joplin/server"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/laurent22/joplin",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B: caddy, the auth reverse proxy in front of k8s-mcp. Moved off Keel 2026-09-03. `2-alpine` is a MAJOR-LINE tag: it rolls across 2.x minors on its own, which is fine for an app but not for a proxy whose entire job is a Caddyfile in the k8s-mcp-caddy ConfigMap — a renamed or retired directive in a 2.x minor takes the MCP endpoint down unattended. pinDigests so in-place rebuilds also raise an MR: that Deployment is deliberately mixed-lane (Keel must stay for the kubernetes-mcp-server container, and Keel is per-Deployment not per-container), and having the digest in the manifest is what makes Keel's 4h force-poll a no-op instead of a silent partial update. Same shape as external-dns-mdapi's webhook container. NO minimumReleaseAge on purpose — see the ghcr.io opt-out below and the 2026-09-03 soak-starvation findings.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["library/caddy"],
+      "enabled": true,
+      "pinDigests": true,
+      "sourceUrl": "https://github.com/caddyserver/caddy"
+    },
+    {
+      "description": "Lane-B: eclipse-mosquitto, the home-automation MQTT bus (LoadBalancer 192.168.1.43; Frigate, ESPHome and a LAN device all publish to it). Moved off Keel 2026-09-03. It was on `:latest`, which on Docker Hub tracks the 2.1 line while the 2.0 line is maintained separately at 2.0.22 — so `latest` crosses MINORS unattended, on a broker that is replicas=1 + strategy=Recreate where every repull is a real outage gap. It had also moved invisibly: the ReplicaSet dates from 2026-04-05 with an unchanged image string, yet the pod served a 2026-06-22 build (2.1.2) — no Deployment revision, no rollout-history entry, no git commit. Pinned + pinDigests so nothing moves without an MR. NOTE the tag shape: the 2.1 line is published ONLY with an -alpine suffix; there is no plain `2.1.2`.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["eclipse-mosquitto"],
+      "enabled": true,
+      "pinDigests": true,
+      "sourceUrl": "https://github.com/eclipse-mosquitto/mosquitto"
+    },
+    {
+      "description": "Auto-merge ALL minor + patch updates — every manager, every package, including critical infra (owner decision 2026-06-29). Placed late so it overrides the automerge key on every rule above while leaving their minimumReleaseAge soaks intact (3-day default; the two in-house mdapi images deliberately carry none). Majors are NOT matched here, so they stay MR-only (the helm-major rule keeps its 7-day soak + review). platformAutomerge merges via GitLab merge-when-pipeline-succeeds once CI is green. NOTE: this is no longer the last rule — the Bussola and ghcr.io opt-outs below have to come after it to survive.",
+      "matchManagers": ["kubernetes", "fleet", "custom.regex"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
+    {
+      "description": "Bussola resta MR-only, e questa regola DEVE stare DOPO la regola blanket qui sopra: la regola qui sopra auto-mergia ogni minor+patch, quindi un `automerge: false` messo prima verrebbe sovrascritto. Fino al 2026-09-03 il pin non veniva nemmeno letto (zot.mdapi.ch chiede Basic auth e mancava da hostRules: ogni run registrava `Failed to look up docker package zot.mdapi.ch/mdapi/bussola: no-result`). Ora che le credenziali ci sono il lookup funziona, ma l'auto-merge NON va riattivato: lo skill bussola-release stabilisce che il push su ~/fleet E' il deploy e va confermato da un umano, e che una build di soli test non si deploya affatto. Bussola applica migrazioni di schema all'avvio su un database che contiene l'unica copia dei dati di qualcuno. L'MR resta aperta come segnale che esiste una build non ancora deployata.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["zot.mdapi.ch/mdapi/bussola"],
+      "automerge": false
+    },
+    {
+      "description": "ghcr.io pins are MR-only, and like the Bussola rule this MUST sit after the blanket minor+patch automerge rule or that rule overrides it. Why not simply soak them: Renovate's docker datasource never fetches a releaseTimestamp for ghcr.io tags, and the default minimumReleaseAgeBehaviour=timestamp-required then holds every timestamp-less release pending forever — so a `minimumReleaseAge` on a ghcr image is a silent permanent freeze. Proven 2026-09-03 with a debug run: zot v2.1.20 (built 2026-08-04) and open-webui v0.11.3 were both parked in 'Pending Status Checks' with the branch never created, and zot had been stuck since June. The soaks are removed and replaced by this opt-out: the MR opens immediately and a human merges it, which is the review those rules always said they wanted. Open WebUI runs Alembic schema migrations at startup and llama.cpp can silently change prompt templates, so unattended merges are the wrong default for these four regardless. The other option (minimumReleaseAgeBehaviour: timestamp-optional) would restore no soak either, it would just auto-merge them.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "ghcr.io/project-zot/zot-linux-amd64",
+        "ghcr.io/open-webui/open-webui",
+        "ghcr.io/ggml-org/llama.cpp",
+        "ghcr.io/remsky/kokoro-fastapi-cpu"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "caddy + eclipse-mosquitto are MR-only, and like the two opt-outs above this MUST sit after the blanket minor+patch automerge rule or that rule overrides it (packageRules are last-wins). Both are config-contract services where an unattended minor is exactly the failure we are buying protection against: a Caddyfile directive change takes down the k8s-mcp endpoint, and an MQTT minor takes down Frigate/ESPHome event delivery on a single-replica Recreate broker. Reading the changelog IS the point of moving them off Keel — auto-merging the minor would put us straight back where we started. Digest-only updates from pinDigests are harmless rebuilds, but Renovate classifies those as `digest`, which the blanket rule does not match, so they stay MR-only too and that is fine at this cadence.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["library/caddy", "eclipse-mosquitto"],
+      "automerge": false
+    }
+  ],
+  "hostRules": [
+    {
+      "description": "Read private mdapi registry tags. Credentials injected at runtime via RENOVATE_HOST_RULES (NOT committed).",
+      "matchHost": "registry.mdapi.ch",
+      "hostType": "docker"
+    },
+    {
+      "description": "Read zot tags (Bussola's image lives at zot.mdapi.ch/mdapi/bussola). zot serves /v2/ behind Basic auth, so without this Renovate got a 401 and logged `no-result` on every single run. Credentials injected at runtime via RENOVATE_HOST_RULES (NOT committed); Akeyless source of truth: /mdapi/zot/zot-auth/password.",
+      "matchHost": "zot.mdapi.ch",
+      "hostType": "docker"
+    }
+  ]
+}

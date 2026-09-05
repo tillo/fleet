@@ -1,0 +1,79 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: owncloud
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
+      # Upstream CRS rule-exclusions plugin for Nextcloud-family servers
+      # (OwnCloud shares the OCS API surface and most WebDAV semantics).
+      # File is mounted into the controller via the rke2-ingress-nginx
+      # HelmChartConfig extraVolume; ConfigMap source lives in fleet at
+      # ingress/nextcloud-rule-exclusions-plugin-cm.yml. The plugin must
+      # be Included BEFORE the CRS Include so its ctl:ruleRemoveTargetById
+      # actions are processed at rule registration time. Replaces the
+      # blanket carveouts that previously sat here:
+      #   - 1001 (WebDAV ruleRemoveByTag=OWASP_CRS) -> plugin rules
+      #     9508101 / 9508103 / 9508104 (and more) excise the specific
+      #     CRS rules that trip on file names / binary upload bodies.
+      #   - 1010 (files_sharing ruleRemoveByTag=OWASP_CRS) -> plugin
+      #     rule 9508135 strips rule 930120 from ARGS:path on the exact
+      #     /ocs/v*.php/apps/files_sharing/api/v*/shares URI.
+      Include /etc/nginx/modsec-plugins/nextcloud-rule-exclusions-before.conf
+      # OwnCloud-specific carveouts NOT covered by the Nextcloud plugin:
+      # 934110 (SSRF: metadata URL in param) flags the RFC 8252 loopback
+      # redirect_uri of native OAuth2 clients. Same blanket approach as
+      # before; phase:1 ctl placed before the CRS Include for propagation.
+      SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/" \
+        "id:1008,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      # 942290 (NoSQL/Mongo injection) flags the OData $expand query
+      # parameter name used by the OwnCloud Graph API (an OwnCloud-only
+      # endpoint with no Nextcloud equivalent, so no plugin coverage).
+      SecRule REQUEST_URI "@beginsWith /graph/" \
+        "id:1009,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      # The Nextcloud rule-exclusions plugin covers Nextcloud client
+      # behavior on /remote.php/dav/ but not OwnCloud sync clients,
+      # which send PROPFIND with a small XML body and no Content-Type
+      # header. That trips 920340/920341 in phase 1, and the body XML
+      # tags also trip 941100/941130 in phase 2. Verified that chained
+      # SecRule + ctl:ruleRemoveBy* does not propagate reliably from a
+      # phase-1 chain in this nginx-ingress + ModSecurity 3.0.14 build,
+      # so this restores the pre-plugin id:1001 behavior under a new id
+      # for the /remote.php/dav/ surface only. The plugin still applies
+      # for other OwnCloud paths (Sharing, OCS, file uploads, etc.).
+      SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
+        "id:1011,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location = /.well-known/caldav  { return 301 https://oc-legacy.mdapi.ch/remote.php/dav/; }
+      location = /.well-known/carddav { return 301 https://oc-legacy.mdapi.ch/remote.php/dav/; }
+    nginx.ingress.kubernetes.io/proxy-body-size: "10g"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: oc-legacy.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: owncloud
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - oc-legacy.mdapi.ch
+      secretName: owncloud-legacy-cert

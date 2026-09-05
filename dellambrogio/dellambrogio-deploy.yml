@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dellambrogio
+  namespace: dellambrogio
+  annotations:
+    reloader.stakater.com/auto: "true"
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: dellambrogio
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: dellambrogio
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: dellambrogio
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: dellambrogio
+          image: registry.mdapi.ch/mdapi/dellambrogio:latest
+          ports:
+            - containerPort: 80
+          env:
+            # Self-hosted ALTCHA (proof-of-work). Both the challenge endpoint and
+            # the form handler fail CLOSED if this is empty, so it must land
+            # BEFORE the image that uses it.
+            - name: ALTCHA_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: altcha-secret
+                  key: ALTCHA_HMAC_SECRET
+            # Scoped to run:flow/f/marketplace/request_membership and nothing
+            # else. Read by send.php server-side; never reaches the browser.
+            - name: WINDMILL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dellambrogio-windmill-token
+                  key: WINDMILL_TOKEN
+            - name: WINDMILL_FLOW_URL
+              value: https://windmill.mdapi.ch/api/w/mdapi/jobs/run/f/f/marketplace/request_membership
+            # Fallback only: if the flow call fails, send.php still mails the
+            # request here rather than dropping it on the floor.
+            - name: EMAIL_TO
+              value: tillo@tillo.ch
+          # Deliberately points at a PHP page, not a static file. /request/ executes
+          # index.php -> /var/www/lib/{i18n,strings}.php, so a container whose PHP is
+          # broken, or that came up without the lib/ layer, never becomes Ready and --
+          # with maxUnavailable: 0 -- the rollout stalls with the old pods still
+          # serving. A static /style.css would only prove Apache is listening.
+          #
+          # ⚠️ This does NOT catch a handler that is broken while the page renders:
+          # on 2026-08-28 every POST to /request/send.php fatal'd for hours while
+          # this exact path returned a healthy 200. Detecting that needs a synthetic
+          # that SUBMITS. Readiness here is about never routing to a dead pod.
+          readinessProbe:
+            httpGet:
+              path: /request/
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # No livenessProbe on purpose: the realistic failure here is bad code, not a
+          # wedged process, and a liveness probe on a PHP path would turn one bad image
+          # into a cluster-wide crashloop -- strictly worse than serving an error page.
+          volumeMounts:
+            - name: msmtp-config
+              mountPath: /etc/msmtprc
+              subPath: msmtprc
+              readOnly: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 256Mi
+            limits:
+              memory: 384Mi
+      volumes:
+        - name: msmtp-config
+          configMap:
+            name: msmtp-config

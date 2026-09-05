@@ -1,0 +1,124 @@
+## In-cluster split-horizon resolver (unbound).
+## Answers the override set in unbound-cm.yml locally and forwards everything
+## else to Technitium. Replaces the per-record address= override list that
+## lived on the BPI-R4 dnsmasq.
+##
+## NOTE: subPath ConfigMap mounts do NOT auto-refresh on their own, but the
+## reloader.stakater.com/auto annotation makes Stakater Reloader roll this
+## Deployment automatically whenever unbound-cm.yml -- OR the external-dns
+## managed `unbound-generated` ConfigMap -- changes.
+##
+## Two config sources, both included by unbound.conf (server clause):
+##   - unbound-config   (this repo, unbound-cm.yml): static exceptions +
+##     non-mdapi.ch overrides + forward zones. Hand-maintained.
+##   - unbound-generated (external-dns, fleet/external-dns-mdapi): the mdapi.ch
+##     ingress-backed A records -> 192.168.1.191. Auto-generated; DO NOT edit.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unbound
+  namespace: split-horizon
+  annotations:
+    reloader.stakater.com/auto: "true"
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  ## 3 replicas, one per node (qui/quo/qua). Strict spread so a node
+  ## losing the LB-announcing node never leaves Unbound without a local
+  ## endpoint, regardless of externalTrafficPolicy.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: unbound
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: unbound
+    spec:
+      imagePullSecrets:
+      - name: mdapi-registry
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: unbound
+      containers:
+      - name: unbound
+        image: registry.mdapi.ch/mdapi/unbound:1.25.2-mdapi.637
+        ## Lane B (boot-safe, pinned 2026-06-11): pinned tag + IfNotPresent so
+        ## unbound -- itself the LAN resolver -- restarts from each node's image
+        ## cache without needing DNS/registry. Renovate bumps this tag via MR
+        ## (mdapi/ci-templates .version-tag mints :<unbound-ver>-mdapi.<pipeline>).
+        ## Do NOT revert to :latest -- that re-breaks cold-boot + the lint.
+        imagePullPolicy: IfNotPresent
+        command: ["unbound"]
+        args: ["-d", "-p", "-c", "/etc/unbound/unbound.conf"]
+        ports:
+        - name: dns-udp
+          containerPort: 53
+          protocol: UDP
+        - name: dns-tcp
+          containerPort: 53
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+            add: ["NET_BIND_SERVICE"]
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        livenessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          ## Functional probe: confirm unbound returns a split-horizon
+          ## override answer, not merely that :53 is open. Catches a
+          ## rollout to a config-broken pod before maxUnavailable:0 lets
+          ## the previous pod be retired.
+          exec:
+            command:
+            - sh
+            - -c
+            - dig +short @127.0.0.1 -p 53 gitlab.mdapi.ch A | grep -qx 192.168.1.191
+          initialDelaySeconds: 3
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: config
+          mountPath: /etc/unbound/unbound.conf
+          subPath: unbound.conf
+          readOnly: true
+        - name: generated
+          mountPath: /etc/unbound/generated.conf
+          subPath: generated.conf
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: unbound-config
+      - name: generated
+        configMap:
+          ## Maintained by external-dns (fleet/external-dns-mdapi). Always
+          ## present + non-empty (the webhook never deletes it). optional:true
+          ## only guards the mount layer; unbound.conf `include:`s this path.
+          name: unbound-generated
+          optional: true

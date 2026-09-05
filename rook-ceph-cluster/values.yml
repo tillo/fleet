@@ -1,0 +1,376 @@
+# Rook Ceph CLUSTER values — bulk tier on the freed P420i. Lane B (pinned chart + image).
+# Tiering: fio Longhorn = fast/rep2 + VM images (unchanged); P420i Ceph = bulk.
+# Decision (2026-06-13): media = CephFS RWX, data rep2/min_size1 + metadata rep3.
+
+clusterName: rook-ceph
+operatorNamespace: rook-ceph
+
+# ── §7 flaky-P420i throttling (ceph.conf override) ───────────────────────────
+# Protects client I/O on a controller that resets under load. Some knobs are also
+# runtime-settable via `ceph config set`; LOAD-TEST (fail-OSD backfill + forced
+# deep-scrub under Plex load) before trusting these — that is the go/no-go gate.
+configOverride: |
+  [global]
+  osd_pool_default_size = 2
+  osd_pool_default_min_size = 1
+  mon_warn_on_pool_no_redundancy = false
+  # 2026-08-07: v19.2.5 multi-copy bdev labels crash freshly mkfs'd OSDs in
+  # rook's expand-bluefs init (_check_main_bdev_label "5!=4" ceph_assert in
+  # BlueStore::expand_devices — upstream PR #61671 family; first hit = the
+  # OSD-recreate campaign's osd.0). Must live HERE, not the mon config-db:
+  # ceph-volume mkfs and ceph-bluestore-tool run --no-mon-config, so only
+  # this file reaches them. Single-label = pre-squid behavior, proven for
+  # years on the other 17 OSDs. Revisit when squid ships the fix.
+  bluestore_bdev_label_multi = false
+  [osd]
+  # 2026-08-02: osd_mclock_profile is deliberately NOT set here. A value in
+  # this file beats the mon config-db (proven live: restarted OSDs ignored a
+  # runtime `ceph config set`), which would defeat the tripwire. The profile is
+  # owned by the mon config-db, managed by Windmill f/heal/ceph_mclock_enforcer:
+  # balanced while a recovery campaign is healthy, high_client_ops on leading
+  # danger signals (slow-ops>=3 OSDs / PG inactive / OSD down; 3 trips in 24h =
+  # circuit breaker) and when no campaign runs. Context: the 16:48Z balanced
+  # storm (5 OSDs BLUESTORE_SLOW_OP_ALERT, osd.7 peer-marked down, 5 PGs
+  # inactive). Baseline when the enforcer is off: high_client_ops in mon db.
+  # NB with mclock, osd_max_backfills/osd_recovery_max_active below are IGNORED
+  # unless osd_mclock_override_recovery_settings=true (it is false).
+  osd_max_backfills = 1
+  osd_recovery_max_active = 1
+  osd_recovery_sleep_hdd = 0.1
+  osd_recovery_op_priority = 1
+  osd_max_scrubs = 1
+  osd_scrub_sleep = 0.1
+  osd_scrub_load_threshold = 0.3
+  osd_scrub_begin_hour = 1
+  osd_scrub_end_hour = 6
+  osd_deep_scrub_interval = 1209600
+  osd_scrub_during_recovery = false
+
+toolbox:
+  enabled: true            # `ceph -s` CLI; used by pre-reboot-guard Ceph gate
+  image: quay.io/ceph/ceph:v19.2.5   # pin to match the cluster; rook-ceph-cluster v1.20.0 floats the toolbox to its v20.2.1 (Tentacle) default otherwise (see cephVersion pin below)
+
+monitoring:
+  enabled: true            # Ceph ServiceMonitor (needs ServiceMonitor CRD - present via rancher/VM)
+  # 2026-06-15: ceph alert rules now live in the mdapi VM stack as a labelled
+  # PrometheusRule (~/fleet/monitoring-rules/30-ceph.yml, monitoring-stack: mdapi ->
+  # vmalert -> vmalertmanager -> ceph dashboard Alerts + Pushover). Disabled here so
+  # ceph alerts are NOT also evaluated by rancher-monitoring (custom => VM rule).
+  # On a major Ceph upgrade, re-sync 30-ceph.yml from rook's prometheus-ceph-rules.
+  createPrometheusRules: false
+
+# Ceph mgr dashboard at https://ceph.mdapi.ch — TLS via cert-manager, gated by the
+# oauth2-proxy admin SSO (same as grafana), DNS auto-created by external-dns from the
+# host. Dashboard serves http on :7000 (ssl:false). ModSecurity in DetectionOnly so
+# the POST-heavy Ceph API isn't blocked (flip SecRuleEngine to On once validated).
+ingress:
+  dashboard:
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-admin.oauth2-proxy.svc.cluster.local/admin/oauth2/auth
+      nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/admin/oauth2/start?rd=https://$host$escaped_request_uri
+      nginx.ingress.kubernetes.io/auth-response-headers: Authorization
+      nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+      nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+      nginx.ingress.kubernetes.io/modsecurity-snippet: |
+        SecRuleEngine DetectionOnly
+        SecAuditEngine RelevantOnly
+        SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+        SecAuditLogParts ABIJDEFHZ
+        SecAuditLogType Serial
+        SecAuditLogFormat JSON
+        SecAuditLog /dev/stdout
+        Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    host:
+      name: ceph.mdapi.ch
+      path: /
+      pathType: Prefix
+    tls:
+      - hosts:
+          - ceph.mdapi.ch
+        secretName: ceph-dashboard-cert
+
+cephClusterSpec:
+  # ── Health-alert tolerance (central config DB, managed by Rook) ──────────────
+  # Tolerances for the flaky P420i bulk tier (#154): stop chronic low-rate
+  # controller noise sitting as a permanent HEALTH_WARN while still tripping on a
+  # genuinely failing device. All were applied at runtime earlier (ceph config
+  # set, mon-DB) and are folded here so the CR is the single source of truth —
+  # no more untracked drift.
+  #   bdev_stalled_read_warn  : default fired on 1 stalled read / 24h / OSD (a
+  #     hair-trigger); raised to ">=50 stalled reads within a 10-min window".
+  #   bluestore_slow_ops_warn : default warns on the 1st slow op; raised to
+  #     75 ops / 300s window.
+  # Deferred real fix = move bulk-OSD block.db to fio once more cards arrive
+  # (no free fio space today; bulk OSDs are single-device BlueStore on the P420i).
+  cephConfig:
+    global:
+      # Redundant with the osd-scope value below (osd scope wins for all OSDs,
+      # the only BlueStore daemons). Replicated to match live runtime state;
+      # safe to drop on a later cleanup.
+      bluestore_slow_ops_warn_threshold: "10"
+      bluestore_slow_ops_warn_lifetime: "300"
+    osd:
+      bluestore_slow_ops_warn_threshold: "75"
+      bluestore_slow_ops_warn_lifetime: "300"
+      bdev_stalled_read_warn_threshold: "50"
+      bdev_stalled_read_warn_lifetime: "600"
+  cephVersion:
+    # renovate: datasource=docker depName=quay.io/ceph/ceph
+    image: quay.io/ceph/ceph:v19.2.5   # Squid (pinned). >=19.2.4 required: tracker #70390 bluestore_elastic_shared_blobs corruption (also set false in mon config store 2026-08-05). Tentacle v20.2.x ceph-bluestore-tool ASSERTS (is_valid_io) on tiny foreign partitions (e.g. a Longhorn iSCSI VM-disk's 1K extended part), which crashes `ceph-volume raw list` and breaks OSD enumeration on hyperconverged nodes. Squid skips them gracefully (proven 2026-06-14). Do NOT bump to v20 until that is fixed upstream.
+    allowUnsupported: false
+  dataDirHostPath: /var/lib/rook       # persisted by /oem/98_rook_ceph.yaml (bind from /usr/local)
+  skipUpgradeChecks: false
+  continueUpgradeAfterChecksEvenIfNotHealthy: false
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+  mgr:
+    count: 2
+    allowMultiplePerNode: false
+    modules:
+      - name: rook
+        enabled: true
+  dashboard:
+    enabled: true
+    ssl: false             # front via ingress-nginx + cert-manager later if exposed
+  network:
+    connections:
+      requireMsgr2: true
+  crashCollector:
+    disable: false
+  logCollector:
+    enabled: true
+    periodicity: daily
+    maxLogSize: 500M
+  disruptionManagement:
+    managePodBudgets: true
+  resources:
+    mon:
+      requests: {cpu: "250m", memory: "1Gi"}
+      limits:   {memory: "2Gi"}
+    mgr:
+      requests: {cpu: "300m", memory: "512Mi"}
+      limits:   {memory: "1Gi"}
+    osd:
+      # 250m request (2026-07-05 N-1 program): 18 idle OSDs used 1.8 cores
+      # TOTAL while requesting 18 — a third of two-node failover capacity.
+      # No CPU limits here, so recovery/scrub still burst freely.
+      requests: {cpu: "250m", memory: "2Gi"}
+      limits:   {memory: "4Gi"}
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    # Freed P420i SSDs by STABLE wwn (verified 2026-06-14; NEVER /dev/sdX — the
+    # blockdevice CRs' cached devPath is already stale, proving the re-enum trap).
+    # All 12 confirmed: 0 Longhorn replicas, excluded OS disk (sda) + HARV_LH_DEFAULT.
+    # Each must be released (blockdevice spec.provision=false) + wiped before Rook claims it.
+    nodes:
+      - name: qui   # 5 × ~1.8T (bay5 added 2026-06-17 after freeing it from Longhorn/defaultdisk)
+        devices:
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cc991a124a501b9d5cf9d  # was sdb
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c5bc908804aadc5f644ff  # was sdd
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c8ca34f6d3c380d351b39  # was sde
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cfc16df93311e0d258612  # was sdf
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2607847a6fd845932500  # bay5 (ex-HARV_LH_DEFAULT/Longhorn defaultdisk; freed to Ceph 2026-06-17 via fio-default re-arch)
+          - fullpath: /dev/disk/by-partlabel/ceph-fio-meta   # 15G FusionIO partition (ORIGINAL card p3) -> CephFS metadata-pool OSD (deviceClass=fio). Was /dev/fioa3 — that name is NOT stable with 2 cards (proven on quo 2026-08-21: the new card enumerated first); by-partlabel resolves via the 68-iomemory-partlinks udev rule (oem 95_fio_udev.yaml, installed on all 3 nodes 2026-08-22).
+            config:
+              deviceClass: "fio"
+          - fullpath: /dev/disk/by-partlabel/qui-fio2   # 100G partition on the NEW card (HP 2.6TB LE, SN US0FJYYT760544C50010) — added 2026-08-23 after the card was flashed 8.5.28 -> 8.9.9 with HP's OEM archive; sized to survive stray bulk PGs; old 15G fio OSDs stay until all three 100G replacements are proven. Same ceph-volume naming trap as quo: the GPT label must NOT contain "ceph".
+            config:
+              deviceClass: "fio"
+      - name: quo   # 5 × ~1.8T (bay5 added 2026-06-17 after freeing it from Longhorn/defaultdisk)
+        devices:
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001cd465f58928a9f278a3a0  # was sdb
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c5052ceee1feb8869f663  # was sdd
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c557ca8f9276a418c3b5f  # was sde
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2442949fc101a9ad2bd0  # was sdf
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c6fd46d8ed96335934351  # bay5 (ex-HARV_LH_DEFAULT/Longhorn defaultdisk; freed to Ceph 2026-06-17 via fio-default re-arch)
+          - fullpath: /dev/disk/by-partlabel/ceph-fio-meta   # 15G FusionIO partition (ORIGINAL card p3, now /dev/fiob3 after the 2026-08-21 two-card enumeration flip) -> CephFS metadata-pool OSD (deviceClass=fio)
+            config:
+              deviceClass: "fio"
+          - fullpath: /dev/disk/by-partlabel/quo-fio2   # 100G partition on the NEW card (HP 2.6TB LE, SN 3UN511X011) — added 2026-08-22 after the CRUSH class-scoping fix; sized to survive stray bulk PGs; old 15G fio OSDs stay until all three 100G replacements are proven. NAMING TRAP: ceph-volume rejects any partition whose GPT label CONTAINS "ceph" as "Used by ceph-disk" (legacy ceph-disk member check) — the original label quo-ceph-fio2 self-sabotaged; qui/qua partitions must use <node>-fio2 too
+            config:
+              deviceClass: "fio"
+      - name: qua   # 5 × ~1.8T (bay5 added 2026-06-17 after freeing it from Longhorn/defaultdisk)
+        devices:
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c8cc1a03af0d9199d7067  # bay1 TEAM T2532TB sn ...600 (replaced faulty SanDisk sn 24375S800356 — silent 4K-write corruption, 2026-06-14)
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001ccbc0029f54a5bd653ce6  # bay2 TEAM (replaced SanDisk SSD PLUS, 2026-06-14)
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c2bac499b979768746436  # bay3 SanDisk SSD PLUS (kept — best of the 3)
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c5ab0133ebea425c6f55e  # bay4 TEAM (replaced SanDisk SSD PLUS, 2026-06-14)
+          - fullpath: /dev/disk/by-id/wwn-0x600508b1001c6f122eccaa0ee20628b8  # bay5 (ex-HARV_LH_DEFAULT/Longhorn defaultdisk; freed to Ceph 2026-06-17 via fio-default re-arch)
+          - fullpath: /dev/disk/by-partlabel/ceph-fio-meta   # 15G FusionIO partition (ORIGINAL card p3) -> CephFS metadata-pool OSD (deviceClass=fio); by-partlabel (udev rule) — fioaN is NOT flip-proof once the 2nd card arrives
+            config:
+              deviceClass: "fio"
+          - fullpath: /dev/disk/by-partlabel/qua-fio2   # 100G partition on the 2nd card (ioDrive2 Duo, ioDrive2/VSL3 generation) — added 2026-09-05, sized like qui/quo to survive stray bulk PGs. The Duo's block devices are fi3* rather than fio*, so by-partlabel is the only stable reference here. Label omits "ceph" on purpose: ceph-volume rejects any partition whose GPT label contains it as a legacy ceph-disk member.
+            config:
+              deviceClass: "fio"
+
+# ── RWO block (bulk tier) ────────────────────────────────────────────────────
+cephBlockPools:
+  - name: ceph-blockpool
+    spec:
+      failureDomain: host
+      # 2026-08-02: PIN TO ssd. Without this the crush rule targets bare `default`,
+      # i.e. EVERY device class — including the three 15 GiB /dev/fioa3 OSDs that exist
+      # solely for the CephFS metadata pool. Bulk RBD data was landing on them (quo's
+      # fio OSD was 34.5% full vs 2.1% on its peers, 5.1 GiB of foreign DATA), which
+      # squeezes the metadata pool's ceiling (MAX AVAIL 9.1 of 15 GiB). Only
+      # ceph-filesystem-metadata may use the fio class.
+      deviceClass: ssd
+      replicated:
+        # 2 -> 3 (2026-08-02): replica-policy rework. Ceph is the bulk tier (15x SATA
+        # SSD, 28 TiB) and had only 2 copies; unlike Longhorn rep3 on 3 nodes, Ceph
+        # rebuilds WITHIN a host (5 SSD OSDs each), so size 3 keeps rebuild headroom.
+        # Cost: stored 341 GiB -> raw 681 -> 1023 GiB.
+        size: 3
+      # min_size is not a first-class replicated field; applied as a pool parameter.
+      # VERIFY post-deploy: `ceph osd pool get ceph-blockpool min_size` == 1
+      parameters:
+        min_size: "1"
+    storageClass:
+      enabled: true
+      name: ceph-block
+      isDefault: false
+      reclaimPolicy: Delete
+      allowVolumeExpansion: true
+      volumeBindingMode: Immediate
+      parameters:
+        imageFormat: "2"
+        imageFeatures: layering
+        csi.storage.k8s.io/fstype: ext4
+        # CSI credential secrets (Rook auto-creates these in the operator ns). The
+        # chart default `parameters` carries these refs; since we override `parameters`,
+        # Helm replaces the whole map, so they MUST be repeated here or the provisioner
+        # fails with "provided secret is empty" (root-caused 2026-06-14). ns hardcoded
+        # rook-ceph (chart default uses "{{ .Release.Namespace }}" which it tpl-renders).
+        csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+        csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+        csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-publish-secret-name: rook-csi-rbd-provisioner
+        csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph
+        csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+        csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+
+# ── RWX file (media tier): metadata rep3, data rep2/min_size1 ────────────────
+cephFileSystems:
+  - name: ceph-filesystem
+    spec:
+      metadataPool:
+        # Phase 2b: pin CephFS metadata to the FusionIO OSDs (fioa3, deviceClass=fio)
+        # — off the P420i SSDs that caused MDS_SLOW_METADATA_IO. Requires the 3 fio
+        # OSDs (1/host) to already be up/in (phase 2a) or the CRUSH rule has no OSDs.
+        deviceClass: fio
+        replicated:
+          size: 3
+      dataPools:
+        - name: data0
+          failureDomain: host
+          # 2026-08-02: PIN TO ssd — this pool's rule targeted bare `default`, so its
+          # PGs could land on the 15 GiB fio metadata OSDs. With 512 PGs it is the
+          # biggest offender by opportunity. fio is reserved for metadata only.
+          deviceClass: ssd
+          replicated:
+            # 2 -> 3 (2026-08-02, phase 1c of the replica rework). The big one:
+            # 2.5 TiB stored / 645k objects (the tv media that moved off Longhorn),
+            # raw 4.9 -> 7.4 TiB. This pool held only 2 copies of the largest data
+            # set in the estate. Ceph rebuilds within a host, so no rebuild-headroom
+            # cost. Runs under mclock 'balanced' (~12.6x faster than high_client_ops)
+            # — deliberately NOT left to crawl, because osd_scrub_during_recovery is
+            # false and this pool is 512 of 876 PGs, so a slow backfill would
+            # suppress deep-scrub across most of the cluster.
+            size: 3
+          parameters:
+            min_size: "1"
+            bulk: "true"
+      metadataServer:
+        activeCount: 1
+        activeStandby: true
+        resources:
+          requests: {cpu: "1", memory: "2Gi"}
+          limits:   {memory: "4Gi"}
+        priorityClassName: system-cluster-critical
+        # Spread the active + standby-replay MDS across nodes so losing one node
+        # (e.g. a reboot) never takes CephFS offline. Required is always
+        # schedulable with 3 nodes / 2 MDS. (2026-06-17: both were on qua.)
+        placement:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: ["rook-ceph-mds"]
+                topologyKey: kubernetes.io/hostname
+    storageClass:
+      enabled: true
+      isDefault: false
+      name: ceph-filesystem
+      pool: data0
+      reclaimPolicy: Delete
+      allowVolumeExpansion: true
+      volumeBindingMode: Immediate
+      parameters:
+        csi.storage.k8s.io/fstype: ext4
+        # See ceph-block note above — secret refs dropped by our `parameters` override
+        # must be restored or CephFS provisioning fails with "provided secret is empty".
+        csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+        csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+        csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+        csi.storage.k8s.io/controller-publish-secret-name: rook-csi-cephfs-provisioner
+        csi.storage.k8s.io/controller-publish-secret-namespace: rook-ceph
+        csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+        csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+
+# ── S3 object (RGW) — PILOT for OpenObserve (see PLAN §11 S3-vs-Garage) ───────
+# NOTE: chart default uses an EC 2+1 data pool; on 3 nodes EC min_size pauses I/O
+# when any node reboots (breaks upgrade-survivability) AND has no spare host to
+# re-create a lost chunk. Overridden to replicated size2/min_size1 for consistency
+# with the bulk tier. Switch to EC only once there are >3 OSD hosts.
+cephObjectStores:
+  - name: ceph-objectstore
+    spec:
+      metadataPool:
+        failureDomain: host
+        # 2026-08-02: PIN TO ssd (see cephBlockPools) — the fio class is reserved for
+        # the CephFS metadata pool alone. Covers the rgw index/log/meta pools too.
+        deviceClass: ssd
+        replicated:
+          size: 3
+      dataPool:
+        failureDomain: host
+        deviceClass: ssd
+        replicated:
+          # 2 -> 3 (2026-08-02, phase 1b of the replica rework): S3/RGW bucket data
+          # was the last size-2 bulk pool besides CephFS. stored 322 GiB,
+          # raw 644 -> 966 GiB. Ceph rebuilds within a host, so 3 copies here cost
+          # no rebuild headroom (unlike Longhorn rep3 on 3 nodes).
+          size: 3
+        parameters:
+          min_size: "1"
+          bulk: "true"
+      preservePoolsOnDelete: true
+      gateway:
+        port: 80
+        instances: 2
+        resources:
+          requests: {cpu: "500m", memory: "1Gi"}
+          limits:   {memory: "2Gi"}
+    storageClass:
+      enabled: true
+      name: ceph-bucket          # ObjectBucketClaim provisioner (dynamic buckets + auto secret)
+      reclaimPolicy: Delete
+      volumeBindingMode: Immediate
+      # Harvester's validator.harvesterhci.io webhook requires this CDI annotation on
+      # every StorageClass (for VM-image import). The bucket provisioner isn't a volume
+      # provisioner, so the value is a benign placeholder just to satisfy the webhook.
+      annotations:
+        cdi.harvesterhci.io/storageProfileVolumeModeAccessModes: '{"Filesystem":["ReadWriteMany"]}'
+      parameters:
+        region: us-east-1
+# NOTE: rook-ceph-cluster chart v1.20.0 has NO cephObjectStoreUsers key — RGW
+# users (gitlab, openobserve) are raw CephObjectStoreUser manifests in
+# fleet/rook-ceph-objectstore-users/ instead.

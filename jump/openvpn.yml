@@ -1,0 +1,225 @@
+## OpenVPN + ovpn-admin — the mbptillo VPN, re-homed into the cluster.
+##
+## Recovered 2026-09-02 from mbptillo's etcd snapshot and /etc/openvpn on the NAS
+## (see ~/openvpn-namespace-recovery-20260902.md). Three things about the old
+## Deployment made it unmovable, and ONE design choice dissolves all three:
+##
+##   hostNetwork: true                     -> banned here, and only ever present so
+##   nodeSelector: hostname=mbptillo          ovpn-admin could reach OpenVPN's
+##   hostPath: /etc/openvpn/easyrsa/…         management socket on 127.0.0.1:7505
+##
+## ⭐ openvpn and ovpn-admin run as TWO CONTAINERS IN ONE POD. Containers in a pod
+## share a network namespace, so `--mgmt=main=127.0.0.1:7505` keeps working with
+## NO hostNetwork at all; the PKI becomes a shared volume instead of a hostPath,
+## which removes the reason for the node pin.
+##
+## AUTH IS NOW CERTIFICATE-ONLY. The old server ran PAM/SSSD against LDAP with
+## `verify-client-cert optional`. The user's requirement is a *cached credential*
+## that is "not strongly dependent on other services" — so: `verify-client-cert
+## require`, no auth-pam plugin, and the credential is the client cert already on
+## the device. The recovered PKI already contains certs for mbpmda and s23ultra,
+## so those two need no re-provisioning.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openvpn-config
+  namespace: jump
+data:
+  server.conf: |
+    dev tun0
+    proto tcp
+    port 1194
+    local 0.0.0.0
+
+    ca        /mnt/easyrsa/pki/ca.crt
+    ## The server certificate is named "server" on purpose: ovpn-admin builds
+    ## its user list from index.txt and skips exactly that CN, so the server's
+    ## own credential can no longer be mistaken for a stale client and revoked
+    ## from the admin UI (which is how the previous one, named after the old
+    ## host, was lost — silently, until the next restart).
+    cert      /mnt/easyrsa/pki/issued/server.crt
+    key       /mnt/easyrsa/pki/private/server.key
+    tls-crypt /mnt/easyrsa/pki/ta.key
+    dh none
+
+    topology subnet
+    server 10.8.10.0 255.255.255.0
+
+    push "route 192.168.1.0 255.255.255.0"
+    push "route 192.168.7.0 255.255.255.0"
+    push "route 192.168.77.0 255.255.255.0"
+    push "redirect-gateway def1 bypass-dhcp"
+    ## DNS: the in-cluster split-horizon Unbound first (internal-first since
+    ## 2026-07-26), NextDNS as the only fallback. mbptillo pushed 9.9.9.9, which
+    ## violates the standing NextDNS-only DNS policy — corrected here.
+    push "dhcp-option DNS 192.168.1.1"
+    push "dhcp-option DNS 45.90.28.16"
+
+    ## CERTIFICATE AUTH. No `plugin openvpn-plugin-auth-pam.so`, no
+    ## `username-as-common-name`: the cert IS the credential.
+    verify-client-cert require
+    remote-cert-tls client
+
+    client-to-client
+    ## Kept from the mbptillo config deliberately, NOT because it is ideal: with
+    ## per-device certs it could be dropped, but doing so would silently lock out
+    ## any device sharing a cert. Tighten once the roster is confirmed.
+    duplicate-cn
+
+    keepalive 10 120
+    cipher AES-256-GCM
+    tls-version-min 1.2
+    persist-key
+    persist-tun
+    user nobody
+    group nogroup
+
+    management 127.0.0.1 7505
+    ifconfig-pool-persist /mnt/easyrsa/ipp.txt
+    status /tmp/openvpn-status.log
+    verb 3
+
+  entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    echo "[openvpn] installing runtime (alpine, apk)…"
+    apk add --no-cache openvpn iptables >/dev/null
+
+    ## The VPN subnet must be masqueraded onto the pod's address, after which
+    ## Canal's own SNAT carries it to the LAN. Without this, clients get an
+    ## address and reach nothing.
+    echo "[openvpn] NAT for 10.8.10.0/24"
+    iptables -t nat -C POSTROUTING -s 10.8.10.0/24 -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s 10.8.10.0/24 -j MASQUERADE
+
+    test -c /dev/net/tun || { echo "[openvpn] FATAL: /dev/net/tun missing"; exit 1; }
+    test -r /mnt/easyrsa/pki/ca.crt || { echo "[openvpn] FATAL: PKI not seeded"; exit 1; }
+
+    echo "[openvpn] starting"
+    exec openvpn --config /etc/openvpn/server.conf
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openvpn
+  namespace: jump
+  labels: { app: openvpn }
+  annotations:
+    ## server.conf lives in the ConfigMap above; without this a config change
+    ## lands on disk but the running openvpn keeps its old settings until
+    ## something else restarts the pod.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  ## RWO PKI volume + a single tun device: never two at once.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: openvpn }
+  template:
+    metadata:
+      labels: { app: openvpn }
+    spec:
+      initContainers:
+        ## net.ipv4.ip_forward is an "unsafe" sysctl: kubelet will not allow it
+        ## via securityContext.sysctls, and NET_ADMIN alone cannot set it from a
+        ## container. A privileged init that exits immediately is the pattern the
+        ## akeyless-pg-bridge WireGuard pod already uses here.
+        - name: enable-forwarding
+          image: docker.io/library/alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+          command: ["/bin/sh", "-c", "sysctl -w net.ipv4.ip_forward=1"]
+          securityContext:
+            privileged: true
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
+      containers:
+        - name: openvpn
+          image: docker.io/library/alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+          command: ["/bin/sh", "/opt/entrypoint.sh"]
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              drop: ["ALL"]
+              # NET_ADMIN: create tun0, set routes. NET_RAW: iptables MASQUERADE.
+              # SETUID/SETGID: openvpn drops to nobody:nogroup after init.
+              add: ["NET_ADMIN", "NET_RAW", "SETUID", "SETGID"]
+          ports:
+            - { name: openvpn, containerPort: 1194, protocol: TCP }
+          volumeMounts:
+            - { name: config,  mountPath: /etc/openvpn/server.conf, subPath: server.conf }
+            - { name: config,  mountPath: /opt/entrypoint.sh,       subPath: entrypoint.sh }
+            - { name: pki,     mountPath: /mnt/easyrsa }
+            - { name: tun,     mountPath: /dev/net/tun }
+          readinessProbe:
+            tcpSocket: { port: 1194 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 1194 }
+            initialDelaySeconds: 90
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "2",    memory: "512Mi" }
+
+        ## Same pod on purpose — this is what replaces hostNetwork.
+        - name: ovpn-admin
+          image: docker.io/flant/ovpn-admin@sha256:a6a04b3d02be2463c1915a7168d253ffee218518371083941385bb12e826f6c4
+          command: ["/app/ovpn-admin"]
+          args:
+            - --listen.host=0.0.0.0
+            - --listen.port=8080
+            ## Own host now (vpnadmin.mdapi.ch), so the app serves at the root.
+            ## The base-url arg is gone with the sub-path it existed for.
+            - --ovpn.network=10.8.10.0/24
+            ## What ovpn-admin writes into generated client configs: the PUBLIC
+            ## door, demuxed by the bastion's sslh.
+            - --ovpn.server=jump.mdapi.ch:443:tcp
+            - --mgmt=main=127.0.0.1:7505
+            - --easyrsa.path=/mnt/easyrsa
+            - --easyrsa.index-path=/mnt/easyrsa/pki/index.txt
+          ## Explicit: ovpn-admin WRITES the easy-rsa tree (index.txt, serial,
+          ## issued/, private/) when it issues or revokes. Leaving the user to the
+          ## image default would make PKI writability depend on an upstream
+          ## choice we do not control.
+          securityContext:
+            runAsUser: 0
+          ports:
+            - { name: http, containerPort: 8080, protocol: TCP }
+          volumeMounts:
+            - { name: pki, mountPath: /mnt/easyrsa }
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi" }
+            limits:   { cpu: "1",    memory: "256Mi" }
+      volumes:
+        - name: config
+          configMap: { name: openvpn-config, defaultMode: 0555 }
+        - name: pki
+          persistentVolumeClaim: { claimName: openvpn-pki }
+        - name: tun
+          hostPath: { path: /dev/net/tun, type: CharDevice }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openvpn
+  namespace: jump
+  labels: { app: openvpn }
+spec:
+  type: ClusterIP
+  selector: { app: openvpn }
+  ports:
+    - { name: openvpn, port: 1194, targetPort: 1194, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ovpn-admin
+  namespace: jump
+  labels: { app: openvpn }
+spec:
+  type: ClusterIP
+  selector: { app: openvpn }
+  ports:
+    - { name: http, port: 80, targetPort: 8080, protocol: TCP }
