@@ -1,0 +1,31 @@
+## Model cache only -- faster-whisper downloads the CTranslate2 weights from
+## HuggingFace on first start (~500 MB for small-int8). Without a PVC every
+## pod restart re-downloads them, which turns a 20 s restart into a 5 min one
+## and makes the service depend on HF being reachable at exactly the wrong
+## moment. Contents are reproducible, so this is a cache, not data: nothing
+## here needs a backup.
+##
+## ⛔ Saying that HERE does not exempt it. Backup coverage is asserted over live
+## state by f/probe/pvc_backup_coverage, which cannot read YAML comments: a PVC
+## counts as exempt only via that probe's EXEMPT list, where this one was added
+## on 2026-09-09. If this claim is renamed or moved, move the entry with it.
+##
+## reclaimPolicy stays Delete (ceph-block's default). Retain is for data that
+## cannot be rebuilt; here it would only strand a Released PV and an orphan RBD
+## image on every recreate, to save a re-download the startupProbe already
+## budgets 10 minutes for.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wyoming-whisper-models
+  namespace: wyoming
+spec:
+  ## Explicit on purpose: the cluster currently advertises TWO default storage
+  ## classes (harvester-longhorn-1replica and -2replicas), so an omitted
+  ## storageClassName is a coin flip.
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

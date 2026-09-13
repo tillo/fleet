@@ -1,0 +1,67 @@
+## Restic repo secret for the VolSync backup of leader-config-claim-ceph (PVC-audit G5,
+## beads infra-jjb). Shared /mdapi/volsync/ceph-backup creds, per-PVC subpath
+## in the offsite-swept external-Garage ceph-backup bucket.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: cribl
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that hostname
+        ## resolves to the shared ingress VIP, so every backup hairpinned through
+        ## ingress-nginx and would fail exactly when the front door is degraded --
+        ## which is when a backup matters most. restic encrypts client-side and S3
+        ## auth is a SigV4 signature, so losing the ingress TLS costs no
+        ## confidentiality: Garage has no TLS listener of its own, and the ingress
+        ## already re-emitted plaintext to these same LAN hosts. Same bucket and
+        ## path, so the existing restic repository is untouched.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/cribl-leader-config-ceph"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+## Cribl leader pipeline config — already hand-rebuilt once (08-07 incident); root-owned.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: leader-config-claim-ceph
+  namespace: cribl
+spec:
+  sourcePVC: leader-config-claim-ceph
+  trigger:
+    schedule: "15 2 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    moverSecurityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      runAsNonRoot: false
+    cacheCapacity: 2Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

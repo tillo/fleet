@@ -1,0 +1,139 @@
+## Second GitLab runner: PERSISTENT WORKSPACE builder for the OpenWrt fork.
+##
+## Why a separate runner at all — the shared `mdapi` runner (in the GitLab
+## chart, bootstrap/gitlab-values.yaml) is stateless: every job restores a
+## ~4.7 GiB cache tarball, builds, then tars + uploads it again. That round
+## trip alone is ~10 min of the ~50 min build, and OpenWrt's stamp/rdep walk
+## re-runs from scratch because a fresh checkout has "now" mtimes everywhere
+## (hence the elaborate touch-the-stamps dance in .gitlab-ci.yml).
+##
+## This runner keeps `builds_dir` on a PVC, so between two jobs on the same
+## branch NOTHING moves: the tree, staging_dir, build_dir, .ccache and dl
+## are simply still there and OpenWrt's own incrementality applies. Kernel-
+## only iterations (the mtk TX-wedge work) drop from ~50 min to ~10.
+##
+## Guardrails learned the hard way:
+##   * concurrent = 1 and one job per runner — two parallel -j25 world builds
+##     saturated qui's IO and wedged the node twice (2026-07-12, qui wedge #2).
+##   * node-pinned to quo: the PVC is RWO, so the workspace only exists where
+##     it was created; pinning makes that explicit instead of accidental.
+##   * rep-1 Longhorn volume: build trees are disposable and fully
+##     reconstructible; a 2-replica volume would double write amplification on
+##     exactly the IO path the storage-stall family lives on.
+##   * CI side MUST set GIT_CLEAN_FLAGS: none for jobs on this runner —
+##     the default `git clean -ffdx` would delete the entire (gitignored)
+##     build tree and turn every "fast" build back into a cold one.
+
+image:
+  registry: registry.gitlab.com
+  image: gitlab-org/gitlab-runner
+  tag: alpine-v18.11.3
+
+gitlabUrl: https://gitlab.mdapi.ch/
+
+runners:
+  secret: gitlab-runner-builder-token
+  config: |
+    concurrent = 1
+    check_interval = 3
+    [[runners]]
+      ## The workspace itself. /builds is the PVC mount below.
+      builds_dir = "/builds"
+      cache_dir = "/builds/.runner-cache"
+      environment = ["FF_USE_FASTZIP=true"]
+      [runners.kubernetes]
+        image = "alpine"
+        namespace = "gitlab-runner-builder"
+        privileged = false
+        cpu_request = "4"
+        cpu_limit = "24"
+        memory_request = "8Gi"
+        memory_limit = "48Gi"
+        helper_cpu_limit = "1"
+        helper_memory_limit = "512Mi"
+        ## Pinned: the workspace PVC is RWO and lives on this node.
+        node_selector_overwrite_allowed = ""
+        poll_timeout = 900
+        [runners.kubernetes.node_selector]
+          "kubernetes.io/hostname" = "quo"
+        [runners.kubernetes.pod_annotations]
+          "container.apparmor.security.beta.kubernetes.io/build" = "unconfined"
+        [[runners.kubernetes.volumes.pvc]]
+          name = "openwrt-workspace"
+          mount_path = "/builds"
+      ## No distributed cache: the whole point is that state never leaves
+      ## the node. (An S3 cache here would re-introduce the tarball cost.)
+
+  ## Registration is token-based (glrt-…) from the ExternalSecret below; the
+  ## runner was pre-created on the project with tag `builder-persistent`,
+  ## run_untagged=false so it never steals ordinary `mdapi` jobs.
+  tags: "builder-persistent"
+  runUntagged: false
+  privileged: false
+
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "pods/exec", "pods/attach", "secrets", "configmaps", "services"]
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get", "list", "watch"]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector:
+  kubernetes.io/hostname: quo
+
+metrics:
+  enabled: true
+
+## --- Supporting resources. NOTE: this chart renders extraObjects as
+##     `tpl (toYaml .)`, so entries must be MAPPINGS (not string blocks)
+##     and any ESO/Go-template braces must be tpl-escaped as below.
+extraObjects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: openwrt-workspace
+      namespace: gitlab-runner-builder
+      labels:
+        ## no-backup PVC: the backup-label enforcer (f/heal/backup_label_enforcer
+        ## NO_BACKUP_PVCS) strips any backup-group label; git must match its
+        ## post-strip state or the two fight and the bundle latches Modified.
+        recurring-job.longhorn.io/source: enabled
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: harvester-longhorn-1replica
+      resources:
+        requests:
+          storage: 60Gi
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: gitlab-runner-builder-token
+      namespace: gitlab-runner-builder
+    spec:
+      refreshInterval: 5m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: gitlab-runner-builder-token
+        creationPolicy: Owner
+        template:
+          engineVersion: v2
+          data:
+            runner-registration-token: ''
+            runner-token: '{{ "{{ .token }}" }}'
+      data:
+      - remoteRef:
+          key: /mdapi/gitlab/runner-builder-token
+        secretKey: token

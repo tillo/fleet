@@ -1,0 +1,118 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: litellm
+  annotations:
+    # Restart pods when the ConfigMap or the Akeyless-backed Secret changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: litellm
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: litellm
+        # Mirrored from ghcr.io/berriai/litellm:v1.97.0 into zot (supply-chain:
+        # well past the 1.82.7/1.82.8 malware). Pinned; no Keel auto-bump.
+        image: zot.mdapi.ch/mdapi/litellm:v1.97.0
+        imagePullPolicy: IfNotPresent
+        # NO --ui FLAG. It does not exist in v1.97.0 -- click rejects it with
+        # "Error: No such option: --ui" and exits 2, i.e. both replicas
+        # CrashLoopBackOff and llm.mdapi.ch goes dark. Verified in the running
+        # image 2026-08-26. The admin UI is served unconditionally at /ui once a
+        # master_key is set; what it needs is a DATABASE_URL, below.
+        args: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+        ports:
+        - containerPort: 4000
+        envFrom:
+        - secretRef:
+            name: litellm-env-secret
+        env:
+        # The admin UI's "Authentication Error, Not connected to DB!" is raised
+        # behind `if prisma_client is None` in every management endpoint, and
+        # prisma_client is only built when DATABASE_URL is present
+        # (proxy_server.py:999-1001). Virtual keys / spend tracking need it too.
+        # Secret + key are CNPG-generated (see litellm-pg.yml); same pattern as
+        # jump/guacamole.yml, so no password round-trips through Akeyless.
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: litellm-pg-app
+              key: uri
+        volumeMounts:
+        - name: config
+          mountPath: /etc/litellm
+          readOnly: true
+        # Probes added 2026-08-26 after the OOM outage. Their ABSENCE was why a
+        # pod that never bound port 4000 kept its Service endpoint and reported
+        # 1/1 READY for the whole incident -- `kubectl get pods` said healthy
+        # while llm.mdapi.ch served 502.
+        #
+        # ⚠ NEVER probe /health. It is auth-gated AND calls perform_health_check,
+        # i.e. a real billed completion against every deployment -- the exact
+        # cost that got background health checks removed on 2026-08-18 (see the
+        # general_settings note in litellm-cm.yml). A kubelet probing it every
+        # 10s would reinstate that spend permanently and worse.
+        # /health/liveliness | /health/liveness | /health/readiness are all
+        # unauthenticated and cheap (measured 0.01-0.09s in-cluster).
+        #
+        # READINESS USES /health/liveliness, NOT /health/readiness -- deliberate.
+        # /health/readiness reports {"status":"healthy","db":"connected"}, so it
+        # would evict BOTH replicas from the Service whenever litellm-pg blips.
+        # But completions do not need the DB (this proxy served them for 8 days
+        # without one); only the admin UI and virtual keys do. Gating chat
+        # traffic on Postgres would chain the gateway's availability to a
+        # database it does not need -- the same mistake that cost Grafana ~32h
+        # when its backend DB lived on ha-recorder-pg (see monitoring-grafana/
+        # grafana-pg.yml). Port-bound is the right readiness signal here.
+        startupProbe:
+          httpGet: { path: /health/liveliness, port: 4000 }
+          periodSeconds: 10
+          timeoutSeconds: 5
+          # 600s. litellm's import graph is slow and first boot also runs Prisma
+          # migrations; generous here costs nothing because the startup probe
+          # stops once it passes, and liveness does not run until it does.
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /health/liveliness, port: 4000 }
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet: { path: /health/liveliness, port: 4000 }
+          periodSeconds: 20
+          timeoutSeconds: 5
+          # ~60s of continuous failure before a restart -- conservative on
+          # purpose so a transient stall does not turn into a restart loop.
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 25m
+            # 256Mi was sized for the DB-less proxy. Attaching DATABASE_URL
+            # (49de189) pulls in Prisma and its Rust query engine at startup and
+            # the pods went straight into an OOMKill loop at the old 1Gi cap --
+            # both replicas, exit 137, ~45s apart, llm.mdapi.ch 502 throughout.
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+      imagePullSecrets:
+      - name: zot-pull
+      volumes:
+      - name: config
+        configMap:
+          name: litellm-config

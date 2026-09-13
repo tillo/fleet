@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: appdaemon
+  namespace: appdaemon
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: appdaemon
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: appdaemon
+    spec:
+      containers:
+      - name: appdaemon
+        image: acockburn/appdaemon:latest
+        ports:
+        - containerPort: 5050
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: HA_URL
+          value: https://home.mdapi.ch
+        - name: LATITUDE
+          value: "46.6387"
+        - name: LONGITUDE
+          value: "6.6290"
+        - name: ELEVATION
+          value: "621"
+        envFrom:
+          - secretRef:
+              name: appdaemon-env-secret
+        volumeMounts:
+        - name: appdaemon-conf
+          mountPath: /conf
+        - name: appdaemon-secrets-yaml
+          mountPath: /conf/secrets.yaml
+          subPath: secrets.yaml
+          readOnly: true
+        - name: appdaemon-elco-app
+          mountPath: /conf/apps/elco
+          readOnly: true
+      volumes:
+      - name: appdaemon-conf
+        persistentVolumeClaim:
+          claimName: appdaemon-conf
+      - name: appdaemon-secrets-yaml
+        secret:
+          secretName: appdaemon-secrets-yaml
+      - name: appdaemon-elco-app
+        configMap:
+          name: appdaemon-elco-app

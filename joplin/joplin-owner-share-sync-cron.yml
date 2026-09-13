@@ -1,0 +1,132 @@
+## Owner-side Joplin client sync -- fans out API-created notes to share recipients.
+##
+## WHY: notes written through the Joplin Data API (the joplin-mcp account, e.g.
+## the /backlog-sync flow) are NOT stamped with jop_share_id by the server. Joplin
+## only assigns share membership CLIENT-side, during a sync. With no owner client
+## ever syncing, every API-created note stays outside the share, so recipients
+## (tillo@tillo.ch) never see it. On 2026-06-11 this had left 30 of 40 notes in the
+## shared "mdapi Infrastructure" notebook invisible to the recipient -- including
+## the daily-updated backlog note. (Proven: creating a folder share via POST
+## /api/shares does not stamp jop_share_id even on the folder; only a client sync
+## does.) See memory joplin_share_fanout_gap_jop_share_id_not_stamped_api_notes.
+##
+## WHAT: run the joplin CLI logged in as the OWNER account on a schedule. Each run:
+## pass 1 pulls any new API-created notes (unstamped); the client stamps them with
+## the parent folder's share_id locally; pass 2 uploads the stamped notes. Joplin
+## Server's "Process shared items" task (#11) then creates the recipient user_items
+## within ~10s. Idempotent -- a run with nothing new uploads nothing.
+##
+## IMAGE: joplin-mcp image with the joplin CLI BAKED IN (mdapi/joplin-mcp
+## Dockerfile, npm i -g joplin@3.6.2 at build). Pinned to an immutable short-sha
+## tag in zot so IfNotPresent still picks up new builds -- no runtime `npm
+## install`, hence no registry/DNS dependency at run time (the old per-run install
+## failed ~half the time: sqlite3 node-pre-gyp prebuilt miss + transient DNS to
+## registry.npmjs.org). Stateless: HOME is an emptyDir, no PVC to corrupt. To bump
+## joplin: edit the Dockerfile, let CI build, then point the tag below at the new sha.
+##
+## SCHEDULE in UTC, NOT spec.timeZone: kube-state-metrics ships without tzdata and
+## panics on named zones, taking every kube_* alert down with it (same reason as
+## postgres-events-cleanup in this bundle).
+##
+## CREDENTIALS: owner email/password from joplin-mcp-env-secret (the same secret the
+## MCP uses). The password lives only in env + the ephemeral profile; never logged.
+##
+## ⛔ KNOWN BROKEN since 2026-08-06 — this job WILL fail until the server side is
+## fixed, and that is now visible rather than silent. Being stateless (emptyDir) it
+## starts every run at delta cursor -1, and Joplin Server serves any cursor below
+## min(changes_2.counter) from the pre-split `changes` table, which was dropped on
+## 2026-08-06: GET /api/items/root:/:/delta returns 500 with Postgres 42P01
+## `relation "changes" does not exist` (ChangeModel.ts, startInOldTable). Clients
+## with an existing cursor are unaffected, which is why phones still sync. The
+## consequence here is that notes created through the API after 2026-08-06 are
+## never stamped with jop_share_id, so recipients cannot see them.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: joplin-owner-share-sync
+  namespace: joplin
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: joplin-owner-share-sync
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: zot-pull
+          containers:
+          - name: sync
+            image: zot.mdapi.ch/mdapi/joplin-mcp:4e233193
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: HOME
+              value: /work
+            - name: JOPLIN_SERVER_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: joplin-mcp-env-secret
+                  key: JOPLIN_SERVER_EMAIL
+            - name: JOPLIN_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: joplin-mcp-env-secret
+                  key: JOPLIN_SERVER_PASSWORD
+            command: ["sh", "-c"]
+            args:
+            - |
+              set -e
+              # joplin CLI is baked into the image (no runtime npm install).
+              joplin config keychain.supported 0 >/dev/null
+              joplin config sync.target 9 >/dev/null
+              joplin config sync.9.path https://notes.mdapi.ch >/dev/null
+              joplin config sync.9.username "$JOPLIN_SERVER_EMAIL" >/dev/null
+              joplin config sync.9.password "$JOPLIN_SERVER_PASSWORD" >/dev/null
+              # Exit NON-ZERO when a sync pass fails, so the job stops advancing
+              # kube_cronjob_status_last_successful_time and CronJobStale fires
+              # (limit 4h, published by f/probe/cronjob_freshness). The old form
+              # piped into grep and ended in `|| true`, so the exit status came
+              # from tail and was ALWAYS 0: this job reported success for 32 days
+              # while every pass failed (see the delta note in the header).
+              #
+              # Two independent checks, because the CLI is not honest on its own:
+              # `joplin sync` prints "Last error: ..." and STILL exits 0, so a
+              # non-zero exit alone would not have caught the 2026-08-06 breakage.
+              rc=0
+              for n in 1 2 3; do
+                echo "sync pass $n:"
+                if joplin sync >/work/sync.$n.log 2>&1; then
+                  grep -iE 'updat|upload|fetch|complet' /work/sync.$n.log | tail -3 || true
+                else
+                  rc=1
+                  echo "SYNC PASS $n EXITED NON-ZERO:"
+                  tail -20 /work/sync.$n.log
+                fi
+                if grep -qiE 'Last error:' /work/sync.$n.log; then
+                  rc=1
+                  echo "SYNC PASS $n REPORTED AN ERROR:"
+                  grep -iE -A8 'Last error:' /work/sync.$n.log | head -24
+                fi
+              done
+              echo "done: $(joplin status 2>&1 | grep -iE 'Total' | head -1)"
+              exit $rc
+            volumeMounts:
+            - name: work
+              mountPath: /work
+            resources:
+              requests:
+                cpu: 50m
+                memory: 128Mi
+              limits:
+                memory: 512Mi
+          volumes:
+          - name: work
+            emptyDir: {}

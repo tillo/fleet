@@ -1,0 +1,456 @@
+# VPA Auto mode — right-sizing for stateless workloads with no PVCs.
+# Pods may be evicted and recreated with updated requests/limits.
+# Safe because all targets here have replicas:2 + minAvailable:1 PDB.
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: joplin-mcp
+  namespace: joplin
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: joplin-mcp
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: joplin-mcp
+      minAllowed:
+        cpu: 10m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 1Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: joplin
+  namespace: joplin
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: joplin
+  updatePolicy:
+    # Initial, not Auto: VPA right-sizes requests at pod creation but never
+    # evicts running pods. Auto-mode eviction churn left the 2-replica
+    # Deployment at 1/2 for ~3.5 min while the evicted pod's replacement
+    # re-pulled the 563 MB joplin/server:latest image, tripping the
+    # replica-availability alert.
+    updateMode: Initial
+  resourcePolicy:
+    containerPolicies:
+    - containerName: joplin
+      minAllowed:
+        cpu: 50m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 1
+        memory: 2Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: keycloak
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: keycloak
+      minAllowed:
+        cpu: 50m
+        memory: 512Mi
+      maxAllowed:
+        cpu: 2
+        memory: 3Gi
+---
+# autoconfig is stateless HTTP — VPA will right-size from the copy-paste defaults
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: autoconfig
+  namespace: mail
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: autoconfig
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: autoconfig
+      minAllowed:
+        cpu: 5m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 200m
+        memory: 256Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: dellambrogio
+  namespace: dellambrogio
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: dellambrogio
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: dellambrogio
+      minAllowed:
+        cpu: 5m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 200m
+        memory: 256Mi
+---
+# Website namespaces — copy-paste 50m/128Mi values, VPA will learn real usage
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: coiffuredreams
+  namespace: coiffuredreams
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: coiffuredreams
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: coiffuredreams
+      minAllowed:
+        cpu: 5m
+        memory: 32Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ivodellambrogio
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: ivodellambrogio
+      minAllowed:
+        cpu: 5m
+        memory: 32Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: spider3
+  namespace: spider3
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: spider3
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: spider3
+      minAllowed:
+        cpu: 5m
+        memory: 32Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi
+---
+# tv namespace: moved from Off → Auto on 2026-06-04 after radarr OOM-looped.
+# All these workloads recover from eviction within seconds to a couple
+# minutes; chasing per-container OOMs by hand was the wrong default.
+# minAllowed = safe baseline so VPA doesn't shrink below working size.
+# maxAllowed = generous ceiling so VPA can grow during scans/transcodes.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: radarr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: radarr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: radarr
+      minAllowed:
+        cpu: 25m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 2000m
+        memory: 4Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: sonarr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sonarr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: sonarr
+      minAllowed:
+        cpu: 50m
+        memory: 1Gi
+      maxAllowed:
+        cpu: 3000m
+        memory: 8Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: bazarr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bazarr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: bazarr
+      minAllowed:
+        cpu: 25m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 2000m
+        memory: 4Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: prowlarr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: prowlarr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: prowlarr
+      minAllowed:
+        cpu: 25m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 2000m
+        memory: 4Gi
+---
+# Plex: 2-replica streaming/transcoding workload. Eviction interrupts
+# active streams (~5-10 s blip while clients reconnect to the second pod).
+# minAllowed reflects the steady-state baseline; maxAllowed accommodates
+# multi-4K-transcode burst with hardware acceleration disabled.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: pms-docker
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pms-docker
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: pms-docker
+      minAllowed:
+        cpu: 100m
+        memory: 2Gi
+      # 2026-06-06: raised maxAllowed.cpu 4 -> 8 to match the deploy
+      # limits.cpu bump; the 4 CPU cap was triggering ContainerCpuThrottling
+      # at >50% during transcoding / library-scan bursts.
+      maxAllowed:
+        cpu: 8000m
+        memory: 10Gi
+---
+# tdarr: transcode workers. Eviction mid-transcode wastes wall-time but
+# tdarr re-queues incomplete jobs on next boot.
+# RequestsOnly + low cpu cap (2026-07-04 N-1 program): VPA had inflated the
+# REQUEST to 11.7 cores (it tracks transcode bursts) — a fifth of two-node
+# failover capacity — while idle usage is ~0.1c. With RequestsOnly the
+# deployment's 12c limit stays the burst ceiling (the 2026-06-05 throttle
+# fix survives) and the request stays scheduling-honest.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: tdarr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tdarr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: tdarr
+      controlledValues: RequestsOnly
+      minAllowed:
+        cpu: 50m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 2000m
+        memory: 10Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: autobrr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: autobrr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: autobrr
+      minAllowed:
+        cpu: 10m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: threadfin
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: threadfin
+  updatePolicy:
+    # Off (recommend-only): threadfin is bursty — idle most of the time, then
+    # ~6Gi spike during the XMLTV parse (15k channels + 40k programs). VPA Auto
+    # capped it at maxAllowed=1Gi (req 1Gi/limit 3Gi) -> OOMKilled crashloop
+    # (2026-06-07). Let the deploy's hand-sized 2Gi req / 6Gi limit stand.
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: threadfin
+      minAllowed:
+        cpu: 25m
+        memory: 128Mi
+      maxAllowed:
+        cpu: 1000m
+        memory: 6Gi
+---
+# transmission-pia: 3 containers (transmission + PIA WireGuard + port-mgr).
+# Eviction breaks active torrent connections; recoverable within ~2 min
+# as peers reconnect. Wildcard policy sizes the swarm container; the
+# sidecars stay tiny.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: transmission-pia
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: transmission-pia
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: transmission
+      minAllowed:
+        cpu: 100m
+        memory: 1Gi
+      maxAllowed:
+        cpu: 4000m
+        # Lowered 8Gi->4Gi 2026-06-21 to cap the swarm footprint (was sitting
+        # at ~11.5GiB actual). Sustained use above this means too many active
+        # torrents -> prune the torrent list (see todo) rather than raise.
+        memory: 4Gi
+    - containerName: pia
+      minAllowed:
+        cpu: 10m
+        memory: 32Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 256Mi
+    - containerName: port-manager
+      minAllowed:
+        cpu: 10m
+        memory: 32Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 256Mi
+---
+# seerr (Overseerr fork) — Next.js SSR app. Was missed from the 2026-06-04
+# tv-app sweep; 32% of its CPU scheduling periods were being throttled
+# against the 500m hardcap, giving the user-visible 246-857ms TTFB swing
+# on /login. Same Auto profile as the other tv apps; max headroom set to
+# 1500m since the workload is largely idle but spiky on SSR render.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: seerr
+  namespace: tv
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: seerr
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: seerr
+      minAllowed:
+        cpu: 25m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 3000m
+        memory: 1Gi

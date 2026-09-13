@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openobserve-config
+  namespace: openobserve
+data:
+  # Single-node mode, writes Parquet to Ceph RGW S3 (migrated off the in-cluster
+  # Garage 2026-06-17 — RGW benchmarked ~3-7x faster). Metadata = local SQLite on
+  # PVC. WAL + cache also on PVC. ZO_S3_FORCE_PATH_STYLE is required (RGW user is
+  # addressed path-style here).
+  ZO_HTTP_PORT: "5080"
+  ZO_GRPC_PORT: "5081"
+  ZO_DATA_DIR: "/data/"
+  ZO_LOCAL_MODE: "true"
+  ZO_LOCAL_MODE_STORAGE: "s3"
+  ZO_S3_PROVIDER: "s3"
+  ZO_S3_SERVER_URL: "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:80"
+  ZO_S3_REGION_NAME: "us-east-1"
+  ZO_S3_BUCKET_NAME: "openobserve"
+  ZO_S3_FORCE_PATH_STYLE: "true"
+  ZO_TELEMETRY: "false"
+  # Default retention in days for streams carrying no per-stream override
+  # (minimum 3). Overrides go via PUT /api/<org>/streams/<stream>/settings and
+  # take precedence over this.
+  #
+  # The NAME is the point. ZO_DATA_RETENTION_DAYS, set here since 2026-05-13, is
+  # not a variable OpenObserve reads at all — the real one is
+  # ZO_COMPACT_DATA_RETENTION_DAYS. Its documented default is 3650, which is
+  # exactly what /config kept reporting while this file appeared to say 7, so
+  # nothing was ever pruned except the two streams holding an explicit
+  # per-stream override. Verify a change here by reading /config back, never by
+  # trusting the manifest: that assumption is what hid this for four months.
+  #
+  # 365 rather than the old nominal 7 because it is a bound, not a target: the
+  # low-volume streams (DNS queries, NTP clients, router and switch events,
+  # crash records) are a few GB in total across a year and their long history is
+  # worth keeping. High-volume streams are bounded individually instead.
+  ZO_COMPACT_DATA_RETENTION_DAYS: "365"
+  # AI assistant (EE only), 2026-09-01. These two are ALL OpenObserve itself
+  # needs — the model provider, model name and API key live on the o2-sre-agent
+  # Deployment, so no LLM credential is held by the log store. Without
+  # O2_AGENT_URL the chat endpoint answers 400 "AI agent URL is not set" even
+  # with O2_AI_ENABLED=true, because OpenObserve only proxies to the agent.
+  O2_AI_ENABLED: "true"
+  O2_AGENT_URL: "http://o2-sre-agent.openobserve.svc.cluster.local:8000"

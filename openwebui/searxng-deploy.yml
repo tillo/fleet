@@ -1,0 +1,121 @@
+## SearXNG — the web-search backend for chat.mdapi.ch.
+##
+## Lives in the openwebui bundle rather than its own, and has NO ingress: it is a
+## private backend with exactly one consumer, the same shape as
+## litellm/claude-shim-*. Nothing outside the cluster should reach it, and a
+## public SearXNG is an abuse magnet.
+##
+## Why SearXNG and not something else (checked against v0.11.1, 2026-08-26):
+## Open WebUI dispatches 29 search engines, but only four need no third-party
+## API key, and of those only searxng / openserp / yacy are self-hostable.
+## openserp drives a headless browser to scrape Google and is fragile; yacy
+## searches its own P2P index and has poor coverage for general questions.
+## SearXNG aggregates real upstream engines, needs no key, and is the one with
+## first-class support here.
+##
+## IMAGE LANE — pinned to a dated release tag (2026-09-02). This file used to
+## run Keel on :latest, argued from SearXNG being a stateless rolling release
+## with no semver for Renovate to reason about. That argument holds for
+## *rollback risk* but not for the two things that actually bit:
+##   1. it was the single image-policy violation in the estate (316/317 clean),
+##      and ImagePolicyFail fired continuously from 2026-08-27;
+##   2. :latest means the running version is whatever the registry served at the
+##      last pull — the bundle is not reproducible and a bad upstream push lands
+##      unreviewed, on a component that reaches the public internet on behalf of
+##      chat.mdapi.ch users.
+## SearXNG does publish immutable dated tags (2026.9.1-18af21159, several a
+## day), so pinning costs nothing but the bump. Bumping is deliberate: pick a
+## dated tag, put it below, let Fleet roll it once while you are watching.
+## Keel is intentionally NOT used here anymore — force+match-tag has nothing to
+## match on a pinned tag, and leaving it on would just re-open the same lane.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: openwebui
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: searxng
+  template:
+    metadata:
+      labels:
+        app: searxng
+    spec:
+      securityContext:
+        # uid/gid 977 baked into the image (verified by running it: the entrypoint
+        # warns loudly when /etc/searxng and /var/cache/searxng are not owned by
+        # searxng:searxng).
+        runAsUser: 977
+        runAsGroup: 977
+        fsGroup: 977
+      containers:
+      - name: searxng
+        # Pinned to the dated release tag that is already running (it resolves
+        # to the same digest sha256:11a9b34c… the live pod reports), NOT :latest.
+        image: docker.io/searxng/searxng:2026.8.22-9fea41204
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        # The image's Granian default is GRANIAN_HOST="::". Pod IPs in this
+        # cluster are IPv4-only (single-stack, 10.52.0.0/16), so pin the bind
+        # explicitly rather than depend on v4-mapped acceptance on a v6 socket.
+        - name: GRANIAN_HOST
+          value: "0.0.0.0"
+        - name: SEARXNG_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: searxng-secret
+              key: SEARXNG_SECRET
+        volumeMounts:
+        # Mounted read-only on purpose. The entrypoint only writes a template
+        # settings.yml when the file is ABSENT; because ours exists it just
+        # validates and moves on (container/entrypoint.sh :: setup()).
+        - name: config
+          mountPath: /etc/searxng
+          readOnly: true
+        # __SEARXNG_DATA_PATH — the entrypoint requires this to exist as a
+        # writable directory. Nothing here needs to survive a restart.
+        - name: data
+          mountPath: /var/cache/searxng
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 192Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      - name: config
+        configMap:
+          name: searxng-config
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  namespace: openwebui
+spec:
+  selector:
+    app: searxng
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP

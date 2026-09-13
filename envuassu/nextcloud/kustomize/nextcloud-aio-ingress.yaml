@@ -1,0 +1,60 @@
+## S2a (infra-ka2, 2026-08-14): cloud.envuassu.ch through the normal ingress —
+## restores ModSec/WAF coverage and cert-manager certs; kills the dedicated
+## LB IP. ModSec snippet cloned from the proven owncloud ingress: the
+## controller-mounted Nextcloud CRS rule-exclusions plugin does the heavy
+## lifting; 1008 keeps native-client OAuth2 loopback redirects working; 1011
+## blankets /remote.php/dav/ for sync-client PROPFIND variants (920340/941100
+## family). owncloud's /graph/ rule (1009) is ownCloud-only — not cloned.
+## Public DNS: cloud.envuassu.ch A 31.3.128.53 -> 31.3.128.50 (nsupdate, same
+## night); internal override auto-managed from this Ingress by the
+## external-dns -> unbound-webhook chain.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nextcloud-aio
+  namespace: envuassu
+  annotations:
+    # http01 via the namespace-local issuer — see cert-manager/http01-issuer.yml
+    # (dns01 got wedged behind a negative-cached NXDOMAIN on 2026-08-14 night).
+    cert-manager.io/issuer: letsencrypt-http01
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
+      Include /etc/nginx/modsec-plugins/nextcloud-rule-exclusions-before.conf
+      SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/" \
+        "id:1008,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      SecRule REQUEST_URI "@beginsWith /remote.php/dav/" \
+        "id:1011,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    nginx.ingress.kubernetes.io/server-snippet: |
+      location = /.well-known/caldav  { return 301 https://cloud.envuassu.ch/remote.php/dav/; }
+      location = /.well-known/carddav { return 301 https://cloud.envuassu.ch/remote.php/dav/; }
+    # APACHE_MAX_SIZE / NEXTCLOUD_UPLOAD_LIMIT are 16G — 17g gives headroom.
+    nginx.ingress.kubernetes.io/proxy-body-size: "17g"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cloud.envuassu.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nextcloud-aio-apache
+                port:
+                  number: 11001
+  tls:
+    - hosts:
+        - cloud.envuassu.ch
+      secretName: nextcloud-aio-tls

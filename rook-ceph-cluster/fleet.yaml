@@ -1,0 +1,55 @@
+defaultNamespace: rook-ceph
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+# The operator bundle must be Active (CRDs registered) before the CephCluster CR
+# applies. dependsOn references the OTHER bundle's name. Fleet derives bundle names
+# from the GitRepo name + path. Verified 2026-06-14: GitRepo "mdapi-prod" (branch
+# main, clusterGroup prod) names bundles "mdapi-prod-<dir>".
+dependsOn:
+  - name: mdapi-prod-rook-ceph
+helm:
+  maxHistory: 25
+  releaseName: rook-ceph-cluster
+  repo: https://charts.rook.io/release
+  chart: rook-ceph-cluster
+  # Lane B: keep the cluster chart pinned to the SAME minor as the operator.
+  version: v1.20.7
+  valuesFiles:
+    - values.yml
+# The Rook operator/CRD defaults many CephCluster /spec fields that aren't in the
+# rendered manifest, which Fleet reports as drift (Modified). These are benign
+# defaults (live config is correct) — ignore them in the diff (metallb pattern,
+# observed 2026-06-14). Device list (/spec/storage/nodes) is intentionally NOT
+# ignored so real disk changes still surface.
+diff:
+  comparePatches:
+    - apiVersion: ceph.rook.io/v1
+      kind: CephCluster
+      namespace: rook-ceph
+      name: rook-ceph
+      # The chart renders these spec fields (from values cephClusterSpec) but Rook
+      # omitempty-strips the default/false ones from the live CR, so each shows as
+      # drift. `remove` normalizes the DESIRED side to match live and SUPPRESSES the
+      # drift (verified: dropping these ops made the CephCluster show 10 Modified
+      # fields). The Fleet agent also tries the op on the live side and logs a
+      # harmless "Unable to remove nonexistent key" for the omitempty'd ones — noise,
+      # not a functional failure (the bundle still reconciles Ready). Use `remove`
+      # (NOT `add value: false` — value is string-typed and a bare bool fatals the
+      # gitjob). Do NOT drop fields from values.yml to "fix" this: some defaults
+      # differ from ours (e.g. Rook defaults dashboard.ssl=true, we set false).
+      operations:
+        - {op: remove, path: /spec/cleanupPolicy}
+        - {op: remove, path: /spec/healthCheck}
+        - {op: remove, path: /spec/network/connections/compression}
+        - {op: remove, path: /spec/network/connections/encryption}
+        - {op: remove, path: /spec/cephVersion/allowUnsupported}
+        - {op: remove, path: /spec/crashCollector/disable}
+        - {op: remove, path: /spec/dashboard/ssl}
+        - {op: remove, path: /spec/mgr/allowMultiplePerNode}
+        - {op: remove, path: /spec/mon/allowMultiplePerNode}
+        - {op: remove, path: /spec/storage/useAllNodes}
+        - {op: remove, path: /spec/skipUpgradeChecks}
+        - {op: remove, path: /spec/continueUpgradeAfterChecksEvenIfNotHealthy}
+        - {op: remove, path: /spec/removeOSDsIfOutAndSafeToRemove}
+        - {op: remove, path: /spec/upgradeOSDRequiresHealthyPGs}

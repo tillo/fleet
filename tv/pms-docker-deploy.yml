@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pms-docker
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: pms-docker
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: pms-docker
+    spec:
+      priorityClassName: mdapi-low
+      containers:
+      - name: pms-docker
+        image: plexinc/pms-docker:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 32400
+        resources:
+          requests:
+            cpu: 100m
+            memory: 4Gi
+          # 2026-06-06: limits.cpu 4 -> 8 to absorb Plex transcoding /
+          # library-scan bursts that were CFS-throttled >50% of periods.
+          # VPA maxAllowed.cpu raised to 8000m in lockstep (vpa-objects).
+          limits:
+            cpu: 8
+            memory: 6Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PLEX_CLAIM
+          value: claim-V9R4xvBixsJK6GbbjPkn
+        - name: ADVERTISE_IP
+          value: http://31.3.128.62:32400/
+        volumeMounts:
+        - name: pms-docker-config
+          mountPath: /config
+        - name: pms-docker-transcode
+          mountPath: /transcode
+        - name: tv
+          mountPath: /data
+      volumes:
+      - name: pms-docker-config
+        persistentVolumeClaim:
+          claimName: pms-docker-config
+      - name: pms-docker-transcode
+        persistentVolumeClaim:
+          claimName: pms-docker-transcode-ceph
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph

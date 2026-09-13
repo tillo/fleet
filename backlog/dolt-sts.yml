@@ -1,0 +1,66 @@
+# Dolt SQL server — canonical store for the beads (bd) issue tracker.
+# Deployed 2026-08-13 (beads trial, kata successor candidate): bd on mbptillo
+# and the in-pod bd serve/bdui all connect here in --server mode; the DB is
+# the single source of truth (the JSONL in ~/backlog is an export, not sync).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dolt
+  namespace: backlog
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  serviceName: dolt
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dolt
+  template:
+    metadata:
+      labels:
+        app: dolt
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: dolt
+        # Pinned by digest (= tag 2.2.3 at pin time). Upgrade = deliberate
+        # digest edit here, same policy as openobserve.
+        image: dolthub/dolt-sql-server@sha256:2abc80e9abde110f5e5912edafaffd2a0ccec91472e45ebd9fa5c2e8decf4e6d
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DOLT_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: backlog-dolt
+              key: DOLT_ROOT_PASSWORD
+        # Root must be reachable from beyond the pod (beads-app pod, mbptillo
+        # via the LAN LB). Access control = password + LAN-only exposure.
+        - name: DOLT_ROOT_HOST
+          value: "%"
+        ports:
+        - { name: mysql, containerPort: 3306 }
+        readinessProbe:
+          tcpSocket: { port: 3306 }
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket: { port: 3306 }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /var/lib/dolt }
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: "1",  memory: 1Gi }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        recurring-job.longhorn.io/source: enabled
+        recurring-job-group.longhorn.io/default: enabled
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 5Gi } }

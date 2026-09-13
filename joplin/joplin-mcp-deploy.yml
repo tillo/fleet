@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: joplin-mcp
+  namespace: joplin
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: joplin-mcp
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: joplin-mcp
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: joplin-mcp
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: joplin-mcp
+        image: zot.mdapi.ch/mdapi/joplin-mcp:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: JOPLIN_SERVER_URL
+          value: https://notes.mdapi.ch
+        envFrom:
+        - secretRef:
+            name: joplin-mcp-env-secret
+        resources:
+          requests:
+            cpu: 25m
+            memory: 1Gi
+          # 2026-05-31: bumped 1536Mi -> 3Gi after both pods OOMKilled sequentially
+          # during /backlog-sync's joplin_apply_patch on the 86 KB note. Baseline
+          # RSS is only 100-220 MiB; spike is per-call (supergateway buffer or
+          # apply_patch heap stacking). See memory
+          # joplin_mcp_patch_primitives_live_2026_05_31.md.
+          limits:
+            memory: 3Gi
+      imagePullSecrets:
+      - name: zot-pull

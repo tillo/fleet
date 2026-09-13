@@ -1,0 +1,186 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-files
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-files.workload
+    rules:
+    ## ⛔ NO WORKLOAD NAME LIST HERE — 2026-09-07, user decision. These two rules
+    ## used to pin an explicit `deployment=~"owncloud|nextcloud-aio-.*|..."`, and
+    ## because PromQL matchers are fully anchored that list silently shrank twice
+    ## over: `mirror` stopped matching when the Longhorn -> Ceph-RBD migration
+    ## renamed the workload `mirror-ceph` (83 days uncovered, fixed by MR !169),
+    ## and five supporting workloads were never in it at all — owncloud/postgres,
+    ## owncloud/redis, envuassu/postgres, spider3/mariadb and
+    ## paperless/paperless-valkey. Each of those takes its app fully down when it
+    ## dies, and none of them fired anything.
+    ##
+    ## A hand list of workload names cannot survive renames or additions, and
+    ## nothing tells you when it has rotted — the query just returns fewer series.
+    ## So the namespaces that hold NOTHING BUT their file service are now selected
+    ## wholesale and a new workload in them is covered the day it appears:
+    ##   nextcloud  -> the nextcloud-aio-* stack
+    ##   spider3    -> spider3 + mariadb
+    ##   paperless  -> paperless + valkey (plus the CNPG paperless-pg-* pods,
+    ##                 which are not Deployments and so are seen only by the
+    ##                 pod-restart rule below)
+    ##   mirror     -> mirror-ceph
+    ## (verified pod-by-pod 2026-09-07, owner kinds included).
+    ##
+    ## ⛔ `envuassu` and `tv` are MIXED namespaces and stay opt-IN. Selecting
+    ## either wholesale would put someone else's service on a PUBLIC statuspage
+    ## component under the wrong name:
+    ##   tv       — the public SFTPGo gateway (*.files.mdapi.ch) sits beside the
+    ##              private media stack (plex, sonarr, radarr, transmission,
+    ##              tdarr, ...): thirteen internal workloads.
+    ##   envuassu — the PPE Nextcloud sits beside keycloak (component Sign-in) and
+    ##              the mail-reconciler CronJob (component Mail). Neither is a
+    ##              Deployment *today*, so only FilesPodCrashLooping below would
+    ##              actually pick them up — but naming the file workloads here too
+    ##              keeps the two rules reading identically, which is the whole
+    ##              point: an asymmetry between them is how the last rot started.
+    ## A namespace-only selector doing exactly this put a private volume on the
+    ## public page on 2026-09-07, thirty hours before this edit.
+    ##
+    ## Verified at merge: 26 -> 31 series, the five added are precisely the ones
+    ## listed above, none removed, and inside tv the selector still matches only
+    ## sftpgo. All five were healthy, so this widened coverage without adding a
+    ## single alert on day one.
+    ##
+    ## 2026-09-13: `owncloud` dropped from every selector in this file — the
+    ## ownCloud 10 stack was decommissioned after the 2026-08-17 cutover to
+    ## Nextcloud, so the namespace no longer exists and the matcher would select
+    ## nothing. The series counts above are the 2026-09-07 measurement, not
+    ## current state.
+    - alert: FilesDeploymentUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{namespace=~"nextcloud|spider3|paperless|mirror"}
+          - kube_deployment_status_replicas_available{namespace=~"nextcloud|spider3|paperless|mirror"}
+        ) > 0
+        or
+        ( kube_deployment_spec_replicas{namespace="envuassu", deployment=~"envuassu-site|nextcloud-aio-.*|postgres"}
+          - kube_deployment_status_replicas_available{namespace="envuassu", deployment=~"envuassu-site|nextcloud-aio-.*|postgres"}
+        ) > 0
+        or
+        ( kube_deployment_spec_replicas{namespace="tv", deployment="sftpgo"}
+          - kube_deployment_status_replicas_available{namespace="tv", deployment="sftpgo"}
+        ) > 0
+      for: 5m
+      labels:
+        severity: critical
+        component: Files & Documents
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: |
+          File-storage component is degraded. Affected services:
+            Nextcloud  -> cloud.mdapi.ch (household) / cloud.envuassu.ch (PPE)
+            SFTPGo     -> *.files.mdapi.ch
+            Paperless  -> documents.mdapi.ch (DMS)
+            Mirror     -> mirror.mdapi.ch (public rsync/HTTP mirror: blackarch,
+                          archstrike, ctan, gentoo-portage, gnu, slackware, tails)
+
+    ## Same namespace split as FilesDeploymentUnavailable above — read its comment
+    ## first. It matters more here: this rule reads pod restarts, so it sees EVERY
+    ## controller kind, not just Deployments. Measured 2026-09-07, selecting
+    ## envuassu wholesale would have pulled in keycloak-0/-1 (component Sign-in)
+    ## and eight mail-reconciler job pods (component Mail) and reported an outage
+    ## in either of them as "Files & Documents".
+    ##
+    ## The five wholesale namespaces gain the supporting datastores:
+    ## 29 -> 33 series (+owncloud/postgres, owncloud/redis, envuassu/postgres,
+    ## spider3/mariadb; none removed), 0 firing before and after. The CNPG
+    ## paperless-pg-* pods were already covered — the old `paperless-.*` prefix
+    ## happened to catch them, which is luck rather than intent.
+    - alert: FilesPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace=~"nextcloud|spider3|paperless|mirror"
+          }[15m]) * 60
+        ) > 0.5
+        or
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="envuassu",
+            pod=~"envuassu-site-.*|nextcloud-aio-.*|postgres-.*"
+          }[15m]) * 60
+        ) > 0.5
+        or
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="tv", pod=~"sftpgo-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Files & Documents
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} restarting"
+
+    ## ns `tv` is opt-IN for this rule. It hosts the public SFTPGo gateway
+    ## (*.files.mdapi.ch), which serves ONLY tv-v3-ceph, alongside the
+    ## media-library volumes used by sonarr/radarr/transmission/plex/tdarr.
+    ## All three rules in this file now treat tv the same way — opt in the one
+    ## public workload, never the namespace. (Until 2026-09-07 the two rules
+    ## above got there differently, by filtering on a hand list of workload
+    ## names estate-wide; that list rotted twice and was replaced by the
+    ## wholesale-plus-opt-in split documented on FilesDeploymentUnavailable.)
+    ## This rule was already the odd one out: selecting ns tv by name matched
+    ## every PVC in it, letting an internal media volume drive a PUBLIC
+    ## status-page component while every file service was healthy. Naming
+    ## the served volume explicitly means a new tv PVC defaults to
+    ## internal rather than public; the rest are covered by
+    ## MediaPVCNearlyFull below.
+    ##
+    ## max by (namespace, persistentvolumeclaim) collapses the RWX case: a
+    ## CephFS volume mounted on several nodes reports one kubelet series
+    ## PER NODE, so a single full volume raised one alert per mount.
+    - alert: FilesPVCNearlyFull
+      expr: |
+        max by (namespace, persistentvolumeclaim) (
+          kubelet_volume_stats_used_bytes{namespace=~"nextcloud|envuassu|spider3|paperless|mirror"}
+            / kubelet_volume_stats_capacity_bytes{namespace=~"nextcloud|envuassu|spider3|paperless|mirror"}
+        ) > 0.85
+        or
+        max by (namespace, persistentvolumeclaim) (
+          kubelet_volume_stats_used_bytes{namespace="tv", persistentvolumeclaim="tv-v3-ceph"}
+            / kubelet_volume_stats_capacity_bytes{namespace="tv", persistentvolumeclaim="tv-v3-ceph"}
+        ) > 0.85
+      for: 10m
+      labels:
+        severity: warning
+        component: Files & Documents
+        team: mdapi
+      annotations:
+        summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+        description: "Plan space addition or cleanup before it fills."
+
+    ## Internal counterpart of FilesPVCNearlyFull for the ns `tv` media
+    ## volumes. `Media` is in the adapter's INTERNAL_COMPONENTS, so this
+    ## still notifies and still satisfies the component taxonomy, but is
+    ## skipped for the public status page by design: media-library
+    ## capacity is operational work, not a user-visible service.
+    - alert: MediaPVCNearlyFull
+      expr: |
+        max by (namespace, persistentvolumeclaim) (
+          kubelet_volume_stats_used_bytes{namespace="tv", persistentvolumeclaim!="tv-v3-ceph"}
+            / kubelet_volume_stats_capacity_bytes{namespace="tv", persistentvolumeclaim!="tv-v3-ceph"}
+        ) > 0.85
+      for: 10m
+      labels:
+        severity: warning
+        component: Media
+        team: mdapi
+      annotations:
+        summary: "Media PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+        description: |
+          Internal media-library capacity, not a user-visible service.
+          Clean up or expand the volume. This deliberately does NOT reach
+          mdapi.statuspage.io (component: Media is internal-only).

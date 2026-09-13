@@ -1,0 +1,60 @@
+## Vendor/management-plane Deployment availability.
+##
+## Gap found 2026-07-29 (infra-health, user-approved 07-30): the Harvester
+## whereabouts-controller Deployment sat at 0/1 with ReplicaFailure
+## (priority-admission FailedCreate) for a full day and NOTHING fired — app
+## namespaces have synthetic probes and per-app alerts, but the vendor
+## planes (kube-system, cattle-*, harvester-system) had no availability
+## coverage at all.
+##
+## kube-state-metrics (cattle-monitoring-system) exports both series. The
+## 1h `for:` rides out upgrades and rollouts (a rolling restart keeps
+## available >= spec-1 only briefly); an hour below spec is stuck, which
+## per the severity policy is when warning is warranted.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: k8s-deployment-availability
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-k8s.deployment-availability
+    rules:
+    - alert: VendorPlaneDeploymentUnavailable
+    ## SCOPE WIDENED 2026-08-31 (user decision, beads infra-3rm.9). The original
+    ## list covered the Rancher and Harvester planes only, so twelve further
+    ## platform namespaces had no availability rule at all — cert-manager (which
+    ## issues every certificate in the estate), external-secrets (which populates
+    ## them), the Longhorn CSI sidecars, MetalLB, CNPG, VolSync, reloader,
+    ## horizon-issuer, gitlab-agent and the two cattle-* controllers. That is 23
+    ## more Deployments, found by f/probe/alert_coverage_check rather than by an
+    ## outage.
+    ## Several of these have FUNCTIONAL coverage already (ExternalSecretNotReady,
+    ## the Longhorn suite) but nothing that fires when the controller itself is
+    ## simply gone — and a controller that is gone stops producing the very signals
+    ## its functional alerts depend on.
+    ## Verified before widening: 0 of the 23 were below spec, and none sits at 0
+    ## replicas, so this adds coverage without adding noise on day one.
+      expr: |
+        kube_deployment_status_replicas_available{namespace=~"kube-system|cattle-system|cattle-fleet-system|cattle-fleet-local-system|harvester-system|cattle-monitoring-system|cattle-logging-system|cattle-capi-system|cattle-turtles-system|cert-manager|cert-manager-infomaniak|cnpg-system|external-secrets|longhorn-system|metallb-system|volsync-system|reloader|horizon-issuer|gitlab-agent"}
+          < kube_deployment_spec_replicas
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Internal plane — never degrade the public statuspage.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }} below spec ({{ $value }} available) for >1h"
+        description: |
+          A vendor/management-plane Deployment has been under its spec'd
+          replica count for over an hour — a rollout does not take this
+          long, so something is stuck (FailedCreate, admission rejection,
+          image pull, scheduling). Check:
+            kubectl -n {{ $labels.namespace }} describe deploy {{ $labels.deployment }}
+          Precedent: whereabouts-controller 0/1 ReplicaFailure 07-29
+          (pod template carried explicit priority: 0 vs computed 1000 —
+          fix was stripping .spec.template.spec.priority).

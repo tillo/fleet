@@ -1,0 +1,40 @@
+defaultNamespace: ciphertrust
+namespace: ciphertrust
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  # The cm VM and its restored 200Gi volume predate this bundle by ~700 days and
+  # carry no Helm ownership metadata; the first reconcile fails without this.
+  takeOwnership: true
+
+# cm is RUNNING and stays running. That matters beyond preference: Fleet reads
+# "no VMI" as unavailable, so a Halted VM holds its bundle NotReady forever and
+# latches FleetBundlesNotReady — readiness, which comparePatches cannot fix.
+# Checked before adopting (learned from ctf/kali).
+#
+# Everything KubeVirt or Harvester would otherwise generate is pinned in
+# cm-vm.yml — firmware uuid, MAC, maxSockets, architecture, machine type, node
+# affinity including the cpumanager term and the empty pod(Anti)Affinity objects,
+# and the resource requests, which are real desired state here because
+# dedicatedCpuPlacement disables the overcommit webhook. `kubectl diff` against
+# the live object is empty, so the list below is the measured remainder.
+diff:
+  comparePatches:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    name: cm
+    namespace: ciphertrust
+    jsonPointers:
+    # Serialised as an explicit null on the pod template.
+    - /spec/template/metadata/creationTimestamp
+    # Rewritten by Harvester on every edit of the VM.
+    - /metadata/annotations/harvesterhci.io~1timestamp
+    # Harvester's own record of the run strategy; controller bookkeeping.
+    - /metadata/annotations/harvesterhci.io~1vmRunStrategy
+    - /metadata/annotations/kubevirt.io~1latest-observed-api-version
+    - /metadata/annotations/kubevirt.io~1storage-observed-api-version
+    # Defensive: absent today (this VM has never been kubectl-applied), but it
+    # appears the moment anyone does and would then read as permanent drift.
+    - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration

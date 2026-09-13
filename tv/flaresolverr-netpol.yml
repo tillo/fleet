@@ -1,0 +1,174 @@
+# ENFORCING. The first real enforcement of the isolation programme (beads
+# infra-az8.4), promoted 2026-09-02 after 14h of learn mode on `learn.flaresolverr`,
+# which this policy REPLACES (that Log+Allow policy was deleted at the same time —
+# leaving both would have let its blanket Allow defeat this one).
+#
+# Derived from OBSERVED flows in the netpol_flows OpenObserve stream, not
+# hand-written. Dashboard: "NetworkPolicy — learn mode flows" on logs.mdapi.ch.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ⭐ HOW A WRONGLY-BLOCKED CALLER SHOWS UP — read this before debugging anything
+#
+# The rule order below is deliberate and gives a clean signal: ALLOWED traffic is
+# never logged (the Allow rules come first and terminate), so after enforcement
+# EVERY calico-packet line for this workload is a BLOCK. The netpol_flows stream
+# stops being a mixed feed and becomes a pure denial log.
+#
+#   a blocked caller  -> SELECT src, dpt FROM "netpol_flows" WHERE dst = '<fs pod IP>'
+#   a blocked egress  -> rows where src = '<fs pod IP>' and dst is internal
+#
+# There is one Log rule per direction, immediately before its Deny, so a drop can
+# always be answered — that was a hard requirement of infra-az8.4 (a silently
+# dropping policy gets switched off after the first mystery outage).
+#
+# ⭐ HOW TO CORRECT IT (expected: another *arr app turns out to need flaresolverr)
+#   1. read the block:  src IP -> `kubectl -n tv get pods -o wide | grep <ip>`
+#   2. add a rule to `ingress` mirroring the prowlarr one, with that app's label
+#   3. commit + push; Fleet reconciles in ~90s
+# EMERGENCY: `kubectl delete globalnetworkpolicy enforce.flaresolverr` takes
+# effect instantly but Fleet RE-CREATES it within ~90s, so it only buys a window.
+# The real revert is `git revert` + push.
+#
+# ⚠️ kubelet probes are NOT at risk here: Calico does not police
+# host->local-workload traffic without a HostEndpoint, proven by experiment
+# 2026-08-31. Watch the pod stays Ready anyway — that is the acid test.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# THE EVIDENCE THIS WAS PROMOTED ON (re-checked 06:20Z 2026-09-02, 14h of data)
+#
+# ✅ WAS BLOCKER 1 — "ingress has n=1, another *arr app might call and hasn't yet."
+#    Settled THREE independent ways, which is why it no longer blocks:
+#      • CONFIG FILES: only prowlarr references http://flaresolverr:8191/.
+#        bazarr, sonarr, radarr, autobrr and seerr have NO flaresolverr key.
+#        bazarr's config.yaml is a real 7611-byte / 347-line file and a control
+#        grep matched 47 lines, so "no match" is absence, not a broken search.
+#      • ⭐ SQLITE DATABASES: the config-file sweep above could NOT have seen a
+#        setting stored in a DB, and sonarr/radarr keep their settings in one —
+#        a real gap in the first pass. Re-checked with `strings` over
+#        sonarr.db / radarr.db / bazarr.db / prowlarr.db: prowlarr HITS in both
+#        prowlarr.db and logs.db; the other three do not, at all.
+#      • OBSERVATION: 14h of flows show exactly ONE real caller, tv/prowlarr.
+#    Prowlarr is the indexer proxy the other *arr apps go through, so this is the
+#    expected topology rather than a quiet period. ⚠️ If a NEW indexer needing
+#    FlareSolverr is added in Prowlarr later, nothing changes — prowlarr is
+#    already allowed. It is a DIFFERENT APP gaining a direct FlareSolverr setting
+#    that would break, and that shows up as a block per the recipe above.
+#
+# ⭐ WAS BLOCKER 2 — "the learn window has not gone quiet." THE GATE ITSELF WAS
+#    WRONG, and that is the more useful finding. I had said to wait for distinct
+#    DESTINATIONS to go flat. For an internet-facing renderer that never happens:
+#    55 unique destinations in 14h and still climbing, because they are rotating
+#    CDN/anycast IPs. Waiting for it would mean never shipping.
+#
+#    Since this policy does NOT allow-list addresses, address churn is
+#    IRRELEVANT. The things that must converge are the ones the rule encodes:
+#      • PORT SET — all 7 port/proto combos appeared within the first ~6 SECONDS
+#        and not one new combo in the 13h since.
+#      • INTERNAL DESTINATIONS — exactly 2 in 14h, both CoreDNS pods on 53/UDP.
+#        Nothing else internal, ever.
+#      • CALLER SET — one, prowlarr.
+#    All three are stable, so the shape below is known rather than guessed.
+#    The dashboard's promotion-gate panel has been corrected to match.
+#
+# ⚠️ STILL TRUE: enforcing this replaces `learn.flaresolverr`. Keep the Log rules
+#    (they are retained below) so a block is answerable, and watch panel 6 (data
+#    quality) plus prowlarr's own behaviour for the first indexer sync — the
+#    03:00Z nightly sync is the heaviest exercise of this path.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ⭐ THE SHAPE OF THIS POLICY IS THE INTERESTING PART, and it inverts the obvious
+# approach. Observed egress was 7 ports across ~29 rotating Cloudflare/Google
+# addresses, plus headless-Chrome noise (STUN 3478/19302, Google FCM 5228).
+# Fetching arbitrary hostile web pages IS flaresolverr's job, so an egress
+# ALLOW-LIST of addresses is both unmaintainable and pointless.
+#
+# The control worth having is the inverse: let it reach the internet, and DENY it
+# the cluster and the LAN. That is what actually contains the container holding
+# 617 of the estate's 923 fixable criticals (infra-az8.3).
+#
+# ⚠️ It reaches CoreDNS by POD IP (10.52.1.113 / 10.52.0.232), never the service
+# VIP 10.53.0.10 — so the DNS exception must be selector-based. An ipBlock on the
+# service VIP would look correct and block all name resolution.
+#
+# Order 500 keeps it alongside the learn policy. When enforcing for real, replace
+# `learn.flaresolverr` rather than running both.
+# ⛔ NAMESPACED NetworkPolicy, NOT a GlobalNetworkPolicy — and this is a trap,
+# not a preference. `fleet/tv/fleet.yaml` declares `namespace: tv`, which pins
+# every resource in the bundle to that namespace. A cluster-scoped
+# GlobalNetworkPolicy committed here is SILENTLY DROPPED: Fleet applied the
+# commit, reported the bundle 1/1 READY, and the policy simply never appeared in
+# the cluster. Nothing errored. Same family as
+# "Fleet Helm bundle ignores stray raw manifests" — a green bundle is NOT proof a
+# resource landed; check for the OBJECT.
+#
+# Calico's namespaced NetworkPolicy takes the identical rule syntax (Allow / Log /
+# Deny, order, selectors), so nothing is lost. It is also the better fit: this
+# policy governs one workload in one namespace. A GlobalNetworkPolicy would only
+# be right for a cluster-wide floor — which is what the `baseline` tier is for.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.flaresolverr
+  namespace: tv
+spec:
+  order: 500
+  # No namespaceSelector: a namespaced policy already scopes to `tv`.
+  selector: app == "flaresolverr"
+  types:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Observed: tv/prowlarr -> 8191/TCP. Selector-based, not an ipBlock: pod IPs
+    # churn on every restart and an IP rule would fail closed after a rollout.
+    - action: Allow
+      protocol: TCP
+      source:
+        # Same namespace, so a bare selector suffices in a namespaced policy.
+        selector: app == "prowlarr"
+      destination:
+        ports: [8191]
+    # ⚠️ ADD bazarr HERE if the 24h window shows it calling. Left out on purpose:
+    # writing a rule for traffic never observed defeats learn-then-enforce.
+    - action: Log
+    - action: Deny
+
+  egress:
+    # 1. DNS first. Selector-based because CoreDNS is reached by POD IP.
+    - action: Allow
+      protocol: UDP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+
+    # 2. ⭐ THE ACTUAL CONTROL: deny everything INTERNAL. Log first so a block is
+    #    answerable — a NetworkPolicy that silently drops is the failure class
+    #    this estate keeps getting bitten by.
+    - action: Log
+      destination:
+        nets:
+          - 10.52.0.0/16      # pod CIDR   (qui/quo/qua = .0/.1/.2 /24s)
+          - 10.53.0.0/16      # service CIDR
+          - 192.168.1.0/24    # LAN: nodes, TrueNAS, router, switches, iLO
+          - 169.254.169.254/32 # link-local metadata, belt and braces
+    - action: Deny
+      destination:
+        nets:
+          - 10.52.0.0/16
+          - 10.53.0.0/16
+          - 192.168.1.0/24
+          - 169.254.169.254/32
+
+    # 3. Everything else is the internet, which is the workload's purpose.
+    #    Observed ports were 80/443/3478/19302/5228; NOT pinned to that list —
+    #    a rendering engine will legitimately reach new ports, and the security
+    #    boundary here is "not inside", not "which port outside".
+    - action: Allow

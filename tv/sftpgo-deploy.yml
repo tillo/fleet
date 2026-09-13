@@ -1,0 +1,159 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sftpgo
+  namespace: tv
+  annotations:
+    reloader.stakater.com/auto: "true"
+    # Floating major-track tag (drakkan/sftpgo:v2-alpine) + keel force: a
+    # Fleet re-apply rewrites the same tag, so it cannot downgrade sftpgo.
+    keel.sh/match-tag: 'true'
+    keel.sh/policy: force
+    keel.sh/pollSchedule: "@every 4h"
+    keel.sh/trigger: poll
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sftpgo
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: sftpgo
+    spec:
+      priorityClassName: mdapi-low
+      # Pod-level k8s admission defaults — written explicitly so Fleet drift
+      # detection doesn't flag the bundle Modified after every Keel rollout.
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      initContainers:
+      - name: sftpgo-host-keys
+        ## alpine:3, not :latest — bounded to Alpine 3.x; `latest` would cross
+        ## into 4.x unattended. Same digest today (3.24.1). Keep Always: a
+        ## non-latest tag defaults to IfNotPresent, which would pin this to a
+        ## cached digest forever.
+        image: alpine:3
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        resources: {}
+        command: ["sh", "-c"]
+        args:
+        - |
+          set -e
+          apk add --no-cache openssh-keygen >/dev/null 2>&1
+          mkdir -p /data/.sftpgo
+          [ -f /data/.sftpgo/host_key_ed25519 ] || ssh-keygen -q -t ed25519     -N '' -f /data/.sftpgo/host_key_ed25519
+          [ -f /data/.sftpgo/host_key_rsa     ] || ssh-keygen -q -t rsa -b 3072 -N '' -f /data/.sftpgo/host_key_rsa
+          chown -R 1000:1000 /data/.sftpgo
+          chmod 700 /data/.sftpgo
+          chmod 600 /data/.sftpgo/host_key_*
+          chmod 644 /data/.sftpgo/host_key_*.pub
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - { mountPath: /data, name: tv-data }
+      containers:
+      - name: sftpgo
+        image: drakkan/sftpgo:v2-alpine
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        args: ["sftpgo", "serve", "--config-file", "/etc/sftpgo/sftpgo.json"]
+        env:
+        - { name: SFTPGO_DEFAULT_ADMIN_USERNAME, value: "admin" }
+        - name: SFTPGO_DEFAULT_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: sftpgo-keycloak, key: SFTPGO_DEFAULT_ADMIN_PASSWORD }
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        ports:
+        - { containerPort: 2022, name: sftp,  protocol: TCP }
+        - { containerPort: 2121, name: ftp,   protocol: TCP }
+        - { containerPort: 8080, name: web,   protocol: TCP }
+        - { containerPort: 22250, name: pasv0, protocol: TCP }
+        - { containerPort: 22251, name: pasv1, protocol: TCP }
+        - { containerPort: 22252, name: pasv2, protocol: TCP }
+        - { containerPort: 22253, name: pasv3, protocol: TCP }
+        - { containerPort: 22254, name: pasv4, protocol: TCP }
+        - { containerPort: 22255, name: pasv5, protocol: TCP }
+        - { containerPort: 22256, name: pasv6, protocol: TCP }
+        - { containerPort: 22257, name: pasv7, protocol: TCP }
+        - { containerPort: 22258, name: pasv8, protocol: TCP }
+        - { containerPort: 22259, name: pasv9, protocol: TCP }
+        resources:
+          limits:
+            memory: 256Mi
+          requests:
+            cpu: 20m
+            memory: 64Mi
+        volumeMounts:
+        - mountPath: /data
+          name: tv-data
+        - mountPath: /etc/sftpgo/sftpgo.json
+          name: sftpgo-config
+          subPath: sftpgo.json
+          readOnly: true
+        - mountPath: /usr/share/sftpgo/static/disclaimer.html
+          name: sftpgo-config
+          subPath: disclaimer.html
+          readOnly: true
+        - mountPath: /usr/share/sftpgo/static/disclaimer.css
+          name: sftpgo-config
+          subPath: disclaimer.css
+          readOnly: true
+        - mountPath: /etc/sftpgo/oidc
+          name: sftpgo-oidc-secret
+          readOnly: true
+      - name: sftpgo-auth
+        # Floating major-3 alpine tag; Keel watches digest, no explicit version pin.
+        image: python:3-alpine
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        command: ["python3", "/app/auth_server.py"]
+        env:
+        - { name: KC_ISSUER,     value: "https://idp.mdapi.ch/realms/tilloch" }
+        - { name: KC_CLIENT_ID,  value: "sftpgo" }
+        - name: KC_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef: { name: sftpgo-keycloak, key: KC_CLIENT_SECRET }
+        - { name: REQUIRED_ROLE, value: "mdapi-tv" }
+        - { name: HOME_DIR,      value: "/data" }
+        - { name: HOME_UID,      value: "1000" }
+        - { name: HOME_GID,      value: "1000" }
+        resources:
+          limits:
+            memory: 64Mi
+          requests:
+            cpu: 5m
+            memory: 16Mi
+        volumeMounts:
+        - mountPath: /app/auth_server.py
+          name: sftpgo-config
+          subPath: auth_server.py
+          readOnly: true
+      volumes:
+      - name: tv-data
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph
+      - name: sftpgo-config
+        configMap:
+          name: sftpgo-config
+          defaultMode: 420
+      - name: sftpgo-oidc-secret
+        secret:
+          secretName: sftpgo-keycloak
+          defaultMode: 420
+          items:
+          - key: KC_CLIENT_SECRET
+            path: client_secret

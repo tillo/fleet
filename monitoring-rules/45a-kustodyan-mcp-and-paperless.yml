@@ -1,0 +1,106 @@
+## The other two Kustodyan services: the hosted MCP endpoint
+## (kustodyan-mcp.mdapi.ch) and the Paperless-ngx integration
+## (paperless-kustodyan.mdapi.ch).
+##
+## Sub-series of 45 rather than a new topic: same family, same reason for existing.
+## They are SEPARATE from 45 because the alert name has to stay true — a rule called
+## `FormbricksKustodyan*` firing about a Paperless container is precisely the
+## name-no-longer-describes-the-thing confusion this estate keeps paying for.
+##
+## ⚠️ THE TRAP THAT HID THESE. `paperless-kustodyan` looks covered and is not:
+## 04-files.yml already carries `namespace=~"…|paperless|…"` for the household DMS
+## at documents.mdapi.ch. PromQL regex matchers are fully anchored — `paperless` does
+## NOT match `paperless-kustodyan` — so the familiar word in an existing selector
+## bought nothing at all. Exactly the `tv` namespace story in 39-media-internal-
+## workloads.yml: a namespace named in a selector that matches none of its workloads
+## reads as coverage to a human and is coverage to nobody.
+##
+## Both namespaces run Keel with an unattended poll, and paperless-kustodyan deploys
+## `strategy: Recreate` on a single RWO PVC — so an ordinary auto-update genuinely
+## has a window with zero replicas while Paperless runs its migrations. Hence 15m:
+## long enough that a rollout is never an alert, short enough that stuck is.
+##
+## Selected BY NAMESPACE and subtracting rather than testing `== 0`, for the reasons
+## written out in 45-formbricks-kustodyan.yml: a workload added later is born covered
+## instead of born silent, and a deliberate scale-to-zero stays quiet (0 - 0 = 0).
+## The `deployment=~".+"` / `statefulset=~".+"` matchers are load-bearing and must not
+## be tidied away — f/probe/alert_coverage_check reads these selectors to decide what
+## is covered, and a namespace-only selector would claim coverage of the OTHER kind,
+## which the expression it came from can never alert on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-kustodyan-mcp-and-paperless
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-kustodyan.services
+    rules:
+    - alert: KustodyanServiceUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{namespace=~"kustodyan-mcp|paperless-kustodyan", deployment=~".+"}
+          - kube_deployment_status_replicas_available{namespace=~"kustodyan-mcp|paperless-kustodyan", deployment=~".+"}
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replica(s) unavailable for 15m"
+        description: |
+          A Kustodyan service has been below its replica count for fifteen minutes.
+          Since 2026-09-05 both hosts also have blackbox probes
+          (46-kustodyan-probes.yml). If KustodyanEndpointUnreachable is silent, the
+          endpoint is still answering from outside and this is a partial loss — for a
+          single-replica Deployment that usually means it is mid-restart rather than
+          gone.
+
+          What is down decides who notices:
+            kustodyan-mcp/kustodyan-mcp
+                the hosted MCP endpoint at kustodyan-mcp.mdapi.ch/mcp. It is
+                bearer-gated and consumed by a partner's tooling rather than by a
+                browser, so a human is unlikely to walk into the failure — their
+                client just starts erroring.
+            paperless-kustodyan/paperless-kustodyan
+                the Paperless-ngx integration. Recreate strategy on an RWO PVC, so
+                check whether the old pod actually released the volume before
+                assuming the new one is broken.
+            paperless-kustodyan/paperless-kustodyan-valkey
+                its cache/queue. Paperless keeps serving without it but stops
+                processing documents — a quiet, partial failure.
+
+          Start with:
+            kubectl -n {{ $labels.namespace }} describe deploy {{ $labels.deployment }}
+            kubectl -n {{ $labels.namespace }} logs deploy/{{ $labels.deployment }} --tail=40
+
+          Both namespaces are on Keel with `policy: force`, so a bad upstream image
+          arrives here on its own. If the failure began without anyone deploying,
+          suspect the image before the config, and compare the running digest against
+          what the previous pod ran.
+
+    ## Matches nothing today: neither namespace has a StatefulSet. It is here for the
+    ## same reason as its twin in 45 — it is what makes the namespace-wide claim above
+    ## TRUE for both kinds. Without it the first StatefulSet added here would inherit
+    ## coverage it does not have, silently, and the coverage probe would agree.
+    - alert: KustodyanServiceStatefulSetUnavailable
+      expr: |
+        ( kube_statefulset_replicas{namespace=~"kustodyan-mcp|paperless-kustodyan", statefulset=~".+"}
+          - kube_statefulset_status_replicas_ready{namespace=~"kustodyan-mcp|paperless-kustodyan", statefulset=~".+"}
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.statefulset }}: {{ $value }} replica(s) not ready for 15m"
+        description: |
+          A StatefulSet in a Kustodyan namespace has been below its ready count for
+          fifteen minutes. Check the volume first — a StatefulSet that cannot bind or
+          attach stays unready indefinitely and presents as a scheduling problem:
+            kubectl -n {{ $labels.namespace }} describe sts {{ $labels.statefulset }}

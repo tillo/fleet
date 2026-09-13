@@ -1,0 +1,119 @@
+## Text-to-speech for Home Assistant Assist (Wyoming protocol, raw TCP 10200).
+##
+## Why this exists: both Assist pipelines ("Casa" and "Casa LLM") had
+## tts_engine: google_translate. That is the last cloud hop in an otherwise
+## on-estate voice chain -- STT is wyoming-whisper in this namespace and the
+## conversation agent is the in-cluster litellm -- so every spoken REPLY left
+## the estate to be synthesised, and every reply also depended on Google being
+## reachable at the moment someone spoke. Piper closes that.
+##
+## CPU-only inference, like whisper: piper is an ONNX vocoder, not a GPU job,
+## and a medium voice synthesises a sentence in well under a second on a
+## couple of cores.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyoming-piper
+  namespace: wyoming
+  labels:
+    app: wyoming-piper
+  ## ⛔ NO keel annotations on purpose. This image carries a PINNED tag, and a
+  ## pinned tag + Keel is the broken middle between the two lanes: Keel bumps the
+  ## live Deployment while git keeps claiming the old version, so the Fleet bundle
+  ## sits Modified forever and GitOps stops telling the truth. Measured here on
+  ## 2026-09-10: Keel took wyoming-piper 2.4.3 -> 2.5.0 at 00:06 and the bundle
+  ## went Modified(1) within hours of the bundle being created.
+  ##   Lane-A = floating tag (:latest/:stable/...) + Keel  -> cannot drift
+  ##   Lane-B = pinned tag + Renovate                      -> git stays the truth
+  ## These are Lane-B; renovate.json carries the matching rule. Same move as
+  ## joplin/server, caddy and eclipse-mosquitto before them.
+spec:
+  replicas: 1
+  ## RollingUpdate is safe here (unlike whisper): the voice cache is an
+  ## emptyDir, not a ReadWriteOnce PVC, so two pods can coexist for the few
+  ## seconds a rollout takes and nothing waits on a volume handover.
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: wyoming-piper
+  template:
+    metadata:
+      labels:
+        app: wyoming-piper
+    spec:
+      containers:
+      - name: wyoming-piper
+        image: rhasspy/wyoming-piper:2.5.2
+        ## The image ENTRYPOINT already supplies --uri, --data-dir and
+        ## --download-dir and appends these after them, so do not repeat those
+        ## here -- the same trap documented on wyoming-whisper.
+        args:
+          ## Italian on purpose: the pipelines are Italian end to end (see the
+          ## wyoming-whisper comment on why a mismatched language silently
+          ## produces confident nonsense rather than an error).
+          ##
+          ## Voice catalogue for it_IT (rhasspy/piper-voices voices.json):
+          ##   it_IT-riccardo-x_low, it_IT-paola-medium,
+          ##   it_IT-serena-medium, it_IT-serena-high
+          ## medium is the deliberate middle: x_low is audibly robotic and
+          ## high costs CPU per utterance for a difference most listeners do
+          ## not notice on a speaker across a room. Swapping voice is a
+          ## one-line change here plus a pod restart -- nothing downstream
+          ## pins the voice name.
+          - --voice
+          - it_IT-paola-medium
+        ports:
+        - name: wyoming
+          containerPort: 10200
+          protocol: TCP
+        volumeMounts:
+        - name: voices
+          mountPath: /data
+        ## Wyoming speaks a bespoke line protocol over TCP, so a socket open is
+        ## the only dependency-free liveness signal available. It is a weak
+        ## check (an accepting-but-wedged process still passes); the real
+        ## functional coverage is HA's own tts entity, not this.
+        startupProbe:
+          tcpSocket:
+            port: 10200
+          periodSeconds: 10
+          ## 5 min: first start downloads the voice (~60 MB) over the internet.
+          ## Deliberately smaller than whisper's 10 min -- that budget is sized
+          ## for a ~500 MB model, this one is not.
+          failureThreshold: 30
+        readinessProbe:
+          tcpSocket:
+            port: 10200
+          periodSeconds: 20
+        livenessProbe:
+          tcpSocket:
+            port: 10200
+          periodSeconds: 30
+          failureThreshold: 5
+        resources:
+          requests:
+            ## Nodes sit at 83-92% of allocatable memory REQUESTS, so this asks
+            ## for the resident set of one loaded medium voice and no more.
+            cpu: 100m
+            memory: 384Mi
+          limits:
+            ## Bursty like whisper: idle at ~0, then a short saturation while
+            ## one sentence is synthesised, a handful of times a day. A limit
+            ## reserves nothing, so the headroom is free while idle.
+            cpu: "2"
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+      volumes:
+      ## emptyDir, NOT a PVC -- a deliberate difference from wyoming-whisper.
+      ## The voice is ~60 MB and re-downloads in seconds, so a PVC would buy
+      ## almost nothing, and it would not be free: PVC backup coverage is
+      ## asserted over LIVE state by f/probe/pvc_backup_coverage, so a new PVC
+      ## either gets a backup it does not need or an entry in that probe's
+      ## EXEMPT list. Not creating the PVC avoids both.
+      - name: voices
+        emptyDir: {}

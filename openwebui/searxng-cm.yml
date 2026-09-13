@@ -1,0 +1,39 @@
+## SearXNG settings for the chat.mdapi.ch web-search backend.
+##
+## Deliberately tiny: `use_default_settings: true` inherits everything from the
+## image's own searx/settings.yml, and this file overrides only what must change.
+## Everything else that matters is already correct upstream and is set through
+## env in searxng-deploy.yml (secret_key via SEARXNG_SECRET, etc.) so no secret
+## ever lands in a ConfigMap.
+##
+## ⚠ THE `json` FORMAT IS THE WHOLE POINT OF THIS FILE.
+## Upstream ships `search.formats: [html]` — JSON output is OFF by default.
+## Open WebUI's client calls the instance with `format=json`
+## (retrieval/web/searxng.py), so without this override every search returns a
+## 403 and the feature looks broken for no visible reason. This is the single
+## most common way the Open WebUI ↔ SearXNG integration fails.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-config
+  namespace: openwebui
+data:
+  settings.yml: |
+    use_default_settings: true
+
+    search:
+      formats:
+        - html
+        - json
+      # Language is passed per-request by Open WebUI (SEARXNG_LANGUAGE, default
+      # "all"); safe_search 1 = moderate, applied instance-wide because this
+      # instance is family-facing.
+      safe_search: 1
+
+    server:
+      # secret_key intentionally absent — SEARXNG_SECRET (Akeyless) overrides it.
+      # limiter stays false (upstream default): the limiter needs a Valkey and
+      # exists to fend off public abuse. This instance is ClusterIP with exactly
+      # one consumer, so it would only add a dependency and a way to rate-limit
+      # ourselves.
+      image_proxy: false

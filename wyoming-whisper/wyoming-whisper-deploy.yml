@@ -1,0 +1,141 @@
+## Speech-to-text for Home Assistant Assist (Wyoming protocol, raw TCP 10300).
+##
+## Why this exists: the Assist pipeline "Casa" is Italian end to end but had
+## stt_engine: null, and with a null STT engine the companion apps do NOT send
+## audio to HA -- they fall back to the phone/watch's own recogniser, which the
+## Wear OS app launches WITHOUT RecognizerIntent.EXTRA_LANGUAGE. Android then
+## uses the device locale, so an English-locale watch transcribed Italian
+## speech as English and the it-IT agent answered "non ho capito".
+## Giving the pipeline a real stt_engine flips the apps to streaming audio, and
+## the transcription language becomes HA's (it) instead of the device's.
+##
+## CPU-only inference: no GPU in the cluster, and the Coral TPU on qui does not
+## accelerate Whisper (edgetpu runs int8 vision graphs, not encoder-decoder).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyoming-whisper
+  namespace: wyoming
+  labels:
+    app: wyoming-whisper
+  ## ⛔ NO keel annotations on purpose. This image carries a PINNED tag, and a
+  ## pinned tag + Keel is the broken middle between the two lanes: Keel bumps the
+  ## live Deployment while git keeps claiming the old version, so the Fleet bundle
+  ## sits Modified forever and GitOps stops telling the truth. Measured here on
+  ## 2026-09-10: Keel took wyoming-piper 2.4.3 -> 2.5.0 at 00:06 and the bundle
+  ## went Modified(1) within hours of the bundle being created.
+  ##   Lane-A = floating tag (:latest/:stable/...) + Keel  -> cannot drift
+  ##   Lane-B = pinned tag + Renovate                      -> git stays the truth
+  ## These are Lane-B; renovate.json carries the matching rule. Same move as
+  ## joplin/server, caddy and eclipse-mosquitto before them.
+spec:
+  replicas: 1
+  ## Recreate, NOT RollingUpdate: the model cache is a ReadWriteOnce PVC, so a
+  ## second pod would sit ContainerCreating waiting for a volume the outgoing
+  ## pod still holds, and the rollout would never converge.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wyoming-whisper
+  template:
+    metadata:
+      labels:
+        app: wyoming-whisper
+    spec:
+      containers:
+      - name: wyoming-whisper
+        image: rhasspy/wyoming-whisper:3.8.0
+        ## The image ENTRYPOINT (/usr/src/docker_run.sh in 3.7.0) already
+        ## supplies --uri, --data-dir and --device, and appends these after
+        ## them, so do not repeat those three here.
+        ## NB the published Dockerfile on master is NOT what built 3.7.0: the
+        ## real image runs from a venv at /usr/src/.venv and its entrypoint is
+        ## docker_run.sh, not run.sh. Check the image, not the repo.
+        args:
+          ## ⛔ Do NOT "optimise" this back to base-int8. It was tried and
+          ## reverted the same evening. Measured on 8 Italian phrases x 2 runs,
+          ## exact-match against what was spoken:
+          ##   base-int8  beam1  10/16  1.80s
+          ##   base-int8  beam5  12/16  2.31s
+          ##   small-int8 beam1  16/16  7.55s
+          ## The earlier "base is fine" call came from 3 phrases at n=1, which
+          ## is not a measurement. base-int8 does not fail on harmless syllables:
+          ## it fails on the exact words that carry the intent --
+          ## "accese" -> "acceze" and "spegni" -> "Spenni" -- so the sentence
+          ## transcribes almost right and then matches NOTHING. A voice
+          ## assistant that mishears the verb is not faster, it is broken.
+          ## Latency is bought below with CPU instead, where it costs only
+          ## burst headroom.
+          - --model
+          - small-int8
+          ## Default language; HA still sends the pipeline's stt_language per
+          ## request, so this only decides what an unqualified request gets.
+          - --language
+          - it
+          ## beam-size 1 = greedy. small-int8 scores 16/16 at beam 1, so the
+          ## extra beams would buy nothing here but latency.
+          - --beam-size
+          - "1"
+          ## MUST match the CPU limit below. CTranslate2 sizes its thread pool
+          ## from the HOST core count -- os.cpu_count() reports 32 inside this
+          ## cgroup -- so left alone it spawns 32 threads to contend for the few
+          ## cores it actually has.
+          - --cpu-threads
+          - "8"
+        ports:
+        - name: wyoming
+          containerPort: 10300
+          protocol: TCP
+        volumeMounts:
+        - name: models
+          mountPath: /data
+        ## Wyoming speaks a bespoke line protocol over TCP, so a socket open is
+        ## the only dependency-free liveness signal available here. It is a
+        ## weak check (an accepting-but-wedged process still passes), which is
+        ## why the real functional coverage is HA's own stt entity, not this.
+        startupProbe:
+          tcpSocket:
+            port: 10300
+          periodSeconds: 10
+          ## 10 min: first start downloads the model over the internet.
+          failureThreshold: 60
+        readinessProbe:
+          tcpSocket:
+            port: 10300
+          periodSeconds: 20
+        livenessProbe:
+          tcpSocket:
+            port: 10300
+          periodSeconds: 30
+          failureThreshold: 5
+        resources:
+          requests:
+            cpu: 200m
+            ## Nodes sit at 83-92% of allocatable MEMORY REQUESTS, so this asks
+            ## for the resident set (~900 MB: torch + the int8 weights) and no
+            ## more, while the limit leaves headroom for a long utterance.
+            memory: 1Gi
+          limits:
+            ## Bursty by nature: idle at ~0, then saturates threads for the
+            ## couple of seconds it takes to transcribe one utterance -- a
+            ## handful of times a day, never concurrently.
+            ##
+            ## Raised 4 -> 8 to buy latency WITHOUT giving up accuracy. The
+            ## earlier thread sweep (2/4/8/16 all ~8s) looked like "threads do
+            ## not help", but it was run inside the 4-CPU limit, so every
+            ## setting was capped at 4 cores of real work -- the sweep measured
+            ## the cgroup, not the thread count. A LIMIT reserves nothing (only
+            ## requests do, and that stays at 200m), so this costs the cluster
+            ## nothing while idle, which is ~all the time.
+            cpu: "8"
+            memory: 3Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: wyoming-whisper-models

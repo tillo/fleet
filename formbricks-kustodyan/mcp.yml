@@ -1,0 +1,143 @@
+# A second kustodyan-mcp instance (same image as ns kustodyan-mcp, same gate token), bound to
+# the `formbric` account so an agent can protect / unprotect with the FormbricksResponses
+# configuration. The data-model manifest below MUST mirror that live configuration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kustodyan-mcp-datamodel
+data:
+  datamodel.json: |
+    {
+      "configuration": "FormbricksResponses",
+      "defaultClassName": "ch.tillo.formbricks.Response",
+      "defaultRole": "DATA_STEWARD",
+      "roleEvidenceName": "Role",
+      "actionEvidenceName": "Action",
+      "protectAction": "Protect",
+      "unprotectAction": "Unprotect",
+      "searchAction": "Search",
+      "classes": [
+        {
+          "className": "ch.tillo.formbricks.Response",
+          "description": "Formbricks survey answers protected by the live FormbricksResponses configuration (the gateway stores them as kproto:FA_… tokens).",
+          "properties": [
+            { "propertyName": "answer", "technique": "probabilistic AES, full-fidelity on read (reversible); the gateway uses this one" },
+            { "propertyName": "answer_search", "technique": "deterministic AES (same answer → same token, reversible); equality lookups" }
+          ]
+        }
+      ],
+      "roles": [
+        { "role": "DATA_STEWARD", "summary": "Transform: protects on write and unprotects to the original answer on read." },
+        { "role": "CASE_WORKER", "summary": "Unprotect-then-mask: sees the first characters then a masked suffix." },
+        { "role": "STAFF", "summary": "Read: receives the stored token only, cannot unprotect." }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kustodyan-mcp
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kustodyan-mcp
+  template:
+    metadata:
+      labels:
+        app: kustodyan-mcp
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: kustodyan-mcp
+          image: zot.mdapi.ch/mdapi/kustodyan-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kustodyan-mcp-secrets
+                  key: MCP_BEARER_TOKEN
+            - name: KUSTODYAN_IDENTITY_URL
+              value: https://dev.kustodyan.io/api/identity
+            - name: KUSTODYAN_ENGINE_URL
+              value: https://dev.kustodyan.io/api/engine
+            - name: KUSTODYAN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: kustodyan-mcp-secrets
+                  key: KUSTODYAN_CLIENT_ID
+            - name: KUSTODYAN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kustodyan-mcp-secrets
+                  key: KUSTODYAN_CLIENT_SECRET
+            - name: KUSTODYAN_DATA_MODEL
+              value: /etc/kustodyan-mcp/datamodel.json
+          volumeMounts:
+            - name: datamodel
+              mountPath: /etc/kustodyan-mcp
+              readOnly: true
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 30
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 384Mi }
+      volumes:
+        - name: datamodel
+          configMap:
+            name: kustodyan-mcp-datamodel
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kustodyan-mcp
+spec:
+  selector:
+    app: kustodyan-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kustodyan-mcp
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [formbricks-kustodyan-mcp.mdapi.ch]
+      secretName: formbricks-kustodyan-mcp-tls
+  rules:
+    - host: formbricks-kustodyan-mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kustodyan-mcp
+                port:
+                  number: 8080

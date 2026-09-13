@@ -1,0 +1,23 @@
+## Namespace-local HTTP-01 issuer (2026-08-15, infra-ka2 S2a): the cluster
+## issuer's dns01 solver covers envuassu.ch, but a stale NXDOMAIN for the
+## _acme-challenge name was negative-cached by one of cert-manager's blessed
+## recursive resolvers under the zone's old SOA minimum (38400s — fixed to
+## 600 the same night). HTTP-01 through the ingress sidesteps resolver
+## caches entirely; usable for any envuassu.ch host that fronts the public
+## web IP. The cluster issuer's http01 solver is scoped to home.tillo.ch
+## only, hence this local one.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-http01
+  namespace: envuassu
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: tillo@tillo.ch
+    privateKeySecretRef:
+      name: letsencrypt-http01-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bazarr
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: bazarr
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: bazarr
+    spec:
+      priorityClassName: mdapi-low
+      containers:
+      - name: bazarr
+        image: lscr.io/linuxserver/bazarr:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 6767
+        # Initial seed only — VPA Auto (vpa-objects/vpa-auto.yaml)
+        # right-sizes per usage. 2 GiB headroom; previous 400Mi cap was
+        # at 78 % steady-state, next OOM candidate after radarr.
+        resources:
+          requests:
+            cpu: 25m
+            memory: 250Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        volumeMounts:
+        - name: bazarr-config
+          mountPath: /config
+        - name: tv
+          mountPath: /tv
+      volumes:
+      - name: bazarr-config
+        persistentVolumeClaim:
+          claimName: bazarr-config
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph

@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tabby
+  namespace: tabby
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine DetectionOnly
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      # Code-completion payloads are raw source code — SQLi/XSS CRS rules
+      # would false-positive constantly, so this host stays DetectionOnly
+      # (audit visibility without blocking). API is token-authenticated.
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tabby.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: tabby
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - tabby.mdapi.ch
+      secretName: tabby-cert

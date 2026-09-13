@@ -1,0 +1,61 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spider3
+  namespace: spider3
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      # SecAction id:900200 BEFORE Include — ModSec keeps first registration
+      # of a duplicate ID so CRS crs-setup.conf id:900200 is dropped and
+      # rule 911100 reads our expanded methods list. No apostrophes anywhere.
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: spider3.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spider3
+                port:
+                  number: 80
+    - host: www.spider3.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spider3
+                port:
+                  number: 80
+    - host: dev.spider3.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spider3
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - spider3.ch
+        - www.spider3.ch
+        - dev.spider3.ch
+      secretName: spider3-cert

@@ -1,0 +1,21 @@
+## S2a (infra-ka2, 2026-08-15): apache behind the ingress. The chart's
+## 11000/tcp+udp QUIC twin shares mergeKey `port`, and every wholesale
+## replace attempt (JSON6902, SMP $patch: replace) rendered empty/UDP-only
+## ports — so we sidestep the collision: ADD a TCP service port on 11001
+## targeting the container's 11000; the chart's UDP twin stays (harmless,
+## same shape as the working family instance). Ingress points at 11001.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nextcloud-aio-apache
+  namespace: envuassu
+spec:
+  type: ClusterIP
+  loadBalancerClass: null
+  externalTrafficPolicy: null
+  loadBalancerIP: null
+  ports:
+    - name: http
+      port: 11001
+      protocol: TCP
+      targetPort: 11000

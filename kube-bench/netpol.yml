@@ -1,0 +1,68 @@
+# Deny-by-default fence for the kube-bench namespace.
+#
+# This workload is privileged and mounts the host filesystem, which makes it the
+# kind of namespace a NetworkPolicy is most worth writing for: if it is ever
+# compromised, the blast radius should not include the rest of the cluster.
+# Note the limit honestly — NetworkPolicy does not police a hostPID/privileged
+# pod's access to the node itself, only its pod-network traffic.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: kube-bench
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: kube-bench
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-pushgateway
+  namespace: kube-bench
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - {protocol: TCP, port: 9091}
+---
+# The benchmark's automated section-5 checks read policy objects from the API.
+# Egress is evaluated AFTER the ClusterIP is DNAT'd, so the destination that
+# has to be allowed is the node address, not 10.53.0.1 — a mismatch that makes
+# an apiserver egress rule look correct while silently dropping every call.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-apiserver
+  namespace: kube-bench
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: {cidr: 192.168.1.190/32}
+        - ipBlock: {cidr: 192.168.1.192/32}
+        - ipBlock: {cidr: 192.168.1.193/32}
+      ports:
+        - {protocol: TCP, port: 6443}

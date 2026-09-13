@@ -1,0 +1,165 @@
+# OpenObserve AI assistant — the "o2-sre-agent" service (added 2026-09-01).
+#
+# WHY A SEPARATE DEPLOYMENT: setting O2_AI_ENABLED on OpenObserve is NOT enough.
+# The chat endpoint (/api/<org>/ai/chat) only proxies; it answers
+#   400 "AI agent URL is not set"  /  "Agent service not configured"
+# until O2_AGENT_URL points at this service. The agent is what actually runs the
+# model loop — it embeds `opencode` and bootstraps its own agents, skills and
+# tools at startup ("Bootstrapped 4 opencode agent file(s)", 8 skills, 6 tools).
+#
+# MODEL ROUTING: the agent talks to the estate's litellm gateway as a generic
+# OpenAI-compatible endpoint — verified from its own startup log:
+#   "Configured OpenCode provider o2-ai-gateway -> http://litellm...:4000/v1
+#    (model=ds-flash)"
+# It appends /v1 itself, so O2_AI_GATEWAY_URL must NOT include it. This settles
+# the long-open question of whether O2_AI_GATEWAY_URL accepts a generic
+# OpenAI-compatible endpoint rather than only OpenObserve's own gateway: it does.
+#
+# ⚠️ PORT IS 8000, NOT 8080. O2_SRE_PORT is documented but did NOT take effect —
+# the process listened on 8000 regardless, which cost a debugging round when
+# OpenObserve reported a connection error to :8080. Checked with a port scan
+# rather than trusted from the variable. If you change the port, VERIFY it.
+#
+# ⚠️ NOT FAST. A one-line answer takes ~30 s, while the model itself answers in
+# ~1.5 s direct through litellm. Essentially all of it is the agent's own
+# reasoning/tool loop — this is an agentic assistant, not a chat completion, so
+# treat the latency as inherent rather than as a fault to chase. Swapping the
+# model will NOT fix it: the model is a few percent of the wall clock.
+#
+# The litellm credential lives ONLY here, never on the OpenObserve StatefulSet:
+# verified that ai_enabled flips true and chat works with O2_AI_ENABLED +
+# O2_AGENT_URL alone on OpenObserve, so the log store never holds an LLM key.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: o2-sre-agent
+  namespace: openobserve
+  labels:
+    app: o2-sre-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: o2-sre-agent
+  template:
+    metadata:
+      labels:
+        app: o2-sre-agent
+    spec:
+      containers:
+      - name: agent
+        # Pinned by digest, matching the OpenObserve EE version (v0.92.0).
+        # ⚠️ Resolve the amd64 digest from the multi-arch INDEX, not by hashing
+        # the manifest response: a hand-computed hash was rejected by containerd
+        # as a blob reference ("401 Unauthorized" on a /blobs/ HEAD).
+        image: public.ecr.aws/zinclabs/o2-sre-agent@sha256:030427ac72937bf17aee2cef2dbcc22342d10a41c1a6d9168a6ef8a0932552a7
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+        env:
+        - name: O2_SRE_HOST
+          value: "0.0.0.0"
+        - name: O2_SRE_LOG_LEVEL
+          value: "info"
+        # Generic OpenAI-compatible provider pointed at litellm. The model is a
+        # litellm ROUTE name, not a vendor model id — change it here to re-point
+        # (the key below is scoped to infra / local-wg / opus / ds-flash /
+        # ds-pro / local-only, so those need no new credential; anything else
+        # requires updating the litellm key's model list too).
+        #
+        # `infra` = the estate's standard local-first door (user decision
+        # 2026-09-01). litellm resolves it as:
+        #     infra -> local-wg -> opus     (wired LM Studio, then WireGuard,
+        #                                    then Anthropic via claude-shim)
+        # so log content stays on mbp-mda unless the local model is unreachable.
+        #
+        # ⚠️ VERIFY THIS AT THE WIRE, NEVER FROM THE MODEL NAME. CLAUDE.md
+        # records that `auto`/`infra` once 400'd deterministically on its local
+        # hop because a tool schema contained `\d`, which llama.cpp's
+        # JSON-schema→GBNF converter rejects — every call then fell through to
+        # Anthropic, turning the door into `opus` with extra steps. That is a
+        # fail-OPEN privacy change and it is SILENT. Checked 2026-09-01 with a
+        # real tool-carrying request; response headers said:
+        #     x-litellm-model-api-base: http://mbp-mda.home.tillo.ch:1234/v1
+        #     x-litellm-attempted-fallbacks: 0
+        #     finish_reason: tool_calls
+        # i.e. served locally WITH working tool calls. Re-check those headers
+        # after any change to the agent's tools or the local model.
+        #
+        # ⚠️ BUT "local-first" is not "local-only", and the gap is COLD START,
+        # not the `\d` bug. Measured 2026-09-01: the FIRST request after this
+        # agent rolled onto `infra` took 43 s and DID register cloud spend
+        # (+$0.00176 on the key); every request afterwards was 2-3 s at exactly
+        # zero cost, and the identical prompt did not reproduce it. Mechanism is
+        # in litellm's own config: the `infra` group sets NO request_timeout, so
+        # it inherits the 20 s global fail-fast, while that same file records a
+        # cold GGUF prefill at ~400 s. So whenever the local model has gone cold,
+        # the first query — CONTENT AND ALL — is answered by Anthropic.
+        #   * cost is negligible; the PRIVACY exposure is the point
+        #   * verified that local calls cost exactly 0, so key spend is a
+        #     trustworthy cloud-leak detector: watch it, don't infer from latency
+        #   * NOT changed here: adding request_timeout to `infra` would alter a
+        #     door shared with ccx/dsx, which is the user's call, not a
+        #     side effect of wiring up OpenObserve. `local-only` is the
+        #     fail-closed alternative (900 s timeout, no cloud tail) if the
+        #     assistant should never reach cloud.
+        - name: O2_AI_PROVIDER
+          value: "openai"
+        - name: O2_AI_MODEL
+          value: "infra"
+        - name: O2_AI_GATEWAY_ENABLED
+          value: "true"
+        - name: O2_AI_GATEWAY_URL
+          value: "http://litellm.litellm.svc.cluster.local:4000"
+        # Where the agent calls BACK into OpenObserve for tool use (running
+        # queries, reading streams). Must be the Service, not a pod IP — a stale
+        # pod IP here leaves the agent retrying a dead endpoint on every request.
+        - name: O2_TOOL_API_URL
+          value: "http://openobserve.openobserve.svc.cluster.local:5080"
+        - name: O2_AI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openobserve-ai
+              key: O2_AI_API_KEY
+        # Measured 865Mi resident after a handful of chats (opencode is a node
+        # subprocess). Requested at 1Gi deliberately: OpenObserve's own 512Mi
+        # request against ~1.2Gi actual already distorts scheduling on these
+        # nodes, and repeating that mistake here is not worth the paper saving.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: o2-sre-agent
+  namespace: openobserve
+  labels:
+    app: o2-sre-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: o2-sre-agent
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http

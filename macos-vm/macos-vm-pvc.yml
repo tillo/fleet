@@ -1,0 +1,33 @@
+## The macOS system disk: an 80G sparse qcow2 plus the persisted recovery image.
+##
+## ⚠️ This claim already exists and is adopted here rather than created. Every
+## field is copied from the live object on purpose -- a PVC spec is effectively
+## immutable, so changing the size, class or access mode here resizes nothing
+## and only makes the apply fail.
+##
+## ⛔ Do not shrink it. 96Gi lets the sparse image grow to its full 80G without
+## running out of room underneath the guest; the upstream default image size
+## over-promises against any smaller volume and fails later, once in use.
+##
+## Backed up off-site by the ReplicationSource in volsync-backup.yml (restic to
+## the swept Garage ceph-backup bucket). It is deliberately NOT in
+## f/probe/pvc_backup_coverage's EXEMPT list: the contents are not reproducible
+## from this repo, so they need a real backup rather than an exemption.
+##
+## Its PV was also changed Delete -> Retain on 2026-09-09, so deleting the claim
+## strands a Released volume instead of destroying the disk. The reclaim policy
+## lives on the dynamically-provisioned PV rather than in this file, so Fleet
+## will not restore it: set it again by hand if the claim is ever rebuilt.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: macos-disk
+  namespace: macos-vm
+spec:
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 96Gi

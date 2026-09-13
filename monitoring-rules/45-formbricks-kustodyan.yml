@@ -1,0 +1,119 @@
+## Formbricks protected by Kustodyan — the partnership showcase
+## (formbricks-kustodyan.mdapi.ch + formbricks-kustodyan-mcp.mdapi.ch).
+##
+## WHY THIS FILE EXISTS. The namespace went live and all SEVEN of its Deployments
+## arrived with no availability coverage at all — tier `none`, meaning not even a
+## blackbox probe reaches them. f/probe/alert_coverage_check found it the morning
+## after (WorkloadLostAlertCoverage, 2026-09-04), which is the mechanism working:
+## the gap was reported by the guard rather than by a visitor finding the demo
+## dead. It is the THIRD app to be born uncovered after bussola and tenant-1 —
+## which is what finally bought the higher-leverage fix named in 43-bussola.yml:
+## since 2026-09-05 the `fleet-bundle-new` skill carries the coverage rule in its
+## standard file set and in the same commit as the bundle, so a fourth one should
+## not happen by omission. The daily coverage probe stays as the safety net.
+##
+## ⭐ SELECTED BY NAMESPACE, NOT BY NAME. Every gap 40-alert-coverage.yml exists to
+## catch was a selector that pinned a name and the name moved. There is no subset
+## of this namespace we would want unwatched, so the honest selector is "everything
+## here": an eighth workload is then born covered instead of born silent.
+##
+## ⚠️ The `deployment=~".+"` / `statefulset=~".+"` matchers look redundant and are
+## not — do not tidy them away. The coverage probe reads these selectors to decide
+## what is covered, and it treats a namespace-only selector as covering BOTH kinds
+## (see selector_matches() in f/probe/alert_coverage_check.py). Without them the
+## Deployment rule below would silently claim coverage of a future StatefulSet that
+## kube_deployment_* series cannot describe — which is exactly the envuassu-Keycloak
+## class of false coverage this estate has already been bitten by twice. With them,
+## each rule claims precisely the kind it can actually fire on.
+##
+## Both arms subtract rather than testing `== 0`, so a deliberate scale-to-zero is
+## silent (0 - 0 = 0) while a workload that lost its replicas is not.
+##
+## `statuspage: exclude` is deliberate. This is a demonstration environment — six
+## shared demo accounts behind one vault password — not a household or customer
+## service, and the public page has already been yellow for four hours on internal
+## noise once (2026-09-03). Drop the label if the showcase should be publicly
+## claimed; that is a one-line decision about what strangers see, not a monitoring
+## change.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-formbricks-kustodyan
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-formbricks-kustodyan.workload
+    rules:
+    ## 15m rather than 5: `formbricks` and `formbricks-postgres` both deploy with
+    ## strategy Recreate, so every ordinary rollout has a genuine gap where the old
+    ## pod is gone and the new one is still running migrations. A quarter of an hour
+    ## below spec means stuck, not deploying.
+    - alert: FormbricksKustodyanWorkloadUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{namespace="formbricks-kustodyan", deployment=~".+"}
+          - kube_deployment_status_replicas_available{namespace="formbricks-kustodyan", deployment=~".+"}
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "formbricks-kustodyan/{{ $labels.deployment }}: {{ $value }} replica(s) unavailable for 15m"
+        description: |
+          A workload of the Kustodyan showcase has been below its replica count for
+          fifteen minutes. Since 2026-09-05 both hosts also have blackbox probes
+          (46-kustodyan-probes.yml), so check whether KustodyanEndpointUnreachable is
+          firing too: if it is NOT, the outside view is still fine and the fault is
+          contained to this one workload — which is the common case for everything
+          below except `formbricks` itself.
+
+          Which one is down decides what a visitor sees:
+            formbricks           the survey app itself; the site is down
+            formbricks-gateway   the Kustodyan gateway that de-tokenises answers on
+                                 the way to the browser. The app stays up and keeps
+                                 serving, but every protected answer reads as a raw
+                                 `kproto:` token — the demo silently shows the wrong
+                                 thing rather than an error. This is the failure
+                                 mode a synthetic probe would NOT catch.
+            formbricks-postgres  the store; app up, nothing loads
+            formbricks-valkey    cache/queue
+            formbricks-hub       role assignment UI (/kustodyan)
+            formbricks-cube      the semantic layer
+            kustodyan-mcp        the MCP endpoint on the -mcp host, not the web demo
+
+          Start with:
+            kubectl -n formbricks-kustodyan describe deploy {{ $labels.deployment }}
+            kubectl -n formbricks-kustodyan logs deploy/{{ $labels.deployment }} --tail=40
+
+          Known precedent: image pulls here have raced the zot pull-secret before —
+          a first `no basic auth credentials` event is that race, not a broken
+          credential (memory zot_not_docker_hub_pull_through_2026_09_03).
+
+    ## No StatefulSet exists in this namespace today. This rule is not speculative
+    ## bookkeeping: it is what makes the namespace-wide claim above TRUE for both
+    ## kinds. Delete it and the next StatefulSet added here inherits coverage it does
+    ## not have, invisibly — the coverage probe would report it covered and no alert
+    ## could ever fire for it. It costs nothing while it matches nothing.
+    - alert: FormbricksKustodyanStatefulSetUnavailable
+      expr: |
+        ( kube_statefulset_replicas{namespace="formbricks-kustodyan", statefulset=~".+"}
+          - kube_statefulset_status_replicas_ready{namespace="formbricks-kustodyan", statefulset=~".+"}
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "formbricks-kustodyan/{{ $labels.statefulset }}: {{ $value }} replica(s) not ready for 15m"
+        description: |
+          A StatefulSet in the Kustodyan showcase namespace has been below its ready
+          count for fifteen minutes. Check the PVC first — a StatefulSet that cannot
+          bind or attach its volume stays unready indefinitely and looks like a
+          scheduling problem:
+            kubectl -n formbricks-kustodyan describe sts {{ $labels.statefulset }}

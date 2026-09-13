@@ -1,0 +1,48 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: joplin
+  namespace: joplin
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine DetectionOnly
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      # Joplin REST API uses PUT/PATCH/DELETE on /api/items, /api/locks, etc.
+      # SecRuleEngine is DetectionOnly so blocking is not active right now, but
+      # the audit log scoring includes 911100 against the CRS-default
+      # GET/HEAD/POST/OPTIONS list — set the explicit list so the score stays
+      # accurate, and so flipping to SecRuleEngine On later does not break the
+      # Joplin MCP sync. No apostrophes anywhere — see docs warning.
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # Joplin sync uploads note bodies and resource attachments as
+      # application/octet-stream. Extend the CRS default content-type list
+      # so rule 920420 stops firing on legitimate sync traffic. CRS init
+      # (rule 901160) only sets the default when the variable is unset,
+      # so a phase:1 SecAction before the Include wins.
+      SecAction "id:900201,phase:1,nolog,pass,t:none,setvar:tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/reports+json| |application/csp-report| |application/octet-stream|"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: notes.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: joplin
+                port:
+                  number: 22300
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - notes.mdapi.ch
+      secretName: joplin-cert

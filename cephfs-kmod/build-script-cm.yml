@@ -1,0 +1,123 @@
+# Build/load script for the CephFS kernel module (ceph.ko).
+# The SUSE Linux Micro 6.2 kernel ships CONFIG_CEPH_FS=n (only libceph+rbd built), so
+# the CephFS *kernel* client has no module. This builds ceph.ko from the matching SUSE
+# kernel source against the EXACT running kernel and loads it. Auto-rebuilds when the
+# kernel changes (vermagic check). Pattern mirrors the FusionIO iomemory loader.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cephfs-kmod-build-script
+  namespace: cephfs-kmod
+data:
+  build.sh: |
+    #!/bin/bash
+    set -uo pipefail
+    KVER="$(uname -r)"                          # shared host kernel (e.g. 6.12.0-160000.28-default)
+    DEST=/host-usrlocal/lib/ceph-kmod           # persisted on COS_PERSISTENT (/usr/local)
+    KO="$DEST/ceph.ko"
+    HOSTRPM=/host/usr/lib/sysimage/rpm
+    LEAP=https://download.opensuse.org/distribution/leap/16.0/repo/oss/
+    log(){ echo "[cephfs-kmod $(date -u +%T)] $*"; }
+
+    # Read the module's vermagic WITHOUT modinfo. modinfo ships in the `kmod` package,
+    # which is NOT present in the base opensuse/leap image and only appears AFTER build()
+    # installs it. Using modinfo here made this check fail on every fresh pod, so a full
+    # ~50 min rebuild of a byte-identical ceph.ko ran after EVERY node reboot even though
+    # the module was already persisted on /usr/local (found + fixed 2026-07-29).
+    ko_vermagic(){ grep -aoP 'vermagic=\K[^[:space:]]+' "$1" 2>/dev/null | head -1; }
+    ko_current(){ [ -f "$KO" ] && [ "$(ko_vermagic "$KO")" = "$KVER" ]; }
+
+    # ---- cross-node module cache -------------------------------------------------
+    # A compiled ceph.ko is identical on every node running the same kernel, yet each node
+    # used to compile its own (~50 min each) after a kernel upgrade. Share it through a
+    # Secret keyed by kernel version: the first node to build publishes, the rest fetch in
+    # seconds. Entirely BEST-EFFORT -- every failure path falls through to a local build,
+    # so this can never make the boot-critical path worse. gzip'd module ~340 KB, well
+    # inside the 1 MiB Secret limit (measured 2026-07-29).
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    CACHE_SECRET="cephfs-kmod-${KVER}"
+    kapi(){ # $1=method $2=path [$3=body]
+      [ -r "$SA/token" ] || return 1
+      curl -sS --max-time 60 --cacert "$SA/ca.crt" \
+        -H "Authorization: Bearer $(cat "$SA/token")" \
+        -H 'Content-Type: application/json' -X "$1" \
+        ${3:+--data-binary @"$3"} \
+        "https://kubernetes.default.svc/api/v1/namespaces/cephfs-kmod/secrets$2?pretty=false"
+    }
+    cache_fetch(){
+      local body b64
+      body="$(kapi GET "/$CACHE_SECRET" 2>/dev/null)" || return 1
+      case "$body" in *'"code": 404'*|*'"code":404'*) return 1;; esac
+      # NB: the API pretty-prints by default -> allow optional whitespace after the colon.
+      b64="$(printf '%s' "$body" | grep -o '"ceph.ko.gz":[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)"
+      [ -n "$b64" ] || return 1
+      mkdir -p "$DEST"
+      printf '%s' "$b64" | base64 -d 2>/dev/null | gzip -dc > "$KO.tmp" 2>/dev/null || { rm -f "$KO.tmp"; return 1; }
+      # never trust the cache blindly -- it must match the running kernel exactly
+      [ "$(ko_vermagic "$KO.tmp")" = "$KVER" ] || { rm -f "$KO.tmp"; return 1; }
+      mv "$KO.tmp" "$KO"; log "fetched ceph.ko from cluster cache ($CACHE_SECRET)"
+    }
+    cache_publish(){
+      local b64 f=/tmp/cache.json
+      b64="$(gzip -9 -c "$KO" | base64 -w0)" || return 1
+      printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s"},"data":{"ceph.ko.gz":"%s"}}' \
+        "$CACHE_SECRET" "$b64" > "$f"
+      if kapi POST "" "$f" | grep -q '"kind": *"Secret"\|"kind":"Secret"'; then
+        log "published ceph.ko to cluster cache ($CACHE_SECRET)"
+      else
+        kapi PUT "/$CACHE_SECRET" "$f" >/dev/null 2>&1 && log "updated cluster cache ($CACHE_SECRET)"
+      fi
+      rm -f "$f"
+    }
+
+    build(){
+      local KPKG KSRC KOBJ
+      KPKG="$(rpm --dbpath "$HOSTRPM" -q --qf '%{VERSION}-%{RELEASE}' kernel-default 2>/dev/null | head -1)"
+      [ -n "$KPKG" ] || { log "FATAL: cannot read host kernel-default version"; return 1; }
+      log "building ceph.ko for kernel $KVER (source pkg $KPKG)"
+      # Only the GA OSS repo is needed (kernel-source/syms/devel @ .28.1 all live there).
+      zypper --non-interactive ar -fG "$LEAP" leap-oss 2>/dev/null || true
+      zypper --non-interactive --gpg-auto-import-keys refresh leap-oss >/dev/null 2>&1 || true
+      # zypper may exit non-zero on benign repo warnings even when packages install fine,
+      # so do NOT gate on its exit code — verify the build tree exists instead.
+      zypper --non-interactive in -y --no-recommends \
+        gcc make kmod tar xz zstd flex bison ncurses-devel libopenssl-devel bc perl libelf-devel \
+        "kernel-source=${KPKG}" "kernel-syms=${KPKG}" "kernel-default-devel=${KPKG}" || true
+      KSRC="/usr/src/linux-${KPKG%.*}"          # strip trailing .N -> /usr/src/linux-6.12.0-160000.28
+      KOBJ=/usr/src/linux-obj/x86_64/default
+      [ -d "$KSRC" ] || KSRC="$(ls -d /usr/src/linux-*-[0-9]* 2>/dev/null | grep -v obj | head -1)"
+      [ -d "$KSRC/fs/ceph" ] && [ -f "$KOBJ/.config" ] || { log "FATAL: kernel build tree not installed (pkg ${KPKG})"; return 1; }
+      "$KSRC/scripts/config" --file "$KOBJ/.config" -m CEPH_FS
+      make -s -C "$KOBJ" olddefconfig
+      make -s -C "$KOBJ" modules_prepare || true   # btf host-tool may fail; autoconf.h is what we need
+      make -j"$(nproc)" -C "$KOBJ" M="$KSRC/fs/ceph" CONFIG_DEBUG_INFO_BTF_MODULES=n modules || {
+          log "FATAL: module build failed"; return 1; }
+      [ -f "$KSRC/fs/ceph/ceph.ko" ] || { log "FATAL: ceph.ko not produced"; return 1; }
+      strip --strip-debug "$KSRC/fs/ceph/ceph.ko"
+      mkdir -p "$DEST"
+      install -m0644 "$KSRC/fs/ceph/ceph.ko" "$KO"
+      [ "$(ko_vermagic "$KO")" = "$KVER" ] || { log "FATAL: built vermagic mismatch"; return 1; }
+      log "installed $KO ($(stat -c%s "$KO") bytes)"
+    }
+
+    # nsenter into PID1 namespaces so modprobe/insmod use the HOST modules + kernel
+    h(){ nsenter -t 1 -m -u -i -n -p -- "$@"; }
+    load(){
+      if h lsmod | awk '{print $1}' | grep -qx ceph; then log "ceph already loaded"; return 0; fi
+      h modprobe libceph 2>/dev/null || true
+      h modprobe netfs   2>/dev/null || true
+      if h insmod /usr/local/lib/ceph-kmod/ceph.ko; then log "ceph.ko loaded"; else log "ERROR: insmod failed"; return 1; fi
+    }
+
+    if ko_current; then
+      log "ceph.ko already current for $KVER"
+    elif cache_fetch 2>/dev/null && ko_current; then
+      log "using cached ceph.ko (skipped local build)"
+    else
+      build || exit 1
+      cache_publish 2>/dev/null || log "cache publish skipped (non-fatal)"
+    fi
+    load || exit 1
+    h grep -qw ceph /proc/filesystems && log "cephfs registered; OK"
+    log "done; idling (re-checks on pod restart / kernel change)"
+    sleep infinity

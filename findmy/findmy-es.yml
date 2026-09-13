@@ -1,0 +1,79 @@
+## The persisted Apple session, seeded from the secret store on first run.
+##
+## ⭐ This is what makes the collector unattended. Apple offers no app-specific
+## password and no TOTP for Apple IDs, so the login is interactive EXACTLY once
+## (SMS or a trusted device); everything afterwards reuses this session. Losing
+## it costs a human round trip for a 2FA code, which is why it lives in the
+## secret store rather than only on a volume.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: findmy-account
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: findmy-account
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## Mounted as a file: findmy loads the session from a path, not an env.
+        account.json: "{{ .session }}"
+        ## Accessory keys imported from OpenTagViewer exports, as one JSON
+        ## object of {filename: contents}. It rides in THIS secret rather than
+        ## its own so it lands in the already-mounted /secrets directory and
+        ## needs no change to the Deployment.
+        ##
+        ## ⭐ This is what makes the collector self-recovering. Without it the
+        ## only copy of these keys is the state volume, and some of them belong
+        ## to another person's Apple account and cannot be re-exported from our
+        ## Mac at all -- losing the volume would mean asking her to run the
+        ## exporter again.
+        imported.json: "{{ .accessories }}"
+        ## The session as the collector last refreshed it, pushed back by the
+        ## PushSecret. Preferred over account.json above, which is the original
+        ## human-managed copy and only ages. Kept as a SEPARATE file so the
+        ## break-glass copy stays readable if this one is ever bad.
+        account-current.json: "{{ .sessionCurrent }}"
+  data:
+    - remoteRef:
+        key: /mdapi/findmy/icloud/ACCOUNT_SESSION
+      secretKey: session
+    ## ⚠️ PushSecret stores a value as JSON keyed by the source secret's key, so
+    ## this MUST be read with `property` -- without it you get the wrapper
+    ## `{"account.json": "..."}` rather than the session, and seeding a fresh
+    ## volume would produce an unusable account file.
+    - remoteRef:
+        key: /mdapi/findmy/icloud/SESSION_CURRENT
+        property: account.json
+      secretKey: sessionCurrent
+    - remoteRef:
+        key: /mdapi/findmy/accessories/BUNDLE
+      secretKey: accessories
+---
+## Guest SSH credential for the macOS VM. Needed every cycle: the accessory keys
+## are re-exported from the Mac each run so a newly enrolled tag is picked up
+## without anyone editing anything.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: findmy-mac
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: findmy-mac
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        MAC_PASS: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/findmy/mac/SSH_PASSWORD
+      secretKey: password

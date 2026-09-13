@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: radarr
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: radarr
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: radarr
+    spec:
+      priorityClassName: mdapi-low
+      containers:
+      - name: radarr
+        image: lscr.io/linuxserver/radarr:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 7878
+        # Initial seed only — VPA Auto (vpa-objects/vpa-auto.yaml)
+        # right-sizes per usage. 2 GiB is generous above the observed
+        # 600 MiB OOM cliff; first-replay safety after the 2026-06-04
+        # OOM loop that prompted the move from VPA Off → Auto.
+        resources:
+          requests:
+            cpu: 25m
+            memory: 400Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        volumeMounts:
+        - name: radarr-config
+          mountPath: /config
+        - name: tv
+          mountPath: /downloads/complete
+          subPath: Torrents/Finish
+
+        ## Phase-2 split: tv-finish-{film,serie} sub-mounts shadow
+
+        ## /downloads/complete/Film and /Serie inside the tv subPath.
+
+        - name: tv-finish-film
+
+          mountPath: /downloads/complete/Film
+
+        - name: tv-finish-serie
+
+          mountPath: /downloads/complete/Serie
+        - name: tv
+          mountPath: /downloads/incomplete
+          subPath: Torrents/Temp
+        - name: tv
+          mountPath: /tv
+      volumes:
+      - name: radarr-config
+        persistentVolumeClaim:
+          claimName: radarr-config
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph
+
+      - name: tv-finish-film
+
+        persistentVolumeClaim:
+
+          claimName: tv-finish-film-ceph
+
+      - name: tv-finish-serie
+
+        persistentVolumeClaim:
+
+          claimName: tv-finish-serie-ceph

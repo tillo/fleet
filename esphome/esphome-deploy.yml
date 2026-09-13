@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esphome
+  namespace: esphome
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: esphome
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: esphome
+    spec:
+      dnsConfig:
+        nameservers:
+          - 192.168.1.1
+      dnsPolicy: None
+      containers:
+      - name: esphome
+        image: esphome/esphome:latest
+        ports:
+        - containerPort: 6052
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: ESPHOME_DASHBOARD_USE_PING
+          value: 'true'
+        envFrom:
+          - secretRef:
+              name: esphome-env-secret
+        volumeMounts:
+        - name: esphome-config
+          mountPath: /config
+        - name: esphome-secrets
+          mountPath: /config/secrets.yaml
+          subPath: secrets.yaml
+      volumes:
+      - name: esphome-config
+        persistentVolumeClaim:
+          claimName: esphome-config-ceph
+      - name: esphome-secrets
+        secret:
+          secretName: esphome-secrets

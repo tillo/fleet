@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-expose
+  namespace: kube-system
+  annotations:
+    # Static IP for kube-vip. NOT the bootstrap pattern — that uses
+    # loadbalancerIPs=0.0.0.0 + hwaddr to trigger DHCP-mode allocation
+    # (per harvester-system/vip ConfigMap which has mode: dhcp).
+    # We don't have a DHCP server reachable from this kube-vip with the
+    # bootstrap MAC registered, so DHCP mode times out. Use static IP.
+    kube-vip.io/ignore-service-security: "true"
+    kube-vip.io/loadbalancerIPs: "192.168.1.191"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.191
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: rke2-ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+    - {name: https, port: 443, targetPort: 443, protocol: TCP}
+    - {name: http,  port: 80,  targetPort: 80,  protocol: TCP}

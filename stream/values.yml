@@ -1,0 +1,403 @@
+# EverTrust Stream — PKI/CA backend, eval on mdapi-prod. Mirrors the horizon bundle.
+global:
+  imagePullSecrets:
+    - evertrust-registry
+
+# 2 replicas: ONE Pekko cluster (same release) -> leader-elected singletons (CRL
+# generation, triggers run once), the 2nd pod adds HA for serving + the public CRL
+# distribution point (crl.mdapi.ch ingress below). Light: 300m/512Mi each.
+replicas: 2
+
+# --- Hard-required secrets (chart fails to render without these) ---
+license:
+  secretName: stream-license
+  secretKey: license
+# Tink keyset is TOP-LEVEL in Stream (vs defaultVault.keyset in Horizon).
+keyset:
+  secretName: stream-vault-keyset
+  secretKey: keyset
+
+# Play app secret + event-seal secret: externalize to an ESO-managed secret instead
+# of letting the chart self-generate them. The chart's eventSealSecret uses Bitnami's
+# common.secrets.passwords.manage, whose Helm `lookup` returns empty under Fleet's
+# render on UPGRADE -> the "provide current passwords" guard fails the bundle
+# (appSecret's lookup-or-default would also silently rotate). Pointing both at a
+# stable secret (seeded with the current values) makes every future upgrade idempotent.
+appSecret:
+  secretName: stream-secrets
+  secretKey: appSecret
+events:
+  secretName: stream-secrets
+  secretKey: eventSealSecret
+
+# Allow the in-cluster MCP bridge (evertrust-mcp ns) to reach the REST API by its
+# Service FQDN. Play's AllowedHostsFilter otherwise rejects it ("Host not allowed").
+# This list REPLACES the chart default, so keep localhost:9000/9443. The ingress
+# hostname (stream.mdapi.ch) is added automatically by the chart helper.
+allowedHosts:
+  - localhost:9000
+  - localhost:9443
+  - stream.stream.svc.cluster.local:9000
+  # The CRL distribution-point host is a SEPARATE ingress (stream-crl below), so the
+  # chart doesn't auto-add it the way it does ingress.hostname. Without this, Play's
+  # AllowedHostsFilter 400s every crl.mdapi.ch request.
+  - crl.mdapi.ch
+
+# --- Datastore: self-managed single-node MongoDB replica set (rs0) ---
+# Stream is fresh, so the RS is built clean from the start (no in-place convert).
+# temporaryDatabase off; MONGODB_URI comes from the stream-mongo-uri secret below.
+temporaryDatabase:
+  enabled: false
+externalDatabase:
+  secretName: stream-mongo-uri
+  secretKey: mongoUri
+
+# --- Ingress: mdapi conventions (rke2 nginx + ModSec, namespaced LE issuer) ---
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  hostname: stream.mdapi.ch
+  tls: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    # PKI REST API uses PUT/PATCH/DELETE -> raise CRS allowed methods before the include.
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAction "id:900200,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+
+# --- Supporting resources (chart tpl-renders each; keep free of `{{ }}`) ---
+extraObjects:
+  # Image pull secret for registry.evertrust.io (full dockerconfigjson in Akeyless,
+  # mapped directly; mergePolicy: Merge keeps the key + overlays the type).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: evertrust-registry
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: evertrust-registry
+        creationPolicy: Owner
+        template:
+          type: kubernetes.io/dockerconfigjson
+          mergePolicy: Merge
+      data:
+        - remoteRef:
+            key: /kyos/evertrust/registry/dockerconfigjson
+          secretKey: .dockerconfigjson
+
+  # Stream license (reuses the training license; has stream-ca/va/tsa/ssh entitlements).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: stream-license
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: stream-license
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /kyos/stream/license/license
+          secretKey: license
+
+  # Tink vault keyset (raw JSON; Stream reads KEYSET as JSON, not base64).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: stream-vault-keyset
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: stream-vault-keyset
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /mdapi/stream/vault-keyset/keyset
+          secretKey: keyset
+
+  # Play app secret + event-seal secret (seeded from the chart's original self-generated
+  # values, see /mdapi/stream/{app-secret,event-seal-secret}). Referenced by appSecret.*
+  # and events.* above so the chart no longer self-manages them (Fleet lookup is flaky).
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: stream-secrets
+    spec:
+      refreshInterval: 1m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: stream-secrets
+        creationPolicy: Owner
+      data:
+        - remoteRef:
+            key: /mdapi/stream/app-secret
+          secretKey: appSecret
+        - remoteRef:
+            key: /mdapi/stream/event-seal-secret
+          secretKey: eventSealSecret
+
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: mdapi-ca-pub
+    binaryData:
+      MDAPI-Root-CA.crt: MIICDDCCAZGgAwIBAgIQc7+JgwH+dvxbrq/xr/l6KjAKBggqhkjOPQQDAzA1MQswCQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwHhcNMjYwNjE5MDQ1OTAxWhcNMzYwNjE2MDQ1OTAxWjA1MQswCQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAR1xDazV3lhbxfV8ihouX9s7jekFCEzFGL9gTV1gOQ6n97AfwjfIjTyz13KvyQv6mdmQDacQPciOBZcaeA2vztfE83MFXeZbXnyFsMqvld2Mzsue+vEYF5I6b+68CAMMoajZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwHQYDVR0OBBYEFJWzdaiI1rxzo/W1sHyTKrykHLSqMB8GA1UdIwQYMBaAFJWzdaiI1rxzo/W1sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNpADBmAjEAqnm2InKpu+JijKJjgegwgP97tqMyJtqBtQ7XiO5gLrAYBbF5ODvLmqvCfrOYDOYJAjEAt5nFrJb4nFUefDRZ4GybHOSb6GO0PpjFoF/xrwlX4t6kTjuLOZxz9CpgdjzHlriJ # gitleaks:allow (public CA cert, not a secret)
+    data:
+      MDAPI-Root-CA.pem: |
+        -----BEGIN CERTIFICATE-----
+        MIICDDCCAZGgAwIBAgIQc7+JgwH+dvxbrq/xr/l6KjAKBggqhkjOPQQDAzA1MQsw
+        CQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3Qg
+        Q0EwHhcNMjYwNjE5MDQ1OTAxWhcNMzYwNjE2MDQ1OTAxWjA1MQswCQYDVQQGEwJD
+        SDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwdjAQBgcq
+        hkjOPQIBBgUrgQQAIgNiAAR1xDazV3lhbxfV8ihouX9s7jekFCEzFGL9gTV1gOQ6
+        n97AfwjfIjTyz13KvyQv6mdmQDacQPciOBZcaeA2vztfE83MFXeZbXnyFsMqvld2
+        Mzsue+vEYF5I6b+68CAMMoajZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwHQYDVR0O
+        BBYEFJWzdaiI1rxzo/W1sHyTKrykHLSqMB8GA1UdIwQYMBaAFJWzdaiI1rxzo/W1
+        sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNpADBmAjEAqnm2
+        InKpu+JijKJjgegwgP97tqMyJtqBtQ7XiO5gLrAYBbF5ODvLmqvCfrOYDOYJAjEA
+        t5nFrJb4nFUefDRZ4GybHOSb6GO0PpjFoF/xrwlX4t6kTjuLOZxz9CpgdjzHlriJ
+        -----END CERTIFICATE-----
+      index.html: |
+        <!doctype html><html lang=en><head><meta charset=utf-8>
+        <meta name=viewport content="width=device-width,initial-scale=1">
+        <title>MDAPI Root CA</title>
+        <style>body{font-family:system-ui,sans-serif;max-width:40em;margin:2em auto;padding:0 1em;line-height:1.5}
+        code{background:#eee;padding:2px 4px;border-radius:4px;word-break:break-all;font-size:.85em}
+        a.btn{display:inline-block;background:#0a5;color:#fff;padding:.7em 1.1em;border-radius:8px;text-decoration:none;margin:.4em 0;font-weight:600}</style>
+        </head><body>
+        <h1>MDAPI Root CA</h1>
+        <p><a class=btn href="/MDAPI-Root-CA.crt">Download root CA (.crt)</a> &nbsp; <a href="/MDAPI-Root-CA.pem">PEM</a></p>
+        <p><b>Verify this SHA-256 on the device before trusting:</b><br>
+        <code>B9:64:99:EF:2F:FB:CA:78:8D:99:6C:52:FE:5E:8B:6F:81:49:57:FE:36:31:43:2D:45:39:4E:0E:9F:53:61:FA</code></p>
+        <p><b>Android:</b> Settings &rarr; Security &amp; privacy &rarr; Encryption &amp; credentials &rarr; Install a certificate &rarr; CA certificate.
+        Note: only browsers/opt-in apps use user-installed CAs on Android 7+.</p>
+        </body></html>
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ca-pub
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: ca-pub
+      template:
+        metadata:
+          labels:
+            app: ca-pub
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: nginx
+              image: nginxinc/nginx-unprivileged:1.31-alpine
+              ports:
+                - name: http
+                  containerPort: 8080
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: [ALL]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 24Mi
+                limits:
+                  memory: 64Mi
+              readinessProbe:
+                httpGet:
+                  path: /MDAPI-Root-CA.crt
+                  port: http
+                periodSeconds: 10
+              volumeMounts:
+                - name: web
+                  mountPath: /usr/share/nginx/html
+                  readOnly: true
+          volumes:
+            - name: web
+              configMap:
+                name: mdapi-ca-pub
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ca-pub
+    spec:
+      selector:
+        app: ca-pub
+      ports:
+        - name: http
+          port: 80
+          targetPort: http
+
+  # Public CRL distribution point. Stream serves CRLs UNAUTHENTICATED at /crls/<ca>
+  # (GET, DER/PEM). This dedicated host is the CRL VA endpoint: the CA's CRL-DP is set
+  # to https://crl.mdapi.ch/crls/mdapi-issuing-ca-01, and Horizon's imported CA points
+  # its crl_url here so revocation is actually checkable. Served HA by the 2 Stream pods.
+  - apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: stream-crl
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+        # Serve the CRL over plain HTTP too (no forced redirect). CRLs are conventionally
+        # fetched over http:// (avoids the cert-to-validate-the-cert chicken-and-egg), and
+        # Horizon's CA crl_url only accepts http://. TLS still available for browsers.
+        nginx.ingress.kubernetes.io/ssl-redirect: "false"
+        nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+        nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+        # crl.mdapi.ch serves only public read-only artifacts (CRL + root CA download).
+        # WAF off: CRS rule 920440 blocks restricted extensions (.cer/.crt) -> 403 on the
+        # cert download, and there's no injection surface here (the Stream mgmt API stays
+        # on stream.mdapi.ch with WAF on). Per-path disable = enable + SecRuleEngine Off.
+        nginx.ingress.kubernetes.io/modsecurity-snippet: |
+          SecRuleEngine Off
+    spec:
+      ingressClassName: nginx
+      tls:
+        - hosts: [crl.mdapi.ch]
+          secretName: crl.mdapi.ch-tls
+      rules:
+        - host: crl.mdapi.ch
+          http:
+            paths:
+              - path: /crls
+                pathType: Prefix
+                backend:
+                  service:
+                    name: stream
+                    port:
+                      name: http
+              # Everything else on crl.mdapi.ch -> the static PKI-artifact server
+              # (root CA download + a landing page). /crls is more specific so it wins.
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: ca-pub
+                    port:
+                      name: http
+
+  # External MongoDB URI for Stream (not sensitive; plain Secret the chart references
+  # via externalDatabase.secretName/secretKey). Points at the single-node RS below.
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: stream-mongo-uri
+    stringData:
+      mongoUri: "mongodb://stream-mongodb.stream.svc.cluster.local:27017/stream?replicaSet=rs0"
+
+  # --- Single-node MongoDB replica set (rs0) ---
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: stream-mongodb
+    spec:
+      storageClassName: harvester-longhorn-2replicas
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 5Gi
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: stream-mongodb
+    spec:
+      type: ClusterIP
+      ports:
+        - name: mongo
+          port: 27017
+          targetPort: mongo
+      selector:
+        app: stream-mongodb
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: stream-mongodb
+    spec:
+      replicas: 1
+      strategy:
+        type: Recreate
+      selector:
+        matchLabels:
+          app: stream-mongodb
+      template:
+        metadata:
+          labels:
+            app: stream-mongodb
+        spec:
+          securityContext:
+            fsGroup: 1001
+          containers:
+            - name: mongo
+              image: mongo:7
+              args: ["--replSet", "rs0", "--bind_ip_all"]
+              securityContext:
+                runAsUser: 1001
+                runAsNonRoot: true
+              ports:
+                - name: mongo
+                  containerPort: 27017
+              volumeMounts:
+                - name: data
+                  mountPath: /data/db
+              startupProbe:
+                tcpSocket: { port: mongo }
+                failureThreshold: 30
+                periodSeconds: 5
+              readinessProbe:
+                tcpSocket: { port: mongo }
+                periodSeconds: 10
+              livenessProbe:
+                tcpSocket: { port: mongo }
+                initialDelaySeconds: 30
+                periodSeconds: 10
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: stream-mongodb
+  # One-shot idempotent rs.initiate (single member).
+  - apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: stream-mongodb-rs-init
+    spec:
+      backoffLimit: 30
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: rs-init
+              image: mongo:7
+              command: ["bash", "-c"]
+              args:
+                - |
+                  host=stream-mongodb.stream.svc.cluster.local:27017
+                  for i in $(seq 1 80); do
+                    mongosh --host "$host" --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1 && break
+                    echo "waiting for mongod ($i)..."; sleep 3
+                  done
+                  mongosh --host "$host" --quiet --eval '
+                    try { rs.status(); print("rs already initiated"); }
+                    catch (e) {
+                      rs.initiate({_id:"rs0", members:[{_id:0, host:"stream-mongodb.stream.svc.cluster.local:27017"}]});
+                      print("rs initiated");
+                    }'

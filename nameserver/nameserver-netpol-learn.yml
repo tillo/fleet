@@ -1,0 +1,89 @@
+# LEARN MODE — logs every flow, blocks NOTHING. Second workload onboarded to the
+# NetworkPolicy programme (beads infra-az8.4), after tv/flaresolverr.
+#
+# ⛔ THIS POLICY MUST NOT BLOCK ANYTHING. Every rule pair is `Log` then `Allow`, in that
+# order, in both directions. Calico's `Log` action does NOT terminate evaluation — it
+# writes the packet to the kernel log and falls through to the next rule — so the
+# trailing unconditional `Allow` accepts everything. If you ever edit this file, keep
+# that shape: a Calico policy that selects an endpoint applies default-deny to any
+# direction it declares in `types`, so DELETING the trailing Allow silently turns this
+# into a total outage of the public nameserver.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# WHY THE NAMESERVER, AND WHY IT WAS SIZED FIRST
+#
+# The programme's own note (infra-399i, 2026-09-01) singles this workload out as the
+# dangerous one to onboard: BIND emits one loggable connection per DNS query, and
+# Calico's Log action generates an iptables LOG rule with NO rate limit, while journald
+# discards above RateLimitBurst=10000 per RateLimitIntervalSec=30s (~333 lines/s). A
+# learn dataset missing flows produces a policy that looks complete and breaks at
+# enforce time, so the instruction was: size the connection rate BEFORE enabling.
+#
+# Measured 2026-09-13 before writing this file:
+#   • BIND query rate      565 queries in 60s  =  ~9.4 q/s   (pod log, query logging ON)
+#   • qui journal baseline 12 lines in 60s     =  ~0.2 lines/s
+#   • qui kernel transport 1 line in 60s       =  ~0.02 lines/s   <- the Calico channel
+#   • journald limits      RateLimitIntervalSec=30s / RateLimitBurst=10000 (defaults,
+#                          both still commented out in /etc/systemd/journald.conf)
+#   • suppression notices  0 in 7 days on qui
+#
+# => expected ~9.4 lines/s against a ~333 lines/s budget: about 3%. Even a 10x traffic
+# spike stays under a third of the budget. The pod is single-replica and pinned to node
+# qui (10.52.0.198), so this is the only node whose budget is touched.
+#
+# ⚠️ One thing NOT verified: whether journald's rate limit is per-node or per-service.
+# systemd documents it as per-service, the bead assumed per-node, and the node image has
+# no man pages to settle it. It does not change this decision — the kernel channel on qui
+# is empty either way — but do not reuse "333 lines/s per node" as a proven number.
+#
+# ⭐ WATCH THESE, they already exist (f/probe/netpol_log_volume, hourly):
+#     netpol_log_lines_per_hour{node="qui"}        - should rise from 0 to ~34k/h
+#     netpol_log_burst_budget_used_ratio{node="qui"} - should sit near 0.03
+#     netpol_log_journald_suppressed_1h{node="qui"}  - MUST stay 0. Any non-zero value
+#         means flow data was lost and the learn window is invalid; alert
+#         NetworkPolicyLogDataLoss fires on it. Restart the window, do not enforce.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ⛔ NAMESPACED, NOT GlobalNetworkPolicy — and this is a trap, not a preference.
+# `nameserver/fleet.yaml` declares `namespace: nameserver`, which pins every resource in
+# the bundle to that namespace. A cluster-scoped GlobalNetworkPolicy committed here is
+# SILENTLY DROPPED: Fleet applies the commit, reports the bundle 1/1 READY, and the
+# policy never appears. That cost a day on tv/flaresolverr, and
+# ~/fleet/tests/test_namespaced_bundle_no_cluster_scoped.py now fails the pipeline for it.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# WHAT TO DO WITH THE DATA
+# Flows land in the OpenObserve `netpol_flows` stream (fields: node, src, dst, spt, dpt,
+# proto, iface_in, iface_out). Policy is AUTHORED BY HAND from the dashboards, never
+# generated — user decision 2026-09-01, beads infra-eum8.
+#
+# ⭐ The promotion gate is NOT "destinations went quiet". That gate was tried on
+# flaresolverr and was wrong: an internet-facing workload never converges on a
+# destination set. What must converge is what the RULE will encode — the port set, the
+# internal destinations, and the caller set. For an authoritative nameserver the caller
+# set is the whole internet and will never converge either; the interesting questions
+# here are the INTERNAL surface (what in-cluster peers does it talk to, and who talks to
+# it) and the egress destinations for zone transfers and any recursion.
+#
+# ⛔ Do not promote this to enforce without re-reading infra-az8.4. Enforcement is a
+# separate, reviewed change.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: learn.nameserver
+  namespace: nameserver
+spec:
+  order: 500
+  selector: app == "nameserver"
+  types:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Log first, then allow unconditionally. Never reorder these two.
+    - action: Log
+    - action: Allow
+
+  egress:
+    - action: Log
+    - action: Allow

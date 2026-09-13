@@ -1,0 +1,125 @@
+## Cribl image: track :latest so Keel can roll new releases through.
+## Chart pinned criblImage.tag to chart appVersion (4.17.1) by default,
+## which is why Keel never bumped it — we have to opt out explicitly.
+criblImage:
+  repository: zot.mdapi.ch/cribl/cribl
+  pullPolicy: Always
+  tag: latest
+
+## IR-resilience: pull through the in-cluster Zot cache so the leader
+## can come back from a cold start even if cribl.io is unreachable.
+## Pairs with the zot-pull dockerconfigjson Secret in the cribl ns
+## (owned by fleet bundle `zot-pull-secrets/`).
+imagePullSecrets:
+  - name: zot-pull
+
+## Keel annotations are NOT set here: the chart only wires podAnnotations onto the
+## pod template, which Keel does NOT read (it watches the Deployment's own
+## metadata.annotations). They are added to the Deployment metadata via the
+## kustomize post-render overlay in kustomize/ (see fleet.yml). criblImage stays
+## :latest + Always above so Keel force-pulls new digests (Lane A).
+
+config:
+  scName: harvester-longhorn-2replicas
+  ## Liveness/readiness probe overrides — chart default is 60s delay, 10s
+  ## period, 1s timeout, 3 failures = 30s of unhealthy before kill. Under
+  ## sustained PQ-drain backpressure (httpraw source spiking 1–2.5 MB
+  ## chunks per worker), the /api/v1/health endpoint can't reply within
+  ## 1s, the pod gets killed mid-drain, restarts hot into the same load,
+  ## and crashloops. 2026-05-25 10:16–10:32 UTC: 17 restarts in 16 min
+  ## while the pod was using <12% of its CPU/RAM budget — the probe was
+  ## the killer, not resources.
+  ##
+  ## New budget: 60s delay (unchanged), 15s period × 6 failures × 5s
+  ## timeout = 90s of unhealthy before kill. Cribl PQ-drain bursts
+  ## typically settle in 5–10s; 90s leaves room for cold-cache reloads
+  ## without losing the liveness signal entirely.
+  livenessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: 9000
+      scheme: HTTP
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: 9000
+      scheme: HTTP
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 6
+## 2026-06-14: chart default CPU limit is 2 cores; the leader's bursty
+## httpraw PQ-drain (1–2.5 MB chunks/worker) saturates both → 99.8% CFS
+## throttle (44.7% of periods throttled cumulatively) while avg use is only
+## ~0.3 core. The chart also derives CRIBL_K8S_CPU_LIMIT from limits.cpu, so
+## raising it lets cribl size more worker processes too. Memory is untouched
+## (live ~0.9 GiB of 4 GiB).
+## 2026-06-29: 4 cores still hit ~14% CFS throttle on PQ-drain bursts
+## (ContainerCpuThrottling). Bump 4 -> 6 to give the bursty leader headroom.
+resources:
+  limits:
+    cpu: "6"
+    memory: 4096Mi
+  requests:
+    cpu: "1"
+    memory: 1024Mi
+persistence:
+  size: 50Gi
+service:
+  ports:
+    - name: api
+      port: 9000
+      protocol: TCP
+      external: true
+    - name: leadercomm
+      port: 4200
+      protocol: TCP
+      external: false
+    - name: httpraw
+      port: 8080
+      protocol: TCP
+      external: true
+ingress:
+  enable: true
+  host: cribl.mdapi.ch
+  prefix: /
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecDebugLog /tmp/modsec_debug.log
+      # Cribl REST API uses PATCH/PUT/DELETE on routes, pipelines, users.
+      # Pattern: declare id:900200 BEFORE Include. ModSec first-wins on
+      # duplicate IDs, so CRS crs-setup.conf id:900200 is silently
+      # dropped and our expanded tx.allowed_methods list survives. Rule
+      # 911100 then reads our list and does not add 5 to anomaly score
+      # for DELETE/PATCH/PUT. AFTER-Include with id:9001 looks correct
+      # but does NOT work: 911100 reads tx.allowed_methods at phase:1
+      # in load order, so any later SecAction runs too late.
+      # No apostrophes in this block: outer modsecurity_rules is
+      # single-quoted and the apostrophe closes the string at the nginx
+      # parser layer (2026-05-11 outage).
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # Cribl /api/v1/system/metrics?filterExp=name.startsWith(...) is a JS-like
+      # expression that rule 942151 (SQL function name detected) misidentifies
+      # as SQL injection. Scope-disable on the metrics endpoint only.
+      SecRule REQUEST_URI "@beginsWith /api/v1/system/metrics" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveById=942151"
+  tls:
+    - secretName: cribl-cert
+      hosts:
+        - cribl.mdapi.ch
+    

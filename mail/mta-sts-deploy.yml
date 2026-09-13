@@ -1,0 +1,76 @@
+# Serves nothing but the MTA-STS policy. Deliberately a real endpoint rather than
+# an ingress server-snippet: it can be probed, and it does not depend on the
+# controller's Critical-risk snippet annotations staying enabled.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mta-sts
+  namespace: mail
+spec:
+  selector:
+    matchLabels:
+      app: mta-sts
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: mta-sts
+    spec:
+      # If this is down, senders in `enforce` mode cannot fetch the policy. While
+      # mode=testing that only costs reports; after the flip to enforce it can
+      # cost delivery, so it rides with the rest of mail.
+      priorityClassName: mdapi-critical
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: mta-sts
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:1.31-alpine
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+          limits:
+            cpu: 200m
+            memory: 64Mi
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 20
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: policy
+          mountPath: /etc/mta-sts
+          readOnly: true
+        - name: site
+          mountPath: /etc/nginx/conf.d
+          readOnly: true
+      volumes:
+      - name: policy
+        configMap:
+          name: mta-sts-policy
+          items:
+          - key: mta-sts.txt
+            path: mta-sts.txt
+      - name: site
+        configMap:
+          name: mta-sts-policy
+          items:
+          - key: default.conf
+            path: default.conf

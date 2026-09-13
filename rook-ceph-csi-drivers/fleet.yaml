@@ -1,0 +1,20 @@
+defaultNamespace: rook-ceph
+helm:
+  maxHistory: 25
+# Operator-mode Ceph CSI driver CRs (csi.ceph.io/v1).
+#
+# Rook v1.20's operator chart installs the ceph-csi-operator + csi.ceph.io CRDs and,
+# because those CRDs are present, runs in CSI-OPERATOR mode: Rook creates only the
+# CephConnection / ClientProfile / CSI auth secrets. The OperatorConfig + Driver CRs
+# that the ceph-csi-operator actually turns into the provisioner Deployments + plugin
+# DaemonSets are NOT created by Rook — by design they ship in a SEPARATE
+# `ceph-csi-drivers` chart that Rook does not publish to its Helm repo (only an in-repo
+# values stub exists). Without these CRs no CSI pods exist and every PVC stays Pending.
+# This bundle supplies them as raw manifests. (Root-caused 2026-06-14.)
+#
+# Driver names MUST equal the StorageClass provisioner names the rook-ceph-cluster
+# chart generates: <operatorNamespace>.{rbd,cephfs}.csi.ceph.com (Rook controller.go).
+# The OperatorConfig singleton name MUST be `ceph-csi-operator-config` (the name the
+# ceph-csi-operator watches — defaults.go:81) in the operator namespace.
+dependsOn:
+  - name: mdapi-prod-rook-ceph        # ceph-csi-operator + csi.ceph.io CRDs + rook-csi-operator-image-set-configmap

@@ -1,0 +1,581 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-mail
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-mail.workload
+    rules:
+    - alert: MailDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{namespace="mail"}
+            - kube_deployment_status_replicas_available{namespace="mail"}
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: |
+          Mail deployment has unavailable replicas for >5m. Statuspage component
+          'Mail' will go to major_outage if not resolved.
+          Check: kubectl -n mail get pods, kubectl -n mail describe deployment {{ $labels.deployment }}
+
+    - alert: MailStatefulSetDegraded
+      expr: |
+        kube_statefulset_status_replicas_ready{namespace="mail"}
+          < kube_statefulset_status_replicas{namespace="mail"}
+      for: 5m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.statefulset }}: not all replicas ready"
+        description: |
+          Mail StatefulSet (roundcube-mariadb, etc.) has fewer ready than desired.
+          Webmail will be degraded.
+
+    - alert: MailPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{namespace="mail"}[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} restarting >0.5/min"
+        description: "Investigate with kubectl -n mail logs --previous {{ $labels.pod }} -c {{ $labels.container }}"
+
+    - alert: MailPodOOMKilled
+      expr: |
+        increase(kube_pod_container_status_last_terminated_reason{
+          namespace="mail", reason="OOMKilled"
+        }[1h]) > 0
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} OOMKilled"
+        description: "Bump memory limits or investigate the leak."
+
+  # Outlook SNDS reputation, gauges pushed by
+  # f/probe/snds_outlook_audit (every 6h).
+  # Migration note: Microsoft announced (2026-04-30) that SNDS would
+  # move to a REST API + MS-account auth in May 2026. As of 2026-06-04
+  # the legacy CSV/key endpoint still responds; SndsEndpointDead is the
+  # tripwire for when MS actually flips it. When that fires, rewrite
+  # the probe against the new REST endpoint.
+  - name: app-mail.snds-reputation
+    rules:
+    - alert: SndsIpListed
+      expr: snds_ipstatus_abnormal_total{job="snds_outlook_audit"} > 0
+      for: 10m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "Outlook SNDS: {{ $value }} mail IP(s) flagged abnormal"
+        description: |
+          One or more of our sending IPs is currently in Outlook SNDS
+          ipStatus (block/suspicious). Outlook delivery is likely
+          impacted.
+          Drill in:  snds_ipstatus_listed{job="snds_outlook_audit"}
+          Console: https://sendersupport.olc.protection.outlook.com/snds/
+
+    - alert: SndsFilterDegraded
+      expr: max by (ip) (snds_filter_result_severity{job="snds_outlook_audit"}) >= 1
+      for: 30m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "Outlook SNDS: {{ $labels.ip }} filter result severity {{ $value }} (1=YELLOW 2=RED)"
+        description: |
+          Outlook is filtering more mail from {{ $labels.ip }} than usual.
+          Check complaint rate + spam-trap hits in the latest probe run
+          output (f/probe/snds_outlook_audit).
+
+    - alert: SndsEndpointDead
+      expr: snds_endpoint_alive{job="snds_outlook_audit"} == 0
+      for: 1h
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "SNDS endpoint not reachable / key invalid"
+        description: |
+          Both legacy SNDS URLs failed for >1h. If this coincides with
+          Microsoft's announced May-2026 migration, rewrite
+          f/probe/snds_outlook_audit against the new REST API
+          (auth via MS account, not the proxy key). Otherwise it's a
+          transient outage and will self-resolve.
+
+    - alert: SndsProbeStale
+      expr: |
+        time() - snds_last_run_timestamp_seconds{job="snds_outlook_audit"} > 60*60*12
+      for: 5m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "SNDS reputation probe last ran {{ $value | humanizeDuration }} ago"
+        description: |
+          f/probe/snds_outlook_audit is scheduled every 6h.
+          A 12h staleness window means at least one run was missed —
+          check Windmill job history.
+
+  ## Postfix queue depth (postfix_exporter sidecar, added 2026-08-20 after
+  ## the helm-v4 empty-env incident: 7 inbound messages sat deferred for
+  ## hours behind healthy listeners — invisible to every synthetic probe).
+  ## Age-bucket based, not raw count: 1-2 long-retry deferrals to dead
+  ## EXTERNAL destinations are normal background; a PILE of messages older
+  ## than the bucket boundary is not. Buckets: le=1000s (~17min),
+  ## le=10000s (~2.8h). Metric names verified against the live exporter.
+  - name: app-mail.queue
+    rules:
+    - alert: MailQueueBacklog
+      expr: |
+        ( postfix_showq_message_age_seconds_count{queue="deferred"}
+          - ignoring(le) postfix_showq_message_age_seconds_bucket{queue="deferred",le="1000"}
+        ) >= 5
+      for: 15m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} deferred mails older than ~17min in the postfix queue"
+        description: |
+          5+ messages have sat in the deferred queue past one retry cycle for
+          15m+. Local-delivery (LMTP) or relay problems look exactly like this
+          while every listener probe stays green (2026-08-20 incident: dovecot
+          LMTP deferrals). Check:
+            kubectl -n mail exec deploy/docker-mailserver -c docker-mailserver -- postqueue -p
+          The queue-file error text names the broken hop.
+
+    - alert: MailQueueStuck
+      expr: |
+        ( postfix_showq_message_age_seconds_count{queue="deferred"}
+          - ignoring(le) postfix_showq_message_age_seconds_bucket{queue="deferred",le="10000"}
+        ) >= 5
+      for: 15m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} deferred mails older than ~3h — delivery is stuck"
+        description: |
+          Sustained undelivered mail: 5+ messages deferred for close to 3 hours.
+          Users are missing mail even though SMTP/IMAP answer. postqueue -p for
+          the per-message error; postqueue -f to retry after fixing the cause.
+
+    - alert: MailQueueMetricsAbsent
+      ## Guard the guard (23-ha-recorder pattern): if the exporter sidecar
+      ## dies or the scrape breaks, the two rules above go silently blind.
+      expr: |
+        absent(postfix_showq_message_age_seconds_count{queue="deferred"})
+      for: 30m
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "postfix queue metrics absent for 30m — queue alerts are blind"
+        description: |
+          The postfix_exporter sidecar (mail/docker-mailserver, port 9154) or
+          its ServiceMonitor scrape stopped producing metrics. MailQueueBacklog
+          and MailQueueStuck cannot fire while this is absent.
+          Check: kubectl -n mail get pods (2/2?), the metrics-exporter
+          container logs, and the docker-mailserver ServiceMonitor.
+
+  - name: app-mail.reconciler
+    ## envuassu/mail-reconciler, a CronJob every 30 min. It configures each
+    ## Nextcloud group member's shared @envuassu.ch mailbox — the automatic half of
+    ## the ask -> approve -> enroll -> CONFIGURE loop.
+    ##
+    ## ⛔ ADDED 2026-09-07 because this job has now failed silently TWICE. The
+    ## script itself is already hardened to fail LOUDLY — its own comment records a
+    ## 4-day silent outage when the AIO image dropped `sudo`, and the fix was to
+    ## stop discarding stderr and exit non-zero. That made the failure loud in the
+    ## POD LOG, which nobody reads. On 2026-09-07 it then failed every run from
+    ## 08:58 to 14:12 (the nextcloud-aio-nextcloud container was gone, so its
+    ## `kubectl exec … occ group:list` could not run) and again nothing said so; it
+    ## surfaced only because someone happened to look at the namespace while
+    ## chasing a different outage. Exiting non-zero is not an alert.
+    ##
+    ## Nothing generic covers this. BatchJobStale (12-batch-jobs.yml) watches
+    ## Windmill jobs that PUSH to the Pushgateway, not Kubernetes CronJobs; of the
+    ## 17 CronJobs on this cluster only gitlab-toolbox-backup and openbao-mirror had
+    ## any alert at all, each pinned to its own name. Their cadences span */15 to
+    ## yearly, so one shared threshold cannot serve them — a general fix needs the
+    ## published-cadence join used by BatchJobStale, which is not built. This rule
+    ## covers the mail one because mail is priority 1.
+    ##
+    ## `statuspage: exclude` throughout: mail DELIVERY is unaffected when this job
+    ## fails — only shared-mailbox provisioning stops catching up, so new members
+    ## silently miss their group mailbox. Degrading the public Mail component for
+    ## that would be the over-signalling this estate keeps relearning.
+    rules:
+    - alert: MailReconcilerStale
+      ## 3 intervals: tolerates two consecutive misses, and the job already retries
+      ## twice within each schedule before the Job is marked failed. Would have
+      ## caught the 2026-09-07 outage at ~10:30 instead of never.
+      expr: |
+        time() - kube_cronjob_status_last_successful_time{
+          namespace="envuassu", cronjob="mail-reconciler"
+        } > 90 * 60
+      labels:
+        severity: warning
+        component: Mail
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "mail-reconciler hasn't succeeded in {{ $value | humanizeDuration }}"
+        description: |
+          Shared @envuassu.ch mailboxes are no longer being configured for Nextcloud
+          group members. Schedule is every 30 min; >90 min means at least two missed
+          runs. Existing mail delivery is unaffected.
+
+          The reconciler fails loudly on purpose — read the pod log first, it names
+          the cause on stderr:
+            kubectl -n envuassu get jobs | grep mail-reconciler
+            kubectl -n envuassu logs job/mail-reconciler-<id>
+
+          Most likely, in order:
+            1. The nextcloud-aio-nextcloud container is not running, so
+               `kubectl exec … occ group:list` cannot run. That is what happened on
+               2026-09-07 ("unable to upgrade connection: container not found"),
+               and it clears by itself once Nextcloud is healthy — check
+               FilesDeploymentUnavailable (04-files.yml) before touching this job.
+            2. The AIO image changed how occ can be run as www-data (a `sudo`
+               removal caused the 2026-07 four-day outage; the script now uses
+               BusyBox `su`).
+            3. RBAC: the reconciler's ServiceAccount lost pods/exec in envuassu.
+    - alert: MailReconcilerUnmonitored
+      ## Coverage is the intersection of the rule and what exists. If the CronJob is
+      ## deleted or renamed, `kube_cronjob_status_last_successful_time` disappears
+      ## and MailReconcilerStale above silently stops being able to fire — the exact
+      ## drift that left mirror.mdapi.ch uncovered for 83 days. This says so out
+      ## loud. It also fires for a CronJob that has never once succeeded, which the
+      ## staleness rule cannot see either.
+      expr: |
+        absent(kube_cronjob_status_last_successful_time{
+          namespace="envuassu", cronjob="mail-reconciler"
+        })
+      for: 1h
+      labels:
+        severity: warning
+        component: Mail
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "mail-reconciler CronJob has no success metric — it may not exist any more"
+        description: |
+          The series MailReconcilerStale depends on is gone, so that alert can no
+          longer fire and this job is effectively unmonitored. Either the CronJob was
+          deleted or renamed (update BOTH rules here), it has never completed a
+          single successful run since being created, or kube-state-metrics is not
+          reporting it.
+
+          Check: kubectl -n envuassu get cronjob mail-reconciler
+    - alert: MailReconcilerSuspended
+      ## Without this, suspending the CronJob shows up as MailReconcilerStale and
+      ## reads as "it is broken" when it is really "someone turned it off" — a
+      ## different investigation, and one that otherwise stays off indefinitely.
+      expr: |
+        kube_cronjob_spec_suspend{namespace="envuassu", cronjob="mail-reconciler"} > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Mail
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "mail-reconciler CronJob is suspended — shared mailboxes will drift"
+        description: |
+          Someone set spec.suspend=true. That is a legitimate thing to do while
+          debugging, but left on it silently stops shared @envuassu.ch mailboxes
+          being provisioned for new group members, with no other symptom. The 2h
+          `for:` is the debugging allowance.
+
+          Resume: kubectl -n envuassu patch cronjob mail-reconciler \
+                    --type merge -p '{"spec":{"suspend":false}}'
+          If the suspension is meant to be permanent, delete the job and these rules
+          together rather than leaving a muted alert behind.
+
+  - name: app-mail.mail-auth
+    ## Fed by f/probe/mail_auth_health (every 2h). Until 2026-09-08 NOTHING watched mail
+    ## authentication: the estate had a stale SPF authorising two IPs with tcp/25 closed,
+    ## a *.tillo.ch TXT wildcard that made MTA-STS undiscoverable, two decommissioned
+    ## domains still in the DKIM signing set, and a Keycloak realm sending from a
+    ## subdomain with no SPF whose mail Gmail hard-rejected for five days. Every one was
+    ## a DNS-visible fact and none of them made anything go red.
+    ##
+    ## `for:` windows are generous on purpose. These records change rarely, the probe
+    ## runs 2-hourly, and a single failed run must never page — but a genuinely missing
+    ## record must not be allowed to sit either, because the damage is invisible from
+    ## our side: strangers stop receiving our mail and nobody tells us.
+    rules:
+    - alert: MailAuthRecordMissing
+      ## The core assertion: every signing domain publishes all four records. Any zero
+      ## means a receiver cannot verify us on that mechanism.
+      ##
+      ## Written as a union of zero-valued series rather than
+      ## `min by (domain) (a or b or c) == 0`. That form happens to work — `or` unions
+      ## series with differing __name__ and the aggregation then takes the minimum — but
+      ## it relies on set-union semantics being read as a logical OR, which is exactly
+      ## the kind of expression that gets "simplified" later into something that no
+      ## longer fires. This form is what it looks like: any of these being 0 alerts, and
+      ## each retains its own metric name in the firing series.
+      expr: |
+        (mail_auth_spf_ok == 0)
+        or (mail_auth_dkim_ok == 0)
+        or (mail_auth_dmarc_ok == 0)
+        or (mail_auth_tlsrpt_ok == 0)
+      for: 4h
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.domain }} is missing a mail authentication record"
+        description: |
+          One of SPF / DKIM / DMARC / TLS-RPT no longer resolves for this domain, so
+          receivers cannot authenticate mail claiming to be from it. With DMARC at
+          p=quarantine and sp=reject, that means our own mail starts landing in spam
+          or being rejected outright.
+
+          Read the PUBLIC view — never this seat's resolver, which is internal-first
+          and overlays mdapi.ch:
+            dig +short @31.3.128.59 {{ $labels.domain }} TXT
+            dig +short @31.3.128.59 _dmarc.{{ $labels.domain }} TXT
+            dig +short @31.3.128.59 mail202603._domainkey.{{ $labels.domain }} TXT
+            dig +short @31.3.128.59 _smtp._tls.{{ $labels.domain }} TXT
+
+          ⛔ A DKIM lookup answering with something that is not v=DKIM1 usually means a
+          wildcard TXT is shadowing it — that is what stopped r3h.ch ever being signed.
+          ⛔ When re-adding a TXT, check whether the name is answered only by a wildcard:
+          creating the node removes its A/AAAA (RFC 4592). Add them in the same update.
+
+    - alert: MailAuthSpfDoesNotCoverSender
+      ## SPF exists but does not authorise the address the MX actually resolves to.
+      ## Both sides are derived by the probe, so this fires when the mail IP moves and
+      ## the record is not followed — the failure mode a hardcoded check cannot see.
+      expr: mail_auth_spf_covers_sender == 0
+      for: 4h
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.domain }} SPF does not authorise the current MX address"
+        description: |
+          The SPF record for this domain does not list the address its MX host resolves
+          to, so every message we send as this domain fails SPF at the receiver.
+          Usually means the mail IP changed and SPF was not updated.
+
+            dig +short @31.3.128.59 {{ $labels.domain }} MX
+            dig +short @31.3.128.59 mail.mdapi.ch A
+            dig +short @31.3.128.59 {{ $labels.domain }} TXT | grep spf1
+
+          Fix with nsupdate + the `mdapi` TSIG key, deleting the old record by EXACT
+          rdata — every apex TXT set here also holds a google-site-verification record
+          that an RRset-wide delete would take with it.
+
+    - alert: MailAuthDmarcNoSubdomainPolicy
+      expr: mail_auth_dmarc_has_sp == 0
+      for: 24h
+      labels:
+        severity: warning
+        component: Mail
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.domain }} DMARC has no explicit sp="
+        description: |
+          Without sp=, subdomains inherit p= — which is weaker than intended here, since
+          the policy is deliberately sp=reject so that only known sending subdomains can
+          be used. Low urgency, but it means a subdomain of this domain is spoofable at
+          quarantine rather than reject.
+
+    - alert: MailStsPolicyUnfetchable
+      ## Only fires where DNS ADVERTISES a policy — a domain with no _mta-sts record is
+      ## simply not participating and must not alert.
+      expr: mail_auth_mtasts_dns_ok == 1 and mail_auth_mtasts_policy_ok == 0
+      for: 1h
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.domain }} advertises MTA-STS but the policy will not fetch"
+        description: |
+          _mta-sts.{{ $labels.domain }} advertises a policy that cannot be retrieved as
+          200 text/plain without a redirect.
+
+          ⚠️ While the policy is mode=testing this only costs TLS-RPT reports. After the
+          flip to mode=enforce it becomes a DELIVERY OUTAGE: conforming senders refuse
+          to deliver rather than risk a downgrade. Treat accordingly once enforcing.
+
+            curl -sSv https://mta-sts.{{ $labels.domain }}/.well-known/mta-sts.txt
+            kubectl -n mail get pods -l app=mta-sts
+            kubectl -n mail get certificate mta-sts-cert
+
+    - alert: MailStsPolicyDrift
+      ## The served policy no longer equals the deployed ConfigMap. Catches a hand-edited
+      ## endpoint, a half-applied fleet change, and the reverse — a ConfigMap edited
+      ## without bumping the DNS id, which leaves senders on a cached old policy.
+      ##
+      ## ⛔ The dns_ok guard is NOT redundant. The probe emits
+      ## mail_auth_mtasts_policy_matches_deployed = 0 for EVERY signing domain that has
+      ## no MTA-STS at all — there is nothing to compare, so "matches" is trivially
+      ## false. Without the guard, adding any domain to the signing set that is not also
+      ## on MTA-STS fires this immediately (2026-09-11: the five secondary domains would
+      ## have fired five times over). "Drift" is only meaningful once a policy exists.
+      expr: |
+        (mail_auth_mtasts_policy_matches_deployed == 0)
+        and on (domain) (mail_auth_mtasts_dns_ok == 1)
+      for: 2h
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.domain }} serves an MTA-STS policy that differs from fleet"
+        description: |
+          What mta-sts.{{ $labels.domain }} serves does not match the mta-sts-policy
+          ConfigMap in fleet.
+
+          Remember both halves move together: changing the policy REQUIRES bumping the
+          id= in every _mta-sts.<domain> TXT record, or receivers keep serving
+          themselves the cached previous policy until max_age expires.
+
+            kubectl -n mail get cm mta-sts-policy -o jsonpath='{.data.mta-sts\.txt}'
+            curl -s https://mta-sts.{{ $labels.domain }}/.well-known/mta-sts.txt
+            dig +short @31.3.128.59 _mta-sts.{{ $labels.domain }} TXT
+
+    - alert: MailStsCertExpiringSoon
+      ## cert-manager renews at ~30 days left. Firing at 15 means renewal has already
+      ## failed twice over, so this is a real failure rather than a countdown.
+      expr: mail_auth_mtasts_cert_days_left < 15
+      for: 6h
+      labels:
+        severity: warning
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "mta-sts.{{ $labels.domain }} certificate expires in {{ $value | printf \"%.0f\" }} days"
+        description: |
+          The MTA-STS policy host certificate is close to expiry and cert-manager has
+          not renewed it. An expired certificate makes the policy unfetchable, which
+          after the flip to mode=enforce stops inbound mail.
+
+            kubectl -n mail describe certificate mta-sts-cert
+            kubectl -n mail get certificaterequest,challenges
+
+    ## ── MX STARTTLS (port 25) ──────────────────────────────────────────────
+    ## Probe `mail-mx-starttls` (10-blackbox-probes.yml) is the only check that
+    ## opens TLS on port 25, so it is the only one that sees the certificate an
+    ## external sender is actually offered. Everything else watches a different
+    ## surface: 465/587/993 are separate listeners, and cert_expiry_days /
+    ## cert-manager watch the SECRET, not what the SMTP listener serves. A
+    ## renewed certificate that the listener never picked up is invisible to all
+    ## of them.
+    ##
+    ## Both alerts are WARNING and excluded from the public status page ON
+    ## PURPOSE, and that holds only while the MTA-STS policy is mode=testing:
+    ## a sender that cannot verify us today downgrades to plaintext and still
+    ## delivers, so this is a security regression, not an outage.
+    ## ⭐ On the flip to mode=enforce, promote BOTH to critical, drop the
+    ## statuspage exclusion, and add `component: Mail` to the Probe — at that
+    ## point a failure here refuses inbound mail outright.
+    - alert: MailMxStarttlsFailing
+      ## 2026-09-12: promoted warning -> critical and un-excluded from the public
+      ## statuspage, because MTA-STS went to `mode: enforce` the same day. While the
+      ## policy was `testing` a TLS fault here made senders DOWNGRADE and still
+      ## deliver, which is a warning. Under enforce the same fault makes a conforming
+      ## sender REFUSE to deliver — that is a mail outage, and it must page and show.
+      expr: probe_success{probe="mx-starttls"} == 0
+      for: 15m
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "MX STARTTLS on mail.mdapi.ch:25 is failing its probe"
+        description: |
+          The MX either stopped advertising STARTTLS, failed the TLS upgrade, or
+          served a certificate that does not validate against public roots
+          (expired, wrong name, or an incomplete chain). Senders are downgrading
+          to plaintext where their policy allows it.
+
+          Note the MX is still ALIVE as far as `mail-smtp` is concerned — that
+          probe never opens TLS, so it stays green through exactly this fault.
+
+            openssl s_client -connect mail.mdapi.ch:25 -starttls smtp \
+              -servername mail.mdapi.ch </dev/null
+            kubectl -n mail describe certificate mail-cert
+
+    - alert: MailMxCertExpiringSoon
+      ## cert-manager renews mail-cert at ~30 days left, so 15 days means the
+      ## renewal has already failed — or succeeded into a secret the SMTP
+      ## listener never reloaded, which is the case only this probe can see.
+      ## 2026-09-12: promoted warning -> critical and un-excluded from the public
+      ## statuspage alongside MailMxStarttlsFailing, for the same reason — under
+      ## MTA-STS `enforce` an expired or unreloaded MX cert stops delivery outright
+      ## rather than downgrading it. As of the flip the served cert had ~82 days.
+      expr: (probe_ssl_earliest_cert_expiry{probe="mx-starttls"} - time()) / 86400 < 15
+      for: 6h
+      labels:
+        severity: critical
+        component: Mail
+        team: mdapi
+      annotations:
+        summary: "MX certificate served on :25 expires in {{ $value | printf \"%.0f\" }} days"
+        description: |
+          This is the certificate presented on the MX port, not the contents of
+          the cert-manager secret — if these two disagree, the listener is
+          serving a stale certificate and needs to reload.
+
+            kubectl -n mail describe certificate mail-cert
+            kubectl -n mail get certificaterequest
+
+    - alert: MailAuthProbeStale
+      ## The probe itself. Without this every alert above silently becomes "no data" and
+      ## the whole group stops meaning anything — the failure mode that makes a monitor
+      ## worse than none. 2h schedule, so 7h is three missed runs.
+      expr: |
+        (time() - max(mail_auth_health_last_run_timestamp_seconds)) > 25200
+        or absent(mail_auth_health_last_run_success)
+      for: 30m
+      labels:
+        severity: warning
+        component: Mail
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "mail_auth_health probe has not reported for over 7 hours"
+        description: |
+          f/probe/mail_auth_health has missed roughly three consecutive runs, so nothing
+          is currently asserting SPF/DKIM/DMARC/TLS-RPT/MTA-STS. Every other alert in
+          app-mail.mail-auth is blind until this recovers.
+
+            https://windmill.mdapi.ch/runs/?path=f/probe/mail_auth_health
+            wmill script run f/probe/mail_auth_health   # from ~/windmill

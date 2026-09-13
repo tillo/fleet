@@ -1,0 +1,17 @@
+# OpenBao internal-config bootstrap — makes the still-imperative structural config
+# (KV v2 mount, kubernetes auth method + config, policies, k8s-auth roles)
+# reproducible. WITHOUT this, restoring OpenBao from the P3b age secret-export
+# (rather than a P3a raft snapshot) leaves a bare server: no mount, no auth, no
+# policies/roles -> the `openbao` ClusterSecretStore and the mirror cannot
+# authenticate until the config is hand-rebuilt.
+#
+# Shipped as a SUSPENDED CronJob (same idiom as openbao-mirror): GitOps-mutable,
+# never auto-fires. Run on demand / after a config change with:
+#   kubectl -n openbao create job --from=cronjob/openbao-bootstrap openbao-bootstrap-manual
+#
+# Token: idempotent re-assert (drift correction) authenticates via k8s-auth
+# role=admin (SA openbao-admin). Disaster recovery on a FRESH raft (admin role
+# doesn't exist yet) supplies the fresh `bao operator init` root token out-of-band
+# in the OPTIONAL Secret `openbao-bootstrap-token` (key root-token) — created at
+# DR time exactly like openbao-unseal-keys, NEVER committed to git.
+defaultNamespace: openbao

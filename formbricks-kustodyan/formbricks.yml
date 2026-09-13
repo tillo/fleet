@@ -1,0 +1,244 @@
+# Formbricks 5.4.2 (pinned; Renovate proposes bumps) + its Hub API + the Cube semantic layer,
+# the service set of upstream's docker-compose at the 5.4.2 tag. Migrations run at start-up
+# (Prisma from the app's own start script, goose + river from an init container on Hub after
+# Formbricks is up, as upstream orders them) so Recreate keeps a single migrator at a time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formbricks
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: formbricks
+  template:
+    metadata:
+      labels:
+        app: formbricks
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: formbricks
+          image: ghcr.io/formbricks/formbricks:5.4.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: WEBAPP_URL
+              value: https://formbricks-kustodyan.mdapi.ch
+            - name: NEXTAUTH_URL
+              value: https://formbricks-kustodyan.mdapi.ch
+            - name: REDIS_URL
+              value: redis://formbricks-valkey:6379
+            - name: HUB_API_URL
+              value: http://formbricks-hub:8080
+            - name: CUBEJS_API_URL
+              value: http://formbricks-cube:4000
+            - name: CUBEJS_JWT_ISSUER
+              value: formbricks-web
+            - name: CUBEJS_JWT_AUDIENCE
+              value: formbricks-cube
+            # No SMTP in the sandbox.
+            - name: EMAIL_VERIFICATION_DISABLED
+              value: "1"
+            - name: PASSWORD_RESET_DISABLED
+              value: "1"
+            # Every respondent arrives from the same ingress hop; per-IP limits would trip.
+            - name: RATE_LIMITING_DISABLED
+              value: "1"
+            - name: TELEMETRY_DISABLED
+              value: "1"
+            - name: LOG_LEVEL
+              value: info
+          envFrom:
+            - secretRef:
+                name: formbricks-env
+          startupProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 5
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 3000 }
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 250m, memory: 768Mi }
+            limits: { memory: 2Gi }
+---
+# The application's own name. The `formbricks` name that the ingress resolves belongs to the
+# Kustodyan proxy (gateway.yml), so nothing can reach the app without passing through it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks-app
+spec:
+  selector:
+    app: formbricks
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formbricks-hub
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: formbricks-hub
+  template:
+    metadata:
+      labels:
+        app: formbricks-hub
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      initContainers:
+        # Upstream runs the Prisma migrations before Hub writes to the shared database.
+        - name: wait-for-formbricks
+          image: zot.mdapi.ch/library/busybox:1.37
+          command: [sh, -c, "until wget -q -T 3 -O /dev/null http://formbricks-app:3000/health; do echo waiting for formbricks; sleep 5; done"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+        - name: migrate
+          image: ghcr.io/formbricks/hub:0.8.6
+          command: [sh, -c, '/usr/local/bin/goose -dir /app/migrations postgres "$DATABASE_URL" up && /usr/local/bin/river migrate-up --database-url "$DATABASE_URL"']
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: formbricks-env, key: HUB_DATABASE_URL } }
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { memory: 256Mi }
+      containers:
+        - name: hub
+          image: ghcr.io/formbricks/hub:0.8.6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: API_KEY
+              valueFrom: { secretKeyRef: { name: formbricks-env, key: HUB_API_KEY } }
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: formbricks-env, key: HUB_DATABASE_URL } }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 25m, memory: 128Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks-hub
+spec:
+  selector:
+    app: formbricks-hub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formbricks-cube
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: formbricks-cube
+  template:
+    metadata:
+      labels:
+        app: formbricks-cube
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: cube
+          image: cubejs/cube:v1.6.6
+          imagePullPolicy: IfNotPresent
+          command: [sh, -c, 'if [ -z "$CUBEJS_API_SECRET" ]; then echo "CUBEJS_API_SECRET is required" >&2; exit 1; fi; exec cubejs server']
+          ports:
+            - containerPort: 4000
+          env:
+            - name: CUBEJS_DB_TYPE
+              value: postgres
+            - name: CUBEJS_DB_HOST
+              value: formbricks-postgres
+            - name: CUBEJS_DB_PORT
+              value: "5432"
+            - name: CUBEJS_DB_NAME
+              value: formbricks
+            - name: CUBEJS_DB_USER
+              value: postgres
+            - name: CUBEJS_DB_PASS
+              valueFrom: { secretKeyRef: { name: formbricks-env, key: POSTGRES_PASSWORD } }
+            - name: CUBEJS_API_SECRET
+              valueFrom: { secretKeyRef: { name: formbricks-env, key: CUBEJS_API_SECRET } }
+            - name: CUBEJS_JWT_ISSUER
+              value: formbricks-web
+            - name: CUBEJS_JWT_AUDIENCE
+              value: formbricks-cube
+            - name: CUBEJS_DEFAULT_API_SCOPES
+              value: meta,data
+            - name: CUBEJS_EXTERNAL_DEFAULT
+              value: "false"
+            - name: CUBEJS_CACHE_AND_QUEUE_DRIVER
+              value: memory
+          startupProbe:
+            httpGet: { path: /readyz, port: 4000 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: 4000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { memory: 1536Mi }
+          volumeMounts:
+            - name: cube-config
+              mountPath: /cube/conf/cube.js
+              subPath: cube.js
+              readOnly: true
+            - name: cube-config
+              mountPath: /cube/conf/model/FeedbackRecords.js
+              subPath: FeedbackRecords.js
+              readOnly: true
+      volumes:
+        - name: cube-config
+          configMap:
+            name: formbricks-cube-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks-cube
+spec:
+  selector:
+    app: formbricks-cube
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000

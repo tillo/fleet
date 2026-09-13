@@ -1,0 +1,240 @@
+## Longhorn volume robustness alert.
+##
+## `longhorn_volume_robustness` is exposed by longhorn-manager with
+## these enum values:
+##   0 = unknown    (detached / no replicas / just created — IGNORE)
+##   1 = healthy
+##   2 = degraded   (one replica failed; volume still serves I/O)
+##   3 = faulted    (all replicas down; volume unusable)
+##
+## Catches the state BEFORE I/O errors surface in pod logs. The
+## existing relay-side PodIOError detector only fires when a workload
+## actually tries to read/write and fails — degraded volumes with
+## quiescent workloads (overnight, etc.) go unalerted there.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-longhorn-robustness
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-longhorn-robustness.workload
+    rules:
+    - alert: LonghornVolumeDegraded
+      ## info while the rebuild drains (routine after node restarts; the
+      ## max-2 rebuild limit can queue volumes for hours post-incident).
+      ## Genuinely-stuck cases are caught much earlier by LonghornRebuildStuck
+      ## (5m no-progress), LonghornGhostSlotStuck and the auto-heals; the 12h
+      ## continuous tier below is the severity backstop.
+      expr: longhorn_volume_robustness == 2 unless min_over_time(longhorn_volume_robustness[12h]) == 2
+      for: 15m
+      labels:
+        severity: info
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} degraded (rebuilding)"
+        description: |
+          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }}) is
+          attached but running with fewer replicas than configured. Auto-recovery is
+          usually fine — escalates to warning if still degraded after 12h continuous.
+          Check `kubectl -n longhorn-system get volume {{ $labels.volume }} -o yaml`.
+
+    - alert: LonghornVolumeDegraded
+      ## Continuously degraded for 12 straight hours — the rebuild queue
+      ## should have long drained; redundancy has been reduced this whole
+      ## time. min_over_time from TSDB so a vmalert restart can't reset the
+      ## clock. min of {degraded=2, faulted=3} is still 2, so a
+      ## degraded→faulted excursion keeps counting (faulted has its own
+      ## alert); a dip to healthy(1) or detached(0) resets the window.
+      expr: min_over_time(longhorn_volume_robustness[12h]) == 2
+      for: 1h
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} degraded 12h+ — rebuild not happening"
+        description: |
+          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }})
+          has run with reduced redundancy for over 12 hours straight — no rebuild
+          has completed in that window. Check for an orphaned/stale replica
+          (delete all replicas except the authoritative RW one so the controller
+          schedules a fresh rebuild) and the max-2 rebuild-limit queue.
+          `kubectl -n longhorn-system get volume {{ $labels.volume }} -o yaml`
+
+    - alert: LonghornVolumeFaulted
+      expr: longhorn_volume_robustness == 3
+      for: 2m
+      labels:
+        severity: critical
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} FAULTED"
+        description: |
+          All replicas down on volume {{ $labels.volume }}. Workloads using PVC
+          {{ $labels.pvc_namespace }}/{{ $labels.pvc }} will get I/O errors. Check
+          longhorn-system events and node disk state. Restore from backup if
+          replicas can't be recovered.
+
+    - alert: LonghornRebuildStuck
+      ## A WO (write-only) replica's `progress%` is reported by the
+      ## f/heal/longhorn_rebuild_stuck Windmill probe every 5 min.
+      ## If the gauge sits unchanged for ≥15 min while progress < 100 — this
+      ## includes a rebuild frozen at 0% (a WO target that retries but never
+      ## starts transferring, e.g. pvc-e9bef15c after the 2026-06-06 outage) —
+      ## the rebuild stalled. Longhorn does NOT auto-recover stalled WO
+      ## rebuilds on its own — the manual fix is to delete the replica so
+      ## auto-balance reschedules.
+      ##
+      ## The probe **also auto-unstucks** the replica after 30 min of no
+      ## progress (one deletion per probe run, cap=1). So if you see this
+      ## alert it means either (a) the stall started <30 min ago and the
+      ## probe hasn't kicked in yet, or (b) the auto-delete failed for
+      ## some reason (likely Rancher API/permissions). If the alert
+      ## persists past 35 min, check Windmill run logs for the probe.
+      ##
+      ## changes(...[15m]) == 0 means no observed change in last 15 min.
+      ## Combined with `for: 5m` we get an effective 20-min stall window.
+      ##
+      ## ⚠️ WINDOW WIDENED 15m -> 45m, 2026-08-29. The note above already described
+      ## the bug without naming it: case (a), "the probe hasn't kicked in yet", is a
+      ## GUARANTEED non-actionable page. The rule fired at ~20 min (15m window +
+      ## for: 5m) while the heal's own STUCK_THRESHOLD_SEC is 30 min — so it woke
+      ## someone ten minutes before the automation was allowed to try, to watch a
+      ## robot that had not had its turn.
+      ## Only case (b) deserves attention. 45 minutes of unchanged progress means the
+      ## 30-minute auto-delete either never ran or did not help, which IS the "someone
+      ## must look" condition. Stalls the automation fixes now pass silently.
+      ## Keep this window comfortably ABOVE STUCK_THRESHOLD_SEC in
+      ## f/heal/longhorn_rebuild_stuck; if that is ever raised, raise this too or the
+      ## pre-emptive page returns.
+      expr: |
+        changes(longhorn_replica_rebuild_progress[45m]) == 0
+          and longhorn_replica_rebuild_progress < 100
+      for: 5m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn rebuild stalled: {{ $labels.volume }} (replica {{ $labels.replica }}) at {{ $value }}%"
+        description: |
+          The rebuild of replica {{ $labels.replica }} on volume {{ $labels.volume }}
+          has been at {{ $value }}% with no change for ≥15 min. The
+          f/heal/longhorn_rebuild_stuck probe will auto-delete the replica
+          after 30 min total stall (one per run). If you want to act sooner:
+            kubectl --context=mdapi-prod -n longhorn-system delete replica {{ $labels.replica }}
+          Auto-balance (best-effort) will re-schedule on a healthier node.
+
+    - alert: LonghornGhostSlotStuck
+      ## The OTHER stall mode, complementary to LonghornRebuildStuck above.
+      ## After a hard node reboot, replicas can return `stopped` with both
+      ## healthyAt AND failedAt empty; Longhorn keeps the dead replica
+      ## occupying the slot and NEVER starts a rebuild, so the volume sits
+      ## degraded on a single replica forever. There is no WO replica, so
+      ## LonghornRebuildStuck is blind to it (it watches rebuild progress).
+      ## The f/heal/longhorn_degraded_stuck probe (every 5 min)
+      ## counts these and auto-deletes the ghost (cap 8/run) so Longhorn
+      ## replenishes — a healed volume gets a WO rebuild and drops out of the
+      ## count within 1-2 runs. So a non-zero count sustained for 30 min means
+      ## the auto-delete is FAILING (Rancher API/permissions) or ghosts are
+      ## regenerating faster than the cap — needs a human.
+      expr: longhorn_ghost_slot_stuck_volume_count > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn ghost-slot autoheal not clearing: {{ $value }} volume(s) stuck degraded"
+        description: |
+          {{ $value }} rep>=2 Longhorn volume(s) have been degraded for >20 min on a
+          single replica with an inert stopped/failedAt-empty replica and no rebuild
+          in progress, and the f/heal/longhorn_degraded_stuck probe has not
+          cleared them in 30 min. The auto-delete is likely failing. Check the probe's
+          Windmill run logs, then clear manually:
+            kubectl --context=mdapi-prod -n longhorn-system get replica \
+              -o json | jq -r '.items[]|select(.status.currentState=="stopped" and .spec.healthyAt==null and .spec.failedAt==null)|.metadata.name'
+          Verify each volume keeps >=1 running healthy replica before deleting.
+
+    - alert: LonghornGhostSlotAutohealStale
+      ## Safety-net-for-the-safety-net: the ghost-slot autoheal only protects
+      ## redundancy if it actually runs. The schedule_integrity_check catches
+      ## the schedule being deleted/disabled; THIS catches the probe present +
+      ## enabled but erroring every run (no metric pushed). Pushgateway retains
+      ## the last timestamp, so a frozen value means the probe stopped pushing.
+      expr: time() - longhorn_degraded_stuck_last_run_timestamp_seconds > 1800
+      for: 5m
+      labels:
+        severity: warning
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn ghost-slot autoheal probe stale (no run in >30 min)"
+        description: |
+          f/heal/longhorn_degraded_stuck has not pushed metrics in >30 min
+          (it runs every 5 min). The ghost-slot stall is now undetected. Check the
+          Windmill job run history for errors (Rancher token, API reachability).
+
+    - alert: LonghornEIOAutohealSilentDegradation
+      ## Mode C (active `ls -laR` filesystem probe) of the EIO auto-healer
+      ## caught a silently-degraded pod — one whose Longhorn volume returns
+      ## EIO at the FS layer but where the app never logged the error to
+      ## stdout, so Modes A (CrashLoopBackOff) and B (Running + log scan)
+      ## missed it. The pod has already been auto-deleted (or rate-limited).
+      ##
+      ## This alert is informational — the script is also acting. It fires
+      ## per detection to give visibility into "how often is the silent path
+      ## being hit", which is a leading indicator that the underlying
+      ## Longhorn instability is worse than visible log noise suggests.
+      ##
+      ## for: 0m because the metric blips to 0 on the next 5-min run after
+      ## the heal completes.
+      expr: longhorn_eio_detected_fs_probe_count > 0
+      labels:
+        severity: info   # was warning; the comment above says "This alert is informational"
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn EIO auto-healer Mode C caught {{ $value }} silently-degraded pod(s)"
+        description: |
+          The active `ls -laR <mount>` probe found {{ $value }} pod(s) with
+          Longhorn-backed volumes returning EIO that did NOT surface in stdout.
+          The first 2026-05-19 cases were openldap/lam (config/ subtree EIO)
+          and openldap configs after the qua node's instance-manager fault.
+          Check the latest Windmill run logs:
+            f/heal/longhorn_eio_autoheal → detected_pods[]
+          Pods are auto-deleted (subject to per-pod 30-min cooldown and
+          global 6/h cap). If this fires repeatedly for the same pod, the
+          underlying Longhorn volume has a persistent FS corruption and
+          needs replica rebuild or restore from backup, not just a pod cycle.
+
+    - alert: LonghornEIOAutohealRateLimited
+      ## The autoheal hit its global 6/hour delete cap. This means EIO is
+      ## storming across multiple pods — the underlying Longhorn fault is
+      ## severe enough that automated healing alone won't restore service.
+      ## Operator should investigate root cause (instance-manager logs,
+      ## node disk health, replica rebuild) rather than just letting the
+      ## healer churn.
+      expr: longhorn_eio_autoheal_global_cap_hit > 0
+      labels:
+        severity: critical
+        component: Backups
+        team: mdapi
+      annotations:
+        summary: "Longhorn EIO auto-healer hit global 6/h delete cap"
+        description: |
+          The EIO auto-healer has detected enough EIO events that its
+          per-hour safety cap is blocking further pod deletes. This is
+          almost always a Longhorn instance-manager fault (one node's
+          data plane is dead while the control plane reports healthy).
+          Check the windmill job logs for the affected pods and node,
+          then:
+            kubectl --context=mdapi-prod -n longhorn-system logs -l app=longhorn-manager --tail 200 | grep -i 'eio\|i/o error'
+          Likely action: cordon the node, force-replicate volumes off it,
+          inspect dmesg/SMART for hardware fault.

@@ -1,0 +1,19 @@
+# Singleton config the ceph-csi-operator reconciles (name + ns are fixed: it watches
+# `ceph-csi-operator-config` in OPERATOR_NAMESPACE). driverSpecDefaults is inherited by
+# every Driver CR, so per-driver specs stay empty.
+apiVersion: csi.ceph.io/v1
+kind: OperatorConfig
+metadata:
+  name: ceph-csi-operator-config
+  namespace: rook-ceph
+spec:
+  driverSpecDefaults:
+    # Pin CSI sidecar/plugin images via the ConfigMap the rook-ceph operator chart
+    # ships (cephcsi v3.17.0, provisioner v6.2.0, … — kept in lockstep with the chart).
+    imageSet:
+      name: rook-csi-operator-image-set-configmap
+    controllerPlugin:
+      priorityClassName: system-cluster-critical
+      replicas: 2                       # HA provisioners on the 3-node cluster
+    nodePlugin:
+      priorityClassName: system-node-critical

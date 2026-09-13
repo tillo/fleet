@@ -1,0 +1,87 @@
+## claude-shim (2026-08-18): OpenAI-compatible bridge to headless Claude Code
+## so litellm's opus/fable fallbacks bill the Max subscription instead of the
+## pay-per-token API. Auth = CLAUDE_CODE_OAUTH_TOKEN minted with
+## `claude setup-token` (Akeyless /mdapi/litellm/litellm-env-secret/
+## CLAUDE_CODE_OAUTH_TOKEN). Personal use only — do not expose outside the
+## cluster; litellm is the sole intended client.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-shim
+  namespace: litellm
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: claude-shim
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: claude-shim
+    spec:
+      containers:
+      - name: claude-shim
+        image: node:22-bookworm-slim
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -e
+          export HOME=/home/shim NPM_CONFIG_PREFIX=/home/shim/.npm-global
+          mkdir -p "$NPM_CONFIG_PREFIX"
+          # CLI installed at pod start (no custom image to build/mirror);
+          # pinned to major 2 so restarts don't jump a breaking major.
+          npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@2"
+          export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+          exec node /app/server.js
+        ports:
+        - containerPort: 8085
+        envFrom:
+        - secretRef:
+            name: claude-shim-env
+        env:
+        - name: SHIM_MODELS
+          value: claude-fable-5,claude-opus-5,claude-sonnet-5,claude-haiku-4-5
+        - name: SHIM_TIMEOUT_MS
+          value: "300000"
+        - name: SHIM_MAX_CONCURRENT
+          value: "2"
+        volumeMounts:
+        - name: app
+          mountPath: /app
+          readOnly: true
+        - name: home
+          mountPath: /home/shim
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8085
+          # npm install of the CLI runs first; allow a slow start
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8085
+          initialDelaySeconds: 300
+          periodSeconds: 30
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+      volumes:
+      - name: app
+        configMap:
+          name: claude-shim-app
+      - name: home
+        emptyDir: {}

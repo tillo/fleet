@@ -1,0 +1,122 @@
+## Dedicated CNPG Postgres (HA, 2 instances) for paperless-ngx.
+##
+## Mirrors fleet/bootstrap/cnpg-cluster.yml. paperless's metadata sits
+## here; documents themselves live on the Longhorn PVC mounted into the
+## paperless pod (paperless-ngx has no native S3 backend; the nightly
+## `document_exporter` to Garage is the off-cluster backup path).
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: paperless-pg
+  namespace: paperless
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  ## Keep primary + replica on different nodes. CNPG defaults to *soft*
+  ## (preferred) anti-affinity, which can let both copies co-locate on one
+  ## node during a rolling restart -- then a node loss takes out both and the
+  ## replica buys zero protection (the trap ha-recorder-pg hit 2026-06-15).
+  ## required is always satisfiable here (2 instances, 3 nodes).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: 128MB
+      effective_cache_size: 384MB
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the standby to confirm each commit. Default async
+    ## drops the last unreplicated writes on promotion. dataDurability:
+    ## preferred falls back to async if the standby is down so writes never
+    ## stall on a missing replica. (Mirrors ha-recorder-pg; CNPG >=1.25.)
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: paperless
+      owner: paperless
+      secret:
+        name: paperless-pg-app-credentials
+
+  backup:
+    barmanObjectStore:
+      ## Postgres backups go to the same Garage bucket pattern as the
+      ## other CNPG clusters. Path is per-cluster.
+      destinationPath: s3://paperless-pg-backup
+      ## ⭐ TLS terminated by Garage's own hosts, not by the ingress.
+      ## Garage has no TLS listener of its own -- upstream: "This endpoint
+      ## does not support TLS: a reverse proxy should be used to provide
+      ## it." So https://api.garage.home.tillo.ch only ever encrypted the
+      ## FIRST hop: ingress-nginx terminated it and re-emitted plaintext to
+      ## salt/pepper over the LAN. barman compresses but does not encrypt
+      ## (there is no `encryption:` key below), so these Postgres dumps
+      ## crossed the LAN in the clear on that last hop.
+      ## :30288 is an nginx TLS terminator running ON salt and pepper,
+      ## reached through the selector-less transit/garage Service, so this
+      ## also drops the ingress out of the backup's dependency chain.
+      ## Bucket and path are unchanged -- the barman store is untouched.
+      endpointURL: https://garage.transit.svc.cluster.local:30288
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: paperless-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: paperless-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        ## Garage validates the SigV4 region scope on HeadBucket; barman
+        ## defaults to us-east-1, so the region must be set explicitly.
+        region:
+          name: paperless-pg-backup-s3
+          key: REGION
+      wal:
+        compression: gzip
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int
+      # renders as a perpetual Fleet "Modified" diff (2 vs "2").
+      cpu: "2"
+      memory: 1Gi
+---
+## Garage credentials for CNPG WAL/base backups. Dedicated key
+## 'paperless-pg-backup', scoped read-write to the s3://paperless-pg-backup
+## bucket on the salt/pepper Garage cluster.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-pg-backup-s3
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-pg-backup-s3
+    creationPolicy: Owner
+  data:
+    - remoteRef: { key: /mdapi/paperless/garage-backup-access-key }
+      secretKey: ACCESS_KEY_ID
+    - remoteRef: { key: /mdapi/paperless/garage-backup-secret-key }
+      secretKey: ACCESS_SECRET_KEY
+    - remoteRef: { key: /mdapi/paperless/garage-region }
+      secretKey: REGION

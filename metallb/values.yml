@@ -1,0 +1,49 @@
+# MetalLB install with strict opt-in via --lb-class.
+#
+# WHY --lb-class: without it, MetalLB controller actively clears
+# status.loadBalancer.ingress on Services whose IP isn't in any of its
+# pools (Red Hat KB 7034718, MetalLB issue #2396). With this flag set,
+# MetalLB ignores every LoadBalancer Service that doesn't carry
+# spec.loadBalancerClass=metallb. Pure opt-in — safe coexistence with
+# Harvester's kube-vip (which manages ingress-expose).
+
+# Metrics on 7475 (non-default 7472 was free at last review but kept
+# off the default in case another hostNetwork pod ever wants 7472).
+prometheus:
+  metricsPort: 7475
+
+# Top-level loadBalancerClass — chart renders this as --lb-class=metallb
+# on BOTH controller and speaker. Verified via `helm template`.
+loadBalancerClass: metallb
+
+controller:
+  replicaCount: 1
+
+speaker:
+  frr:
+    enabled: false
+
+# The validating webhook intercepts only metallb.io CRDs (verified live —
+# rules.resources is {bgppeers, ipaddresspools, bgpadvertisements,
+# communities, bfdprofiles, l2advertisements}). Default failurePolicy=Fail
+# is therefore safe — only writes to MetalLB's own CRDs would block.
+
+# Bundled frr-k8s subchart values (key = subchart name, with the hyphen).
+# Probe tolerance raise (approved 2026-08-03): under node IO saturation
+# (storage-rework windows on quo) the 1s-timeout probes flunk and restart-
+# loop the frr container — +10 restarts / x56 liveness failures on quo
+# during the 08-03 phase-2 window alone, no actual frr fault. failureThreshold
+# 3 -> 6 applies to BOTH the controller (:7572) and frr (:9141/livez) probes;
+# timeoutSeconds 1 -> 5 reaches only the controller probes (the frr container
+# template hardcodes no timeout field). The doubled failure budget proved
+# insufficient under Ceph OSD-recreate backfill (85 probe-kill restarts by
+# 08-12), so the frr timeout is now raised via the kustomize/ post-render
+# patch (approved 2026-08-12) — the chart offers no value for it.
+frr-k8s:
+  frrk8s:
+    livenessProbe:
+      failureThreshold: 6
+      timeoutSeconds: 5
+    readinessProbe:
+      failureThreshold: 6
+      timeoutSeconds: 5

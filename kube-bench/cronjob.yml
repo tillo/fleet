@@ -1,0 +1,140 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kube-bench
+  namespace: kube-bench
+spec:
+  # Weekly, Sunday 03:17. Odd minute on purpose: scheduled work on this estate
+  # picks collision-free minutes so two jobs never contend for the same window.
+  schedule: "17 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      # One pod per control-plane node. The three nodes are configured
+      # identically by Harvester, but "identical by construction" is an
+      # assumption — auditing each node is what turns it into a measurement.
+      completions: 3
+      parallelism: 3
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: kube-bench
+        spec:
+          serviceAccountName: kube-bench
+          restartPolicy: Never
+          hostPID: true
+          priorityClassName: mdapi-low
+          tolerations:
+            - operator: Exists
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: kube-bench
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: kube-bench
+              image: docker.io/aquasec/kube-bench:v0.13.0
+              securityContext:
+                privileged: true
+              env:
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+                - name: PUSHGATEWAY
+                  value: http://pushgateway.monitoring.svc.cluster.local:9091
+                # Pinned deliberately. kube-bench ships one config bundle per
+                # benchmark revision; letting it auto-detect means the audit
+                # silently changes shape when the image is bumped.
+                - name: BENCHMARK
+                  value: rke2-cis-1.24
+              resources:
+                requests: {cpu: 50m, memory: 96Mi}
+                limits:   {cpu: 500m, memory: 256Mi}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  OUT=/tmp/kube-bench.json
+                  RC=0
+                  kube-bench run \
+                    --targets master,etcd,controlplane,node,policies \
+                    --benchmark "$BENCHMARK" --json > "$OUT" 2>/tmp/err.txt || RC=$?
+
+                  push() {
+                    # --post-file, not --post-data: Pushgateway rejects a body
+                    # whose last line has no trailing newline with a bare
+                    # "400 Bad Request", and --post-data sends the string exactly
+                    # as given. Writing the file is the only form where the
+                    # trailing newline is guaranteed to survive.
+                    printf '%s\n' "$1" > /tmp/push.txt
+                    wget -q -O- --post-file=/tmp/push.txt \
+                      "$PUSHGATEWAY/metrics/job/kube_bench/node/$NODE_NAME" >/dev/null
+                  }
+
+                  if ! jq -e . "$OUT" >/dev/null 2>&1; then
+                    echo "kube-bench produced no parseable JSON (rc=$RC):"
+                    cat /tmp/err.txt
+                    # Publish the failure rather than losing the run silently:
+                    # a missing series and a failed series are not the same signal.
+                    push "kube_bench_last_run_timestamp_seconds $(date +%s)
+                  kube_bench_last_run_success 0" || echo "pushgateway POST failed too"
+                    exit 1
+                  fi
+
+                  PASS=$(jq '.Totals.total_pass' "$OUT")
+                  FAIL=$(jq '.Totals.total_fail' "$OUT")
+                  WARN=$(jq '.Totals.total_warn' "$OUT")
+                  INFO=$(jq '.Totals.total_info' "$OUT")
+                  SCORED=$((PASS + FAIL))
+                  if [ "$SCORED" -gt 0 ]; then
+                    RATIO=$(awk "BEGIN{printf \"%.4f\", $PASS/$SCORED}")
+                  else
+                    RATIO=0
+                  fi
+
+                  echo "node=$NODE_NAME pass=$PASS fail=$FAIL warn=$WARN info=$INFO ratio=$RATIO"
+                  jq -r '.Controls[] | "  section \(.id) \(.text): pass=\(.total_pass) fail=\(.total_fail) warn=\(.total_warn)"' "$OUT"
+                  echo "--- FAIL detail ---"
+                  jq -r '.Controls[].tests[].results[] | select(.status=="FAIL") | "  \(.test_number)  \(.test_desc)"' "$OUT"
+
+                  # Per-section gauges let a regression be attributed without
+                  # re-reading the raw report.
+                  SECTIONS=$(jq -r '.Controls[] | "kube_bench_section_fail{section=\"\(.id)\"} \(.total_fail)\nkube_bench_section_pass{section=\"\(.id)\"} \(.total_pass)\nkube_bench_section_warn{section=\"\(.id)\"} \(.total_warn)"' "$OUT")
+
+                  BODY=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+                    "kube_bench_last_run_timestamp_seconds $(date +%s)" \
+                    "kube_bench_last_run_success 1" \
+                    "kube_bench_checks_pass $PASS" \
+                    "kube_bench_checks_fail $FAIL" \
+                    "kube_bench_checks_warn $WARN" \
+                    "kube_bench_checks_info $INFO" \
+                    "kube_bench_score_ratio $RATIO" \
+                    "$SECTIONS")
+
+                  # POST, not PUT: PUT replaces the whole job group. The group is
+                  # keyed by node here so PUT would be safe today, but POST keeps
+                  # it safe if anything else is ever pushed under the same key.
+                  push "$BODY" && echo "metrics pushed for $NODE_NAME" \
+                    || { echo "pushgateway POST failed"; exit 1; }
+              volumeMounts:
+                - {name: var-lib-rancher, mountPath: /var/lib/rancher,   readOnly: true}
+                - {name: etc-rancher,     mountPath: /etc/rancher,       readOnly: true}
+                - {name: etc-systemd,     mountPath: /etc/systemd,       readOnly: true}
+                - {name: etc-kubernetes,  mountPath: /etc/kubernetes,    readOnly: true}
+                - {name: usr-bin,         mountPath: /usr/local/mount-from-host/bin, readOnly: true}
+                - {name: tmp,             mountPath: /tmp}
+          volumes:
+            - {name: var-lib-rancher, hostPath: {path: /var/lib/rancher}}
+            - {name: etc-rancher,     hostPath: {path: /etc/rancher}}
+            - {name: etc-systemd,     hostPath: {path: /etc/systemd}}
+            - {name: etc-kubernetes,  hostPath: {path: /etc/kubernetes}}
+            - {name: usr-bin,         hostPath: {path: /usr/bin}}
+            - {name: tmp,             emptyDir: {}}

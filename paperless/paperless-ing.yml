@@ -1,0 +1,68 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: paperless
+  namespace: paperless
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "200m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      ## Paperless uploads multipart PDFs/images via /api/documents/post_document/
+      ## which trips CRS 920420 (Request content type is not allowed by policy)
+      ## the same way OwnCloud WebDAV did. Disable that rule for the upload
+      ## endpoint. Carveout MUST come before the CRS Include - see
+      ## fleet/owncloud/owncloud-ing.yml and docs modsec.md.
+      ## NOTE: do NOT put apostrophes (or backslash-newline continuations) in
+      ## this entire snippet, including comments. nginx-ingress wraps the
+      ## whole thing in a single-quoted modsecurity_rules block, so any
+      ## apostrophe inside terminates the quoted string at parse time and
+      ## ALL cluster ingress reloads fail until fixed.
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      ## Paperless REST API uses PATCH for /api/profile/ and other partial
+      ## updates, PUT for replace, DELETE for removal. CRS default
+      ## tx.allowed_methods is GET HEAD POST OPTIONS so anything else
+      ## scores 5 on rule 911100 and trips the 949110 anomaly threshold.
+      ## The previous workaround used ctl:ruleRemoveById=911100 from a
+      ## phase-1 SecRule -- this is documented as ineffective: rule 911100
+      ## is itself phase 1 and loaded inside the CRS Include, so by the time
+      ## our ctl fires the score has already been incremented. Set the
+      ## allowed-methods variable directly instead. The value is a plain
+      ## space-separated token list; no inner quoting needed (owncloud uses
+      ## the same SecAction pattern with a longer WebDAV method list).
+      SecAction "id:1002,phase:1,pass,nolog,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      ## /api/documents/post_document accepts multipart PDF/image uploads.
+      ## CRS 920420 (disallowed Content-Type) and 920430 (HTTP version)
+      ## both fire on legitimate ingest. Same phase-1 ctl:ruleRemoveById
+      ## propagation issue as keycloak/owncloud -- switch to ruleRemoveByTag
+      ## scoped to the upload endpoint. See fleet/owncloud/owncloud-ing.yml
+      ## for the same fix and CRS CHANGES.md for upstream guidance.
+      SecRule REQUEST_URI "@beginsWith /api/documents/post_document" \
+        "id:1001,phase:1,pass,nolog,ctl:ruleRemoveByTag=OWASP_CRS"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: documents.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: paperless
+                port:
+                  number: 8000
+  tls:
+    - hosts:
+        - documents.mdapi.ch
+      secretName: paperless-cert

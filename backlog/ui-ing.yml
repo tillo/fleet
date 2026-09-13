@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backlog-ui
+  namespace: backlog
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Public exposure approved 2026-08-13 (user choice: public + auth):
+    # basic-auth (creds: user tillo, password in Akeyless
+    # /mdapi/backlog/basicauth-password) in front of the community UI,
+    # which has no auth of its own. WAF stays on.
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: backlog-basicauth
+    nginx.ingress.kubernetes.io/auth-realm: "backlog"
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      # beads-ui API uses PUT/PATCH/DELETE
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+    # websocket live updates
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: backlog.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backlog-ui
+                port:
+                  number: 3000
+  tls:
+    - hosts:
+        - backlog.mdapi.ch
+      secretName: backlog-ui-cert

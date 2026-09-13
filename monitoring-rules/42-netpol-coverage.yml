@@ -1,0 +1,183 @@
+## Is the NetworkPolicy floor actually in force? — producer f/probe/netpol_coverage
+##
+## The isolation model (beads infra-az8.4) is a Calico Tier `baseline` holding a
+## cluster-wide default-deny, which namespaces opt out of with the label
+## netpol-onboarded=true; an opted-in namespace is then governed by its OWN ordinary
+## k8s NetworkPolicy. That buys the property the rollout depends on — onboarding a
+## namespace needs no edit to the shared floor object — and it buys one specific
+## hazard in exchange.
+##
+## ⚠️ THE MODEL FAILS OPEN, and it was verified failing open on a scratch namespace
+## on 2026-08-31, not reasoned about: deleting an onboarded namespace's NetworkPolicy
+## silently reopens it to everything. A pod that had just been blocked connected
+## freely straight afterwards. The label asserts onboarding; nothing in Kubernetes or
+## Calico checks that a policy exists behind it.
+##
+## Fail-open degradation is the dangerous direction because it never announces
+## itself — the cluster keeps working perfectly while the control is off. These rules
+## are the only thing that would say so, which is why the probe's own silence is an
+## alert too.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: netpol-coverage
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-security.netpol-coverage
+    rules:
+
+    ## A namespace claiming to be governed that has nothing governing it. The floor
+    ## issues action:Pass for it and the default tier then has no policy to apply, so
+    ## it is wide open while looking onboarded.
+    ##
+    ## `for: 15m` deliberately tolerates a brief window during a legitimate change.
+    ## ⭐ The correct onboarding order is POLICY FIRST, LABEL SECOND — commit the
+    ## namespace's NetworkPolicy, let Fleet reconcile it, and only then add the label.
+    ## Done the other way round the namespace is genuinely open for the length of the
+    ## gap, and this alert is what tells you that happened.
+    - alert: NetworkPolicyFailOpen
+      expr: netpol_onboarded_no_policy_total > 0
+      for: 15m
+      labels:
+        severity: critical
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "{{ $value }} namespace(s) labelled netpol-onboarded hold NO NetworkPolicy — silently open"
+        description: >-
+          These namespaces are exempted from the cluster-wide deny floor on the promise
+          that they police themselves, and they are not. Traffic that the floor would
+          have blocked is currently reaching them from anywhere in the cluster. Either
+          commit the missing NetworkPolicy or remove the netpol-onboarded label so the
+          floor resumes covering them — removing the label is the safe direction and can
+          be done immediately. The offending namespaces are carried per-series on
+          netpol_onboarded_no_policy.
+
+    ## The floor itself is gone. One deleted tier or one deleted GlobalNetworkPolicy
+    ## reopens every namespace at once — the same failure as above at cluster scale.
+    ##
+    ## Guarded on netpol_onboarded_total > 0 so this stays silent until the programme
+    ## actually reaches enforcement: before phase 1 nothing is onboarded and no floor is
+    ## expected, and an alert that fires for months before its subject exists is an
+    ## alert people learn to ignore.
+    - alert: NetworkPolicyFloorMissing
+      expr: netpol_floor_present == 0 and on() netpol_onboarded_total > 0
+      for: 5m
+      labels:
+        severity: critical
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "The Calico baseline tier or one of its floor policies is missing — cluster-wide deny is OFF"
+        description: >-
+          Namespaces are labelled as onboarded, which means they are relying on the
+          baseline tier to deny everything not explicitly permitted, but the tier or one
+          of baseline.pass-onboarded / baseline.deny-rest no longer exists. The cluster
+          is flat again. Restore from ~/fleet; do not hand-apply, or Fleet will fight the
+          reconcile.
+
+    ## Fails CLOSED: if either side of the coverage comparison could not be read, the
+    ## counts above are meaningless and must not be read as "coverage is fine".
+    - alert: NetworkPolicyCoverageCheckBroken
+      expr: netpol_coverage_check_ok == 0
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "NetworkPolicy coverage check could not read the cluster — its counts are invalid"
+        description: >-
+          The probe could not list namespaces or policies, so netpol_onboarded_no_policy_total
+          reflects nothing. Treat coverage as UNKNOWN, not as zero, until this clears.
+
+    ## The probe is the only thing that would report any of the above, so its silence
+    ## has to be an alert in its own right.
+    ##
+    ## ⭐ The `or absent(...)` half is load-bearing. A bare `time() - <metric> > N`
+    ## returns NOTHING when the series is gone rather than firing, so deleting the
+    ## Pushgateway group — or never deploying the producer — would make this silently
+    ## unfireable. That is exactly the failure class the 2026-08-29 coverage audit found
+    ## 25 instances of. An alert about a missing signal must test for it being missing.
+    ##
+    ## Not covered by the generic BatchJobStale: that requires the job to appear in BOTH
+    ## the timestamp set and schedule_cadence_map, and a newly added script is absent
+    ## from the latter until the cadence map next runs.
+    - alert: NetworkPolicyCoverageProbeStale
+      expr: >-
+        (time() - netpol_coverage_last_run_timestamp_seconds > 10800)
+        or absent(netpol_coverage_last_run_timestamp_seconds)
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "NetworkPolicy coverage probe has not run in over 3h — the fail-open guard is blind"
+        description: >-
+          Nothing is currently checking whether onboarded namespaces still hold policies.
+          The probe runs hourly, so three hours means it is broken rather than late. This
+          reports unknown coverage rather than known-bad coverage, hence warning.
+
+    ## ── Log-volume budget (producer f/probe/netpol_log_volume, beads infra-399i) ──
+    ##
+    ## Calico's Log action emits an iptables LOG rule with no `-m limit`, and journald
+    ## discards messages above RateLimitBurst. These two rules exist because the loss is
+    ## SILENT and lands in the worst possible place: a learn-mode dataset missing a
+    ## fraction of its flows yields a policy that looks complete, passes review, and then
+    ## blocks legitimate traffic the moment it is switched from Log to Deny.
+
+    ## Warning rather than critical on purpose: nothing is broken in production at the
+    ## moment this fires. What is broken is the DATA you are about to build a policy
+    ## from — so it needs action before the next enforce step, not at 3am.
+    - alert: NetworkPolicyLogDataLoss
+      expr: netpol_log_journald_suppressed_total > 0
+      for: 5m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "journald DISCARDED log lines — any NetworkPolicy learned from this window is incomplete"
+        description: >-
+          One or more nodes reported journald suppression, so an unknown fraction of
+          calico-packet flow lines never reached the journal or OpenObserve. Do NOT
+          promote a policy from Log to Deny using data from this period. Either raise
+          RateLimitBurst on the affected nodes (check how journald.conf is managed on
+          Harvester — /oem/ may be the right layer) or narrow learn mode to fewer
+          namespaces at a time.
+
+    ## Fires BEFORE data is lost, which is the whole point — the rule above tells you
+    ## the dataset is already damaged, this one gives you room to prevent it.
+    - alert: NetworkPolicyLogBudgetHigh
+      expr: max(netpol_log_burst_budget_used_ratio) > 0.5
+      for: 15m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "calico-packet logging is using {{ $value | humanizePercentage }} of journald's burst budget"
+        description: >-
+          Approaching the point where journald starts discarding silently. Note this
+          measures the calico-packet lines ALONE; everything else on the node shares the
+          same budget, so the real headroom is smaller than this ratio suggests.
+
+    - alert: NetworkPolicyLogVolumeProbeStale
+      expr: >-
+        (time() - netpol_log_volume_last_run_timestamp_seconds > 10800)
+        or absent(netpol_log_volume_last_run_timestamp_seconds)
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Calico Log volume probe has not run in over 3h — the drop detector is blind"
+        description: >-
+          Nothing is currently watching whether journald is discarding flow-log lines.
+          Same reasoning as the coverage probe: a guard that stops running looks exactly
+          like a guard reporting all-clear unless its own silence is an alert.

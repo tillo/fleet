@@ -1,0 +1,237 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: home-assistant
+  namespace: home-assistant
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    ## NIGHT-ONLY UPGRADE WINDOW (was "@every 4h", i.e. round the clock).
+    ## HA is the home's control plane: an upgrade costs ~2 min of no
+    ## automations, no Zigbee, no doorbell. Confine that to the middle of
+    ## the night rather than any random afternoon.
+    ##
+    ## ⛔ THE FIELD ORDER IS SECONDS-FIRST, AND A 5-FIELD CRONTAB IS
+    ## ACCEPTED AND SILENTLY MISPARSED. Keel (0.21.1) parses this with
+    ## github.com/rusenask/cron v1.1.0:
+    ##     NewParser(Second|Minute|Hour|Dom|Month|DowOptional|Descriptor)
+    ## so 5 OR 6 fields parse, always filling Second first. The ordinary
+    ## crontab line "0 3 * * *" therefore means sec=0 min=3 hour=* — every
+    ## hour at HH:03:00, i.e. 24x MORE polling, with no error logged.
+    ## Six fields, always.
+    ##
+    ## ⛔ THE CLOCK IS UTC, NOT Europe/Zurich. The keel container sets no TZ
+    ## and ships no /etc/localtime, and cron.New() takes time.Now().Location()
+    ## — so the spec is evaluated in UTC. This fork has no CRON_TZ=/TZ=
+    ## prefix support, so a local-time window has to be picked by hand.
+    ## 02:30 UTC = 04:30 CEST (summer) / 03:30 CET (winter): inside a
+    ## 03:00-05:00 household window on both sides of the DST change.
+    ## Only 02:00 and 03:00 UTC have that property — do not move this to
+    ## "03:00" thinking it is local.
+    ##
+    ## One poll per night on purpose: a second attempt in the same window
+    ## would re-install an image the rollback watchdog had just backed out.
+    keel.sh/pollSchedule: "0 30 2 * * *"
+spec:
+  ## HA's measured cold start (pod created -> /api/prometheus scraping again)
+  ## is 90-105 s across the last four rollouts (2026-09-05 13:40:30->13:42:00,
+  ## 09-08 20:55:30->20:57:00, 09-09 08:46:30->08:48:30). The startupProbe
+  ## below buys 20 min, so the deadline has to sit above that or a slow but
+  ## healthy boot (recorder schema migration, custom-component wheel builds)
+  ## would be reported as a failed rollout. 1800 s = startup budget + 10 min.
+  progressDeadlineSeconds: 1800
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: home-assistant
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: home-assistant
+    spec:
+      # Home's control plane — evicted last among user workloads (N-1 program).
+      priorityClassName: mdapi-critical
+      # Pinned to the node that physically hosts the Zigbee USB stick.
+      # Pod is privileged, so /dev access is granted unconditionally —
+      # no device plugin needed. Edit this if the stick is moved.
+      nodeSelector:
+        kubernetes.io/hostname: qui
+      initContainers:
+      # Bootstrap initContainer (2026-05-14 migration):
+      # If a /config/configuration.yaml.bootstrap exists on the PVC AND the
+      # real configuration.yaml is missing OR empty (0 bytes — happened on the
+      # initial migration because the PVC had a 0-byte stub from pre-CM-mount
+      # days), promote .bootstrap to configuration.yaml. On normal restarts,
+      # this is a no-op because configuration.yaml is present and non-empty.
+      - name: bootstrap-configuration
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          if [ -f /config/configuration.yaml.bootstrap ] && [ ! -s /config/configuration.yaml ]; then
+            mv -f /config/configuration.yaml.bootstrap /config/configuration.yaml
+            echo "bootstrap-configuration: installed configuration.yaml from .bootstrap (target was missing or empty)"
+          else
+            echo "bootstrap-configuration: nothing to do (target=$( [ -s /config/configuration.yaml ] && echo non-empty || echo missing-or-empty ), bootstrap=$( [ -f /config/configuration.yaml.bootstrap ] && echo present || echo absent ))"
+          fi
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+      containers:
+      - name: home-assistant
+        image: ghcr.io/home-assistant/home-assistant:latest
+        securityContext:
+          privileged: true
+        ports:
+        - containerPort: 8123
+#        command: ['/bin/sh']
+#        args:
+#        - '+x'
+#        - '-c'
+#        - >-
+#          udevd -d
+#          && sleep 20
+#          && [ -c "/dev/ttyUSB0" ]
+#          && /run/s6/legacy-services/home-assistant/run
+#          || apk add --no-cache eudev
+#          ; /run/s6/legacy-services/home-assistant/run
+#          ; sleep infinity
+        ## Probes added 2026-09-09 with the night upgrade window. Until now the
+        ## Deployment had none at all, so the pod counted Ready the instant the
+        ## container process existed and `Available` said nothing about whether
+        ## HA was serving — a rollout could "succeed" onto an image that never
+        ## finished booting.
+        ##
+        ## /manifest.json is HA's own unauthenticated static endpoint (200 in
+        ## 8 ms, measured); / and /auth/providers also answer 200 without a
+        ## token, /api/ does not (401) and is unusable as a probe.
+        ##
+        ## startupProbe: 120 x 10 s = 20 min of boot budget before readiness is
+        ## evaluated at all — ~12x the measured 90-105 s cold start, so a slow
+        ## but healthy start (DB migration, HACS component wheel builds) is not
+        ## treated as a failure. There is deliberately NO livenessProbe: with a
+        ## single-replica Recreate workload on an RWO PVC, a liveness restart
+        ## loop during a slow boot is a worse outcome than a hung HA.
+        startupProbe:
+          httpGet:
+            path: /manifest.json
+            port: 8123
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 120
+        ## readinessProbe: after startup, 6 x 30 s = 3 min of failure before the
+        ## Service drops the endpoint. Longer than HA's in-place core restart
+        ## (~2.5 min, f/heal/ha_stream_unwedge) so that does not flap the ingress.
+        readinessProbe:
+          httpGet:
+            path: /manifest.json
+            port: 8123
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 6
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        envFrom:
+        - secretRef:
+            name: home-assistant-env-secret
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+        # configuration.yaml lives on the PVC (home-assistant-data) since
+        # 2026-05-14 — see bootstrap-configuration initContainer above and the
+        # home-assistant-bootstrap ConfigMap (kept as DR seed, not mounted).
+        - name: home-assistant-secrets
+          mountPath: /config/secrets.yaml
+          subPath: secrets.yaml
+        # /dev/ttyUSB* re-enumerate across reboots (a node reboot moved the Zigbee
+        # ZBT-1 from ttyUSB1->ttyUSB0, breaking ZHA which was pinned to ttyUSB1).
+        # Mount the udev /dev/serial/by-id symlinks so ZHA can use the stable
+        # by-id path (privileged already exposes the underlying ttyUSB* nodes).
+        - name: dev-serial
+          mountPath: /dev/serial
+          readOnly: true
+        # Honest request = observed steady-state (~2.4Gi). The main container was
+        # BestEffort ({}), so HA was first against the wall on node-memory
+        # eviction/OOM — unacceptable for the home's control plane (2026-07-05
+        # N-1 program). Limit left generous for recorder/history spikes; this
+        # only makes the scheduler account for memory HA already uses.
+        resources:
+          requests:
+            cpu: 200m
+            memory: 2560Mi
+          limits:
+            memory: 4Gi
+      # Sidecar: hourly off-site sync of /config/backups → Garage S3.
+      # Local retention is unchanged (auto_backup keeps the rolling window).
+      #
+      # ⚠️ THE NIGHT WINDOW ABOVE DOES NOT COVER THIS CONTAINER, and an update
+      # to it restarts the whole pod (Recreate, single replica) — i.e. it can
+      # still take HA down at any hour.
+      # Keel's poll job is keyed by REGISTRY IMAGE ONLY — `getImageIdentifier`
+      # returns `registry/shortname:tag`, with no namespace (keel 0.21.1
+      # trigger/poll/watcher.go:95) — so every Deployment referencing
+      # `rclone/rclone:latest` shares ONE cron entry, and the schedule is
+      # whichever Deployment keel scanned last ("todo: this is not right, we
+      # are using the last seen schedule" is upstream's own comment on that
+      # code path). frigate/frigate and paperless/paperless also run this
+      # image, both still on "@every 4h", so 4-hourly usually wins.
+      # ghcr.io/home-assistant/home-assistant:latest has no such sharer, so
+      # HA's OWN image really is night-only.
+      # To close this: put frigate + paperless on the same nightly schedule,
+      # or move this sidecar off `:latest` onto a pinned version tag (its own
+      # cron key). Neither is done here — see ~/ha-upgrade-window-rollback.md.
+      - name: rclone-backups-s3
+        image: rclone/rclone:latest
+        imagePullPolicy: Always
+        command:
+        - sh
+        - -c
+        - |
+          set -u
+          : "${BUCKET:?BUCKET env required}"
+          while true; do
+            rclone copy --min-age 1h --transfers 4 --s3-no-check-bucket \
+              /config/backups "garage:${BUCKET}" 2>&1 || true
+            sleep 3600
+          done
+        envFrom:
+        - secretRef:
+            name: garage-ha-backup-s3
+        volumeMounts:
+        - name: home-assistant-data
+          mountPath: /config
+          readOnly: true
+        ## CA for the Garage TLS terminator on salt/pepper; rclone reads it
+        ## via RCLONE_CA_CERT, set in the garage-ha-backup-s3 secret.
+        - name: garage-transit-ca
+          mountPath: /etc/garage-tls
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      volumes:
+      - name: home-assistant-data
+        persistentVolumeClaim:
+          claimName: home-assistant-data
+      - name: garage-transit-ca
+        secret:
+          secretName: garage-transit-ca
+      # home-assistant-config volume removed 2026-05-14 (configuration.yaml on PVC).
+      # The home-assistant-bootstrap ConfigMap still exists in fleet as a DR seed.
+      - name: home-assistant-secrets
+        secret:
+          secretName: home-assistant-secrets
+      - name: dev-serial
+        hostPath:
+          path: /dev/serial
+          type: Directory      # exists while the ZBT-1 (permanently installed) is present on qui

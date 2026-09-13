@@ -1,0 +1,71 @@
+## VolSync backup of nextcloud-aio-nextcloud-data-ceph (FAMILY user files — mdapi instance) —
+## family instance day-one backup (beads infra-xdm; pattern from infra-jjb).
+## Same pattern as owncloud + paperless: per-PVC restic repo in the external
+## Garage ceph-backup bucket (offsite-swept to B2/SFTP since 2026-08-14),
+## CSI snapshot, mover as uid 33 (www-data owns /mnt/ncdata). Daily 03:45 UTC
+## — after paperless 03:15, before the 04:00 offsite sweep kickoff (the sweep
+## reads yesterday's state; today's snapshot rides tomorrow's sweep).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: nextcloud
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that hostname
+        ## resolves to the shared ingress VIP, so every backup hairpinned through
+        ## ingress-nginx and would fail exactly when the front door is degraded --
+        ## which is when a backup matters most. restic encrypts client-side and S3
+        ## auth is a SigV4 signature, so losing the ingress TLS costs no
+        ## confidentiality: Garage has no TLS listener of its own, and the ingress
+        ## already re-emitted plaintext to these same LAN hosts. Same bucket and
+        ## path, so the existing restic repository is untouched.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/mdapi-nextcloud-data-ceph"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: nextcloud-aio-nextcloud-data-ceph
+  namespace: nextcloud
+spec:
+  sourcePVC: nextcloud-aio-nextcloud-data-ceph
+  trigger:
+    schedule: "0 3 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    # uid 33 owns /mnt/ncdata — same CAP_DAC_OVERRIDE lesson as owncloud's RS.
+    moverSecurityContext:
+      runAsUser: 33
+      runAsGroup: 33
+      runAsNonRoot: true
+    cacheCapacity: 4Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

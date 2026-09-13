@@ -1,0 +1,23 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: claude-shim-env
+  namespace: litellm
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: claude-shim-env
+    creationPolicy: Owner
+
+  data:
+    # Long-lived Claude Code OAuth token minted interactively with
+    # `claude setup-token` (Max subscription). Re-mint + update in Akeyless
+    # if headless auth starts failing.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/CLAUDE_CODE_OAUTH_TOKEN
+      secretKey: CLAUDE_CODE_OAUTH_TOKEN

@@ -1,0 +1,74 @@
+## Early warning for the storage-stall family, on the signal that actually measures the
+## failing quantity: PSI memory *full* stall — the fraction of wall time in which EVERY
+## task on the node is blocked waiting on memory reclaim.
+##
+## Why this metric and not the obvious ones: the 2026-07-28 investigation established that
+## each event begins with a multi-GiB allocation burst 1–3 min before onset, then heavy
+## reclaim, then IO completions stall, then a D-state avalanche (994–1569 blocked procs at
+## near-idle device throughput). `MemAvailable` drop and `pgmajfault` are *shadows* of that
+## and were both backtested and REJECTED over 39 days: no threshold caught all events
+## without paging 9–84x/week, and every operating point had ~0 min of lead time
+## (see ~/storage-stall-isolation-design.md §0.1). PSI measures the stall directly.
+##
+## PSI was unavailable until 2026-07-29: the kernel has CONFIG_PSI=y with
+## CONFIG_PSI_DEFAULT_DISABLED=y, so it needed `psi=1` on the cmdline, applied fleet-wide
+## in the 07-28/29 night window.
+##
+## node_pressure_memory_stalled_seconds_total = PSI "full" (ALL tasks stalled).
+## node_pressure_memory_waiting_seconds_total = PSI "some" (at least one task stalled).
+## "full" is the severe one and is what a reclaim-driven node freeze looks like.
+##
+## ⚠️ THRESHOLD IS PROVISIONAL — REVIEW AFTER 2026-08-28 ⚠️
+## Only ~7 h of PSI history existed when this was written (PSI went live 2026-07-29), so the
+## 30-day backtest applied to the rejected MemAvailable rule could NOT be run. The threshold
+## is instead derived from the measured distribution over that 7 h, which usefully INCLUDES
+## the heaviest churn this cluster has seen in months (full quiesce + 3 node reboots +
+## 89 volumes reattaching + every workload restarting):
+##     median 0.0001 · p99 0.46 · max 0.548
+## Sustained-run lengths at 1 min resolution over that window:
+##     >0.20 -> 5 min · >0.40 -> 4 min · >0.50 -> 2 min · >0.60 -> NEVER · >0.70 -> NEVER
+## So 0.60 sits just above the worst legitimate excursion ever observed, and `for: 3m` adds a
+## second independent margin (nothing sustained even 0.50 for 3 min). A genuine reclaim
+## freeze — every task blocked while the node wedges for 9–35 min — sits far above this.
+## (An earlier draft used 0.20 on the strength of a "0.95 % peak" that was an artefact of a
+## 6 h lookback window which did not reach the real 01:51Z peak. Measure over the full range.)
+## When 30 days exist, backtest properly: count firing EPISODES and verify non-zero lead time.
+##
+## Deliberately NOT alerting on io PSI: it legitimately reached 41 % full-stall during the
+## same restore, so it has no usable margin yet. Memory is also the causal signal — IO stall
+## is the downstream consequence.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-psi-memory-stall
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: node-psi.memory
+    rules:
+    - alert: NodeMemoryStallPSI
+      # fraction of wall-clock time with ALL tasks blocked on memory reclaim
+      expr: rate(node_pressure_memory_stalled_seconds_total[2m]) > 0.60
+      for: 3m
+      labels:
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.instance }}: memory FULL-stall {{ $value | humanizePercentage }} — node may be entering a reclaim freeze"
+        description: >-
+          Every task on {{ $labels.instance }} has been blocked on memory reclaim for
+          {{ $value | humanizePercentage }} of the last 2 minutes, sustained 3 min.
+          This is the precursor signature of the storage-stall family (qua 06-30,
+          qui 07-04, qui 07-12, quo 07-17): allocation burst -> reclaim -> IO completions
+          stall -> D-state avalanche -> NotReady -> eviction. Healthy idle is ~0.01% and the heaviest
+          observed legitimate churn (full quiesce + 3 node reboots) peaked at 54.8% but never
+          sustained 0.60 for 3 min.
+          ACT NOW, while userspace still works - you have roughly 1-3 min before the node
+          may wedge. Check what allocated: `kubectl top pods -A --sort-by=memory` and the
+          ingress-nginx controllers (a ModSec reload transiently doubles ~8-13 GiB of nginx
+          RSS per pod and is the prime suspect for the burst). Cordoning the node early is
+          cheaper than recovering a wedged one - see ~/wedge-recover.sh and
+          ~/storage-stall-isolation-design.md.

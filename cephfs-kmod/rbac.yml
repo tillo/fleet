@@ -1,0 +1,33 @@
+# ServiceAccount + minimal RBAC so the builder can share a compiled ceph.ko between nodes
+# via a Secret keyed by kernel version. Without this, every node compiles the same module
+# independently after a kernel upgrade (~50 min each). Scope is deliberately tiny: secrets
+# in this namespace only, no cluster-wide rights.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cephfs-kmod-builder
+  namespace: cephfs-kmod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cephfs-kmod-cache
+  namespace: cephfs-kmod
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cephfs-kmod-cache
+  namespace: cephfs-kmod
+subjects:
+  - kind: ServiceAccount
+    name: cephfs-kmod-builder
+    namespace: cephfs-kmod
+roleRef:
+  kind: Role
+  name: cephfs-kmod-cache
+  apiGroup: rbac.authorization.k8s.io

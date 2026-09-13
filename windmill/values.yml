@@ -1,0 +1,237 @@
+postgresql:
+  persistence:
+    enabled: true
+    storageClass: "harvester-longhorn-2replicas"
+    size: 5Gi
+
+windmill:
+  baseDomain: windmill.mdapi.ch
+  baseProtocol: https
+  # PINNED 2026-09-02 — chart 4.0.251 has appVersion 1.799.0 and `tag: ""`
+  # means "use the appVersion", but ghcr.io/windmill-labs/windmill:1.799.0 WAS
+  # NEVER PUBLISHED. Verified against the ghcr manifest API: 1.796.0, 1.797.0,
+  # 1.798.0, 1.800.0 and 1.801.0 all return 200; 1.799.0 returns 404. The chart
+  # has shipped that dangling appVersion since 4.0.246 (Renovate commit 0b1b0e9,
+  # 08-24), so the rollout that started 2026-09-01T10:12Z left six pods in
+  # ImagePullBackOff for a day while the old 1.796.0 ReplicaSets kept serving —
+  # not an outage, but GitOps convergence stopped dead and mdapi-prod-windmill
+  # has been the one un-ready bundle since.
+  #
+  # 1.798.0 is the newest published version at or below the chart's own
+  # appVersion, i.e. the smallest step that unblocks (1.796.0 -> 1.798.0).
+  # 1.800.0/1.801.0 exist too; leave that jump to a chart bump that asks for it.
+  # DROP THIS PIN once the chart's appVersion resolves to a published image
+  # again — leaving it here silently freezes the app version at a Renovate bump.
+  tag: "1.798.0"
+  # Lane B: all windmill component images are pinned (chart appVersion / the
+  # windmillExtra pin below). The chart defaults imagePullPolicy to Always
+  # (boot-fragile, no update benefit on a pinned tag). Set IfNotPresent across
+  # all components (operator/app/worker-groups/hub/indexer/extra all read
+  # $.Values.windmill.imagePullPolicy).
+  imagePullPolicy: IfNotPresent
+  # windmill-extra (LSP/Multiplayer/Debugger) tag defaults to the chart's
+  # appVersion (currently 1.725.0), but the windmill-extra image repo on ghcr
+  # lags the main windmill image by ~one release — 1.725.0 does not exist for
+  # extra (latest published is 1.724.0), so the rollout was stuck in
+  # ImagePullBackOff. Pin extra to the latest tag that actually exists. REMOVE
+  # this pin (or bump it) once ghcr.io/windmill-labs/windmill-extra:1.725.0
+  # publishes, so extra tracks the app version again.
+  windmillExtra:
+    tag: "1.724.0"
+  app:
+    extraEnv:
+      # Windmill AI (customai provider) points at the in-cluster litellm
+      # service; the API server's SSRF guard refuses private base URLs
+      # without this (2026-08-18). Scope: AI base URLs only.
+      - name: ALLOW_PRIVATE_AI_BASE_URLS
+        value: "true"
+  # Override the chart's default workerGroups list to bump the default
+  # group's memory limit from 2Gi → 4Gi. Required since the
+  # scrypted_data_backup script streams a ~50 MiB tarball + base64
+  # buffers, peaking ~250 MiB; under load the shared worker pod can
+  # easily exceed 2Gi across concurrent jobs. Helm lists don't merge
+  # so we must re-declare all 3 chart-default groups verbatim.
+  workerGroups:
+    - name: default
+      replicas: 3
+      mode: worker
+      controller: Deployment
+      privileged: true
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      terminationGracePeriodSeconds: 604800
+      resources:
+        # requests MUST be declared explicitly: with only `limits` set, k8s
+        # defaults the request to equal the limit, so these 3 pods each
+        # reserved 4Gi while using ~420Mi — 90% of qua/qui's schedulable
+        # memory was over-request, not use (rancher-topology-study E8).
+        # 2Gi tracks the VPA recommendation (mode Off = recommend-only, so it
+        # will not fight this value): target 1.85GiB, lowerBound 826Mi.
+        # The 4Gi LIMIT is unchanged and still covers the burst described above.
+        requests:
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+    - name: native
+      replicas: 1
+      mode: worker
+      controller: Deployment
+      privileged: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      extraEnv:
+        - name: NATIVE_MODE
+          value: "true"
+        - name: SLEEP_QUEUE
+          value: "200"
+      resources:
+        limits:
+          memory: 2Gi
+    - name: gpu
+      replicas: 0
+      mode: worker
+      controller: Deployment
+      privileged: true
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      resources:
+        limits:
+          memory: 2Gi
+    # Dedicated group for cert-delivery jobs to PULL-ONLY devices. Mounts the
+    # cert-staging RWX (created by the cert-host Fleet bundle, also mounted
+    # read-only by the cert-host web pod at 192.168.1.61) so jobs can stage a
+    # PEM for a device to fetch (AOS-6 IAP `download-cert`, etc.), then delete
+    # it. Isolated here so a CephFS hiccup can't stall the default/native
+    # workers; tag delivery scripts with worker tag "certs". Non-privileged.
+    - name: certs
+      replicas: 1
+      mode: worker
+      controller: Deployment
+      privileged: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      # Serve ONLY the custom "certs" tag so cert-delivery scripts (tagged
+      # "certs") run here — the only worker mounting /staging. Dependency/lock
+      # jobs keep their language tags and run on the default workers.
+      extraEnv:
+        - name: WORKER_TAGS
+          value: "certs"
+      volumes:
+        - name: cert-staging
+          persistentVolumeClaim:
+            claimName: cert-staging
+        # Pod-lifetime dep cache: an OOM kill restarts only the container, so
+        # this emptyDir keeps /tmp/windmill/cache (uv wheels + py_runtime)
+        # warm across restarts — otherwise each OOM wipes the cache and the
+        # next job start re-bursts cold, a self-sustaining crash loop.
+        - name: dep-cache
+          emptyDir: {}
+      volumeMounts:
+        - name: cert-staging
+          mountPath: /staging
+        - name: dep-cache
+          mountPath: /tmp/windmill/cache
+      resources:
+        # Explicit request so this pod stops reserving its whole 2Gi limit for
+        # a steady ~190Mi (see the default group above / study E8). No VPA on
+        # this deployment, so nothing will overwrite it.
+        requests:
+          memory: 512Mi
+        limits:
+          # 4Gi since 2026-08-10: the cold-cache uv install burst at aos6 job
+          # start OOM-killed the worker at 2Gi on 08-09 and 08-10 (exit 137
+          # <40s after start, too fast for the 30s scrape). The dep-cache
+          # emptyDir above removes the burst on restarts; 4Gi absorbs the one
+          # cold burst after a genuine pod replacement.
+          memory: 4Gi
+    # Dedicated group for hours-scale slot holders (infra-health ledger
+    # ext:windmill-worker-pool-contention): the nightly garage_offsite_backup
+    # held a default slot for 5h+ (02:00-07:10), which together with the
+    # hourly skill_dispatch hold (15-90 min) left ONE free default slot — a
+    # third long job starved the whole heal/probe layer for ~25 min on
+    # 2026-08-07. Scripts tagged "long" run here; the 3 default slots stay
+    # for short latency-sensitive jobs. The dispatcher deliberately stays on
+    # default: on this 1-slot group it would queue behind the 5h backup.
+    - name: long
+      replicas: 1
+      mode: worker
+      controller: Deployment
+      privileged: false
+      podSecurityContext:
+        runAsNonRoot: false
+        runAsUser: 0
+      # 6h grace: let an in-flight nightly backup finish during a roll
+      terminationGracePeriodSeconds: 21600
+      extraEnv:
+        - name: WORKER_TAGS
+          value: "long"
+      resources:
+        requests:
+          memory: 512Mi
+        limits:
+          memory: 2Gi
+ingress:
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: "route"
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecRule REQUEST_URI "@beginsWith /api/w/mdapi/workspaces/tarball" "id:1001,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly"
+      # Windmill REST API uses DELETE on variables/scripts/flows/schedules
+      # and PATCH on most resources. Declare id:900200 BEFORE Include so
+      # ModSec keeps OUR allowed_methods list (first-wins on duplicate
+      # IDs) and the CRS crs-setup.conf id:900200 is dropped. Rule
+      # 911100 then sees the expanded list at phase:1 and does not add
+      # 5 to anomaly_score for DELETE/PATCH/PUT.
+      # No apostrophes in this block: the outer modsecurity_rules is
+      # single-quoted and the apostrophe closes the string at the nginx
+      # parser layer (2026-05-11 outage).
+      SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE"
+      # The wmill node SDK (workspace tarball backup, resource downloads)
+      # sets Content-Type: application/octet-stream on GET requests. CRS
+      # rule 920420 fires on that MIME type by default. Extend the
+      # allowed list in phase:1 before the Include so 920420 stops
+      # firing on legitimate authenticated API traffic. Same pattern as
+      # joplin/joplin-ing.yml cf3e8c3.
+      SecAction "id:900201,phase:1,nolog,pass,t:none,setvar:tx.allowed_request_content_type=|application/x-www-form-urlencoded| |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| |application/json| |application/reports+json| |application/csp-report| |application/octet-stream|"
+      # Windmill resource paths (scripts/flows/apps) are user-named and can
+      # legitimately end in a CRS restricted-file token, e.g.
+      # f/gitlab/upgrade_bump_dockerfile -> 930130 matches "dockerfile" in
+      # restricted-files.data and blocks the authenticated API call. Drop the
+      # attack-lfi group only on the authenticated workspace API surface;
+      # root-level scanner probes (/.env, /.git/config) are not under /api/w/
+      # and stay blocked. ruleRemoveByTag (not ruleRemoveById) is required:
+      # 930130 is phase:1 in CRS 4.22.0 -- the SAME phase as this rule, so the
+      # earlier does-not-propagate-across-phases reading was wrong (phase
+      # attribution corrected 2026-08-24 against upstream
+      # rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf). The no-op itself is
+      # real (verified 2026-06-17 by probe); the mechanism is that
+      # ruleRemoveById is only honoured inside the target rule during its own
+      # evaluate(), whereas ruleRemoveByTag is enforced by the phase
+      # dispatcher BEFORE evaluate() is called, so it skips the whole
+      # attack-lfi group regardless of phase. LFI rules add no
+      # real protection on /api/w/mdapi/ since an authenticated Windmill user
+      # can run arbitrary scripts anyway. Two-line continuation is mandatory or
+      # the ctl silently no-ops.
+      SecRule REQUEST_URI "@beginsWith /api/w/mdapi/" \
+        "id:1002,phase:1,pass,nolog,ctl:ruleRemoveByTag=attack-lfi"
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+  tls:
+    - secretName: windmill-cert
+      hosts:
+        - windmill.mdapi.ch
+    

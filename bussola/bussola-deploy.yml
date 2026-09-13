@@ -1,0 +1,332 @@
+## Bussola — applicazione di budget personale a bussola.mdapi.ch.
+##
+## POSTURA DI RISERVATEZZA. L'applicazione è MULTI-TENANT: ogni persona che
+## entra riceve i propri conti, e le famiglie non si vedono fra loro se non per
+## invito esplicito e revocabile. Non raggiunge nessun servizio fuori dal
+## cluster: niente modelli in cloud, nemmeno come riserva.
+##
+## Nessun elenco di persone nella configurazione, e nemmeno in Akeyless: chi
+## può entrare lo dice il ruolo Keycloak `mdapi-bussola`, chi vede cosa lo dice
+## il database, tenant per tenant. Un elenco di indirizzi qui sarebbe un
+## secondo posto dove sapere chi è chi — e questo repository ha un mirror
+## pubblico su GitHub.
+##
+## CORSIA DELL'IMMAGINE — pinnata + Renovate, NON Keel. L'applicazione esegue
+## migrazioni di schema all'avvio: un salto automatico di più versioni
+## migrerebbe il database prima che qualcuno legga le note di rilascio. Stessa
+## proprietà e stesso trattamento di Open WebUI e joplin/server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bussola
+  namespace: bussola
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bussola
+  template:
+    metadata:
+      labels:
+        app: bussola
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+      - name: bussola
+        image: zot.mdapi.ch/mdapi/bussola:1.0.0-mdapi.47
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        env:
+        ## CNPG genera questo Secret con la chiave `uri` già formata.
+        - name: BUSSOLA_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: bussola-pg-app
+              key: uri
+        ## L'identità arriva solo dalle intestazioni di oauth2-proxy. Con
+        ## questo a true l'applicazione rifiuta ogni richiesta che non ne porti
+        ## una, così parlare direttamente al Service non aggira la porta.
+        - name: BUSSOLA_TRUST_PROXY_HEADERS
+          value: "true"
+        - name: BUSSOLA_TZ
+          value: "Europe/Zurich"
+        ## Le origini da cui si accetta una richiesta che cambia qualcosa.
+        - name: BUSSOLA_ORIGINI
+          value: "https://bussola.mdapi.ch"
+        ## --- rubrica: chi si può invitare come sostegno -------------------
+        ## Sola lettura, con un client Keycloak dedicato che ha il solo
+        ## diritto `view-users`: verificato che un POST /users risponde 403.
+        ## Bussola elenca le persone, non amministra il realm.
+        - name: BUSSOLA_IDP_URL
+          value: "https://idp.mdapi.ch"
+        - name: BUSSOLA_IDP_REALM
+          value: "tilloch"
+        - name: BUSSOLA_DIRECTORY_CLIENT_ID
+          value: "bussola-directory"
+        - name: BUSSOLA_DIRECTORY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: bussola-directory
+              key: client-secret
+        ## Il giorno che servissero ospiti con accesso ristretto, si aggiunge
+        ## il loro gruppo qui — non nel codice.
+        - name: BUSSOLA_DIRECTORY_GROUPS
+          value: "Family"
+        ## Caselle condivise che stanno nel gruppo ma non sono persone.
+        ## ESPLICITO e non dedotto: il gruppo `Person` del realm sembrava il
+        ## filtro naturale e invece lascia fuori due familiari veri, cioè li
+        ## avrebbe tolti dall'elenco senza dirlo a nessuno.
+        - name: BUSSOLA_DIRECTORY_EXCLUDE
+          value: "documents"
+        ## --- avvisi -------------------------------------------------------
+        ## Due soli eventi: una persona nuova che riceve i suoi conti, e un
+        ## invito che diventa accesso. MAI a ogni accesso o a ogni spesa:
+        ## sarebbe sorveglianza travestita da notifica, che su questa
+        ## applicazione è precisamente la cosa da non fare.
+        - name: BUSSOLA_PUSHOVER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: bussola-pushover
+              key: token
+        - name: BUSSOLA_PUSHOVER_USER
+          valueFrom:
+            secretKeyRef:
+              name: bussola-pushover
+              key: user
+        ## La posta, che è la copia che DURA. Il Pushover si legge di sfuggita e
+        ## si azzera in blocco: va bene per «è successo qualcosa», va male per
+        ## il messaggio di una persona che ha preso il tempo di scriverlo, e
+        ## quello è precisamente il terzo evento. Si mandano tutte e due, e
+        ## l'email porta il commento INTERO (il Pushover taglia a 400).
+        ##
+        ## Relay di casa, senza credenziali: accetta da dentro l'infrastruttura.
+        ## STARTTLS quando lo offre — verificato che lo offre.
+        - name: BUSSOLA_MAIL_HOST
+          value: "mail.mdapi.ch"
+        - name: BUSSOLA_MAIL_PORT
+          value: "25"
+        - name: BUSSOLA_MAIL_FROM
+          value: "bussola@mdapi.tillo.ch"
+        ## ⚠ Il destinatario NON sta qui: questo repository ha un mirror
+        ## pubblico su GitHub, e un indirizzo di posta scritto qui è un
+        ## indirizzo pubblicato. Arriva da Akeyless, come /mdapi/keel/pushover-email.
+        - name: BUSSOLA_MAIL_TO
+          valueFrom:
+            secretKeyRef:
+              name: bussola-notify
+              key: email
+        ## Il narratore. Vive nello stesso namespace, senza ingress: un solo
+        ## consumatore, stessa forma di searxng e claude-shim. Se il pod è
+        ## spento l'applicazione funziona per intero, solo con testi fissi.
+        - name: BUSSOLA_NARRATOR_URL
+          value: "http://bussola-narratore.bussola.svc.cluster.local:8080"
+        - name: BUSSOLA_NARRATOR_MODEL
+          value: "bussola"
+        ## 25s era il default e stava stretto: /frase è fuori dal percorso
+        ## critico (la pagina è già a schermo), quindi tanto vale dargli aria.
+        - name: BUSSOLA_NARRATOR_TIMEOUT
+          value: "60"
+        ## --- l'assistente delle domande («Chiedi») ------------------------
+        ## Preferisce local-only via litellm (il 30B sul portatile): misurato
+        ## meglio del 4B in cluster su ogni domanda vera, e più veloce. Ma quel
+        ## portatile può essere spento, quindi NON è l'unico: senza risposta si
+        ## ripiega sul narratore in cluster, che è sempre acceso.
+        ##
+        ## Il Service interno e non llm.mdapi.ch: quell'ingress è
+        ## whitelist-source-range 192.168.1.0/24 e un IP di pod prende 403.
+        ## ⚠ SENZA `/v1` finale: l'applicazione aggiunge lei
+        ## `/v1/chat/completions`. Con il `/v1` qui — che è come litellm scrive
+        ## il proprio indirizzo dappertutto — usciva `/v1/v1/chat/completions`,
+        ## 404 a ogni domanda, e il ripiego sul narratore in cluster rispondeva
+        ## comunque: «Chiedi» sembrava funzionare e il 30B non è mai stato
+        ## interrogato. Adesso l'applicazione tollera entrambe le forme, ma
+        ## quella giusta è questa.
+        - name: BUSSOLA_ASSISTANT_URL
+          value: "http://litellm.litellm.svc.cluster.local:4000"
+        - name: BUSSOLA_ASSISTANT_MODEL
+          value: "local-only"
+        ## Chiave virtuale limitata al solo gruppo local-only: con questa un
+        ## "opus" risponde 403, verificato.
+        - name: BUSSOLA_ASSISTANT_KEY
+          valueFrom:
+            secretKeyRef:
+              name: bussola-assistant
+              key: litellm-key
+        livenessProbe:
+          httpGet: {path: /health, port: 8080}
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        ## /health/db e non /health: senza database l'applicazione è viva ma non
+        ## può rispondere niente di utile, e non deve ricevere traffico.
+        readinessProbe:
+          httpGet: {path: /health/db, port: 8080}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: "1"
+            memory: 512Mi
+        ## Cinque secondi di grazia PRIMA che uvicorn riceva il SIGTERM.
+        ##
+        ## Alla cancellazione di un pod succedono due cose IN PARALLELO e senza
+        ## nessun ordine garantito: il kubelet manda SIGTERM, e il pod viene
+        ## tolto dagli Endpoints. uvicorn smette di ascoltare subito, mentre
+        ## ingress-nginx puo' continuare a mandargli richieste per qualche
+        ## decimo di secondo: quelle prendono un connection refused, cioe' un
+        ## 502 in faccia a chi sta usando l'applicazione.
+        ##
+        ## Osservato durante il rilascio di 1.0.0-mdapi.23, dal kubelet stesso:
+        ##   Readiness probe failed: dial tcp 10.52.2.85:8080: connect:
+        ##   connection refused
+        ## sul pod in terminazione, che era ancora nel Service.
+        ##
+        ## Le due repliche NON bastano a evitarlo: il problema non e' quante ce
+        ## ne sono, e' che quella che se ne va smette di rispondere prima che
+        ## qualcuno smetta di chiamarla. Lo sleep tiene il processo in ascolto
+        ## mentre la rimozione si propaga; terminationGracePeriodSeconds e' 30,
+        ## quindi c'e' spazio abbondante per lo sleep piu' la richiesta in corso.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sleep", "5"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      ## Le due repliche su due nodi diversi.
+      ##
+      ## Erano su quo e qua per scelta dello scheduler, non per una regola:
+      ## niente impediva che finissero tutte e due sullo stesso nodo, e in quel
+      ## caso un riavvio del nodo spegne l'applicazione per intero — cioe'
+      ## esattamente cio' che avere due repliche dovrebbe impedire.
+      ##
+      ## ScheduleAnyway e non DoNotSchedule: e' una preferenza forte, non un
+      ## vincolo. Con tre nodi e maxSurge=1 durante un rilascio ci sono per un
+      ## momento tre pod, e un vincolo rigido bloccherebbe il rollout se un
+      ## nodo fosse cordonato o pieno. Meglio un pod mal distribuito che un
+      ## rilascio fermo.
+      ##
+      ## matchLabelKeys su pod-template-hash: senza, durante un rilascio il
+      ## conteggio mescola i pod vecchi e quelli nuovi e la distribuzione
+      ## voluta viene calcolata su una fotografia che non esiste piu'.
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: bussola
+        matchLabelKeys:
+        - pod-template-hash
+      volumes:
+      ## readOnlyRootFilesystem: l'unica scrittura è /tmp, e non ci resta niente.
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bussola
+  namespace: bussola
+spec:
+  selector:
+    app: bussola
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+---
+## Segreto del client di sola lettura della rubrica.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: bussola-directory
+  namespace: bussola
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: bussola-directory
+    creationPolicy: Owner
+  data:
+    - secretKey: client-secret
+      remoteRef:
+        key: /mdapi/bussola/directory/client-secret
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: bussola-notify
+  namespace: bussola
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: bussola-notify
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/bussola/notify/email
+      secretKey: email
+---
+## Credenziali Pushover per i due avvisi all'amministratore.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: bussola-pushover
+  namespace: bussola
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: bussola-pushover
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/pushover/api-token
+    - secretKey: user
+      remoteRef:
+        key: /mdapi/pushover/user-key
+---
+## Chiave litellm per «Chiedi», limitata al gruppo local-only.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: bussola-assistant
+  namespace: bussola
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: bussola-assistant
+    creationPolicy: Owner
+  data:
+    - secretKey: litellm-key
+      remoteRef:
+        key: /mdapi/bussola/assistant/litellm-key

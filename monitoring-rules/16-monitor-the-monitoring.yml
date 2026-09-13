@@ -1,0 +1,238 @@
+## Watchdog rules for the monitoring/alerting/logging plane itself.
+##
+## If Cribl dies, log-based alerts go silent.
+## If fluentd dies, Cribl receives nothing, log-based alerts go silent.
+## If the statuspage adapter dies, Alertmanager webhooks 5xx and
+##   statuspage components don't update.
+## If the Alertmanager AC matcher strategy gets reverted by a chart
+##   upgrade, no team=mdapi alerts route anywhere.
+##
+## All rides the existing Pushover path so a problem in *one* signal
+## class doesn't silently mask all the others.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: meta-monitoring-stack
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: meta-monitoring.workload
+    rules:
+    - alert: MonitoringComponentDown
+    ## SELECTOR CORRECTED 2026-08-29, found by f/probe/alert_coverage_check on its
+    ## first run. Two problems, both invisible from reading the rule:
+    ##  * `monitoring-grafana` matched NOTHING — the deployment is named `grafana`.
+    ##    Verified: kube_deployment_spec_replicas{deployment="monitoring-grafana"}
+    ##    returns 0 series. A dead entry in a live regex reads as coverage.
+    ##  * The entire VictoriaMetrics stack was absent from the list. vmsingle-mdapi
+    ##    is the metrics DATABASE and vmagent-mdapi is the scraper — the two pieces
+    ##    everything else in this file depends on — and neither had ANY availability
+    ##    alert, from any rule. vmalert, the operator and snmp-exporter likewise.
+    ## ⚠️ vmsingle going down is partly self-masking (no database, no alerting), so
+    ## this is a best-effort signal; the deadman WatchdogMdapi via healthchecks.io is
+    ## what actually survives that case. vmagent and vmalert dying are NOT self-
+    ## masking and are exactly what this now catches.
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace=~"cribl|monitoring|cattle-logging-system",
+              deployment=~"logstream-leader|rancher-logging|blackbox|grafana|pushgateway|prometheus-adapter|kube-state-metrics|vmsingle-mdapi|vmagent-mdapi|vmalert-mdapi|vm-operator-victoria-metrics-operator|snmp-exporter"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace=~"cribl|monitoring|cattle-logging-system",
+              deployment=~"logstream-leader|rancher-logging|blackbox|grafana|pushgateway|prometheus-adapter|kube-state-metrics|vmsingle-mdapi|vmagent-mdapi|vmalert-mdapi|vm-operator-victoria-metrics-operator|snmp-exporter"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "monitoring stack: {{ $labels.namespace }}/{{ $labels.deployment }} down ({{ $value }} replicas unavailable)"
+        description: |
+          A component of the monitoring/alerting/logging plane is down.
+          Other alerts in the affected signal class may be silently failing.
+
+    ## SPLIT OUT OF MonitoringComponentDown 2026-09-02. Same expression, one
+    ## deployment, one label different — and that label is the whole point.
+    ##
+    ## statuspage-adapter is the process that PUBLISHES the public statuspage.
+    ## While it is down it publishes nothing; when it comes back, its reconcile
+    ## loop reads the still-active alert about its own outage and PATCHes the
+    ## component that alert maps to. With component=Platform and severity=critical
+    ## that resolved to `Platform=major_outage` on the PUBLIC page on 2026-09-01,
+    ## caused by nothing worse than a 34-minute image pull. The adapter was
+    ## reporting itself, to customers, as a platform outage.
+    ##
+    ## It cannot stay in the shared rule: MonitoringComponentDown covers 12
+    ## deployments in one series, so there is no way to exclude one of them by
+    ## label. Hence the split. Everything else about the signal is unchanged —
+    ## it still pages at critical, it just cannot reach the public page.
+    - alert: StatuspageAdapterDown
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{namespace="monitoring", deployment="statuspage-adapter"}
+            - kube_deployment_status_replicas_available{namespace="monitoring", deployment="statuspage-adapter"}
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "statuspage-adapter down ({{ $value }} replicas unavailable)"
+        description: |
+          The public statuspage stops tracking reality while this is down —
+          components keep whatever status they last had. Nothing else is
+          affected; internal alerting (Pushover, the healthchecks.io deadman)
+          does not route through the adapter.
+
+    - alert: MonitoringStatefulSetDown
+      expr: |
+        kube_statefulset_status_replicas_ready{
+          namespace=~"cribl|monitoring|cattle-logging-system",
+          statefulset=~"rancher-logging-root-fluentd"
+        } < kube_statefulset_status_replicas{
+          namespace=~"cribl|monitoring|cattle-logging-system",
+          statefulset=~"rancher-logging-root-fluentd"
+        }
+      for: 5m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "monitoring stack: {{ $labels.namespace }}/{{ $labels.statefulset }} ready < desired"
+        description: |
+          A monitoring/alerting StatefulSet is not at full strength.
+          Same risk as MonitoringComponentDown — silent gap in alerting.
+
+    - alert: FluentBitDaemonSetDegraded
+      expr: |
+        kube_daemonset_status_number_unavailable{
+          namespace="cattle-logging-system", daemonset=~"rancher-logging-root-fluentbit.*"
+        } > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "fluent-bit DS has {{ $value }} unavailable replicas"
+        description: |
+          One or more nodes are not shipping pod logs to Cribl.
+          Log-based alerts from those nodes' workloads are blind.
+
+    - alert: PushgatewayMissingScripts
+      ## When Pushgateway has been up for a day but nothing is pushing yet,
+      ## the staleness backstop in app-batch-jobs only fires after >24h.
+      ## This is an info-level reminder that no batch jobs are reporting.
+      expr: |
+        absent(
+          {__name__=~".+_last_run_timestamp_seconds", job!=""}
+        ) and on() (time() - kube_pod_start_time{namespace="monitoring", pod=~"pushgateway-.*"}) > 86400
+      labels:
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "pushgateway has no jobs pushing"
+        description: "Pushgateway is up but no batch jobs are publishing *_last_run_timestamp_seconds. Either nothing's been migrated yet, or every script has stopped running."
+
+  - name: meta-monitoring.statuspage-adapter
+    rules:
+    - alert: StatuspageAdapterUnhealthy
+      ## Synthetic probe checks /healthz on the adapter Service. If down,
+      ## AM webhooks 5xx → statuspage components stop updating.
+      ##
+      ## statuspage: exclude — ADDED 2026-09-02, and the reason is structural,
+      ## not noise-tuning. This alert is about the PUBLISHER. While it fires the
+      ## adapter cannot publish anything, so the label can only take effect on
+      ## recovery — at which point the reconcile loop reads a still-active alert
+      ## and PATCHes the component it maps to. On 2026-09-01 that is exactly what
+      ## happened: a 34-minute image-pull gap (single replica, Recreate) ended
+      ## with the adapter publishing `Platform=major_outage` to the PUBLIC page,
+      ## three times, describing its own restart. A status publisher must never
+      ## be able to report itself as a customer-facing outage — the honest
+      ## external signal for "the adapter is down" is the healthchecks.io deadman
+      ## and Pushover, both of which are outside this loop.
+      expr: probe_success{instance="http://statuspage-adapter.monitoring.svc.cluster.local:8080/healthz"} == 0
+      for: 3m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "statuspage adapter /healthz failing"
+        description: "Alertmanager webhooks to the adapter will 5xx; public statuspage components won't reflect actual outages."
+
+  - name: meta-monitoring.embedded-retired
+    rules:
+    - alert: EmbeddedMonitoringResurrected
+      ## The bundled rancher-monitoring SERVER stack (Prometheus / Alertmanager
+      ## / Grafana / prometheus-adapter) was intentionally retired 2026-06-24 in
+      ## favour of VictoriaMetrics — disabled via the rancher-monitoring-config
+      ## HelmChartConfig (`enabled: false`). If any of these workloads is running
+      ## again, a Harvester upgrade or a manual change re-rendered the chart and
+      ## overrode the Fleet disable: VM is now double-scraped and the dead-
+      ## datasource confusion is back. Re-assert the HelmChartConfig (Fleet
+      ## should self-heal within a reconcile; investigate if it doesn't).
+      ## `for: 30m` rides out the transient re-render during a Harvester upgrade.
+      expr: |
+        kube_statefulset_replicas{
+          namespace="cattle-monitoring-system",
+          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager"
+        } > 0
+        or
+        kube_deployment_spec_replicas{
+          namespace="cattle-monitoring-system",
+          deployment=~"rancher-monitoring-grafana|rancher-monitoring-prometheus-adapter"
+        } > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "embedded rancher-monitoring resurrected: {{ $labels.statefulset }}{{ $labels.deployment }}"
+        description: |
+          A retired embedded rancher-monitoring server component is running
+          again (VictoriaMetrics is meant to be the sole source). Most likely a
+          Harvester upgrade re-rendered the chart. Verify rancher-monitoring-config's
+          HelmChartConfig still carries the `enabled: false` flags and that Fleet
+          has reconciled it; then confirm the embedded Prometheus/AM/Grafana/adapter
+          are gone again.
+
+  - name: meta-monitoring.scrape-targets
+    rules:
+    - alert: SnmpTargetDown
+      ## A dead SNMP scrape target previously went unnoticed for 9 days:
+      ## the zyxel rez AP (192.168.1.199) power-cycled 2026-06-24 and came
+      ## back with SNMP disabled (the activation had never been written to
+      ## startup config), and nothing alerted on up==0 for the snmp jobs.
+      ## Covers every job scraped through snmp-exporter (aruba-snmp,
+      ## host_snmp, ilo_snmp, msm_snmp, zyxel_snmp + future additions).
+      ## `for: 30m` rides out device reboots and firmware flashes.
+      expr: up{job=~".*snmp.*"} == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "SNMP target {{ $labels.instance }} ({{ $labels.job }}) unreachable"
+        description: |
+          The SNMP scrape target {{ $labels.instance }} of job {{ $labels.job }}
+          has been down for 30 minutes. If the device is reachable (ping/ssh)
+          but SNMP is off, check whether its SNMP config survived the last
+          reboot — on the Zyxel AP, CLI changes are lost unless saved with
+          `write`. Probe manually:
+            kubectl --context=mdapi-prod get --raw "/api/v1/namespaces/monitoring/services/snmp-exporter:9116/proxy/snmp?target={{ $labels.instance }}&auth=public_v2c&module=ifmib"

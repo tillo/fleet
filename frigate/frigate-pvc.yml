@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: frigate-config
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: frigate-media-ceph
+  labels:
+    app.mdapi.ch/phase2: migrated
+spec:
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 10Gi -> 30Gi (2026-08-16). At 10Gi the recording sawtooth peaked around
+      # 7.8Gi, close enough to capacity that the rising edge kept tripping
+      # PVCWillFillIn24h even though retention was pruning normally. Tripling
+      # gives real headroom rather than muting the alert.
+      storage: 30Gi

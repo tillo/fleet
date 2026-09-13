@@ -1,0 +1,39 @@
+defaultNamespace: monitoring
+namespace: monitoring
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+  # Allow the first install to adopt pre-existing K8s objects (created
+  # manually via `kubectl apply` before this bundle was added). Helm
+  # otherwise refuses to import them ("invalid ownership metadata") and
+  # the install loops. Set once on bundle creation; safe to keep on.
+  takeOwnership: true
+# Two sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running pods.
+#   2. Keel (`keel.sh/policy: force`) rewrites the image field on its poll
+#      cadence as new digests publish for the rolling tag.
+# Strip both from the diff so Fleet stops flagging Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: grafana
+    namespace: monitoring
+    operations:
+    # resources: use `add` with a string "{}" (Fleet types operations[].value as
+    # STRING) instead of `remove` — the dashboard-sidecar ships NO resources in
+    # the rendered chart, so `remove .../containers/1/resources` fails
+    # ("doc is missing path") and voids the WHOLE patch, spamming the agent and
+    # letting grafana flap Modified. `add` tolerates an absent key (creates it)
+    # and normalizes BOTH desired+live resources to the same "{}" -> drift
+    # ignored. Fixed 2026-08-17 (was silently failing for weeks).
+    - {"op": "add", "path": "/spec/template/spec/containers/0/resources", "value": "{}"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}
+    # container 1 = dashboard-sidecar: VPA(Auto) may write resources, and Keel's
+    # force-policy can re-pin the image digest on its poll. Strip both from drift.
+    - {"op": "add", "path": "/spec/template/spec/containers/1/resources", "value": "{}"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/1/image"}

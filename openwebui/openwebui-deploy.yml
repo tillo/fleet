@@ -1,0 +1,288 @@
+## Open WebUI — the family/friends chat frontend at chat.mdapi.ch.
+##
+## Identity comes from oauth2-proxy-portal (Keycloak realm tilloch, no role
+## restriction) and is handed to the app as a trusted header; models come from
+## the in-cluster LiteLLM gateway under a scoped virtual key. See
+## openwebui-ingress.yml and openwebui-es.yml.
+##
+## IMAGE LANE — pinned + Renovate, NOT Keel. Open WebUI runs Alembic schema
+## migrations against its own DB at startup, so an unattended Keel bump on a
+## floating tag can jump several minors and migrate the database before anyone
+## looks at the release notes. That is exactly the failure that moved
+## joplin/server off Keel on 2026-08-06 (see joplin-deploy.yml), and this app
+## has the same property. Renovate rule lives in renovate.json; the kubernetes
+## manager only scans *-deploy.yml, which this file is.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openwebui
+  namespace: openwebui
+  annotations:
+    # Restart when the Akeyless-backed Secret rotates (virtual key / secret key).
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  ## RWO volume + SQLite: two pods must never hold it at once, and a rolling
+  ## update would try. Recreate accepts ~20s of downtime instead.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: openwebui
+  template:
+    metadata:
+      labels:
+        app: openwebui
+    spec:
+      priorityClassName: mdapi-critical
+      securityContext:
+        fsGroup: 0
+      containers:
+      - name: openwebui
+        image: ghcr.io/open-webui/open-webui:v0.11.3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        # --- upstream: the in-cluster LiteLLM gateway -------------------------
+        # NOT http://llm.mdapi.ch — that hairpins out to the ingress, which is
+        # whitelist-source-range 192.168.1.0/24; a pod IP is cluster CIDR and
+        # gets 403. The Service is the only correct address from in here.
+        # LiteLLM speaks the OpenAI API, so this is OPENAI_*, never OLLAMA_*.
+        - name: OPENAI_API_BASE_URL
+          value: "http://litellm.litellm.svc.cluster.local:4000/v1"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openwebui-secret
+              key: OPENAI_API_KEY
+        # ENABLE_OLLAMA_API defaults to True upstream, and the app then polls
+        # /api/tags against whatever it thinks is Ollama. There is no Ollama in
+        # this estate; leaving it on costs a failing request every refresh.
+        - name: ENABLE_OLLAMA_API
+          value: "false"
+        # ⚠ PersistentConfig: openai.api_base_urls / openai.api_keys are seeded
+        # from these env vars on FIRST BOOT ONLY and then live in the app's DB
+        # (config.py DEFAULT_CONFIG + ENABLE_PERSISTENT_CONFIG, default True).
+        # Editing them here later changes nothing. To rotate the virtual key,
+        # change it in Admin Settings → Connections as well — or wipe the config
+        # row. Left persistent on purpose so admin-UI tuning survives restarts.
+
+        # --- web search: self-hosted SearXNG (searxng-deploy.yml) ------------
+        # ⚠ THESE THREE ARE INERT ON THIS RUNNING INSTANCE and are here for
+        # rebuild-from-scratch correctness only. web.search.* are PersistentConfig
+        # and all 74 of those keys were written to the app's DB at its first boot
+        # on 2026-08-26, before SearXNG existed — so the DB values win and env is
+        # ignored. On a live instance the switch is Admin Settings → Web Search
+        # (or the config table). On a fresh DB these env vars seed it correctly,
+        # which is why they belong in git.
+        - name: ENABLE_WEB_SEARCH
+          value: "true"
+        - name: WEB_SEARCH_ENGINE
+          value: "searxng"
+        # Cluster Service, never an ingress — SearXNG here has no ingress at all.
+        # The client appends its own params; a legacy `...?q=<query>` form also
+        # works because retrieval/web/searxng.py strips the query string when it
+        # sees the placeholder.
+        - name: SEARXNG_QUERY_URL
+          value: "http://searxng.openwebui.svc.cluster.local:8080/search"
+        # 3 is upstream's default and is stingy for a RAG answer; 5 keeps the
+        # prompt small enough for the local 30B's context while giving the model
+        # something to cross-check.
+        - name: WEB_SEARCH_RESULT_COUNT
+          value: "5"
+
+        # --- auth: trusted header from oauth2-proxy-portal --------------------
+        # The ingress runs auth_request against oauth2-proxy-portal and copies
+        # X-Auth-Request-Email onto the upstream request. Open WebUI creates the
+        # account on first sight of a new address (auths.py, signup_handler) and
+        # never shows a password form.
+        # ⚠ The FIRST user to sign in becomes admin — sign in yourself before
+        # sharing the URL.
+        - name: WEBUI_AUTH_TRUSTED_EMAIL_HEADER
+          value: "X-Auth-Request-Email"
+        - name: WEBUI_AUTH_TRUSTED_NAME_HEADER
+          value: "X-Auth-Request-Preferred-Username"
+        # Upstream default is "pending", i.e. every new arrival waits for manual
+        # approval. Keycloak already decided who may be here (oauth2-proxy-portal
+        # admits any valid tilloch-realm account), so a second gate is friction
+        # with no extra safety. Also PersistentConfig — first boot only.
+        - name: DEFAULT_USER_ROLE
+          value: "user"
+        # Hard requirement: with WEBUI_AUTH on (default) an empty secret key is
+        # a startup `raise SystemExit` (env.py:765). It also signs session JWTs
+        # — generating one per restart would log everybody out on every rollout.
+        - name: WEBUI_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openwebui-secret
+              key: WEBUI_SECRET_KEY
+        - name: WEBUI_URL
+          value: "https://chat.mdapi.ch"
+        # Behind TLS-terminating nginx; scope the auth cookie accordingly.
+        - name: WEBUI_AUTH_COOKIE_SECURE
+          value: "true"
+        - name: WEBUI_AUTH_COOKIE_SAME_SITE
+          value: "lax"
+
+        # --- ⚠ CONFIG THAT LIVES IN THE PVC, NOT IN GIT ----------------------
+        # Recorded here because it is NOT reproducible from this repo. Open WebUI
+        # keeps workspace model entries in its SQLite DB on the PVC. Lose the
+        # volume and the bundle redeploys fine, but web search silently reverts
+        # to "the model is never offered the tool" — which looks like nothing at
+        # all, not like an error. Restore via Admin → Models, or POST
+        # /api/v1/models/create, with exactly:
+        #
+        #   id/name    params.function_calling   meta.defaultFeatureIds
+        #   ds-flash   native                    ["web_search"]
+        #   local-only native                    ["web_search"]
+        #   local-small legacy                   ["web_search"]
+        #
+        # all three with meta.capabilities web_search + builtin_tools true, and
+        # image_generation / terminal / vision FALSE. vision especially: none of
+        # these models can see. litellm reports supports_vision=False for both
+        # DeepSeek models, and qwen3-coder-30b / qwen3-4b are text-only. Leaving
+        # vision on lets a family member attach a photo and get a baffling
+        # failure rather than an honest "not supported".
+        #
+        # WHY THE SPLIT. In NATIVE mode Open WebUI offers the model `search_web`
+        # and `fetch_url` and lets it decide when to search and which links to
+        # follow (upstream calls this agentic search). That needs reliable tool
+        # calling: verified working on ds-flash and on local-only, the 30B, which
+        # returns real tool_use through litellm. local-small is a 4B — upstream
+        # warns that very small models cannot drive the multi-step loop — so it
+        # gets LEGACY, where Open WebUI runs the search itself and injects the
+        # results as RAG context. Both end up with citations; only the trigger
+        # differs.
+        #
+        # ⚠ Builtin tools are injected ONLY when the request carries a
+        # session_id (middleware.py: "Only inject when the request originates
+        # from the UI"). A raw API call with features.web_search=true will NEVER
+        # search and the model will answer from training data — that is by
+        # design, not a bug. Do not diagnose native search over plain HTTP.
+        #
+        # defaultFeatureIds puts web search ON by default so household users do
+        # not have to find the toggle.
+        #
+        # AUDIO — also PVC-resident, also not reproducible from this repo:
+        #
+        #   audio.stt.engine              ""        (= local faster-whisper, NOT off)
+        #   audio.tts.engine              "openai"  (= kokoro-tts, see kokoro-deploy.yml)
+        #   audio.tts.openai.api_base_url "http://kokoro-tts.openwebui.svc.cluster.local:8880/v1"
+        #   audio.tts.openai.api_key      any non-empty string (kokoro does not check it)
+        #   audio.tts.model               "kokoro"
+        #   audio.tts.voice               "if_sara"   (Italian; im_nicola is the male one)
+        #   ui.default_interface_settings {}        (MUST stay empty — see below)
+        #
+        # The engine was "" (browser Web Speech) for a few hours on 2026-08-27 and
+        # that did not work either: speechSynthesis.speak() is only reliable when
+        # tied to a user gesture, and in voice mode it fires seconds after the tap.
+        # Silent, and absent from the console. Hence the server-side engine.
+        #
+        # ⚠ Do NOT push {"audio":{"tts":{"engine":"browser-kokoro"}}} as a
+        # default interface setting. It was set 2026-08-26 and silently broke
+        # voice mode until 2026-08-27. The two TTS call sites disagree upstream
+        # (v0.11.1):
+        #
+        #   ResponseMessage.svelte:258  checks $config.audio.tts.engine FIRST,
+        #                               and inits the worker before use.
+        #   CallOverlay.svelte:520      checks $settings.audio.tts.engine FIRST
+        #                               and calls $TTSWorker.generate() with NO
+        #                               init and NO null guard.
+        #
+        # So in a fresh session that goes straight to voice mode, $TTSWorker is
+        # null, the TypeError is thrown on property access (outside the promise
+        # .catch), and the outer try/catch logs to console only — no toast. The
+        # audio cache stays empty and monitorAndPlayAudio re-queues forever.
+        # Symptom: speech is transcribed fine, the model answers fine, the reply
+        # is in the chat history, and NOTHING is ever spoken. No error anywhere.
+        #
+        # With engine "" both paths use the device's own voices, which is also
+        # the only mode where the per-user Voice dropdown populates (it is fed by
+        # speechSynthesis.getVoices(), gated on the CONFIG engine being ""). That
+        # matters here: the household speaks Italian and every phone/laptop has
+        # an Italian voice built in, at zero server cost and zero download.
+        #
+        # Rejected alternatives, both server-side and both worse:
+        #   transformers — SpeechT5, ENGLISH ONLY, would mispronounce every
+        #                  Italian reply, and cold-downloads ~600 MB of model +
+        #                  xvectors dataset into a pod capped at 3Gi.
+        #   browser-kokoro — 80–326 MB ONNX download into EVERY family member's
+        #                  browser, then WASM inference on a phone.
+        # If device voices ever prove too inconsistent, the right upgrade is a
+        # Kokoro-FastAPI sidecar (engine "openai", in-cluster base_url, Italian
+        # voices if_sara / im_nicola) — one download, served to everyone.
+
+        # --- per-person spend attribution ------------------------------------
+        # The virtual key is shared by the whole household, so litellm sees one
+        # anonymous blob of spend. This forwards the signed-in identity upstream
+        # as X-OpenWebUI-User-{Email,Id,Name}; litellm picks the email up via
+        # general_settings.user_header_name (litellm-cm.yml) and attributes
+        # SpendLogs per person. That is only possible at all because litellm now
+        # has a database.
+        # NOT PersistentConfig — this one is a plain env var (env.py:976), so
+        # unlike the web.search.* block above it really does take effect here.
+        - name: ENABLE_FORWARD_USER_INFO_HEADERS
+          value: "true"
+
+        # --- data ------------------------------------------------------------
+        - name: DATA_DIR
+          value: "/app/backend/data"
+
+        volumeMounts:
+        - name: data
+          mountPath: /app/backend/data
+
+        ## /health is a plain liveness ping; /health/db also touches the
+        ## database, which is what readiness should gate on.
+        startupProbe:
+          httpGet: { path: /health, port: 8080 }
+          periodSeconds: 5
+          failureThreshold: 60      # first boot runs schema migrations
+        readinessProbe:
+          httpGet: { path: /health/db, port: 8080 }
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet: { path: /health, port: 8080 }
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            # 512Mi (the first draft's limit) OOMKills this image: it ships
+            # sentence-transformers and loads a local embedding model for RAG
+            # the first time a document is attached.
+            #
+            # 2Gi -> 3Gi (2026-08-26): voice input is served by LOCAL
+            # faster-whisper in this same process (audio.stt.engine == "" means
+            # local whisper, not "disabled"), and the model is loaded lazily on
+            # the first transcription and then kept. Measured: 423Mi idle, 994Mi
+            # once whisper was resident, on top of the RAG embedding model that
+            # loads on the first document. Three lazily-loaded models sharing one
+            # limit is exactly the shape that OOMKilled litellm this morning;
+            # headroom is cheaper than a second outage.
+            memory: 3Gi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: openwebui-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openwebui
+  namespace: openwebui
+spec:
+  selector:
+    app: openwebui
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP

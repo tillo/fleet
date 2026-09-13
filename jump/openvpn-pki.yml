@@ -1,0 +1,100 @@
+## The OpenVPN easy-rsa PKI, recovered 2026-09-02 from mbptillo's etcd-era
+## /etc/openvpn/easyrsa/pki-root on the NAS. It holds ca.crt + **ca.key**, ta.key,
+## the server keypair and the existing client certs (mbpmda, s23ultra).
+##
+## Why a PVC and not a Secret: ovpn-admin ISSUES and REVOKES certificates, so it
+## needs a writable easy-rsa tree (index.txt, serial, issued/, private/) — not a
+## read-only projection. It was a hostPath on mbptillo, which is exactly what
+## pinned that Deployment to a single node.
+##
+## ⚠️ ca.key is IRREPLACEABLE — losing it means re-issuing every client. Hence its
+## own ReplicationSource rather than riding on jump-home-ceph: this volume is tiny,
+## changes rarely, and must not share a fate with the seat's home. A second copy
+## also lives in ~/bootstrap (jump-home-ceph), because recovery material must not
+## exist only inside the cluster it would be used to recover.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openvpn-pki
+  namespace: jump
+  labels: { app: openvpn }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 1Gi
+---
+## ⚠️ Its OWN restic repository, NOT the shared volsync-ceph-backup-restic.
+## That secret's RESTIC_REPOSITORY ends in /jump-home-ceph, so pointing this
+## source at it put the PKI's snapshots INTO jump-home's repo. VolSync tags
+## nothing: every snapshot is host=volsync paths=/data, so the two PVCs are
+## indistinguishable and `restic forget` prunes across both by recency —
+## jump-home's hourly 4 GiB snapshots would evict the PKI's, and
+## `restore latest` for the PKI could hand back home data.
+## Every other namespace uses a per-PVC subpath; this now does too.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-openvpn-pki-restic
+  namespace: jump
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-openvpn-pki-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that hostname
+        ## resolves to the shared ingress VIP, so every backup hairpinned through
+        ## ingress-nginx and would fail exactly when the front door is degraded --
+        ## which is when a backup matters most. restic encrypts client-side and S3
+        ## auth is a SigV4 signature, so losing the ingress TLS costs no
+        ## confidentiality: Garage has no TLS listener of its own, and the ingress
+        ## already re-emitted plaintext to these same LAN hosts. Same bucket and
+        ## path, so the existing restic repository is untouched.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/openvpn-pki"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: openvpn-pki
+  namespace: jump
+spec:
+  sourcePVC: openvpn-pki
+  trigger:
+    schedule: "37 * * * *"        # clear of jump-home-ceph's :17
+  restic:
+    repository: volsync-openvpn-pki-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    moverSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      fsGroup: 1000
+    cacheCapacity: 1Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      hourly: 24
+      daily: 14
+      weekly: 8
+      monthly: 12

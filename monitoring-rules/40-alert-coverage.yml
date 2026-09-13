@@ -1,0 +1,171 @@
+## Does any alerting rule actually select each running workload?
+##
+## Fed by Windmill f/probe/alert_coverage_check (daily 07:10 Zurich), which
+## computes the intersection of the rules LOADED in the cluster and the workloads
+## that actually exist. Nothing here maintains a list; both sides are derived,
+## because a maintained list becomes the next thing to rot.
+##
+## WHY THIS EXISTS. The 2026-08-29 audit found four separate coverage failures
+## that were one bug — a selector pinned a name, and the name moved:
+##   * 04-files.yml still selected `owncloud` after the Nextcloud cutover, so the
+##     live 700 GiB household file service had no pod-side alert at all;
+##   * `namespace=~"keycloak|envuassu", deployment="keycloak"` looks like
+##     two-instance coverage and cannot be — envuassu's Keycloak is a StatefulSet
+##     and emits no kube_deployment_* series;
+##   * ExternalDnsUnavailable pinned the first of two external-dns instances;
+##   * the public BIND had replicas-only coverage while Technitium had 26 rules.
+## It had already happened once and been fixed once — 30-ceph.yml still carries a
+## comment about TechnitiumUnavailable keyed to a non-existent
+## deployment="technitium", corrected 2026-06-23. That fix went to one alert and
+## was never turned into a guard. This is the guard.
+##
+## ⛔ WHAT THIS DELIBERATELY DOES NOT DO: alert on the standing backlog. There are
+## ~150 uncovered workloads today (107 with nothing at all), most of them vendor
+## controllers where a per-workload rule is not obviously wanted. Firing on all of
+## them would recreate exactly the wallpaper problem the same audit found in
+## NamespaceWithCriticalCves — an alert that is always on is functionally off, and
+## it camouflages its neighbours. The standing count is a gauge to look at; only
+## a CHANGE is an event.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: alert-coverage
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-monitoring.coverage
+    rules:
+    - alert: WorkloadLostAlertCoverage
+      ## THE actionable one, and the whole point of the probe: a workload that was
+      ## covered and is not any more. That is either a selector someone just broke,
+      ## or a new workload that arrived unmonitored — both worth knowing on the day
+      ## it happens rather than during the incident it causes.
+      ##
+      ## ⚠️ The gap guard is load-bearing, not defensive habit. If the probe stops
+      ## pushing for a week, the lookback window empties and EVERY uncovered
+      ## workload looks newly-uncovered at once — a 150-instance storm that is pure
+      ## artefact. Same failure the CVE delta rule guards against, same fix:
+      ## max_over_time across the whole window rather than a point `offset 7d`, plus
+      ## a refusal to evaluate unless the history actually exists.
+      ##
+      ## ⛔ TENANT NAMESPACES ARE EXCLUDED HERE TOO, not only in the backstop below.
+      ## Excluding tenant-1 from UncoveredWorkloadUnavailable alone was the whole
+      ## opt-out the tenant-onboard skill asked for, and it was not enough: on
+      ## 2026-09-04 her three workloads still paged us the morning after onboarding,
+      ## through THIS rule, because "no rule selects them" is precisely the arrangement
+      ## we agreed to. For a tenant, uncovered is the intended state and can never be
+      ## an event — she monitors her own apps. Keep this list and the one in
+      ## UncoveredWorkloadUnavailable in step; the skill now says so.
+      ##
+      ## The filter goes on the LEFT operand only. The lookback and the gap guard are
+      ## deliberately left whole: `unless` drops by matching label set, so tenant
+      ## series on the right are inert, and the guard is asking "does 7 days of
+      ## history exist at all", a question no exclusion should be able to answer.
+      expr: |
+        (
+          alert_coverage_uncovered{namespace!~"tenant-1"}
+          unless
+          max_over_time(alert_coverage_uncovered[7d:1h] offset 12h)
+        )
+        and on() (count(max_over_time(alert_coverage_uncovered[7d:1h] offset 12h)) > 20)
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.workload }} is no longer selected by any availability alert"
+        description: |
+          This {{ $labels.kind }} was not in the uncovered set at any point in the
+          previous 7 days and is now, so something changed: a rule's selector was
+          edited, or the workload was renamed, or it is new and arrived without
+          coverage. Current tier: {{ $labels.tier }}.
+
+          "Covered" here means some loaded rule selects it via
+          kube_deployment_status_replicas_available / kube_statefulset_status_replicas_ready
+          or their spec counterparts. Tier `probe_only` means an external blackbox
+          check reaches it but nothing watches the workload itself; `crashloop_only`
+          means restarts are watched but "quietly gone" is not.
+
+          ⚠️ Check the SELECTOR before adding a rule — the usual cause is an existing
+          rule that intended to cover this and no longer matches. A regex naming
+          `deployment=` cannot match a StatefulSet however right it looks.
+
+    - alert: AlertCoverageCheckStale
+      ## Monitor-the-monitor. Without this the guard can die quietly and its silence
+      ## reads as "coverage is fine", which is the failure mode it exists to prevent.
+      expr: time() - alert_coverage_check_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Alert-coverage check stale ({{ $value | humanizeDuration }})"
+        description: |
+          f/probe/alert_coverage_check has not pushed in over two days (it runs
+          daily). WorkloadLostAlertCoverage is blind until this resolves, and its
+          gap guard will suppress it for a further 7 days after the probe returns.
+
+    - alert: UncoveredWorkloadUnavailable
+      ## THE SAFETY NET, and the real answer to "107 workloads have no alert".
+      ##
+      ## Writing 107 rules would have been the wrong fix twice over: most are vendor
+      ## controllers nobody wants paged on individually, and the next workload to
+      ## arrive would still be uncovered. Writing one blanket availability rule would
+      ## have been wrong differently — it would duplicate every existing app-specific
+      ## alert and add ~30 more duplicate pairs to the 9 the audit already found.
+      ##
+      ## So this joins the two: fire when a workload is unavailable AND the coverage
+      ## probe says nothing else selects it. By construction it CANNOT duplicate an
+      ## existing alert, and it shrinks automatically as real coverage is added —
+      ## the opposite of a list that rots.
+      ##
+      ## ⛔ rook-ceph excluded deliberately, not lazily. It is 39 of the 107, and its
+      ## function is already covered by 68 Ceph health rules (mon/osd/pg/mds/pool
+      ## state) which describe what Ceph is DOING far better than pod counts do. Its
+      ## per-node crashcollector and exporter Deployments also churn with node
+      ## maintenance, so pod-level alerting there is noise on top of a signal that
+      ## already exists.
+      ##
+      ## Verified live before shipping: the join selects 137 uncovered Deployments,
+      ## correctly excludes ones that ARE covered (nextcloud returns 0 after today's
+      ## selector fix), and returns 0 today because nothing is below spec.
+      ##
+      ## ⛔ tenant-1 excluded deliberately: it is a dedicated hosting tenant whose
+      ## workloads Sabrina Vialetto monitors herself (user decision 2026-09-04). The
+      ## platform still guards the namespace's infra/access/backup — just not whether
+      ## her apps are up. Same intent as the image-policy lint skipping tenant-1.
+      expr: |
+        (
+          (kube_deployment_spec_replicas{namespace!~"rook-ceph|tenant-1"}
+           - kube_deployment_status_replicas_available{namespace!~"rook-ceph|tenant-1"}) > 0
+        )
+        and on (namespace, deployment)
+        label_replace(
+          alert_coverage_uncovered{kind="Deployment", namespace!~"rook-ceph|tenant-1"},
+          "deployment", "$1", "workload", "(.*)"
+        )
+      for: 20m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.deployment }} is unavailable and no other alert covers it"
+        description: |
+          This Deployment has been below its replica count for 20 minutes and the
+          coverage probe reports that no availability rule selects it — so without
+          this backstop, nothing would have said anything.
+
+          Two things to do, in this order. Deal with the outage; then decide whether
+          this workload deserves a real rule of its own. If it does, add it and this
+          alert stops matching it automatically. If it does not, that is a legitimate
+          answer too — the point is that the decision gets made once, deliberately,
+          instead of by omission.
+
+          Current uncovered population: alert_coverage_uncovered_total by tier.

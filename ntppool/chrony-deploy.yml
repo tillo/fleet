@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chrony
+  namespace: ntppool
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    # Roll the pod when the NTS-KE TLS Secret (mirror-mdapi-ch-tls) changes,
+    # so cert-manager's 60-day rotation propagates without a manual restart.
+    reloader.stakater.com/auto: "true"
+spec:
+  # Recreate so the old pod releases the GPS USB serial (FT232R, single-writer;
+  # the image auto-detects it by ftdi_sio driver) before the new one claims it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: chrony
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: chrony
+    spec:
+      # Pinned to the node that physically hosts the GPS USB UART.
+      # Pod is privileged, so /dev access is granted unconditionally —
+      # no device plugin needed. Edit this if the GPS is moved.
+      nodeSelector:
+        kubernetes.io/hostname: qui
+      containers:
+      - name: chrony
+        image: registry.mdapi.ch/mdapi/chrony:latest
+        securityContext:
+          privileged: true
+        ports:
+        - name: ntp
+          containerPort: 123
+          protocol: UDP
+        - name: nts-ke
+          containerPort: 4460
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: NTP_SERVERS
+          value: "81.94.123.16,81.94.123.17,194.242.34.149,193.5.68.2,192.33.96.101,192.33.96.102,84.16.73.33,84.16.67.12,193.134.29.11,193.134.29.12"
+        # NTS-KE server directives: cert + key paths point into the Secret
+        # volume mounted below; ntsport 4460 is the IANA-assigned default;
+        # ntsdumpdir persists the server-cookie keys across pod restarts so
+        # existing client cookies remain valid after a roll.
+        - name: NTP_DIRECTIVES
+          value: "rtcsync\nclientloglimit 1073741824\nleapsectz right/UTC\nntsserverkey /etc/chrony/tls/tls.key\nntsservercert /etc/chrony/tls/tls.crt\nntsport 4460\nntsdumpdir /var/lib/chrony"
+        - name: NOCLIENTLOG
+          value: "false"
+        # GPS re-enabled 2026-06-16. The image auto-detects the GPS by DRIVER
+        # (ftdi_sio = the FT232R) in startup.sh — re-enumeration-proof, no hard
+        # ttyUSBn path. Verified the FT232R streams clean multi-constellation
+        # NMEA @115200 (GNGGA fix, 23 sats) — it IS the working GPS. The earlier
+        # "FT232R faulty" call (2026-05-21) blamed the wrong adapter: the
+        # Prolific PL2303 (ttyUSB1) is the dead one (no NMEA at any baud, no PPS).
+        # Startup degrades gracefully (timeout-guarded) if the GPS is ever absent.
+        - name: ENABLE_GPS
+          value: "true"
+        resources: {}
+        # chronyc exits non-zero ("Cannot talk to daemon") if chronyd is not
+        # running — so a wedged startup can no longer hide behind a false
+        # "1/1 Running". (k8s ignores the image's Docker HEALTHCHECK.)
+        livenessProbe:
+          exec:
+            command: ["chronyc", "-n", "tracking"]
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command: ["chronyc", "-n", "tracking"]
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: nts-tls
+          mountPath: /etc/chrony/tls
+          readOnly: true
+      volumes:
+      - name: nts-tls
+        secret:
+          secretName: mirror-mdapi-ch-tls
+          # tls.crt + tls.key are world-readable; chronyd drops to user
+          # `chrony` before reading them. Tightening to mode 0440 with
+          # fsGroup=chrony would require a SecurityContext change to a
+          # privileged pod, which is unnecessary inside the namespace.
+      imagePullSecrets:
+      - name: mdapi-registry

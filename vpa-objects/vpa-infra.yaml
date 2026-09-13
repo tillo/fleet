@@ -1,0 +1,231 @@
+# Infrastructure utility services: honeypot, mqtt, squid, nameserver,
+# certspotter, mirror, znc, zot, cribl
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: trapeye-clusterip
+  namespace: honeypot
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-clusterip
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 5m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 200m
+        memory: 256Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: trapeye-loadbalancer
+  namespace: honeypot
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-loadbalancer
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 5m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 200m
+        memory: 256Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: trapeye-nodeport
+  namespace: honeypot
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-nodeport
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 5m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 200m
+        memory: 256Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: eclipse-mosquitto
+  namespace: mqtt
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: eclipse-mosquitto
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 5m
+        memory: 8Mi
+      maxAllowed:
+        cpu: 100m
+        memory: 128Mi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: squid
+  namespace: squid
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: squid
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 512Mi
+---
+# certspotter: bursts to 272m CPU during cert checks — give it headroom
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: certspotter
+  namespace: certspotter
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: certspotter
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      # RequestsOnly (2026-07-04 N-1 program): the deployment's 4c limit stays
+      # the scan-burst ceiling; the schedulable REQUEST caps near steady-state.
+      controlledValues: RequestsOnly
+      minAllowed:
+        cpu: 50m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 1200m
+        memory: 2Gi
+---
+# mirror-ceph (Ceph-RBD mirror): recommend-only. The mirror does bursty full-tree
+# re-syncs whose rsync file lists + page-cache OOM if the limit is pinned to the
+# idle figure (it OOM-killed at 1Gi during the initial re-sync). Keep the static
+# 2Gi limit from the deployment; VPA only advises.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: mirror-ceph
+  namespace: mirror
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mirror-ceph
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 256Mi
+      maxAllowed:
+        cpu: 500m
+        memory: 2Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: znc
+  namespace: znc
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: znc
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 5m
+        memory: 16Mi
+      maxAllowed:
+        cpu: 100m
+        memory: 256Mi
+---
+# zot: registry mirror — holds ~908Mi, needs headroom for concurrent pulls
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: zot
+  namespace: zot
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: zot
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 512Mi
+      maxAllowed:
+        cpu: "1"
+        memory: 2Gi
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: logstream-leader
+  namespace: cribl
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: logstream-leader
+  updatePolicy:
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 256Mi
+      maxAllowed:
+        cpu: "2"
+        memory: 2Gi

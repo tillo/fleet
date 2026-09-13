@@ -1,0 +1,30 @@
+## ExternalSecret pulling shared Pushover credentials from akeyless.
+## The mdapi-team VMAlertmanagerConfig in this bundle references the
+## resulting `pushover` Secret by name+key.
+##
+## creationPolicy: Merge is the live state — it was flipped to Merge in
+## monitoring-alertmanager-config (commit 2e88d21) before the file move
+## so the Secret survived the cross-bundle hand-off. Kept on Merge here
+## because flipping back to Owner would require deleting the Secret first
+## to reset ownerRef; the only practical cost of Merge is that removing
+## the entire bundle leaves an orphan Secret, which is fine.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: pushover
+  namespace: monitoring
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: pushover
+    creationPolicy: Merge
+  data:
+    - remoteRef:
+        key: /mdapi/pushover/api-token
+      secretKey: api-token
+    - remoteRef:
+        key: /mdapi/pushover/user-key
+      secretKey: user-key

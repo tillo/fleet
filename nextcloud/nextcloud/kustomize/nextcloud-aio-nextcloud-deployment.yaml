@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-nextcloud
+  namespace: nextcloud
+spec:
+  # See sibling -apache patch for rationale (Recreate avoids cross-node RWX
+  # window during rollouts of the shared pvc nextcloud-aio-nextcloud).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+        - name: nextcloud-aio-nextcloud
+          # 2026-08-15: exec probes (healthcheck.sh) time out under heavy qua
+          # I/O (migration night: 40 kills of a HEALTHY container at 137 —
+          # the frr/u4w pattern). timeout 60s + threshold 6 rides out storms;
+          # a genuinely dead container still gets caught within 3 min.
+          livenessProbe:
+            exec:
+              command: ["/healthcheck.sh"]
+            periodSeconds: 30
+            timeoutSeconds: 60
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["/healthcheck.sh"]
+            periodSeconds: 30
+            timeoutSeconds: 60
+            failureThreshold: 6
+          # A2 (infra-ka2): explicit request floors sized from the VPA
+          # recommender's targets — VPA Auto does NOT mutate envuassu pods
+          # (works in other namespaces; tracked separately). No limits.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ADMIN_PASSWORD
+              $patch: delete
+            - name: FULLTEXTSEARCH_PASSWORD
+              $patch: delete
+            - name: IMAGINARY_SECRET
+              $patch: delete
+            - name: ONLYOFFICE_SECRET
+              $patch: delete
+            - name: POSTGRES_PASSWORD
+              $patch: delete
+            - name: REDIS_HOST_PASSWORD
+              $patch: delete
+            - name: SIGNALING_SECRET
+              $patch: delete
+            - name: TURN_SECRET
+              $patch: delete
+          envFrom:
+            - secretRef:
+                name: nextcloud-aio-env-secret
+      volumes:
+        - name: nextcloud-aio-nextcloud-data
+          persistentVolumeClaim:
+            claimName: nextcloud-aio-nextcloud-data-ceph

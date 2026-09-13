@@ -1,0 +1,82 @@
+## NAT64 (Jool, bpi-r4) port-pool pressure.
+##
+## Context (2026-07-29, dual-stack LB design ~/dualstack-lb-design.md): all inbound
+## public IPv6 reaches the v4-only cluster through one stateful NAT64. pool4 gives each
+## (protocol, pool4-address) class ports 1024-32767 + 33000-65535 = 64280 ports (second
+## range added 2026-08-05 in /etc/jool/setupjool.sh — the netns ephemeral range is pinned
+## to 32768-32999, so 1024-32767 is collision-free); a session pins one.
+## Serving the v6 NTP pool natively was considered and REJECTED (the ntppool scope is
+## stratum-1 service from the GPS-disciplined cluster chrony), so the dominant consumer
+## stays: measured 2026-07-29, 9 662 of 9 811 sessions were udp (~98 %) — NTP churn on
+## the external class. By 2026-08-05 organic NTP-pool growth (82k distinct v6 clients/h,
+## broad eyeball ASes — no single top-talker) pushed daily peaks to 22-28k, ~87 % of the
+## old single 32536-port class, which is what drove the pool raise.
+##
+## Threshold: 43 000 ≈ 67 % of a class (same utilization the old 22000/32536 encoded).
+## Total sessions slightly overcounts any one class (tcp+icmp ≈ 1.5 %, internal-mark
+## share small), which errs toward firing early — the right direction for port
+## exhaustion. Plausible driver of a surge: NTP pool rebalancing multiplying traffic
+## when other pool members drop out.
+##
+## The `and (time() - last_run) < 600` leg gates on scrape freshness: Pushgateway
+## retains last values forever, so without it a dead watcher would freeze the gauge
+## and the alert could fire (or stay silent) on stale data indefinitely.
+##
+## Source gauge: nat64-watch.sh (router-tools, minute cron) -> pushgateway.mdapi.ch,
+## job bpi_r4_nat64. Per-session forensics: OpenObserve `nat64` stream
+## (jool-session-shipper.sh) — query per proto / per xlat class there before acting.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nat64-pool-pressure
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: nat64.pool
+    rules:
+    ## Re-tiered 2026-08-29. Was a flat warning at `for: 10m`; measured 17 episodes with a
+    ## 10-minute median and 76% resolving inside 30 minutes unaided. The description below
+    ## already said the right thing — "a burst drains on its own; sustained growth does
+    ## not" — so this only makes the severity match the rule's own text.
+    - alert: NAT64PortPoolPressure
+      expr: >-
+        (bpi_r4_nat64_sessions > 43000
+         and (time() - bpi_r4_nat64_last_run_timestamp_seconds) < 600)
+        unless (min_over_time(bpi_r4_nat64_sessions[2h:5m]) > 43000)
+      for: 10m
+      labels:
+        severity: info
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "NAT64 session table at {{ $value }} — approaching udp port-pool exhaustion"
+        description: >-
+          Jool on bpi-r4 holds {{ $value }} live sessions; one udp (proto, pool4-address)
+          class has 64280 ports and udp is ~98% of sessions (NTP pool traffic).
+          At exhaustion, new inbound IPv6 flows to v4 services fail silently.
+          Check the per-proto/per-class split in the OpenObserve `nat64` stream, and
+          whether the ntppool v6 score/traffic spiked (pool rebalancing). Session
+          timeouts: udp 5 min, tcp-est longer — a burst drains on its own; sustained
+          growth does not. See ~/dualstack-lb-design.md §P0/P5.
+
+    - alert: NAT64PortPoolPressureSustained
+      ## The escalation the flat warning used to conflate with a burst: the session
+      ## table has stayed above the mark for two hours, so it is growth, not a spike.
+      expr: >-
+        min_over_time(bpi_r4_nat64_sessions[2h:5m]) > 43000
+        and (time() - bpi_r4_nat64_last_run_timestamp_seconds) < 600
+      for: 15m
+      labels:
+        severity: warning
+        component: Internet
+        team: mdapi
+      annotations:
+        summary: "NAT64 session table above 43000 continuously for 2h — pool exhaustion is approaching, not passing"
+        description: >-
+          Sustained, so udp session timeouts (5 min) are no longer draining it. At
+          exhaustion new inbound IPv6 flows to v4 services fail SILENTLY, which is the
+          reason this is worth acting on before it arrives. Check the per-proto and
+          per-class split in the OpenObserve `nat64` stream and whether ntppool v6
+          traffic has stepped up. See ~/dualstack-lb-design.md §P0/P5.

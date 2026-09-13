@@ -1,0 +1,57 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: roundcube
+  namespace: mail
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "220m"
+    nginx.ingress.kubernetes.io/server-alias: "webmail.coders.ch,webmail.coiffuredreams.ch,webmail.dellambrogio.ch,webmail.tillo.ch,webmail.lithia.eu"
+    nginx.ingress.kubernetes.io/enable-modsecurity: "true"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/modsecurity-snippet: |
+      SecRuleEngine On
+      SecAuditEngine RelevantOnly
+      SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+      SecAuditLogParts ABIJDEFHZ
+      SecAuditLogType Serial
+      SecAuditLogFormat JSON
+      SecAuditLog /dev/stdout
+      SecDebugLog /tmp/modsec_debug.log
+      Include /etc/nginx/owasp-modsecurity-crs/nginx-modsecurity.conf
+      # Roundcube is a mail webapp, so the literal word "mail" appears in
+      # its routing params (_task=mail, _url=_task=mail&_mbox=INBOX, etc.).
+      # Rule 932235 treats "mail" as a Unix command name (mail(1)) and
+      # fires on every mail-task URL. Disable it on this host. Other
+      # 93xxxx PHP/LFI rules stay active so real Roundcube exploitation
+      # paths remain covered.
+      SecRuleRemoveById 932235
+      SecRule REQUEST_URI "@rx ^/\?_task=(?:login|mail&_unlock=loading)" \
+        "id:1000,\
+        phase:1,\
+        pass,\
+        t:none,\
+        nolog,\
+        ctl:ruleRemoveById=949110"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: webmail.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: roundcube
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - webmail.mdapi.ch
+      - webmail.coders.ch
+      - webmail.coiffuredreams.ch
+      - webmail.dellambrogio.ch
+      - webmail.tillo.ch
+      - webmail.lithia.eu
+      secretName: webmail-cert

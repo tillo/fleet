@@ -1,0 +1,143 @@
+# beads-app: bd serve HTTP API (for Windmill/automation) + beads-ui web UI,
+# sharing one server-mode workspace against the dolt StatefulSet.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beads-app
+  namespace: backlog
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beads-app
+  template:
+    metadata:
+      labels:
+        app: beads-app
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+      - name: setup
+        # node:22-bookworm (beads-ui needs node>=22; git+curl+npm; glibc for
+        # the bd binary). Pinned by digest; upgrade = deliberate edit.
+        image: node:22-bookworm@sha256:673fce836d5a9185da33352682bfedb17c174d016370d08616748dff76fda862
+        env:
+        - { name: HOME, value: /workspace }
+        - { name: npm_config_cache, value: /tmp/.npm }
+        command: ["bash", "-ec"]
+        args:
+        - |
+          # bd binary (v1.2.1, sha256-verified — same release as on mbptillo)
+          curl -fsSL -o /tmp/beads.tgz https://github.com/steveyegge/beads/releases/download/v1.2.1/beads_1.2.1_linux_amd64.tar.gz
+          echo "48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2  /tmp/beads.tgz" | sha256sum -c -
+          mkdir -p /shared/bin && tar -xzf /tmp/beads.tgz -C /shared/bin bd
+          # web UI (pinned)
+          npm install --prefix /shared/ui beads-ui@0.12.6
+          # workspace from the ConfigMap (copy: bd wants it writable)
+          mkdir -p /workspace/.beads /workspace/.config/bd
+          cp /wscm/config.yaml /workspace/.beads/config.yaml
+          cp /wscm/metadata.json /workspace/.beads/metadata.json
+          cp /wscm/dolt-server.port /workspace/.beads/dolt-server.port
+          cp /wscm/local_version /workspace/.beads/.local_version
+          cp /wscm/bd-user-config.yaml /workspace/.config/bd/config.yaml
+          # git identity for bd/bdui; safe.directory because the emptyDir
+          # mount root is not owned by uid 1000
+          git config --global init.defaultBranch main
+          git config --global --add safe.directory /workspace
+          cd /workspace && git init -q
+          git config user.name tillo && git config user.email tillo@tillo.ch
+          # wait for the database (fail after ~5min -> pod restart, visible)
+          for i in $(seq 1 60); do
+            /shared/bin/bd -C /workspace dolt test >/dev/null 2>&1 && exit 0
+            echo "waiting for dolt ($i)"; sleep 5
+          done
+          echo "dolt unreachable"; exit 1
+        envFrom:
+        - secretRef: { name: backlog-dolt }
+        volumeMounts:
+        - { name: shared, mountPath: /shared }
+        - { name: workspace, mountPath: /workspace }
+        - { name: wscm, mountPath: /wscm }
+      containers:
+      - name: bd-serve
+        image: node:22-bookworm@sha256:673fce836d5a9185da33352682bfedb17c174d016370d08616748dff76fda862
+        # workingDir matters: bd's repository-root detection uses the process
+        # cwd (observed 2026-08-13: with only -C it failed "not a git repository")
+        workingDir: /workspace
+        command: ["/shared/bin/bd", "-C", "/workspace", "serve",
+                  "--addr", "0.0.0.0:8090", "--allow-non-loopback",
+                  "--auth-token-file", "/auth/tokens",
+                  "--allowed-host", "backlog-api",
+                  "--allowed-host", "backlog-api.backlog.svc.cluster.local",
+                  "--actor", "api"]
+        env:
+        - { name: HOME, value: /workspace }
+        envFrom:
+        - secretRef: { name: backlog-dolt }
+        ports:
+        - { name: api, containerPort: 8090 }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8090 }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8090 }
+          initialDelaySeconds: 20
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: shared, mountPath: /shared }
+        - { name: workspace, mountPath: /workspace }
+        - { name: serve-token, mountPath: /auth, readOnly: true }
+        resources:
+          requests: { cpu: 50m, memory: 128Mi }
+          limits:   { cpu: "1", memory: 512Mi }
+      - name: bdui
+        image: node:22-bookworm@sha256:673fce836d5a9185da33352682bfedb17c174d016370d08616748dff76fda862
+        workingDir: /workspace
+        command: ["bash", "-ec"]
+        args:
+        - |
+          node /shared/ui/node_modules/beads-ui/server/index.js --host 0.0.0.0 --port 3000 &
+          pid=$!
+          sleep 3
+          until curl -sf -X POST -H 'content-type: application/json' \
+            -d '{"path":"/workspace","database":"infra"}' \
+            http://127.0.0.1:3000/api/register-workspace; do sleep 2; done
+          echo "workspace registered"
+          wait $pid
+        env:
+        - { name: HOME, value: /workspace }
+        - { name: BD_BIN, value: /shared/bin/bd }
+        - { name: BEADS_ACTOR, value: web }
+        envFrom:
+        - secretRef: { name: backlog-dolt }
+        ports:
+        - { name: ui, containerPort: 3000 }
+        readinessProbe:
+          httpGet: { path: /, port: 3000 }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /, port: 3000 }
+          initialDelaySeconds: 20
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: shared, mountPath: /shared }
+        - { name: workspace, mountPath: /workspace }
+        resources:
+          requests: { cpu: 50m, memory: 192Mi }
+          limits:   { cpu: "1", memory: 768Mi }
+      volumes:
+      - { name: shared, emptyDir: {} }
+      - { name: workspace, emptyDir: {} }
+      - name: wscm
+        configMap: { name: beads-workspace }
+      - name: serve-token
+        secret: { secretName: backlog-serve-token }

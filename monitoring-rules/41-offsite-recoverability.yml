@@ -1,0 +1,168 @@
+## Can we get the off-site backups back? — producer f/probe -> f/config_backup/garage_offsite_restore_drill
+##
+## Every other backup alert in this directory answers "did the backup run". None of
+## them answers "does the backup restore", and those are different questions with
+## different failure modes. garage_offsite_backup can report a clean sweep for months
+## while the data it wrote is unrecoverable, and the only moment that becomes visible
+## is the moment it is fatal.
+##
+## 11 of 12 off-site buckets are encrypted in place with rclone crypt. The password and
+## salt live in Windmill variables — i.e. inside the very prod cluster the off-site copy
+## exists to survive — with the operator's password manager holding the only external
+## copy (~/offsite-recovery-card.sh generates that card, and its --check mode prints a
+## fingerprint you can compare without revealing the secret). These rules watch the two
+## ways that arrangement fails.
+##
+## ⚠️ Both alerts are CRITICAL and neither is auto-solving: nothing in the estate fixes
+## either condition by itself, and both mean the current backups cannot be relied on.
+## That is the bar for waking someone (see the alarm-hygiene policy in the AM config).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: offsite-recoverability
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-backup.offsite-recoverability
+    rules:
+
+    ## The escrowed crypt material no longer decrypts real off-site data. Fires on a
+    ## rotated password, a drifted salt, or a changed crypt parameter —
+    ## filename_encryption / suffix / password2 are all part of the key, so a config
+    ## edit can break restores while the sweep keeps reporting success.
+    - alert: OffsiteBackupUnrecoverable
+      expr: garage_offsite_restore_ok == 0
+      for: 10m
+      labels:
+        severity: critical
+        team: mdapi
+        component: Backups
+      annotations:
+        summary: "Off-site backups do NOT decrypt — the recovery material is wrong or stale"
+        description: >-
+          The restore drill decrypted an object from the Backblaze copy and it did not
+          match the live source. Every encrypted off-site bucket should be treated as
+          unrecoverable from outside the cluster until this is resolved. If the crypt
+          password was rotated, the recovery card in the password manager is now stale:
+          regenerate it with ~/offsite-recovery-card.sh and repaste. Verify the current
+          material with `wmill script run f/config_backup/garage_offsite_restore_drill`.
+
+    ## A bucket on the encrypt allowlist whose off-site object is NOT actually
+    ## encrypted. This is the 2026-08-15 grafana/guac failure mode, and it is invisible
+    ## to any check that only compares source with decrypted output — on an unencrypted
+    ## bucket those two are trivially equal and the check passes.
+    - alert: OffsiteBackupNotEncryptedAtRest
+      expr: garage_offsite_encrypted_at_rest == 0
+      for: 10m
+      labels:
+        severity: critical
+        team: mdapi
+        component: Backups
+      annotations:
+        summary: "Off-site data is being written in the CLEAR despite being on the encrypt allowlist"
+        description: >-
+          The raw object on Backblaze is byte-identical to its decrypted form, so this
+          bucket is not encrypted at rest despite appearing in
+          GARAGE_OFFSITE_ENCRYPT_BUCKETS. The copies land on Backblaze B2 and an
+          o2switch SHARED-HOSTING account, so treat the contents as disclosed and
+          decide on rotation for anything credential-bearing.
+
+    ## The drill is the only thing that would report either condition above, so its own
+    ## silence has to be an alert — otherwise a broken drill looks exactly like a
+    ## healthy estate. (BatchJobStale does not cover this job: it requires the job to
+    ## appear in BOTH the timestamp set and the cadence map, and a newly added script is
+    ## absent from the latter until the cadence map next runs.)
+    ##
+    ## ⭐ The `or absent(...)` half is not decoration. A bare
+    ## `time() - <metric> > 172800` returns NOTHING when the series is gone rather
+    ## than firing, so deleting the Pushgateway group — or never deploying the
+    ## producer at all — makes this alert silently unfireable, which is precisely the
+    ## failure class the 2026-08-29 coverage audit found 25 instances of. An alert
+    ## about a missing signal has to test for the signal being missing.
+    - alert: OffsiteRestoreDrillStale
+      expr: >-
+        (time() - garage_offsite_restore_drill_last_run_timestamp_seconds > 172800)
+        or absent(garage_offsite_restore_drill_last_run_timestamp_seconds)
+      for: 30m
+      labels:
+        severity: warning
+        team: mdapi
+        component: Backups
+      annotations:
+        summary: "Off-site restore drill has not run in over 48h — recoverability is unverified"
+        description: >-
+          Nothing is currently proving the off-site backups can be decrypted. The drill
+          runs daily; two missed runs means the check itself is broken. This is a
+          warning rather than a critical because it reports unknown recoverability, not
+          known-bad recoverability.
+
+    ## ---- Harvester VM backup target: is it still encrypted IN TRANSIT? ----
+    ## Producer: f/probe/harvester_backup_target_transport (daily 06:25).
+    ##
+    ## Harvester v1.8.0 validates a backup target by CONNECTING and verifying
+    ## against the system trust store, ignoring the setting's own `cert` field,
+    ## so the harvesterhci.io backup-target setting can never hold our private-CA
+    ## endpoint — it permanently reads api.garage.home.tillo.ch, the ingress,
+    ## which re-emits PLAINTEXT to salt/pepper. The working configuration lives
+    ## one level down in longhorn-system/harvester-backup-target-secret, and a
+    ## Harvester UI edit rewrites that secret FROM the setting.
+    ##
+    ## ⛔ There is deliberately NO alert on the setting disagreeing with reality:
+    ## it always will, and an alert that fires forever trains people to ignore
+    ## the probe that carries the real one.
+    - alert: HarvesterBackupTargetPlaintext
+      ## Availability is useless here — the plaintext path works, which is
+      ## exactly why the revert is silent. The scheme is the only honest signal.
+      expr: harvester_backup_target_tls == 0
+      for: 15m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Harvester VM backups are crossing the LAN in PLAINTEXT again"
+        description: |
+          harvester_backup_target_tls=0: AWS_ENDPOINTS in
+          longhorn-system/harvester-backup-target-secret is no longer https, so ~1 TB of
+          Longhorn VM backups — which are not encrypted by anything else — reach Garage
+          over a plaintext hop. Almost certainly someone edited the backup target in the
+          Harvester UI, which rewrites that secret from the (permanently stale) setting.
+          Restore AWS_ENDPOINTS=https://garage.transit.svc.cluster.local:30288 and
+          AWS_CERT=the MDAPI Root+Issuing bundle in that secret.
+
+    - alert: HarvesterBackupTargetCaMissing
+      ## Separate from the scheme: https with no CA fails closed rather than
+      ## leaking, so this is the "backups have stopped" half, not the
+      ## "backups are exposed" half.
+      expr: harvester_backup_target_ca_present == 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Harvester backup target has no CA — Longhorn cannot verify the terminator"
+        description: |
+          AWS_CERT is empty in longhorn-system/harvester-backup-target-secret. With an
+          https endpoint this fails closed and VM backups stop.
+          ⚠️ Note the node trust store matters too and this probe cannot see it: Longhorn's
+          ENGINE BINARY runs on the node and uses its CA bundle, so the house CAs must stay
+          in the Harvester `additional-ca` setting. Removing them broke the target within
+          seconds on 2026-09-05.
+
+    - alert: HarvesterBackupTargetProbeStale
+      expr: time() - max(harvester_backup_target_transport_last_run_timestamp_seconds) > 93600
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Harvester backup-target transport probe stale (>26h)"
+        description: |
+          f/probe/harvester_backup_target_transport has not run in >26h, so
+          HarvesterBackupTargetPlaintext is blind. Check its daily 06:25 schedule and the
+          read-only SA token (g/all/HARVESTER_PROBE_TOKEN, escrowed at Akeyless
+          /mdapi/harvester/backup-target-probe/token).

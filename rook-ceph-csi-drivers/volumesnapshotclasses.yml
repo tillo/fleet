@@ -1,0 +1,28 @@
+## Ceph CSI VolumeSnapshotClasses — used by VolSync (copyMethod: Snapshot) to take
+## crash-consistent point-in-time snapshots before restic-copying to Garage.
+## clusterID + snapshotter secrets match the rook-ceph CSI provisioners (the
+## rook-csi-{rbd,cephfs}-provisioner secrets in the rook-ceph namespace).
+## Names mirror the StorageClasses (ceph-block / ceph-filesystem).
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ceph-block
+  labels:
+    velero.io/csi-volumesnapshot-class: "true"
+driver: rook-ceph.rbd.csi.ceph.com
+deletionPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: rook-ceph
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ceph-filesystem
+driver: rook-ceph.cephfs.csi.ceph.com
+deletionPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: rook-ceph
