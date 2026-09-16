@@ -1,0 +1,43 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: garage-ha-backup-s3
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: garage-ha-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        RCLONE_CONFIG_GARAGE_TYPE: "s3"
+        RCLONE_CONFIG_GARAGE_PROVIDER: "Other"
+        # 2026-06-22: moved off bootstrap/garage (being decommissioned) to the
+        # external salt/pepper garage cluster, where off-site backups belong.
+        # Bucket home-assistant-backups + key ha-backup-ext (RW) created there;
+        # creds in Akeyless /mdapi/home-assistant/garage-s3/{access,secret}_key.
+        ## 2026-09-04: http -> https. Home Assistant's backup tarballs are NOT
+        ## encrypted by anything before they leave this pod (that is exactly why
+        ## home-assistant-backups sits in GARAGE_OFFSITE_ENCRYPT_BUCKETS), so
+        ## this hop was the estate's largest plaintext backup stream. :30288 is
+        ## the nginx TLS terminator on salt/pepper; Garage has no TLS listener
+        ## of its own. RCLONE_CA_CERT below points at the mounted CA bundle.
+        RCLONE_CONFIG_GARAGE_ENDPOINT: "https://garage.transit.svc.cluster.local:30288"
+        RCLONE_CA_CERT: "/etc/garage-tls/ca.crt"
+        RCLONE_CONFIG_GARAGE_REGION: "garage"
+        RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID: "{{ .access_key }}"
+        RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY: "{{ .secret_key }}"
+        BUCKET: "home-assistant-backups"
+
+  data:
+    - remoteRef:
+        key: /mdapi/home-assistant/garage-s3/access_key
+      secretKey: access_key
+    - remoteRef:
+        key: /mdapi/home-assistant/garage-s3/secret_key
+      secretKey: secret_key

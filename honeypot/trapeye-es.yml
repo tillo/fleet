@@ -1,0 +1,69 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: trapeye-env-secret
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: trapeye-env-secret
+    creationPolicy: Owner
+
+  data:
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-env-secret/INGESTION_URL
+      secretKey: INGESTION_URL
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-env-secret/ENTITY_UUID
+      secretKey: ENTITY_UUID
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-env-secret/ENTITY_TOKEN
+      secretKey: ENTITY_TOKEN
+---
+## Fixed per-workload TRAPEYE_UUIDs (Anantis request 2026-08-06: stop minting
+## a new UUID on every pod replacement — the old downward-API metadata.uid
+## did exactly that). One stable UUID per workload, stored in Akeyless:
+## the three Deployments keep the pod UID they happened to be running with
+## at cutover (no identity break on the ingestion side); the DaemonSet's
+## three pods share one freshly minted UUID (per-workload identity per the
+## Anantis instruction — split to per-node keys if they ever want that).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: trapeye-uuid-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: trapeye-uuid-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-uuid-secret/TRAPEYE_UUID_NODEPORT
+      secretKey: TRAPEYE_UUID_NODEPORT
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-uuid-secret/TRAPEYE_UUID_CLUSTERIP
+      secretKey: TRAPEYE_UUID_CLUSTERIP
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-uuid-secret/TRAPEYE_UUID_LOADBALANCER
+      secretKey: TRAPEYE_UUID_LOADBALANCER
+    ## DaemonSet: one fixed UUID PER NODE (Anantis 2026-08-06: the console
+    ## can't represent several live sensors behind one UUID, so every agent
+    ## instance needs its own). Values are the pod UIDs those per-node agents
+    ## already used before the cutover, so each node's sensor keeps its
+    ## existing device record and history instead of appearing as new.
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-uuid-secret/TRAPEYE_UUID_NODE_qui
+      secretKey: TRAPEYE_UUID_NODE_qui
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-uuid-secret/TRAPEYE_UUID_NODE_quo
+      secretKey: TRAPEYE_UUID_NODE_quo
+    - remoteRef:
+        key: /mdapi/honeypot/trapeye-uuid-secret/TRAPEYE_UUID_NODE_qua
+      secretKey: TRAPEYE_UUID_NODE_qua

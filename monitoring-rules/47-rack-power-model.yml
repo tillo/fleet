@@ -1,0 +1,255 @@
+## Rack power accounting — what is metered, what is only estimated, and the
+## residual that keeps the estimates honest.
+##
+## WHY. The twin could show watts for the five servers and for delivered PoE, and
+## nothing at all for the rest of the rack: the Cisco stack and everything in the
+## void behind the screen were drawn with a link light and no power. The user
+## asked for those two, offering "individual meters, estimations, or just whole
+## minus known". This does the third AND the second, because either alone is
+## weak: an estimate nobody checks drifts silently, and a residual with no model
+## behind it gives a number but no way to tell whether it is reasonable.
+##
+## Read as one subtraction, all on the SAME 6h basis so the rows on the twin
+## actually add up:
+##   rack:power_ups_out:avg6h      what the UPS reports delivering to the load
+##   rack:power_metered:avg6h      5 chassis (IPMI) + the PoE the XikeStor delivers
+##   rack:power_unmetered:avg6h    the difference = every unmetered thing in the rack
+##   rack:power_estimate_total:watts   the datasheet figures below
+##   rack:power_model_error:avg6h  residual − estimated: the only line that can be WRONG
+##
+## ⛔⛔ EVERY WINDOW HERE IS 6h AND THAT IS NOT DECORATION. `chassis_power_watts`
+## is pushed by a Windmill probe every **15 minutes** while the HA UPS entity
+## updates continuously, so subtracting them instantaneously measures the
+## sampling skew between two unrelated schedules, not the rack. Measured
+## 2026-09-05 within four minutes: the raw residual read **313 W then 408 W** —
+## a 95 W swing with nothing physical changing — and one server alone (qui)
+## ranged 246→330 W across a single 2h window. Averaged it is steady: 15m 363 ·
+## 1h 340 · 3h 351 · **6h 361**. This is the same trap that forced the 6h window
+## on "UPS self-use"; it is not a different bug, it is the same one, and anyone
+## shortening these windows will reintroduce it. (12h/24h return EMPTY — the
+## chassis series does not reach back that far.)
+##
+## ⛔ ESTIMATES ARE NOT MEASUREMENTS. They are datasheet-class figures, named
+## `rack:power_estimate:watts` so nothing downstream can mistake them for
+## telemetry, and the twin renders them in their own colour, never green.
+## Replace any of them with a real series the moment a metering PDU or a smart
+## plug appears — the residual will say immediately whether the estimate was good.
+##
+## ⚠️ WHAT IS NOT IN HERE: bpi-r4. Its only feed is the Hue "Internet" plug, a
+## different socket from the myStrom rack plug, and Hue plugs do not meter. It is
+## outside `sensor.rack_power` entirely, so counting it would corrupt the residual
+## rather than improve it.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rack-power-model
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: rack-power.model
+    ## 1m: every input here is a 6h average, so a faster interval would only
+    ## resample the same smoothed number.
+    interval: 1m
+    rules:
+
+    ## ---- measured -------------------------------------------------------
+    ## ⚠️ UPS OUTPUT, not the wall plug. `sensor.ups_real_power` is what the UPS
+    ## delivers to the load; `sensor.rack_power` is the myStrom wattmeter on the
+    ## circuit and includes the UPS's own ~50 W of self-consumption, which the
+    ## twin already shows separately on the U41-42 row. Subtracting from the wall
+    ## would quietly bill that loss to the Cisco stack.
+    ##
+    ## ⛔ avg() around it — not for the value, for the LABELS. The HA exporter
+    ## stamps every series with `pod` and `instance`, and the HA pod restarts
+    ## about every 34 h (6 distinct pods in the 7 days to 2026-09-05). Whenever a
+    ## restart sits inside the window, `avg_over_time(...[6h])` returns one series
+    ## PER POD — measured over 24h: three, differing only in `pod`/`instance` —
+    ## and without the avg() this record changed identity on every restart (the
+    ## recorded series carried pod=home-assistant-74dd99f68-zrmfq). avg() collapses
+    ## them to one label-less series regardless of pod churn; the same label
+    ## collapse is what keeps the subtraction below alive.
+    - record: rack:power_ups_out:avg6h
+      expr: avg(avg_over_time(hass_sensor_power_w{entity="sensor.ups_real_power"}[6h]))
+
+    ## ⭐ ONE convention for all five servers. `chassis_power_watts` (Windmill
+    ## f/probe/chassis_health, IPMI sensor "Avg Power") covers qui/quo/qua/salt/
+    ## pepper uniformly. The twin's per-server bars still show qui/quo/qua from
+    ## the iLO-via-HA entity instead, and the two sources DISAGREE by 7-10 % on
+    ## the same machine (2026-09-05: chassis 264/262/202 vs iLO 248/239/184 —
+    ## different averaging, neither wrong). Mixing them in one subtraction would
+    ## put that disagreement straight into the residual.
+    ##
+    ## ⭐ `sum(avg_over_time(...))`, NOT `avg_over_time(sum(...)[6h:1m])`. Same
+    ## answer (361.04 vs 360.76) for a sixth of the work — the subquery form
+    ## re-evaluates the sum at every step.
+    - record: rack:power_metered:avg6h
+      expr: |
+        sum(avg_over_time(chassis_power_watts[6h]))
+        + sum(avg_over_time(xikestor_poe_total_watts[6h]))
+
+    ## ⚠️ A missing host does NOT make that sum fail — it silently shrinks it and
+    ## inflates the residual by that host's draw. `chassis_power_watts` arrives
+    ## through pushgateway, where a stopped probe leaves the LAST value in place
+    ## rather than removing it, so the failure looks like a plausible number.
+    ##
+    ## ⛔ This count is only HALF the tell. The probe pushes all five hosts as ONE
+    ## group (exactly one `push_time_seconds{job="chassis_health"}` series, no
+    ## per-host instance), so a run in which one host's IPMI fails replaces the
+    ## five-host group with a four-host one and this drops to 4 — that it catches,
+    ## and the twin shows it. A probe that STOPS RUNNING it cannot catch: for the
+    ## reason above pushgateway keeps all five series, this reads 5 and stays
+    ## green forever while the residual freezes at its last value. That case is
+    ## the feed age below.
+    - record: rack:power_metered_hosts:count
+      expr: count(chassis_power_watts)
+
+    ## ⭐ The real freshness signal: seconds since the probe last pushed, from the
+    ## timestamp pushgateway stamps on each push group. The probe runs every 15
+    ## minutes, so healthy is under ~900 s (73 s when this was added, 2026-09-05)
+    ## and one missed cycle already puts it past ~1200 s.
+    ## ⛔ NOT `timestamp(chassis_power_watts)` — that is when the SCRAPE saw the
+    ## sample, i.e. pushgateway's own scrape, so all five hosts read a few seconds
+    ## old (3.74 s, all five identical) no matter how stale the value behind it is.
+    - record: rack:power_metered_feed_age:seconds
+      expr: time() - push_time_seconds{job="chassis_health"}
+
+    ## ---- estimated, per device -------------------------------------------
+    ## Datasheet-class figures for the hardware actually installed. Each is a
+    ## separate series so the twin can label a device with its own number and so
+    ## replacing one with a real meter is a one-line change.
+    ##
+    ## 2× C9300-24T, non-PoE, each with a C9300-NM-8X 10G module and
+    ## PWR-C1-350WAC-P. ⛔ There is no wattage to read: on IOS-XE 16.12.02 the
+    ## Cisco entSensor tree returns only celsius/voltsDC/amperes/dBm — no type 6
+    ## (watts) anywhere — mib-2.99 is absent and the stack does no PoE. Metering
+    ## this needs a PDU, not another walk.
+    - record: rack:power_estimate:watts
+      expr: vector(160)
+      labels: {device: c9300-stack, basis: datasheet}
+    ## The XikeStor's OWN draw. The PoE it DELIVERS is measured
+    ## (xikestor_poe_total_watts ≈30 W) and already inside the metered sum, so
+    ## counting it here too would double-count it.
+    - record: rack:power_estimate:watts
+      expr: vector(12)
+      labels: {device: xikestor-self, basis: datasheet}
+    - record: rack:power_estimate:watts
+      expr: vector(45)
+      labels: {device: screen-la2405wg, basis: datasheet}
+    ## nastillo = Synology DS412+, 4 bays spun up. santillo = DS212+.
+    - record: rack:power_estimate:watts
+      expr: vector(40)
+      labels: {device: nastillo, basis: datasheet}
+    - record: rack:power_estimate:watts
+      expr: vector(22)
+      labels: {device: santillo, basis: datasheet}
+    - record: rack:power_estimate:watts
+      expr: vector(4)
+      labels: {device: bone, basis: datasheet}
+    - record: rack:power_estimate:watts
+      expr: vector(7)
+      labels: {device: firewalla, basis: datasheet}
+    - record: rack:power_estimate:watts
+      expr: vector(11)
+      labels: {device: aptc, basis: datasheet}
+
+    - record: rack:power_estimate_total:watts
+      expr: sum(rack:power_estimate:watts)
+
+    ## ---- the residual, and the check ------------------------------------
+    ## ⛔ avg() around the UPS term is what keeps this subtraction alive, for the
+    ## reason given on rack:power_ups_out:avg6h: while an HA restart sits inside
+    ## the 6h window the raw `avg_over_time` returns one series per pod, and with
+    ## a 6h window against a ~34 h restart cadence that is roughly 18 % of the
+    ## time. Without it a bare subtraction matched nothing (HA labels against a
+    ## label-less sum) — the silent-empty-panel trap that already bit the "UPS
+    ## self-use" readout — and scalar() did NOT rescue it, see next.
+    ##
+    ## ⛔ scalar() is NOT a safety net on this stack; the note that stood here
+    ## claiming it "surfaces a missing input as NaN" was wrong. Measured
+    ## 2026-09-05 against VictoriaMetrics: scalar() of a multi-series vector
+    ## returns EMPTY, and so does scalar() of an absent one — never NaN. So every
+    ## HA restart inside the window recorded NOTHING here and, downstream, nothing
+    ## in rack:power_model_error:avg6h: the residual and model-error rows went
+    ## blank rather than wrong, and the rule only ever read a number because no
+    ## restart happened to be in the window at the time. Pod churn, not a missing
+    ## input, is the realistic trigger. scalar() stays only because both sides
+    ## are now guaranteed single-series; it earns nothing on its own.
+    ##
+    ## Self-contained rather than referencing the two records above, so it cannot
+    ## be broken by rule ordering inside the group.
+    - record: rack:power_unmetered:avg6h
+      expr: |
+        scalar(avg(avg_over_time(hass_sensor_power_w{entity="sensor.ups_real_power"}[6h])))
+        - scalar(
+            sum(avg_over_time(chassis_power_watts[6h]))
+            + sum(avg_over_time(xikestor_poe_total_watts[6h]))
+          )
+
+    ## The one number here that can be WRONG, and therefore the one worth looking
+    ## at. It moves when something is plugged in, unplugged, or dies — and also
+    ## when a metered input goes missing, which is what the host count (one host
+    ## dropped from the push) and the feed age (probe stopped) are for.
+    ##
+    ## ⚠️ HONEST BASELINE, 2026-09-05: residual 361 W against 301 W of estimates,
+    ## so the model runs about **+60 W short** and the twin's green band is set
+    ## around that offset rather than around zero. That is a known gap, not a
+    ## calibration: the estimates are datasheet figures and were NOT fudged to
+    ## make this read zero. Leading candidates, none verified — the retired kit
+    ## that is still racked and may still be plugged in (fntillo, vortex, exion,
+    ## the swtillo stack, bomberos), and the room exhaust fan if it is on the rack
+    ## circuit. ⭐ Tighten the band once the 60 W is identified; do not tighten it
+    ## by editing an estimate upward until something actually measures it.
+    ##
+    ## ---- 2026-09-06: the gap was CHASED. Two candidates narrowed, not closed ----
+    ## Still ~60 W (model error 59.8 W, residual 360.8 W vs 301 W estimated), so
+    ## the baseline above is stable across a day. What the hunt established:
+    ##
+    ## ⛔ FIRST, why instantaneous attribution is impossible, which is the thing
+    ## that makes this hard: measured over 24h the INSTANTANEOUS residual ranges
+    ## **210 - 616 W, sd 55 W** — because UPS output and the metered sum each swing
+    ## ~500 W with real server load and are sampled on unrelated schedules. The
+    ## quantity being hunted is 60 W, i.e. one sigma of its own noise. ONLY the 6h
+    ## average means anything here; do not try to read a device out of a spot value.
+    ##
+    ## ⭐ "Retired kit still racked and plugged in" — NOT SUPPORTED. Every port UP
+    ## on the C9300 maps to a live device (the five servers and their iLOs, both
+    ## NAS, bpi-r4, firewalla, aptc, xikestor). Not one of fntillo, vortex, exion,
+    ## the swtillo stack or bomberos is on the network. ⚠️ This NARROWS, it does not
+    ## eliminate: a box that is powered but uncabled still draws and still would not
+    ## appear. It does mean nothing retired is powered AND connected.
+    ##
+    ## ⚠️ "The exhaust fan on the rack circuit" — UNTESTABLE with what is collected,
+    ## and explicitly NOT eliminated. corr(residual, fan speed) = +0.005 over 72h,
+    ## but that null is worthless: the fan only varies 50-95 %, so even at 40 W
+    ## full scale its power varies by sd ~3.5 W against the residual's sd ~60 W —
+    ## an expected correlation of ~0.06, far under the noise. Settling this needs
+    ## the fan on its own meter, not more statistics.
+    ##
+    ## ⛔ The C9300 stack still cannot be metered, now double-checked: none of
+    ## entPhySensorValue / ciscoEnvMonSupplyState / cefcTotalDrawnCurrent /
+    ## cefcFRUPowerOperStatus is collected, and the voltsDC + amperes the entSensor
+    ## tree does expose are transceiver DOM (per-SFP supply voltage and bias
+    ## current), so V*I there yields optics, not switch draw. A metering PDU
+    ## remains the only route.
+    ##
+    ## ⭐ LEADING HYPOTHESIS now: no hidden device — the estimates are simply
+    ## datasheet IDLE/TYPICAL figures and the rack runs above them. 160 W for two
+    ## C9300-24T each carrying a populated NM-8X sits at the BOTTOM of a plausible
+    ## 160-220 W band; 45 W for a 24" CCFL LA2405wg is low against a typical 55-65 W;
+    ## 12 W for a 6-port 10G PoE switch is low. Those three plausible shortfalls sum
+    ## to roughly the 60 W observed. ⛔ That is a hypothesis and it stays one — it is
+    ## exactly the reasoning that would tempt someone to edit the numbers upward
+    ## until the error reads zero, which is forbidden above and still is.
+    ##
+    ## ⚠️ Also unmodelled, small: the Zigbee coordinator and the GPS serial adapter
+    ## are on the rack/wall and appear in NO estimate here. Neither is PoE from the
+    ## XikeStor (its four powered ports are all APs), so if either is on a wall-wart
+    ## on this circuit it is unmetered AND unestimated — a few watts each, worth
+    ## confirming how they are fed before assuming the list is complete.
+    - record: rack:power_model_error:avg6h
+      expr: |
+        scalar(rack:power_unmetered:avg6h)
+        - scalar(rack:power_estimate_total:watts)

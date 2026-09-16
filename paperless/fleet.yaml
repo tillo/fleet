@@ -1,0 +1,54 @@
+defaultNamespace: paperless
+namespace: paperless
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+
+# VPA (mode=Auto) writes resources.requests/limits onto running pods
+# after start — strip resources from the diff so Fleet does not flag
+# the bundle Modified. paperless Deployment containers: 0 paperless,
+# 1 tika, 2 gotenberg, 3 consume-puller.
+#
+# The paperless-ngx image tag is bumped by the fleet-image-sync Windmill
+# job: it scans ghcr for newer 2.x releases and commits the bump into
+# paperless-deploy.yml, so git stays the single source of truth and a
+# Fleet re-apply can never downgrade the code below the DB migration
+# level. paperless-ngx has no major-track floating tag (:latest crosses
+# into 3.x), so it cannot use the floating-tag + Keel pattern. Keel is
+# intentionally not used on this Deployment.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: paperless
+    namespace: paperless
+    operations:
+    - {"op": "add", "path": "/spec/template/spec/containers/0/resources", "value": "{}"}
+    - {"op": "add", "path": "/spec/template/spec/containers/1/resources", "value": "{}"}
+    - {"op": "add", "path": "/spec/template/spec/containers/2/resources", "value": "{}"}
+    - {"op": "add", "path": "/spec/template/spec/containers/3/resources", "value": "{}"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: paperless-valkey
+    namespace: paperless
+    operations:
+    - {"op": "add", "path": "/spec/template/spec/containers/0/resources", "value": "{}"}
+  # f/heal/volsync_restic_stale_lock (every 15 min) clears an orphaned restic
+  # repo lock by writing spec.restic.unlock on the ReplicationSource live.
+  # git therefore can never match the cluster on that one field: the heal set
+  # 'autoheal-20260828T053845Z' over git's '2026-08-27-stale-root-lock' and
+  # Fleet held mdapi-prod-paperless Modified for 21h+, keeping
+  # FleetBundlesNotReady/Sustained lit and statuspage Platform degraded.
+  # The heal is correct — the GitOps coupling was the defect. Hand the field to
+  # the heal so a successful autoheal stops red-flagging the bundle. The value
+  # in paperless-backup-rs.yml stays as the documented seed/reset value.
+  - apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    name: paperless-data-ceph
+    namespace: paperless
+    operations:
+    - {"op": "remove", "path": "/spec/restic/unlock"}

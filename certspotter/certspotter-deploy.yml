@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: certspotter
+  namespace: certspotter
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: certspotter
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: certspotter
+        # CT-log scan loop bursts to its lid by design (already tuned 2c->4c).
+        # Exempt from ContainerCpuThrottling (monitoring-rules/18-cpu-throttling.yml)
+        # via the KSM pod-label allowlist in rancher-monitoring-config.
+        monitoring.mdapi.ch/cpu-throttle-exempt: "true"
+    spec:
+      initContainers:
+      - name: prepare-file-system
+        command:
+        - sh
+        args:
+        - -c
+        - chown -R 65534:65534 /certspotter/.certspotter && ln -sf /certspotter/base-hooks.d /certspotter/.certspotter/hooks.d
+        image: docker.io/busybox
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: certspotter-config
+          mountPath: /certspotter/.certspotter
+      containers:
+      - name: certspotter
+        image: registry.mdapi.ch/mdapi/certspotter:latest
+        imagePullPolicy: Always
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: CS_DELAY
+          value: '3600'
+        - name: CS_DOMAINS
+          ## .kyos.dev .kustodyan.com .kustodyan.io added 2026-07-13.
+          value: .tillo.ch .mdapi.org .mdapi.ch .dellambrogio.ch .dellambrogio.com .dellambrogio.org .maurodellambrogio.com .icebow.org .coders.ch .lithia.eu .r3h.ch .kyos.ch .kyos.dev .kustodyan.com .kustodyan.io
+        - name: CS_CMD
+          value: /certspotter/bin/certspotter -stdout -start_at_end
+        envFrom:
+          - secretRef:
+              name: certspotter-env-secret
+        # Limit==Request gave 37% CFS-throttle (Guaranteed QoS but zero
+        # headroom for CT-log scan bursts). Bumped limit 2c -> 4c so the
+        # scan loop can finish without being paused; VPA still keeps the
+        # request floor at its 1643m steady-state.
+        resources:
+          requests:
+            cpu: "2"
+            memory: 1568Mi
+          limits:
+            cpu: "4"
+            memory: 2Gi
+        volumeMounts:
+        - name: certspotter-config
+          mountPath: /certspotter/.certspotter
+      volumes:
+      - name: certspotter-config
+        persistentVolumeClaim:
+          claimName: certspotter-config
+      imagePullSecrets:
+      - name: mdapi-registry

@@ -1,0 +1,83 @@
+## Off-site backup for macos-disk -- the estate's last PVC with no backup story.
+## The disk holds an installed macOS, its iCloud session and the keychain ACL
+## grant the Find My collector needs: not reproducible from this repo, and a
+## reinstall needs a human at the console for every phase.
+##
+## Shared /mdapi/volsync/ceph-backup creds and a per-PVC subpath in the
+## offsite-swept Garage ceph-backup bucket (as jump/esphome/...), so this needs
+## no new bucket and no new grant on the offsite-backup key.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: macos-vm
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster Garage, not api.garage.home.tillo.ch: that name resolves to
+        ## the ingress VIP, so backups would hairpin through ingress-nginx and
+        ## fail exactly when the front door is degraded.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/macos-disk"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+## Daily, not hourly: restic must read the whole ~55 GiB image every run to chunk
+## it, so each run costs real IO even though only changed chunks upload. 04:20
+## UTC sits after the 02:00-04:00 backup cluster.
+##
+## ⚠️ Crash-consistent: the snapshot is taken while the guest runs, so a restore
+## replays the journal as an abrupt power cut would. macOS ignores ACPI powerdown
+## so there is no cheap way to quiesce it, and the guest already takes that same
+## cut on every pod replacement. The mover works on a CLONE, so it never contends
+## for the RWO source the VM holds.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: macos-disk
+  namespace: macos-vm
+spec:
+  sourcePVC: macos-disk
+  trigger:
+    schedule: "20 4 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    ## Images are uid/gid 1000 and lost+found is mode 2770 root:1000, so the
+    ## mover needs gid 1000 to read the volume. fsGroup is not optional: the
+    ## cache PVC is provisioned root-owned, and a mover that cannot write it
+    ## silently runs cacheless, still reporting success.
+    moverSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      fsGroup: 1000
+    ## 8Gi: cache scales with pack count and this repo is ~10x the next largest.
+    cacheCapacity: 8Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 14
+    ## Shallow on purpose -- depth is expensive for a disk image, where each
+    ## snapshot pins the chunks that changed.
+    retain:
+      daily: 14
+      weekly: 4
+      monthly: 3

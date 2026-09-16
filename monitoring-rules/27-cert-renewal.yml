@@ -1,0 +1,201 @@
+## Certificate renewal safety net.
+##
+## Closes the gap that the event-driven renewal rollout exposed: renewals now run via
+## Horizon on_expire triggers (→ Windmill cert_renew_dispatch / ilo_cert_renew), with the
+## old crons kept only as backstop. Nothing alerted if BOTH a trigger and its cron silently
+## failed — the cert would surface only at expiry (an outage; several are mail/ingress/BMC
+## adjacent). Before this, only blackbox-probe served-cert checks existed; nothing watched the
+## per-device *_cert_days_to_expiry push metrics, the Horizon managed-cert portfolio, or a
+## renewal job erroring. Companion to memory event_driven_cert_renewal_horizon_onexpire_windmill.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cert-renewal
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cert-renewal.rules
+    rules:
+    # --- per-device push certs (cm / msm430 / nastillo / santillo / zyxel) ---
+    - alert: DeviceCertExpiringSoon
+      ## *_cert_days_to_expiry is pushed by each device renewal job. Gates renew ~15-30d and
+      ## the on_expire trigger fires at 30d, so <14d means a renewal has not landed. 6h `for`
+      ## rides out the renew+verify window + a metric-scrape blip.
+      expr: min by (__name__) ({__name__=~".+_cert_days_to_expiry"}) < 14
+      for: 6h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Internal renewal-pipeline signal (2026-07-30, user-approved):
+        ## a device cert 14d from expiry is not a user-visible Platform
+        ## outage — it was degrading the public statuspage.
+        statuspage: exclude
+      annotations:
+        summary: "Device cert {{ $labels.__name__ }} at {{ $value }}d to expiry — renewal not landing"
+        description: |
+          A device cert tracked by *_cert_days_to_expiry is under 14 days and has not renewed.
+          Check the event-driven path (Horizon on_expire → cert_renew_dispatch / ilo_cert_renew)
+          and the backstop cron/schedule for that device.
+
+    - alert: DeviceCertExpiringCritical
+      expr: min by (__name__) ({__name__=~".+_cert_days_to_expiry"}) < 7
+      for: 1h
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Device cert {{ $labels.__name__ }} at {{ $value }}d to expiry"
+        description: |
+          A device cert is under 7 days — both the trigger and the backstop cron have failed.
+          Renew now: `wmill script run` the device's renew script with force=true.
+
+    # --- Horizon managed-cert portfolio (catch-all: iLO BMC + any managed cert without a device metric) ---
+    - alert: ManagedCertExpiring
+      expr: horizon_certs_expiring{window="7d"} > 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Same internal renewal-pipeline signal as DeviceCertExpiringSoon
+        ## above; this catch-all was simply missed in that 2026-07-30 pass and
+        ## was found still degrading the public Platform component on
+        ## 2026-09-03. A managed cert that has NOT yet expired is a renewal
+        ## backlog, not a user-visible outage. The critical tier stays public:
+        ## DeviceCertExpiringCritical (<7d, severity critical) has no exclude.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $value }} Horizon-managed cert(s) within 7 days of expiry"
+        description: |
+          The Horizon CLM portfolio (horizon_cert_metrics, hourly) reports managed cert(s)
+          within 7 days. Covers iLO BMC + any managed cert lacking a per-device metric.
+          Identify via the CLM dashboard or Horizon search `status is valid and valid.until < <date>`.
+
+    # --- a renewal job returned an error ---
+    - alert: CertRenewalError
+      expr: cert_renew_dispatch_result{result="error"} > 0 or ilo_cert_renew_event_result{result="error"} > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Cert renewal errored (device {{ $labels.device }}{{ $labels.ilo }})"
+        description: |
+          An event-driven renewal returned status=error. Inspect the Windmill job
+          (cert_renew_dispatch or ilo_cert_renew) for that device and re-run.
+
+    # --- the inventory metric pipeline itself stopped (ManagedCertExpiring would go blind) ---
+    - alert: CertInventoryMetricsStale
+      expr: time() - max(horizon_cert_metrics_last_run_timestamp_seconds) > 10800
+      for: 15m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Horizon cert-inventory metrics stale (>3h)"
+        description: |
+          horizon_cert_metrics (hourly) has not pushed in >3h, so ManagedCertExpiring is blind.
+          Check the f/probe/horizon_cert_metrics Windmill schedule.
+
+    # --- AOS-6 pull-model AP (.217 apin0325): served-cert drift + pipeline stall ---
+    # (aruba_aos6_cert_days_to_expiry — the cert-manager secret expiry — is already
+    #  covered by DeviceCertExpiringSoon/Critical via the .+_cert_days_to_expiry regex.)
+    - alert: Aos6CertOutOfSync
+      ## aruba_aos6_cert_insync is 1 when .217 serves the current secret cert on BOTH :443 and
+      ## :4343, 0 when a delivery failed (AP still serving the old/expiring cert). The daily
+      ## backstop self-heals drift, so a sustained 0 means delivery is genuinely failing.
+      expr: aruba_aos6_cert_insync == 0
+      for: 2h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: ".217 (apin0325) serving a stale cert — AOS-6 pull delivery failing"
+        description: |
+          aruba_aos6_cert_insync=0: the served leaf on .217 :443/:4343 no longer matches the
+          cert-manager secret. The on_enroll -> cert_renew_dispatch -> aruba_aos6_cert_sync pull
+          path (and the daily backstop) is not landing. Run
+          `wmill script run f/infra_certs/aruba_aos6_cert_sync -d '{"force":true}'` and check
+          cert-host (.61) reachability from .217 and .217 SSH reachability from the certs worker.
+
+    - alert: Aos6CertSyncStale
+      ## last-run is pushed on every run (incl. failures), so >26h means the daily backstop AND
+      ## on_enroll are both silent — Aos6CertOutOfSync would then be blind.
+      expr: time() - max(aruba_aos6_cert_sync_last_run_timestamp_seconds) > 93600
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "AOS-6 .217 cert-sync metrics stale (>26h)"
+        description: |
+          aruba_aos6_cert_sync has not run in >26h (daily backstop + on_enroll both silent).
+          Check the f/infra_certs/aruba_aos6_cert_sync schedule and the certs worker group.
+
+    ## ---- Garage TLS terminator (salt/pepper) ----
+    ## Added 2026-09-05. This one is load-bearing in a way the device certs are
+    ## not: the terminator is what keeps every backup that is not already
+    ## ciphertext off the LAN in the clear (the CNPG barman dumps, the Home
+    ## Assistant and GitLab tarballs, the Longhorn VM backups). Garage has no TLS
+    ## listener of its own, so if the leaf goes stale and expires, those backups
+    ## do not quietly fall back to plaintext -- they FAIL, all at once, on both
+    ## nodes. Hence a hard expiry alert rather than only a sync alert.
+    - alert: GarageTlsCertOutOfSync
+      ## nginx re-reads its cert hourly on its own AND f/infra_certs/garage_tls_cert_sync
+      ## runs daily, so 0 for 6h means both the timer and the delivery are failing --
+      ## not merely that a delivery has just happened and not yet been picked up.
+      expr: garage_tls_cert_in_sync == 0
+      for: 6h
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Garage TLS node {{ $labels.node }} serving a stale certificate"
+        description: |
+          garage_tls_cert_in_sync=0 for 6h on {{ $labels.node }}: the certificate it presents
+          on :30288 is not the current transit/garage-tls leaf. cert-manager rotates that leaf
+          roughly every 31 days and nothing else carries it to the bare-metal Garage hosts, so
+          this is the precursor to every backup failing at expiry.
+          Run `wmill script run f/infra_certs/garage_tls_cert_sync` and check SSH to
+          salt/pepper as the mdapi user.
+
+    - alert: GarageTlsCertExpiringSoon
+      ## Judged on the SERVED certificate, not on the cert-manager secret: the secret
+      ## renewing while delivery is broken is exactly the failure this must catch.
+      expr: garage_tls_cert_days_to_expiry < 10
+      for: 30m
+      labels:
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Garage TLS node {{ $labels.node }} cert expires in <10d — backups will fail"
+        description: |
+          The certificate SERVED on {{ $labels.node }}:30288 expires in
+          {{ $value | printf "%.1f" }} days. When it does, every backup client that verifies
+          it stops: the 6 CNPG barman stores, the Home Assistant sidecar, GitLab's backup
+          upload, the offsite job's read leg and Longhorn's VM backup target.
+          Deliver now: `wmill script run f/infra_certs/garage_tls_cert_sync`.
+
+    - alert: GarageTlsCertSyncStale
+      expr: time() - max(garage_tls_cert_sync_last_run_timestamp_seconds) > 93600
+      for: 30m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Garage TLS cert-sync metrics stale (>26h)"
+        description: |
+          f/infra_certs/garage_tls_cert_sync has not run in >26h, so GarageTlsCertOutOfSync
+          and GarageTlsCertExpiringSoon are both blind. Check its daily 05:40 schedule.

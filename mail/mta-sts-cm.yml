@@ -1,0 +1,63 @@
+# MTA-STS policy (RFC 8461) served at https://mta-sts.<domain>/.well-known/mta-sts.txt
+#
+# ⛔ TWO things must change together when this policy changes:
+#   1. the `mode`/`mx`/`max_age` below, and
+#   2. the `id=` in every `_mta-sts.<domain>` TXT record in BIND.
+# Receivers only re-fetch the policy when the DNS id changes. Editing this file
+# alone leaves every sender on the cached old policy until max_age expires.
+#
+# Rollout decision (user, 2026-09-08): start in `mode: testing` — senders REPORT
+# TLS failures via TLS-RPT but still deliver — and flip to `enforce` only after a
+# few weeks of clean reports. `enforce` means a conforming sender REFUSES to
+# deliver if the MX set or TLS ever stops matching this file, and a cached policy
+# cannot be recalled, so the failure would last up to max_age.
+#
+# ⭐ 2026-09-12 (user "Go"): flipped to `enforce` in a STAGED form — mode and
+# max_age are INDEPENDENT fields, and bundling them is what made this look like a
+# one-way door. `max_age` deliberately STAYS 86400, so a bad policy ages out in a
+# DAY instead of a week. Raise to 604800 only after a clean week of enforce, as a
+# separate change (which needs its own DNS id bump).
+#
+# Preconditions that were actually met before flipping, all verified by behaviour:
+#   - TLS on :25 is validated by the `mail-mx-starttls` probe (fleet !229). The
+#     older `mail-smtp` probe uses smtp_banner and never opens TLS, so before !229
+#     NOTHING would have noticed a cert fault on the MX — that was the real gap.
+#   - One MX, mail.mdapi.ch, matching `mx:` below exactly, for all seven domains.
+#   - Served cert is publicly-valid Let's Encrypt, ~82 days out, cert-manager
+#     renewing at ~30.
+#   - Every observed :25 probe failure was a WHOLE-SERVER outage, not a TLS fault:
+#     mail-smtp, mail-mx-starttls and mail-submissions all dropped together. A
+#     sender that cannot connect defers and retries under ANY policy mode, so the
+#     nightly Keel roll of docker-mailserver is not an enforce hazard.
+#
+# ⏳ Known residual risk, accepted: TLS-RPT has had exactly ONE reporter (Google);
+# Microsoft sends DMARC reports but no TLS-RPT. The 86400 max_age is what buys
+# that back — one day of exposure, not seven.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mta-sts-policy
+  namespace: mail
+data:
+  mta-sts.txt: |
+    version: STSv1
+    mode: enforce
+    mx: mail.mdapi.ch
+    max_age: 86400
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+      # RFC 8461: the policy MUST be text/plain and MUST NOT be reached via a
+      # redirect. Serve it directly, and give nothing else away.
+      location = /.well-known/mta-sts.txt {
+        default_type text/plain;
+        add_header Cache-Control "max-age=3600";
+        alias /etc/mta-sts/mta-sts.txt;
+      }
+      location = /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+      }
+      location / { return 404; }
+    }

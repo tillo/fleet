@@ -1,0 +1,42 @@
+# One Ingress, one multi-SAN cert, seven mta-sts.<domain> hosts — same shape as
+# autoconfig-ing.yml. The letsencrypt-prod ClusterIssuer already solves DNS-01 for
+# all seven of these zones.
+#
+# ⛔ No ModSecurity here on purpose. This endpoint serves one static text file to
+# other people's mail servers; a WAF false positive on it would make our MTA-STS
+# policy unfetchable, which after the flip to `enforce` means senders refuse to
+# deliver to us. Availability beats inspection for this one path.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mta-sts
+  namespace: mail
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/server-alias: "mta-sts.tillo.ch,mta-sts.coders.ch,mta-sts.coiffuredreams.ch,mta-sts.dellambrogio.ch,mta-sts.lithia.eu,mta-sts.envuassu.ch"
+    # RFC 8461: the policy must be fetched over HTTPS without a redirect. Senders
+    # go straight to https://, so plain-HTTP is only ever a courtesy redirect.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mta-sts.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: mta-sts
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - mta-sts.mdapi.ch
+      - mta-sts.tillo.ch
+      - mta-sts.coders.ch
+      - mta-sts.coiffuredreams.ch
+      - mta-sts.dellambrogio.ch
+      - mta-sts.lithia.eu
+      - mta-sts.envuassu.ch
+      secretName: mta-sts-cert

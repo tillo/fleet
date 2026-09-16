@@ -1,0 +1,104 @@
+## macOS VM (ns `macos-vm`).
+##
+## Selectors are NAMESPACE-WIDE on purpose: a name-pinned selector is how the
+## second workload in a namespace gets born uncovered.
+##
+## severity: warning + statuspage: exclude -- a deliberate call. Nothing outside
+## the household depends on this VM, so its loss has no business appearing on
+## the public status page. component `Platform` rather than `Smart Home`: it is
+## hosting infrastructure that happens to feed a smart-home pipeline.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-macos-vm
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-macos-vm.workload
+    rules:
+    ## Subtract rather than test == 0, so a deliberate scale-to-zero (freeing
+    ## the ReadWriteOnce volume, for instance) stays silent. 20m rather than
+    ## 15m because Recreate takes the VM fully down and a cold boot is slow.
+    - alert: MacosVmDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="macos-vm", deployment=~".+"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="macos-vm", deployment=~".+"
+            }
+          ) > 0
+        )
+      for: 20m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "macos-vm/{{ $labels.deployment }} unavailable"
+        description: |
+          The macOS VM has had no available replica for 20m. Check
+          `kubectl -n macos-vm describe deploy {{ $labels.deployment }}`.
+          A Multi-Attach error means an earlier pod still holds the disk; a
+          Pending pod usually means no node could satisfy both the memory
+          request and the KVM device.
+
+    ## ⚠️ Do not remove this arm because it matches nothing today. It is what
+    ## makes the namespace-wide claim honest: the coverage probe treats a
+    ## namespace-only selector as covering both kinds, so a Deployment-only file
+    ## would silently claim coverage of a StatefulSet it could never fire on.
+    - alert: MacosVmStatefulSetUnavailable
+      expr: |
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace="macos-vm", statefulset=~".+"
+            }
+            - kube_statefulset_status_replicas_available{
+              namespace="macos-vm", statefulset=~".+"
+            }
+          ) > 0
+        )
+      for: 20m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "macos-vm/{{ $labels.statefulset }} unavailable"
+        description: |
+          A StatefulSet in this namespace has fewer available replicas than
+          desired.
+
+    ## Readiness only proves QEMU is accepting console connections. This catches
+    ## the likelier failure -- QEMU exiting on a damaged disk image or being
+    ## killed against its memory limit -- which appears as a restart loop rather
+    ## than a closed port.
+    ##
+    ## ⭐ Restarts are not harmless here: the guest ignores ACPI shutdown, so
+    ## every restart is an abrupt power cut and a journal replay. A loop means
+    ## damage accumulating, not just noise.
+    - alert: MacosVmPodCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="macos-vm"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "macos-vm/{{ $labels.pod }} crash-looping"
+        description: |
+          Container restart rate above 0.5/min for 10m. Check
+          `kubectl -n macos-vm logs {{ $labels.pod }} --previous`; "Image is not
+          in qcow2 format" means the disk was created at the wrong path and the
+          mkdisk initContainer is not doing its job.

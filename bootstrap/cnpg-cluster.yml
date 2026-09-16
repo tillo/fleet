@@ -1,0 +1,111 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gitlab-pg
+  namespace: bootstrap
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  primaryUpdateStrategy: unsupervised
+
+  ## Keep primary + replica on different nodes. CNPG defaults to *soft*
+  ## (preferred) anti-affinity, which can let both copies co-locate on one
+  ## node during a rolling restart -- then a node loss takes out both and the
+  ## replica buys zero protection (the trap ha-recorder-pg hit 2026-06-15).
+  ## required is always satisfiable here (2 instances, 3 nodes).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "400"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+    # GitLab's required extensions, plus pg_stat_statements which our
+    # bundled bitnami install already has loaded.
+    shared_preload_libraries:
+    - pg_stat_statements
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the standby to confirm each commit. Default async
+    ## drops the last unreplicated writes on promotion. dataDurability:
+    ## preferred falls back to async if the standby is down so GitLab writes
+    ## never stall on a missing replica. (Mirrors ha-recorder-pg; CNPG >=1.25.)
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: gitlabhq_production
+      owner: gitlab
+      # CNPG auto-creates a Secret `gitlab-pg-app` with the generated
+      # password. We read it post-deploy and stage it in akeyless / GitLab
+      # values for the cutover.
+      postInitTemplateSQL:
+      - CREATE EXTENSION IF NOT EXISTS pg_trgm
+      - CREATE EXTENSION IF NOT EXISTS btree_gist
+      - CREATE EXTENSION IF NOT EXISTS amcheck
+      - CREATE EXTENSION IF NOT EXISTS pg_stat_statements
+
+  backup:
+    barmanObjectStore:
+      # WAL + base backups land in Garage on salt/pepper (independent of
+      # the prod cluster's storage layer). Switched 2026-05-13 from
+      # api.minio.home.tillo.ch as part of MinIO retirement (#19).
+      destinationPath: s3://gitlab-pg-backup
+      ## ⭐ TLS terminated by Garage's own hosts, not by the ingress.
+      ## Garage has no TLS listener of its own -- upstream: "This endpoint
+      ## does not support TLS: a reverse proxy should be used to provide
+      ## it." So https://api.garage.home.tillo.ch only ever encrypted the
+      ## FIRST hop: ingress-nginx terminated it and re-emitted plaintext to
+      ## salt/pepper over the LAN. barman compresses but does not encrypt
+      ## (there is no `encryption:` key below), so these Postgres dumps
+      ## crossed the LAN in the clear on that last hop.
+      ## :30288 is an nginx TLS terminator running ON salt and pepper,
+      ## reached through the selector-less transit/garage Service, so this
+      ## also drops the ingress out of the backup's dependency chain.
+      ## Bucket and path are unchanged -- the barman store is untouched.
+      endpointURL: https://garage.transit.svc.cluster.local:30288
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: gitlab-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: gitlab-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        # Garage validates the SigV4 region scope on HeadBucket; barman
+        # defaults to us-east-1, so the region must be set explicitly.
+        region:
+          name: gitlab-pg-backup-s3
+          key: REGION
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+        immediateCheckpoint: false
+        jobs: 2
+    retentionPolicy: "14d"
+---
+# Daily base backup at 03:00 Europe/Zurich.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: gitlab-pg-daily
+  namespace: bootstrap
+spec:
+  cluster:
+    name: gitlab-pg
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  immediate: false

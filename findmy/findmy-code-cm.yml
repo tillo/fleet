@@ -1,0 +1,483 @@
+## Collector source. This ConfigMap is the canonical copy -- it is what runs,
+## and it is the only copy under version control, so there is nothing to drift
+## against.
+##
+## One invocation == one cycle. The pod's command loops it with a sleep, so a
+## failure in a single cycle cannot take the workload down; persistent failure
+## surfaces as a stale success timestamp instead (see monitoring-rules/50).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: findmy-code
+  namespace: findmy
+data:
+  collector.py: |
+    """Apple Find My -> Home Assistant, one cycle per invocation.
+
+    The account used here does not have to own the tags: any account can fetch a
+    tag's reports GIVEN the tag's key. The keys are the hard part -- they come
+    off a Mac that can see the tag in Find My, which is why every cycle starts
+    by extracting them over SSH rather than trusting a cached copy. That is what
+    makes a newly enrolled tag appear with no human action.
+    """
+
+    import base64
+    import hashlib
+    import json
+    import logging
+    import os
+    import pathlib
+    import shutil
+    import ssl
+    import sys
+    import time
+    import unicodedata
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+    import paramiko
+    from findmy import AppleAccount, FindMyAccessory
+
+    LOG = logging.getLogger("findmy")
+
+    STATE = pathlib.Path(os.environ.get("FINDMY_STATE_DIR", "/state"))
+    # The original, human-managed session. Only ages -- nothing rewrites it.
+    SEED = pathlib.Path("/secrets/account.json")
+    # The session as WE last refreshed it, carried back to the store by the
+    # PushSecret. Preferred when seeding, because the copy above goes stale and
+    # re-authenticating needs a person with a two-factor code.
+    SEED_CURRENT = pathlib.Path("/secrets/account-current.json")
+    # Secret the collector writes for PushSecret to pick up.
+    SESSION_SECRET = os.environ.get("SESSION_SECRET_NAME", "findmy-session-current")
+    # Remembers what we last published, so an unchanged session is not rewritten
+    # every cycle just because the store's copy has not been re-read yet.
+    PUSHED_MARK = pathlib.Path(os.environ.get("FINDMY_STATE_DIR", "/state")) / ".session-pushed"
+    ACCOUNT = STATE / "account.json"
+    ANISETTE = STATE / "ani_libs.bin"
+    # Keys extracted from the Mac. REWRITTEN EVERY CYCLE, so that a tag newly
+    # enrolled on the Mac's account appears without anyone editing anything.
+    DEVICES = STATE / "devices"
+    # Keys imported from OpenTagViewer exports. Kept SEPARATE precisely because
+    # the directory above is wiped each cycle -- and because these come from
+    # accounts we do not own, which the Mac can never export. The fetching
+    # account does not need to own a tag: any account can query any tag given
+    # its key, which is what makes a tag on someone else's Apple ID trackable
+    # here at all. Populate with import_opentagviewer.py.
+    IMPORTED = STATE / "imported"
+    # Secret-store copy of the above, as {filename: contents}, so a lost state
+    # volume does not mean asking another household member to re-run an
+    # exporter for keys our own Mac can never produce.
+    IMPORTED_SEED = pathlib.Path("/secrets/imported.json")
+
+    MAC_HOST = os.environ.get("MAC_HOST", "macos-vm-vnc.macos-vm.svc.cluster.local")
+    MAC_PORT = int(os.environ.get("MAC_PORT", "10022"))
+    MAC_USER = os.environ.get("MAC_USER", "martinodellambrogio")
+    MAC_PY = os.environ.get("MAC_PY", "/usr/local/bin/python3")
+
+    MQTT_HOST = os.environ.get("MQTT_HOST", "eclipse-mosquitto.mqtt.svc.cluster.local")
+    MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+    DISCOVERY_PREFIX = os.environ.get("MQTT_DISCOVERY_PREFIX", "homeassistant")
+
+    PUSHGATEWAY = os.environ.get(
+        "PUSHGATEWAY", "http://pushgateway.monitoring.svc.cluster.local:9091")
+    JOB = "findmy_collector"
+
+    # A report older than this is history, not a position. Publishing it would
+    # assert a stale location as current and Home Assistant would resolve it to a
+    # zone and act on it.
+    MAX_REPORT_AGE_S = int(os.environ.get("FINDMY_MAX_REPORT_AGE_S", str(6 * 3600)))
+    # Apple's own hardware sits in OwnedBeacons beside the tags. Set to 1 only to
+    # prove the pipeline against a device.
+    TRACK_APPLE_DEVICES = os.environ.get("FINDMY_TRACK_APPLE_DEVICES") == "1"
+
+    # Splits the decrypt output into one file per accessory ON THE MAC, so master
+    # keys go Mac -> pod over SFTP and never through an argv or a log.
+    #
+    # The keychain is unlocked per session; the ACL grant that lets `security -w`
+    # return the BeaconStoreKey at all was made once, interactively, with
+    # "Always Allow" and is permanent. Unlock alone is NOT sufficient -- if this
+    # starts raising ValueError again, the ACL was lost and must be re-granted
+    # once from the VNC console.
+    REMOTE = """#!/bin/sh
+    set -u
+    security unlock-keychain -p "$MACPW" "$HOME/Library/Keychains/login.keychain-db" \
+      2>/dev/null || echo UNLOCK_FAILED
+    rm -f /tmp/fm.json /tmp/fm.err
+    %(py)s -m findmy decrypt >/tmp/fm.json 2>/tmp/fm.err &
+    pid=$!
+    i=0
+    while kill -0 $pid 2>/dev/null; do
+      i=$((i+1))
+      if [ $i -gt 45 ]; then kill -9 $pid 2>/dev/null; echo TIMEOUT_KEYCHAIN_PROMPT; break; fi
+      sleep 1
+    done
+    wait $pid 2>/dev/null
+    %(py)s - <<'PYEOF'
+    import json, pathlib, sys
+    try:
+        data = json.load(open("/tmp/fm.json"))
+    except Exception as exc:
+        sys.stderr.write("DECRYPT_FAILED %%r\\n" %% (exc,)); print("STATUS fail"); raise SystemExit(0)
+    out = pathlib.Path("%(dir)s"); out.mkdir(exist_ok=True)
+    for stale in out.glob("*.json"): stale.unlink()
+    for acc in data:
+        acc["type"] = "accessory"
+        (out / (acc["identifier"] + ".json")).write_text(json.dumps(acc))
+    print("STATUS ok")
+    PYEOF
+    """
+
+
+    def is_apple_device(model):
+        """True for Apple hardware, whose model reads like `iPhone12,1`.
+
+        Those beacons live in OwnedBeacons alongside tags but an online Apple
+        device reports directly to Apple, so locating one is usually a miss.
+        Tags and third-party accessories do not use the Name<major>,<minor> form.
+        """
+        if not model:
+            return False
+        head, _, tail = model.partition(",")
+        return bool(tail) and tail.isdigit() and head[-1:].isdigit()
+
+
+    def extract_keys():
+        """Pull accessory keys off the Mac. Returns True if the export succeeded."""
+        remote_dir = "/Users/%s/devices" % MAC_USER
+        script = REMOTE % {"py": MAC_PY, "dir": remote_dir}
+        password = os.environ["MAC_PASS"]
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(MAC_HOST, port=MAC_PORT, username=MAC_USER,
+                       password=password, timeout=25, banner_timeout=25,
+                       auth_timeout=25, look_for_keys=False, allow_agent=False)
+        try:
+            sftp = client.open_sftp()
+            with sftp.file("/tmp/fm_export.sh", "w") as fh:
+                fh.write(script)
+            sftp.chmod("/tmp/fm_export.sh", 0o700)
+
+            _, out, _ = client.exec_command(
+                "MACPW=%r sh /tmp/fm_export.sh" % password, timeout=180)
+            text = out.read().decode(errors="replace")
+            if "STATUS ok" not in text:
+                LOG.error("key export failed on the Mac: %s", text.strip()[:300])
+                return False
+
+            DEVICES.mkdir(parents=True, exist_ok=True)
+            for stale in DEVICES.glob("*.json"):
+                stale.unlink()
+            for name in sftp.listdir(remote_dir):
+                if name.endswith(".json"):
+                    sftp.get("%s/%s" % (remote_dir, name), str(DEVICES / name))
+            sftp.close()
+            return True
+        finally:
+            client.close()
+
+
+    def load_account():
+        """Restore the session, seeding from the secret store on first run.
+
+        The seed is copied rather than used in place: findmy rewrites the file as
+        tokens refresh, and a mounted secret is read-only.
+        """
+        STATE.mkdir(parents=True, exist_ok=True)
+        if not ACCOUNT.exists():
+            # Freshest first: the pushed-back copy, then the original. Each is
+            # parsed before being trusted, so a malformed one falls through to
+            # the next rather than seeding an unusable session.
+            for seed in (SEED_CURRENT, SEED):
+                if not seed.exists():
+                    continue
+                try:
+                    json.loads(seed.read_text())
+                except Exception as exc:
+                    LOG.warning("%s is not usable (%r), trying the next seed",
+                                seed.name, exc)
+                    continue
+                shutil.copy(seed, ACCOUNT)
+                LOG.info("seeded session from %s", seed.name)
+                break
+            else:
+                sys.exit("no session at %s and no usable seed" % ACCOUNT)
+        return AppleAccount.from_json(str(ACCOUNT), anisette_libs_path=str(ANISETTE))
+
+
+    def publish_session():
+        """Carry the refreshed session back to the secret store.
+
+        findmy rewrites the session as tokens refresh, so the stored copy only
+        ages; left alone it eventually stops working and recovery needs a person
+        with a two-factor code. Written into a Secret that a PushSecret carries
+        to the store, so this pod never needs a store credential of its own.
+        """
+        if not ACCOUNT.exists():
+            return
+        try:
+            # Compact, and parsed first: never publish something unreadable over
+            # a copy that currently works.
+            session = json.dumps(json.loads(ACCOUNT.read_text()),
+                                 separators=(",", ":"))
+        except Exception as exc:
+            LOG.warning("refreshed session is not valid JSON (%r); not publishing",
+                        exc)
+            return
+
+        digest = hashlib.sha256(session.encode()).hexdigest()
+        if PUSHED_MARK.exists() and PUSHED_MARK.read_text().strip() == digest:
+            return
+
+        sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+        try:
+            token = pathlib.Path(f"{sa}/token").read_text().strip()
+            ns = pathlib.Path(f"{sa}/namespace").read_text().strip()
+        except OSError as exc:
+            LOG.warning("no service account token (%r); cannot publish session", exc)
+            return
+
+        ctx = ssl.create_default_context(cafile=f"{sa}/ca.crt")
+        url = (f"https://kubernetes.default.svc/api/v1/namespaces/{ns}"
+               f"/secrets/{SESSION_SECRET}")
+        payload = {"data": {"account.json":
+                            base64.b64encode(session.encode()).decode()}}
+
+        def call(method, target, body, ctype):
+            req = urllib.request.Request(target, data=json.dumps(body).encode(),
+                                         method=method)
+            req.add_header("Authorization", "Bearer " + token)
+            req.add_header("Content-Type", ctype)
+            return urllib.request.urlopen(req, context=ctx, timeout=30).read()
+
+        try:
+            call("PATCH", url, payload, "application/strategic-merge-patch+json")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                LOG.warning("could not publish session: %s %s", exc.code, exc.reason)
+                return
+            # First run: the Secret does not exist yet.
+            body = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                    "metadata": {"name": SESSION_SECRET, "namespace": ns},
+                    "data": payload["data"]}
+            try:
+                call("POST", url.rsplit("/", 1)[0], body, "application/json")
+            except Exception as exc2:
+                LOG.warning("could not create session secret: %r", exc2)
+                return
+        except Exception as exc:
+            LOG.warning("could not publish session: %r", exc)
+            return
+
+        PUSHED_MARK.write_text(digest)
+        LOG.info("published refreshed session to %s", SESSION_SECRET)
+
+
+    def seed_imported():
+        """Restore imported accessory keys from the secret store if absent.
+
+        Only ever ADDS files that are missing, so a key imported later by hand
+        is never clobbered by an older bundle, and re-running is harmless.
+        """
+        if not IMPORTED_SEED.exists():
+            return
+        try:
+            bundle = json.loads(IMPORTED_SEED.read_text())
+        except Exception as exc:
+            LOG.warning("imported-key seed unreadable: %r", exc)
+            return
+        IMPORTED.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for fname, content in bundle.items():
+            # Defend against a stray path in the bundle writing outside IMPORTED.
+            target = IMPORTED / pathlib.Path(fname).name
+            if target.exists():
+                continue
+            target.write_text(content if isinstance(content, str)
+                              else json.dumps(content))
+            added += 1
+        if added:
+            LOG.info("seeded %d accessory key(s) from the secret store", added)
+
+
+    def slugify(name):
+        """Build an MQTT discovery node id.
+
+        ⛔ MUST be pure ASCII. Home Assistant only accepts a discovery node id
+        matching [a-zA-Z0-9_-] and DISCARDS the message otherwise -- silently,
+        with nothing in the log. A tag named "Clés de Elisa" published happily
+        to `findmy_clés_de_elisa` for a day and never produced an entity,
+        because `'é'.isalnum()` is True in Python and the accent survived.
+
+        NFKD splits an accented letter into base + combining mark, so encoding
+        to ASCII with errors="ignore" drops the mark and keeps the letter
+        (é -> e) rather than losing the character entirely.
+        """
+        ascii_name = (unicodedata.normalize("NFKD", name)
+                      .encode("ascii", "ignore").decode("ascii"))
+        out = "".join(c if c.isalnum() else "_" for c in ascii_name.lower())
+        slug = "_".join(filter(None, out.split("_")))
+        return "findmy_" + (slug or "unnamed")
+
+
+    def ha_publish(client, dev_id, name, lat, lon, accuracy):
+        """Announce via MQTT discovery and publish the position.
+
+        ⛔ NOT device_tracker.see: that service returns 200 and the entity never
+        appears, because new_device_defaults.track_new_devices is false and every
+        legacy tracker it creates lands in known_devices.yaml with track: false.
+
+        Both messages are retained so the entity survives a Home Assistant
+        restart without waiting for the next cycle.
+        """
+        base = "findmy/%s" % dev_id
+        config = {
+            # name None => the entity takes the device's name verbatim. Setting
+            # both composes "<device> <entity>" and yields a doubled name.
+            "name": None,
+            "unique_id": dev_id,
+            # Deliberately NO state_topic: with gps attributes present Home
+            # Assistant derives home/zone/not_home itself. Publishing a state
+            # here pinned the tracker to not_home while its coordinates sat
+            # inside a zone.
+            "json_attributes_topic": "%s/attributes" % base,
+            "source_type": "gps",
+            "device": {"identifiers": [dev_id], "name": name,
+                       "manufacturer": "Apple Find My",
+                       "model": "Find My accessory"},
+        }
+        client.publish("%s/device_tracker/%s/config" % (DISCOVERY_PREFIX, dev_id),
+                       json.dumps(config), qos=1, retain=True).wait_for_publish()
+        attrs = {"latitude": lat, "longitude": lon, "source_type": "gps"}
+        if accuracy is not None:
+            attrs["gps_accuracy"] = round(accuracy)
+        client.publish("%s/attributes" % base, json.dumps(attrs), qos=1,
+                       retain=True).wait_for_publish()
+
+
+    def push_metrics(**vals):
+        """Publish cycle outcome so staleness is alertable.
+
+        A loop cannot report failure by exit code -- the wrapper restarts it
+        regardless -- so the success TIMESTAMP is the real health signal.
+        """
+        lines = []
+        for key, val in vals.items():
+            lines.append("# TYPE %s gauge" % key)
+            lines.append("%s %s" % (key, val))
+        body = ("\n".join(lines) + "\n").encode()
+        req = urllib.request.Request("%s/metrics/job/%s" % (PUSHGATEWAY, JOB),
+                                     data=body, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except (urllib.error.URLError, OSError) as exc:
+            # Never let telemetry failure break the actual job.
+            LOG.warning("pushgateway unreachable: %r", exc)
+
+
+    def main():
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+        import paho.mqtt.client as mqtt
+
+        extract_ok = 0
+        try:
+            extract_ok = 1 if extract_keys() else 0
+        except Exception as exc:
+            # A Mac that is down must not stop us publishing from keys already
+            # fetched in an earlier cycle -- it only stops us noticing NEW tags.
+            LOG.error("key extraction failed, using keys from the last cycle: %r", exc)
+
+        # Both stores use the same schema, so they load identically. Deduplicate
+        # by `identifier` because the OpenTagViewer export of our OWN account
+        # overlaps what the Mac exports; without this each shared tag would be
+        # fetched and published twice. IMPORTED is read second and therefore
+        # wins, which is what we want -- those records carry key alignment.
+        seed_imported()
+
+        by_id = {}
+        for store in (DEVICES, IMPORTED):
+            if not store.is_dir():
+                continue
+            for f in sorted(store.glob("*.json")):
+                try:
+                    ident = json.loads(f.read_text()).get("identifier") or f.stem
+                except Exception as exc:
+                    LOG.warning("%s: unreadable key file: %r", f.name, exc)
+                    continue
+                by_id[ident] = f
+        key_files = list(by_id.values())
+        if not key_files:
+            LOG.warning("no accessory keys available; nothing to do")
+            push_metrics(findmy_collector_extract_ok=extract_ok,
+                         findmy_collector_accessories_total=0,
+                         findmy_collector_tags_total=0,
+                         findmy_collector_tags_located=0,
+                         findmy_collector_last_success_timestamp_seconds=time.time())
+            return 0
+
+        account = load_account()
+        LOG.info("logged in as %s", account.account_name)
+
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+        client.loop_start()
+
+        tags = located = 0
+        try:
+            for key_file in key_files:
+                spec = json.loads(key_file.read_text())
+                name = spec.get("name") or spec.get("identifier") or key_file.stem
+                if is_apple_device(spec.get("model")) and not TRACK_APPLE_DEVICES:
+                    continue
+                tags += 1
+                try:
+                    accessory = FindMyAccessory.from_json(str(key_file))
+                    loc = account.fetch_location(accessory)
+                except Exception as exc:
+                    LOG.error("%s: fetch failed: %r", name, exc)
+                    continue
+
+                if loc is None:
+                    # Normal and frequent: a tag is located only when a passing
+                    # Apple device relays it. Not an error.
+                    LOG.info("%s: no report available", name)
+                    continue
+
+                age = (datetime.now(timezone.utc) - loc.timestamp).total_seconds()
+                if age > MAX_REPORT_AGE_S:
+                    LOG.info("%s: last report %.1fh old, not publishing",
+                             name, age / 3600)
+                    continue
+
+                LOG.info("%s: %s,%s (+/-%sm, %.0f min old)", name, loc.latitude,
+                         loc.longitude,
+                         getattr(loc, "horizontal_accuracy", "?"), age / 60)
+                ha_publish(client, slugify(name), name, loc.latitude, loc.longitude,
+                           getattr(loc, "horizontal_accuracy", None))
+                located += 1
+        finally:
+            client.loop_stop()
+            client.disconnect()
+            # Persist refreshed tokens so restarts do not always fall back to the
+            # seed, which will eventually go stale.
+            try:
+                account.to_json(str(ACCOUNT))
+            except Exception as exc:
+                LOG.warning("could not persist refreshed session: %r", exc)
+            # Only after a cycle that logged in successfully, so a broken
+            # session is never published over one that still works.
+            publish_session()
+
+        push_metrics(findmy_collector_extract_ok=extract_ok,
+                     findmy_collector_accessories_total=len(key_files),
+                     findmy_collector_tags_total=tags,
+                     findmy_collector_tags_located=located,
+                     findmy_collector_last_success_timestamp_seconds=time.time())
+        LOG.info("cycle done: %d accessories, %d tags, %d located",
+                 len(key_files), tags, located)
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())

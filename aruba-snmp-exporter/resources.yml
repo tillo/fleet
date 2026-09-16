@@ -1,0 +1,589 @@
+# Prometheus snmp_exporter for the Aruba Instant APs (SNMPv3) -> VictoriaMetrics.
+# snmp.yml (with the v3 auth/priv passwords) is rendered by ESO from Akeyless so no
+# secrets land in git. VMScrapeConfig scrapes the exporter once per AP target.
+# Baseline module: sysUpTime + interface oper-status + HC octets (ifName-labelled).
+# Aruba-specific OIDs (radio util, client counts) to be added after an SNMP walk.
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: aruba-snmp-config
+  namespace: monitoring
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: aruba-snmp-config
+    creationPolicy: Owner
+    template:
+      type: Opaque
+      data:
+        snmp.yml: |
+          auths:
+            aruba_v3:
+              version: 3
+              username: monitoring
+              security_level: authPriv
+              password: "{{ .authpass }}"
+              auth_protocol: SHA
+              priv_protocol: AES
+              priv_password: "{{ .privpass }}"
+            msm430_v2c:
+              version: 2
+              community: "{{ .msm430ro }}"
+            public_v2c:
+              version: 2
+              community: public
+          modules:
+            aruba:
+              walk:
+                - 1.3.6.1.2.1.1.3.0
+                - 1.3.6.1.2.1.2.2.1.8
+                - 1.3.6.1.2.1.31.1.1.1.1
+                - 1.3.6.1.2.1.31.1.1.1.6
+                - 1.3.6.1.2.1.31.1.1.1.10
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.8
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.10
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.11
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.2.1.5
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.2.1.6
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.2.1.7
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.4.1.5
+                - 1.3.6.1.4.1.14823.2.3.3.1.2.4.1.7
+              metrics:
+                - name: sysUpTime
+                  oid: 1.3.6.1.2.1.1.3
+                  type: gauge
+                - name: ifOperStatus
+                  oid: 1.3.6.1.2.1.2.2.1.8
+                  type: gauge
+                  indexes:
+                    - {labelname: ifIndex, type: gauge}
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifName, oid: 1.3.6.1.2.1.31.1.1.1.1, type: DisplayString}
+                - name: ifHCInOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.6
+                  type: counter
+                  indexes:
+                    - {labelname: ifIndex, type: gauge}
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifName, oid: 1.3.6.1.2.1.31.1.1.1.1, type: DisplayString}
+                - name: ifHCOutOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.10
+                  type: counter
+                  indexes:
+                    - {labelname: ifIndex, type: gauge}
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifName, oid: 1.3.6.1.2.1.31.1.1.1.1, type: DisplayString}
+                # --- Aruba WLSR-MIB: per-AP CPU/mem, per-radio util/noise/power, per-client SNR ---
+                - name: arubaApCpuUtilization
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.11
+                  type: gauge
+                  indexes:
+                    - {labelname: apMac, type: PhysAddress48}
+                  lookups:
+                    - {labels: [apMac], labelname: apName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2, type: DisplayString}
+                - name: arubaApMemoryFree
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.8
+                  type: gauge
+                  indexes:
+                    - {labelname: apMac, type: PhysAddress48}
+                  lookups:
+                    - {labels: [apMac], labelname: apName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2, type: DisplayString}
+                - name: arubaApMemoryTotal
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.10
+                  type: gauge
+                  indexes:
+                    - {labelname: apMac, type: PhysAddress48}
+                  lookups:
+                    - {labels: [apMac], labelname: apName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2, type: DisplayString}
+                - name: arubaRadioTxPower
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.2.1.5
+                  type: gauge
+                  indexes:
+                    - {labelname: apMac, type: PhysAddress48}
+                    - {labelname: radioNum, type: gauge}
+                  lookups:
+                    - {labels: [apMac], labelname: apName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2, type: DisplayString}
+                - name: arubaRadioNoiseFloor
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.2.1.6
+                  type: gauge
+                  indexes:
+                    - {labelname: apMac, type: PhysAddress48}
+                    - {labelname: radioNum, type: gauge}
+                  lookups:
+                    - {labels: [apMac], labelname: apName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2, type: DisplayString}
+                - name: arubaRadioChannelUtilization
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.2.1.7
+                  type: gauge
+                  indexes:
+                    - {labelname: apMac, type: PhysAddress48}
+                    - {labelname: radioNum, type: gauge}
+                  lookups:
+                    - {labels: [apMac], labelname: apName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.1.1.2, type: DisplayString}
+                - name: arubaClientSnr
+                  oid: 1.3.6.1.4.1.14823.2.3.3.1.2.4.1.7
+                  type: gauge
+                  indexes:
+                    - {labelname: clientMac, type: PhysAddress48}
+                  lookups:
+                    - {labels: [clientMac], labelname: clientName, oid: 1.3.6.1.4.1.14823.2.3.3.1.2.4.1.5, type: DisplayString}
+            host:
+              # generic host: net-snmp UCD (cpu/mem/load) + if_mib + host-resources storage.
+              # used for TrueNAS salt/pepper (and any future net-snmp host).
+              walk:
+                - 1.3.6.1.2.1.1.3.0
+                - 1.3.6.1.2.1.2.2.1.8
+                - 1.3.6.1.2.1.31.1.1.1.1
+                - 1.3.6.1.2.1.31.1.1.1.6
+                - 1.3.6.1.2.1.31.1.1.1.10
+                - 1.3.6.1.4.1.2021.4
+                - 1.3.6.1.4.1.2021.10.1.2
+                - 1.3.6.1.4.1.2021.10.1.3
+                - 1.3.6.1.4.1.2021.11.11
+                - 1.3.6.1.2.1.25.2.3.1
+              metrics:
+                - {name: sysUpTime, oid: 1.3.6.1.2.1.1.3, type: gauge}
+                - name: ifOperStatus
+                  oid: 1.3.6.1.2.1.2.2.1.8
+                  type: gauge
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifName, oid: 1.3.6.1.2.1.31.1.1.1.1, type: DisplayString}]
+                - name: ifHCInOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.6
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifName, oid: 1.3.6.1.2.1.31.1.1.1.1, type: DisplayString}]
+                - name: ifHCOutOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.10
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups: [{labels: [ifIndex], labelname: ifName, oid: 1.3.6.1.2.1.31.1.1.1.1, type: DisplayString}]
+                - {name: memTotalReal, oid: 1.3.6.1.4.1.2021.4.5, type: gauge}
+                - {name: memAvailReal, oid: 1.3.6.1.4.1.2021.4.6, type: gauge}
+                - {name: memAvailSwap, oid: 1.3.6.1.4.1.2021.4.4, type: gauge}
+                ## ⭐ memBuffer/memCached exist so "memory used" can be computed the
+                ## SAME WAY as on the node-exporter hosts. UCD's memAvailReal is
+                ## MemFree — it EXCLUDES buffers and cache — while node-exporter's
+                ## MemAvailable INCLUDES reclaimable cache. Without these two, salt
+                ## and pepper read systematically higher than qui/quo/qua for the same
+                ## real pressure, and the rack twin puts all five in ONE column under
+                ## ONE 80/92 threshold, so the columns were not comparable.
+                ## ⛔ No walk entry needed: 1.3.6.1.4.1.2021.4 (above) already covers
+                ## the whole UCD memory subtree, so these were being FETCHED and simply
+                ## never turned into metrics. Adding them costs no extra SNMP work.
+                ## Both hosts are TrueNAS SCALE = Debian Linux (verified 2026-09-06 via
+                ## hrStorageDescr: /boot/grub, /dev/shm, /mnt/.ix-apps), where net-snmp
+                ## populates both. On FreeBSD they would read 0 — check before reusing
+                ## this module for a non-Linux host.
+                - {name: memBuffer, oid: 1.3.6.1.4.1.2021.4.14, type: gauge}
+                - {name: memCached, oid: 1.3.6.1.4.1.2021.4.15, type: gauge}
+                - {name: ssCpuIdle, oid: 1.3.6.1.4.1.2021.11.11, type: gauge}
+                - name: laLoad
+                  oid: 1.3.6.1.4.1.2021.10.1.3
+                  type: gauge
+                  indexes: [{labelname: laIndex, type: gauge}]
+                  lookups: [{labels: [laIndex], labelname: laNames, oid: 1.3.6.1.4.1.2021.10.1.2, type: DisplayString}]
+                - name: hrStorageUsed
+                  oid: 1.3.6.1.2.1.25.2.3.1.6
+                  type: gauge
+                  indexes: [{labelname: hrStorageIndex, type: gauge}]
+                  lookups: [{labels: [hrStorageIndex], labelname: hrStorageDescr, oid: 1.3.6.1.2.1.25.2.3.1.3, type: DisplayString}]
+                - name: hrStorageSize
+                  oid: 1.3.6.1.2.1.25.2.3.1.5
+                  type: gauge
+                  indexes: [{labelname: hrStorageIndex, type: gauge}]
+                  lookups: [{labels: [hrStorageIndex], labelname: hrStorageDescr, oid: 1.3.6.1.2.1.25.2.3.1.3, type: DisplayString}]
+            ilo:
+              # HPE iLO4 Agentless — CPQHLTH-MIB hardware health. condition enums: 2=ok 3=degraded 4=failed.
+              walk:
+                - 1.3.6.1.2.1.1.3.0
+                - 1.3.6.1.4.1.232.6.2.6.1.0
+                - 1.3.6.1.4.1.232.6.2.6.8.1.3
+                - 1.3.6.1.4.1.232.6.2.6.8.1.4
+                - 1.3.6.1.4.1.232.6.2.6.8.1.6
+                - 1.3.6.1.4.1.232.6.2.6.7.1.9
+                - 1.3.6.1.4.1.232.6.2.9.3.1.4
+                - 1.3.6.1.4.1.232.6.2.9.3.1.7
+              metrics:
+                - {name: sysUpTime, oid: 1.3.6.1.2.1.1.3, type: gauge}
+                - {name: cpqHeThermalCondition, oid: 1.3.6.1.4.1.232.6.2.6.1, type: gauge}
+                - name: cpqHeTemperatureCelsius
+                  oid: 1.3.6.1.4.1.232.6.2.6.8.1.4
+                  type: gauge
+                  indexes: [{labelname: chassis, type: gauge}, {labelname: sensor, type: gauge}]
+                  lookups: [{labels: [chassis, sensor], labelname: locale, oid: 1.3.6.1.4.1.232.6.2.6.8.1.3, type: gauge}]
+                - name: cpqHeTemperatureCondition
+                  oid: 1.3.6.1.4.1.232.6.2.6.8.1.6
+                  type: gauge
+                  indexes: [{labelname: chassis, type: gauge}, {labelname: sensor, type: gauge}]
+                - name: cpqHeFltTolFanCondition
+                  oid: 1.3.6.1.4.1.232.6.2.6.7.1.9
+                  type: gauge
+                  indexes: [{labelname: chassis, type: gauge}, {labelname: fan, type: gauge}]
+                - name: cpqHeFltTolPowerSupplyStatus
+                  oid: 1.3.6.1.4.1.232.6.2.9.3.1.4
+                  type: gauge
+                  indexes: [{labelname: chassis, type: gauge}, {labelname: bay, type: gauge}]
+                - name: cpqHeFltTolPowerSupplyCapacityUsed
+                  oid: 1.3.6.1.4.1.232.6.2.9.3.1.7
+                  type: gauge
+                  indexes: [{labelname: chassis, type: gauge}, {labelname: bay, type: gauge}]
+            msm:
+              # HP MSM430 associated-client table (Colubris 8744). Walked
+              # 2026-09-01: .5.4.1.5.1 is the ASSOCIATED CLIENT table — 4 rows
+              # matching the ~3-4 clients the AP really serves — while .7.1 (36
+              # rows) and .17.1 (~270 rows) are station history and the scan
+              # list. Counting the wrong one would have put a confident, wrong
+              # number on a wall display.
+              #   .2 = client MAC   .4 = RSSI dBm   .6 = SNR dB
+              # count(msmClientRssi{instance="192.168.1.15"}) == clients.
+              walk:
+                - 1.3.6.1.4.1.8744.5.4.1.5.1.2
+                - 1.3.6.1.4.1.8744.5.4.1.5.1.4
+                - 1.3.6.1.4.1.8744.5.4.1.5.1.6
+              metrics:
+                - name: msmClientRssi
+                  oid: 1.3.6.1.4.1.8744.5.4.1.5.1.4
+                  type: gauge
+                  indexes:
+                    - {labelname: msmRadio, type: gauge}
+                    - {labelname: msmClientIdx, type: gauge}
+                  lookups:
+                    - labels: [msmRadio, msmClientIdx]
+                      labelname: clientMac
+                      oid: 1.3.6.1.4.1.8744.5.4.1.5.1.2
+                      type: PhysAddress48
+                - name: msmClientSnr
+                  oid: 1.3.6.1.4.1.8744.5.4.1.5.1.6
+                  type: gauge
+                  indexes:
+                    - {labelname: msmRadio, type: gauge}
+                    - {labelname: msmClientIdx, type: gauge}
+                  lookups:
+                    - labels: [msmRadio, msmClientIdx]
+                      labelname: clientMac
+                      oid: 1.3.6.1.4.1.8744.5.4.1.5.1.2
+                      type: PhysAddress48
+            zyxel:
+              # Zyxel NWA130BE (ground-floor AP). Walked 2026-09-01: the AP has
+              # no dot11 MIB and no association table, but .890.1.15.3.5.1.1 is a
+              # per-RADIO table where col 1 is the channel (1 / 44 / 53 = the
+              # 2.4, 5 and 6 GHz radios) and **col 2 is the station count**
+              # (3 / 3 / 0). So clients are a SUM over radios, not a row count —
+              # unlike every other AP here.
+              #   sum(zyxelRadioStations{instance="192.168.1.199"}) == clients
+              walk:
+                - 1.3.6.1.4.1.890.1.15.3.5.1.1.1
+                - 1.3.6.1.4.1.890.1.15.3.5.1.1.2
+              metrics:
+                - name: zyxelRadioStations
+                  oid: 1.3.6.1.4.1.890.1.15.3.5.1.1.2
+                  type: gauge
+                  indexes: [{labelname: zyxelRadio, type: gauge}]
+                  lookups:
+                    - {labels: [zyxelRadio], labelname: zyxelChannel,
+                       oid: 1.3.6.1.4.1.890.1.15.3.5.1.1.1, type: gauge}
+            ifmib:
+              # generic interface stats (sysUpTime + if_mib, 32-bit + HC) for APs/switches
+              # ifHighSpeed (.31.1.1.1.15) added 2026-09-01: without it the octet
+              # counters have no denominator, so port UTILISATION cannot be
+              # computed at all and dashboards can only show absolute Mb/s.
+              walk:
+                - 1.3.6.1.2.1.1.3.0
+                - 1.3.6.1.2.1.2.2.1.2
+                - 1.3.6.1.2.1.2.2.1.8
+                - 1.3.6.1.2.1.2.2.1.10
+                - 1.3.6.1.2.1.2.2.1.16
+                - 1.3.6.1.2.1.31.1.1.1.6
+                - 1.3.6.1.2.1.31.1.1.1.10
+                - 1.3.6.1.2.1.31.1.1.1.15
+                - 1.3.6.1.2.1.31.1.1.1.18
+              metrics:
+                - {name: sysUpTime, oid: 1.3.6.1.2.1.1.3, type: gauge}
+                - name: ifOperStatus
+                  oid: 1.3.6.1.2.1.2.2.1.8
+                  type: gauge
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: ifHighSpeed
+                  # interface speed in Mb/s — the denominator for utilisation
+                  oid: 1.3.6.1.2.1.31.1.1.1.15
+                  type: gauge
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: ifInOctets
+                  oid: 1.3.6.1.2.1.2.2.1.10
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: ifOutOctets
+                  oid: 1.3.6.1.2.1.2.2.1.16
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: ifHCInOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.6
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: ifHCOutOctets
+                  oid: 1.3.6.1.2.1.31.1.1.1.10
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+            cisco:
+              # Catalyst platform health (c9300-stack): per-interface errors +
+              # CPU / memory pools / temperature sensors. Interfaces come from
+              # the shared ifmib module (scraped as module=ifmib,cisco).
+              walk:
+                - 1.3.6.1.2.1.2.2.1.2
+                - 1.3.6.1.2.1.2.2.1.14
+                - 1.3.6.1.2.1.2.2.1.20
+                - 1.3.6.1.2.1.31.1.1.1.18
+                - 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+                - 1.3.6.1.4.1.9.9.48.1.1.1.5
+                - 1.3.6.1.4.1.9.9.48.1.1.1.6
+                - 1.3.6.1.4.1.9.9.13.1.3.1.3
+              metrics:
+                - name: ifInErrors
+                  oid: 1.3.6.1.2.1.2.2.1.14
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: ifOutErrors
+                  oid: 1.3.6.1.2.1.2.2.1.20
+                  type: counter
+                  indexes: [{labelname: ifIndex, type: gauge}]
+                  lookups:
+                    - {labels: [ifIndex], labelname: ifDescr, oid: 1.3.6.1.2.1.2.2.1.2, type: DisplayString}
+                    - {labels: [ifIndex], labelname: ifAlias, oid: 1.3.6.1.2.1.31.1.1.1.18, type: DisplayString}
+                - name: cpmCPUTotal5minRev
+                  oid: 1.3.6.1.4.1.9.9.109.1.1.1.1.8
+                  type: gauge
+                  indexes: [{labelname: cpuIndex, type: gauge}]
+                - name: ciscoMemoryPoolUsed
+                  oid: 1.3.6.1.4.1.9.9.48.1.1.1.5
+                  type: gauge
+                  indexes: [{labelname: poolIndex, type: gauge}]
+                - name: ciscoMemoryPoolFree
+                  oid: 1.3.6.1.4.1.9.9.48.1.1.1.6
+                  type: gauge
+                  indexes: [{labelname: poolIndex, type: gauge}]
+                - name: ciscoEnvMonTemperature
+                  oid: 1.3.6.1.4.1.9.9.13.1.3.1.3
+                  type: gauge
+                  indexes: [{labelname: tempIndex, type: gauge}]
+  data:
+    - secretKey: authpass
+      remoteRef:
+        key: /mdapi/aruba/snmp/auth-pass
+    - secretKey: privpass
+      remoteRef:
+        key: /mdapi/aruba/snmp/priv-pass
+    - secretKey: msm430ro
+      remoteRef:
+        key: /mdapi/msm430/snmp-ro-community
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snmp-exporter
+  namespace: monitoring
+  labels: {app: snmp-exporter}
+  annotations:
+    ## ⛔ WITHOUT THIS, A MODULE EDIT SILENTLY DOES NOTHING. snmp_exporter reads
+    ## --config.file ONCE at startup and never re-reads it; nothing sends it a
+    ## SIGHUP. The config arrives as the ESO-rendered Secret above, so an edit
+    ## reaches the mounted volume within a minute and then sits there being
+    ## ignored by the running process: Secret updated, bundle green, new metric
+    ## never appears.
+    ## ⛔ And a hand-bumped pod-template revision annotation does NOT fix it —
+    ## tried 2026-09-06 and it LOST A RACE. Fleet applies the Deployment and the
+    ## ExternalSecret together, so the new pod started at 22:39:10Z while ESO only
+    ## re-rendered the Secret at 22:39:27Z: the pod rolled on schedule, mounted the
+    ## correct file, and had already read the OLD module 17 seconds earlier. The
+    ## symptom is the nastiest kind — every object looks right, including the file
+    ## on disk inside the pod, and only the metric is missing.
+    ## ⭐ Reloader watches the Secret and restarts the pod when it actually
+    ## CHANGES, which is after ESO renders, so the ordering cannot invert. Same
+    ## convention as the rest of the estate (litellm, statuspage-adapter, backlog).
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: snmp-exporter}
+  template:
+    metadata:
+      labels: {app: snmp-exporter}
+    spec:
+      containers:
+        - name: snmp-exporter
+          image: prom/snmp-exporter:v0.26.0
+          args: ["--config.file=/etc/snmp_exporter/snmp.yml"]
+          ports:
+            - {name: http, containerPort: 9116}
+          volumeMounts:
+            - {name: config, mountPath: /etc/snmp_exporter}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            # 200m clipped the per-scrape SNMP-walk bursts (5-8% of CFS
+            # periods throttled, ContainerCpuThrottling); avg usage ~0.
+            limits: {cpu: 500m, memory: 128Mi}
+      volumes:
+        - name: config
+          secret:
+            secretName: aruba-snmp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: snmp-exporter
+  namespace: monitoring
+  labels: {app: snmp-exporter}
+spec:
+  selector: {app: snmp-exporter}
+  ports:
+    - {name: http, port: 9116, targetPort: 9116}
+---
+# VMStaticScrape (not VMScrapeConfig): the VMAgent selects staticScrapes (staticScrapeSelector:{})
+# but has no scrapeConfigSelector, so this is the one that gets discovered without touching the
+# shared VMAgent. Scrapes the snmp_exporter once per AP target (snmp multi-target pattern).
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: aruba-snmp
+  namespace: monitoring
+spec:
+  jobName: aruba-snmp
+  targetEndpoints:
+    - targets: ["192.168.1.211", "192.168.1.212", "192.168.1.217"]
+      labels: {job: aruba_snmp}
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [aruba_v3]
+        module: [aruba]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# Generic net-snmp hosts (TrueNAS salt/pepper) — separate VMStaticScrape so the
+# job label is host_snmp (spec.jobName overrides per-target labels). Future device
+# classes (printer/iLO/…) each get their own VMStaticScrape + jobName.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: host-snmp
+  namespace: monitoring
+spec:
+  jobName: host_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.207", "192.168.1.219"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [aruba_v3]
+        module: [host]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# HPE iLO4 BMCs (qui/quo/qua, Agentless) — cpqHealth hardware health via the monitoring v3 user
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: ilo-snmp
+  namespace: monitoring
+spec:
+  jobName: ilo_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.170", "192.168.1.181", "192.168.1.182"]
+      path: /snmp
+      interval: 120s
+      params:
+        auth: [aruba_v3]
+        module: [ilo]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# HP MSM430 AP (.15) — v2c read-only community (no v3 on this EOL AP); if_mib only
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: msm430-snmp
+  namespace: monitoring
+spec:
+  jobName: msm_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.15"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [msm430_v2c]
+        module: ["ifmib,msm"]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# Zyxel NWA130BE AP (.199) — v2c public read-only (enabled in GUI; SSH CLI = snmp-server enable); if_mib
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: zyxel-snmp
+  namespace: monitoring
+spec:
+  jobName: zyxel_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.199"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [public_v2c]
+        module: ["ifmib,zyxel"]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}
+---
+# Cisco C9300 LAN core (c9300-stack) — if_mib + Catalyst health via the monitoring v3 user
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMStaticScrape
+metadata:
+  name: switch-snmp
+  namespace: monitoring
+spec:
+  jobName: switch_snmp
+  targetEndpoints:
+    - targets: ["192.168.1.250"]
+      path: /snmp
+      interval: 60s
+      params:
+        auth: [aruba_v3]
+        module: ["ifmib,cisco"]
+      relabelConfigs:
+        - {sourceLabels: [__address__], targetLabel: __param_target}
+        - {sourceLabels: [__param_target], targetLabel: instance}
+        - {targetLabel: __address__, replacement: "snmp-exporter.monitoring.svc:9116"}

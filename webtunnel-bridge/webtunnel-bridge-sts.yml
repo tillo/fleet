@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: webtunnel-bridge
+  namespace: webtunnel-bridge
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    # Roll the pod when SECRET_PATH (from Akeyless via ExternalSecret) changes.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  serviceName: webtunnel-bridge
+  selector:
+    matchLabels:
+      app: webtunnel-bridge
+  template:
+    metadata:
+      labels:
+        app: webtunnel-bridge
+    spec:
+      securityContext:
+        fsGroup: 101
+      containers:
+      - name: webtunnel-bridge
+        image: thetorproject/webtunnel-bridge:latest
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: OR_PORT
+          value: "9001"
+        - name: PT_PORT
+          value: "15000"
+        - name: EMAIL
+          value: "tillo@tillo.ch"
+        - name: NICKNAME
+          value: "MDAPI"
+        - name: SECRET_PATH
+          valueFrom:
+            secretKeyRef:
+              name: webtunnel-bridge-secret
+              key: secret-path
+        # k8s substitutes $(SECRET_PATH) at container start using the env
+        # value defined above. The full URL never lives in git.
+        - name: WEBTUNNEL_URL
+          value: "https://mdapi.ch/api/v1/proxy/$(SECRET_PATH)"
+        ports:
+        - name: webtunnel
+          containerPort: 15000
+          protocol: TCP
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/tor
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 50m
+          limits:
+            # Tor `:latest` (0.4.9.5 + OpenSSL 3.5.5) sizes MaxMemInQueues
+            # from node-level RAM (sees 8 GB) and OOMs at 1Gi after first
+            # bootstrap pass (~2 min). 2Gi clears it; follow-up: mount a
+            # torrc override that pins MaxMemInQueues to ~256 MB so the
+            # pod limit can come back down.
+            memory: 2Gi
+            # Tor's onion-routing crypto bursts well above 500m during
+            # traffic; with the old cap it was throttling 59% of CFS
+            # periods. 2c gives the relay enough headroom for steady
+            # circuit churn without throttling.
+            cpu: 2
+      - name: nginx
+        ## library/ prefix matches keel's canonicalized rewrite of the live
+        ## object (same-tag force-poll, spider3 pattern) so Fleet stops
+        ## seeing permanent Modified drift on this sts.
+        image: library/nginx:alpine
+        imagePullPolicy: Always
+        env:
+        - name: SECRET_PATH
+          valueFrom:
+            secretKeyRef:
+              name: webtunnel-bridge-secret
+              key: secret-path
+        # Restrict envsubst to ONLY the SECRET_PATH variable so nginx's own
+        # $http_upgrade / $host / etc. are preserved in the templates.
+        - name: NGINX_ENVSUBST_FILTER
+          value: "^SECRET_PATH$"
+        ports:
+        - name: ingress
+          containerPort: 8443
+          protocol: TCP
+        volumeMounts:
+        - name: nginx-template
+          mountPath: /etc/nginx/templates
+          readOnly: true
+        resources:
+          requests:
+            memory: 16Mi
+            cpu: 10m
+          limits:
+            memory: 64Mi
+            # 100m throttled ~10.5h/day (ContainerCpuThrottling, infra-health
+            # 2026-07-14, user-approved raise)
+            cpu: 500m
+      volumes:
+      - name: nginx-template
+        configMap:
+          name: webtunnel-bridge-nginx
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources:
+        requests:
+          # Tor caches ~50MB of router descriptors at runtime — 100Mi
+          # filled within minutes during bootstrap. 1Gi gives plenty of
+          # headroom for cached-descriptors + state + keys.
+          storage: 1Gi

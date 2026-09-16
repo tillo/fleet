@@ -1,0 +1,107 @@
+## File-level backup for jump-home-ceph (mbptillo retirement, 2026-09-02).
+##
+## The jump namespace had NO ReplicationSource at all while seven other namespaces
+## did — jump-home carried only Longhorn recurring-job labels (block-level volume
+## backups), so there was no per-file restore for anything on the seat. This closes
+## that gap and is the replacement for mbptillo's timeshift+rsnapshot chain.
+##
+## Shared /mdapi/volsync/ceph-backup creds, per-PVC subpath in the offsite-swept
+## external-Garage ceph-backup bucket (same convention as esphome/paperless/...).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: jump
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that hostname
+        ## resolves to the shared ingress VIP, so every backup hairpinned through
+        ## ingress-nginx and would fail exactly when the front door is degraded --
+        ## which is when a backup matters most. restic encrypts client-side and S3
+        ## auth is a SigV4 signature, so losing the ingress TLS costs no
+        ## confidentiality: Garage has no TLS listener of its own, and the ingress
+        ## already re-emitted plaintext to these same LAN hosts. Same bucket and
+        ## path, so the existing restic repository is untouched.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/jump-home-ceph"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+## HOURLY, not the usual daily: this replaces timeshift, whose real cadence on
+## mbptillo was daily x2 (schedule_hourly was false) plus a single rsnapshot
+## generation. restic dedupes, and the curated set is only ~11.5k files, so the
+## per-run scan is cheap. NOTE: VolSync has no exclude support — whatever is in the
+## PVC is what gets snapshotted; the scope is enforced by
+## ~/mbptillo-home-curation.rsync-filter at copy-in time.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: jump-home-ceph
+  namespace: jump
+spec:
+  sourcePVC: jump-home-ceph
+  trigger:
+    schedule: "17 * * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    # Data is owned by tillo (uid/gid 1000) — the mover must match the data owner
+    # or it cannot read it.
+    # fsGroup is NOT optional here: VolSync provisions the cache PVC root-owned, so
+    # a mover pinned to uid 1000 without it gets
+    #   "unable to open cache: open /cache/CACHEDIR.TAG: permission denied"
+    # and restic then runs CACHELESS — it still reports Successful, it just re-reads
+    # everything every run. Observed on the first real backup, 2026-09-02.
+    moverSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      fsGroup: 1000
+    cacheCapacity: 4Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    # 2026-09-02: the one-off `restic-verify` pod that was proving a single-file
+    # restore died with its session still holding an exclusive lock (PID 152,
+    # UID 0, taken 08:21:40Z). Every mover since then backed up fine — snapshots
+    # kept landing — and then aborted in `forget`, so lastSyncTime froze at
+    # 08:20:58Z while VolSync respawned a mover every ~4 min, each re-reading the
+    # full 6.47 GiB, and retention never ran.
+    #
+    # f/heal/volsync_restic_stale_lock did NOT catch this one. Its real gate is
+    # "the newest mover pod's log contains the lock signature", and a mover only
+    # prints that line in the last seconds of its ~3 min life — so sampling the
+    # newest pod every 15 min lands mid-backup more often than not. It logged
+    # "the log does NOT match ... different fault, leaving it alone" and stood
+    # down for 4 h. Cleared from git instead.
+    #
+    # VolSync runs `restic unlock` once per NEW value of this field and records
+    # it in status.restic.lastUnlocked, so leaving it here is idempotent, not a
+    # recurring unlock. Excluded from the Fleet diff (see jump/fleet.yaml) — the
+    # heal overwrites it live, so git and cluster can never agree on it. This is
+    # the seed, not the live truth; read status.restic.lastUnlocked for that.
+    unlock: "2026-09-02-stale-restic-verify-lock"
+    retain:
+      hourly: 24
+      daily: 14
+      weekly: 8
+      monthly: 6

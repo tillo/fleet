@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-nextcloud
+  namespace: envuassu
+spec:
+  # See sibling -apache patch for rationale (Recreate avoids cross-node RWX
+  # window during rollouts of the shared pvc nextcloud-aio-nextcloud).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+        - name: nextcloud-aio-nextcloud
+          # A2 (infra-ka2): explicit request floors sized from the VPA
+          # recommender's targets — VPA Auto does NOT mutate envuassu pods
+          # (works in other namespaces; tracked separately). No limits.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ADMIN_PASSWORD
+              $patch: delete
+            - name: FULLTEXTSEARCH_PASSWORD
+              $patch: delete
+            - name: IMAGINARY_SECRET
+              $patch: delete
+            - name: ONLYOFFICE_SECRET
+              $patch: delete
+            - name: POSTGRES_PASSWORD
+              $patch: delete
+            - name: REDIS_HOST_PASSWORD
+              $patch: delete
+            - name: SIGNALING_SECRET
+              $patch: delete
+            - name: TURN_SECRET
+              $patch: delete
+          envFrom:
+            - secretRef:
+                name: nextcloud-aio-env-secret
+      volumes:
+        - name: nextcloud-aio-nextcloud-data
+          persistentVolumeClaim:
+            claimName: nextcloud-aio-nextcloud-data-ceph

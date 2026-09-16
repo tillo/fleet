@@ -1,0 +1,78 @@
+## Off-site backup of findmy-state. Shared /mdapi/volsync/ceph-backup creds,
+## per-PVC subpath in the offsite-swept external-Garage ceph-backup bucket.
+##
+## WHY, given the keys are already in the secret store: the volume also holds
+## the Apple session AS IT IS REFRESHED IN USE, which drifts away from the seed
+## in Akeyless. Losing the volume would fall back to a seed that eventually goes
+## stale, and re-authenticating needs a human with a 2FA code -- the one step
+## this whole pipeline exists to avoid. The keys are belt, this is braces.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: findmy
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that
+        ## hostname resolves to the shared ingress VIP, so every backup would
+        ## hairpin through ingress-nginx and fail exactly when the front door is
+        ## degraded -- which is when a backup matters most. restic encrypts
+        ## client-side and S3 auth is a SigV4 signature, so terminating without
+        ## ingress TLS costs no confidentiality here.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/findmy-state"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key
+---
+## Apple session (as refreshed), imported accessory keys, and the downloaded
+## Apple library bundle. Small volume, so a daily snapshot is cheap.
+##
+## ⚠️ This volume is now genuinely sensitive: it carries keys that grant
+## location access to another person's AirTags and AirPods. restic encrypts
+## client-side with the shared repository password, so the off-site copy is not
+## readable at the bucket.
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: findmy-state
+  namespace: findmy
+spec:
+  sourcePVC: findmy-state
+  trigger:
+    ## 03:20 UTC, clear of the other ceph-backup movers so they do not contend
+    ## for the same Garage endpoint.
+    schedule: "20 3 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    moverSecurityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      runAsNonRoot: false
+    cacheCapacity: 1Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

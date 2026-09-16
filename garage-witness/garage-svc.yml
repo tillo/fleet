@@ -1,0 +1,56 @@
+## LoadBalancer Service so salt+pepper (bare-metal, can't resolve cluster
+## DNS) can reach the witness on a stable IP. RPC is the only port the
+## storage nodes actually need; admin is exposed in-cluster only.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage-rpc
+  namespace: garage-witness
+  labels:
+    app: garage-witness
+spec:
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.59
+  externalTrafficPolicy: Local
+  selector:
+    app: garage-witness
+  ports:
+    - name: rpc
+      port: 3901
+      targetPort: 3901
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage
+  namespace: garage-witness
+  labels:
+    app: garage-witness
+spec:
+  type: ClusterIP
+  selector:
+    app: garage-witness
+  ports:
+    - name: admin
+      port: 3903
+      targetPort: 3903
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: garage-headless
+  namespace: garage-witness
+  labels:
+    app: garage-witness
+spec:
+  clusterIP: None
+  selector:
+    app: garage-witness
+  ports:
+    - name: rpc
+      port: 3901
+    - name: admin
+      port: 3903

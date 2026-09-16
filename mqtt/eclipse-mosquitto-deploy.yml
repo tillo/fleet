@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eclipse-mosquitto
+  namespace: mqtt
+  annotations:
+    reloader.stakater.com/auto: "true"
+    # Lane B since 2026-09-03 — Keel annotations REMOVED on purpose.
+    #
+    # This was `:latest` + keel force-poll. On Docker Hub `latest` tracks the
+    # mosquitto 2.1 line while the 2.0 line is maintained separately at 2.0.22,
+    # so `latest` crosses MINORS unattended — on a broker that is replicas=1,
+    # strategy=Recreate, and the only MQTT bus for Frigate, ESPHome and a LAN
+    # device (LoadBalancer 192.168.1.43). Every force-poll was a hard restart
+    # with a real gap, and a minor could change broker behaviour with nobody
+    # reading the release notes.
+    #
+    # It also moved invisibly: this Deployment's ReplicaSet dates from
+    # 2026-04-05 and its image string never changed, yet the pod was serving a
+    # 2026-06-22 build (mosquitto 2.1.2). Content drifted ~2 months with no
+    # Deployment revision, no `rollout history` entry and no git commit.
+    #
+    # Now pinned by tag + digest and owned by Renovate (renovate.json), so
+    # nothing here moves without an MR. Dropping `:latest` also flips the
+    # implicit imagePullPolicy to IfNotPresent = the Lane-B boot-safety shape.
+spec:
+  selector:
+    matchLabels:
+      app: eclipse-mosquitto
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: eclipse-mosquitto
+    spec:
+      containers:
+      - name: eclipse-mosquitto
+        # 2.1.2. NOTE: the 2.1 line is published ONLY with an -alpine suffix —
+        # there is no plain `2.1.2` tag. `2.0`/`2.0.22` is the older line.
+        image: eclipse-mosquitto:2.1.2-alpine@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797
+        resources: {}
+        ports:
+        - containerPort: 1883
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        volumeMounts:
+        - name: mosquitto-data
+          mountPath: /mosquitto/data
+        - name: mosquitto-config
+          mountPath: /mosquitto/config
+      volumes:
+      - name: mosquitto-data
+        persistentVolumeClaim:
+          claimName: mosquitto-data
+      - name: mosquitto-config
+        configMap:
+          name: mosquitto-config

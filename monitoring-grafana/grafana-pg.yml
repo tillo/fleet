@@ -1,0 +1,171 @@
+## Dedicated tiny CNPG Postgres for Grafana's backend DB (user decision 8b,
+## 2026-07-31). Until now Grafana used a `grafana` database ON the
+## home-assistant/ha-recorder-pg cluster — which chained monitoring
+## availability to the smart-home recorder DB: the 07-29/30 purge-night WAL
+## incident on ha-recorder-pg took Grafana down ~32h (48 crash-loop
+## restarts; DB connection refused at boot is fatal for Grafana).
+##
+## Sizing rationale: the DB is small and mostly disposable — 63/64
+## dashboards + all recording rules are fleet-provisioned; unified storage
+## holds little beyond sessions/annotations/short-urls. Hence: no barman.
+## Durability = Longhorn 2-replica volumes + the recurring Longhorn backup
+## groups (backup_label_enforcer labels the PVCs automatically).
+## Rollback: the old `grafana` DB stays untouched on ha-recorder-pg until a
+## later cleanup (see nightwindow-next/WORKLIST.md).
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: grafana-pg
+  namespace: monitoring
+spec:
+  backup:
+    ## G6 (infra-jjb, 2026-08-15): barman to the external Garage — this
+    ## cluster previously had NO offsite story at all.
+    barmanObjectStore:
+      destinationPath: s3://grafana-pg-backup
+      ## ⭐ TLS terminated by Garage's own hosts, not by the ingress.
+      ## Garage has no TLS listener of its own -- upstream: "This endpoint
+      ## does not support TLS: a reverse proxy should be used to provide
+      ## it." So https://api.garage.home.tillo.ch only ever encrypted the
+      ## FIRST hop: ingress-nginx terminated it and re-emitted plaintext to
+      ## salt/pepper over the LAN. barman compresses but does not encrypt
+      ## (there is no `encryption:` key below), so these Postgres dumps
+      ## crossed the LAN in the clear on that last hop.
+      ## :30288 is an nginx TLS terminator running ON salt and pepper,
+      ## reached through the selector-less transit/garage Service, so this
+      ## also drops the ingress out of the backup's dependency chain.
+      ## Bucket and path are unchanged -- the barman store is untouched.
+      endpointURL: https://garage.transit.svc.cluster.local:30288
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: grafana-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: grafana-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        region:
+          name: grafana-pg-backup-s3
+          key: REGION
+    retentionPolicy: "14d"
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  ## Same lesson as ha-recorder-pg (2026-06-15): soft anti-affinity let both
+  ## instances co-locate; `required` is always satisfiable (2 instances,
+  ## 3 nodes) and guarantees real node-failure protection.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    ## DB is ~tens of MB; 5Gi leaves a deep WAL cushion (the ha-recorder
+    ## 07-30 disk-full lesson: pg_wal bursts eat headroom fast).
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    ## Lossless failover, same pattern as ha-recorder-pg: preferred keeps
+    ## availability when the standby is down.
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: grafana
+      owner: grafana_rw
+      secret:
+        name: grafana-pg-app
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int
+      # renders as a perpetual Fleet "Modified" diff (1 vs "1").
+      cpu: "1"
+      memory: 1Gi
+---
+## App-role credentials. Same Akeyless key Grafana's deployment already
+## consumes as GF_DATABASE_PASSWORD (grafana-es.yml) — CNPG initdb sets the
+## grafana_rw role password from here, so the migration is host-swap only.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: grafana-pg-app
+  namespace: monitoring
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: grafana-pg-app
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      data:
+        username: grafana_rw
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/grafana/pg-password
+      secretKey: password
+---
+## S3 creds for grafana-pg barman backups (G6, beads infra-jjb, 2026-08-15).
+## Key GK3afd8019c7a64b6ebe8b49d5 scoped RW to the grafana-pg-backup bucket on the external Garage;
+## offsite-swept to B2/SFTP by garage_offsite_backup.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: grafana-pg-backup-s3
+  namespace: monitoring
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: grafana-pg-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ACCESS_KEY_ID: "{{ .access_key }}"
+        ACCESS_SECRET_KEY: "{{ .secret_key }}"
+        ## Garage validates the SigV4 region scope; barman defaults us-east-1.
+        REGION: "garage"
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/monitoring/grafana-pg-backup-s3/access_key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/monitoring/grafana-pg-backup-s3/secret_key
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: grafana-pg-daily
+  namespace: monitoring
+spec:
+  schedule: "0 30 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: grafana-pg

@@ -1,0 +1,140 @@
+## Postgres per Bussola.
+##
+## A DIFFERENZA di litellm-pg, questo database NON è ricostruibile: contiene
+## l'unica copia di quello che le persone ci hanno scritto dentro. Quindi ha
+## barman verso Garage dal primo deploy, non "poi" — è esattamente l'errore
+## commesso con il PVC di Open WebUI il 26 agosto, che ha girato giorni senza
+## uno snapshot.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: bussola-pg
+  namespace: bussola
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  ## `required` e non `preferred`: con 2 istanze su 3 nodi è sempre
+  ## soddisfacibile, ed è l'unica forma che sopravvive davvero alla perdita di
+  ## un nodo (lezione ha-recorder-pg 2026-06-15, poi grafana-pg e litellm-pg).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    ## Il database è di pochi MB; 5Gi è tutto cuscino per il WAL (lezione
+    ## ha-recorder 2026-07-30: pg_wal si mangia il margine in fretta).
+    size: 5Gi
+
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://bussola-pg-backup
+      ## ⭐ TLS terminated by Garage's own hosts, not by the ingress.
+      ## Garage has no TLS listener of its own -- upstream: "This endpoint
+      ## does not support TLS: a reverse proxy should be used to provide
+      ## it." So https://api.garage.home.tillo.ch only ever encrypted the
+      ## FIRST hop: ingress-nginx terminated it and re-emitted plaintext to
+      ## salt/pepper over the LAN. barman compresses but does not encrypt
+      ## (there is no `encryption:` key below), so these Postgres dumps
+      ## crossed the LAN in the clear on that last hop.
+      ## :30288 is an nginx TLS terminator running ON salt and pepper,
+      ## reached through the selector-less transit/garage Service, so this
+      ## also drops the ingress out of the backup's dependency chain.
+      ## Bucket and path are unchanged -- the barman store is untouched.
+      endpointURL: https://garage.transit.svc.cluster.local:30288
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: bussola-pg-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: bussola-pg-backup-s3
+          key: ACCESS_SECRET_KEY
+        region:
+          name: bussola-pg-backup-s3
+          key: REGION
+    retentionPolicy: "30d"
+    target: prefer-standby
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: bussola
+      owner: bussola
+      ## UTF8 esplicito: l'interfaccia è in italiano e un cluster creato
+      ## SQL_ASCII rompe ogni accento. L'applicazione forza comunque
+      ## client_encoding, ma il posto giusto per deciderlo è qui.
+      encoding: UTF8
+      ## Nessun `secret:` — CNPG genera bussola-pg-app con dentro la chiave
+      ## `uri` già pronta, che il Deployment consuma come BUSSOLA_DATABASE_URL.
+      ## La password serve solo dentro il cluster: farla passare da Akeyless
+      ## aggiungerebbe un accoppiamento di rotazione per niente.
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quotato: CNPG memorizza la quantità come stringa, e un intero non
+      # quotato lascia il bundle Fleet perennemente "Modified" (1 contro "1").
+      cpu: "1"
+      memory: 1Gi
+---
+## Credenziali S3 per i backup barman. Chiave scoped in sola scrittura sul
+## bucket bussola-pg-backup del Garage esterno; il job garage_offsite_backup
+## la porta poi su B2 e SFTP.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: bussola-pg-backup-s3
+  namespace: bussola
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: bussola-pg-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ACCESS_KEY_ID: "{{ .access_key }}"
+        ACCESS_SECRET_KEY: "{{ .secret_key }}"
+        ## Garage verifica lo scope SigV4 della regione; barman userebbe us-east-1.
+        REGION: "garage"
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/bussola/pg-backup-s3/access_key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/bussola/pg-backup-s3/secret_key
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: bussola-pg-daily
+  namespace: bussola
+spec:
+  schedule: "0 15 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: bussola-pg

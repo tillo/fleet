@@ -1,0 +1,151 @@
+## macOS Monterey VM (QEMU/OpenCore via docker-osx).
+##
+## It runs as an ordinary workload and gets /dev/kvm from the KubeVirt device
+## plugin by requesting `devices.kubevirt.io/kvm`, so it needs no privileged
+## pod and no changes to the virtualisation stack.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: macos-vm
+  namespace: macos-vm
+  labels:
+    app: macos-vm
+spec:
+  ## Scaled to zero on 2026-09-11: the VM was the biggest single memory consumer
+  ## on qua (~6 GB) when qua thrashed (no swap) and its rke2 crashed. Set back to
+  ## 1 to boot it; the disk, the Service and the volsync backup stay in place, and
+  ## the alert rule is written to stay silent on a deliberate scale-to-zero.
+  replicas: 0
+  ## ⛔ Recreate, never RollingUpdate: the disk is ReadWriteOnce, so a second
+  ## pod can never attach while the first holds it and a rolling update would
+  ## deadlock on Multi-Attach until the old pod is removed by hand.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: macos-vm
+  template:
+    metadata:
+      labels:
+        app: macos-vm
+    spec:
+      ## Preferred rather than a hard nodeSelector: the disk is network-attached
+      ## and every node advertises the KVM device, so the VM can fail over
+      ## instead of staying down for as long as one node is gone.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["qua"]
+
+      ## ⚠️ NOT a graceful guest shutdown -- there is no such thing here. macOS
+      ## ignores ACPI powerdown (it raises the Shut Down dialog and waits for a
+      ## human), so a preStop hook would be decorative and is deliberately
+      ## absent. The extra time exists so QEMU's own SIGTERM path can flush the
+      ## qcow2: the disk image stays structurally intact while the guest sees a
+      ## power cut and replays its journal on the next boot.
+      ##
+      ## ⇒ Shut the guest down from inside before any planned restart.
+      terminationGracePeriodSeconds: 60
+
+      ## Nothing in this pod talks to the Kubernetes API.
+      automountServiceAccountToken: false
+
+      initContainers:
+        ## ⛔ Required, and do not replace it by trusting IMAGE_PATH alone.
+        ## docker-osx honours IMAGE_PATH when launching QEMU but not in the
+        ## entrypoint's own `qemu-img create`, which builds the disk at its
+        ## default path instead. QEMU then opens an empty file and exits with
+        ## "Image is not in qcow2 format", looping and re-downloading the
+        ## recovery image every cycle.
+        - name: mkdisk
+          image: sickcodes/docker-osx@sha256:3a3c82c79bc4e73531f819ccdfa4053b3084efd7c1f645678dbf8b4b3a24369c
+          command:
+            - sh
+            - -c
+            - test -s /disk/mac_hdd_ng.img || qemu-img create -f qcow2 /disk/mac_hdd_ng.img 80G
+          volumeMounts:
+            - name: disk
+              mountPath: /disk
+
+      containers:
+        - name: osx
+          ## ⛔ Pinned by digest, with no Keel annotations on purpose. A floating
+          ## tag meant any restart could pick up a different upstream build --
+          ## different QEMU flags or a different bootloader -- against an
+          ## installed operating system that cannot be reproduced from this
+          ## repository. An unattended image change is the larger risk here.
+          image: sickcodes/docker-osx@sha256:3a3c82c79bc4e73531f819ccdfa4053b3084efd7c1f645678dbf8b4b3a24369c
+          imagePullPolicy: IfNotPresent
+          env:
+            ## ⛔ Monterey, not a newer release: these hosts have AVX but not
+            ## AVX2, which macOS Ventura and later require. A newer release does
+            ## not report an error -- the installer simply returns to the boot
+            ## picker with no message.
+            - name: SHORTNAME
+              value: monterey
+            - name: RAM
+              value: "6"
+            - name: SMP
+              value: "4"
+            - name: CORES
+              value: "4"
+            - name: IMAGE_PATH
+              value: /disk/mac_hdd_ng.img
+            - name: BASESYSTEM_IMAGE
+              value: /disk/BaseSystem.img
+            ## Skip the boot picker: installation is complete, and each prompt
+            ## otherwise needs a human at the console.
+            - name: NOPICKER
+              value: "true"
+            ## -qmp coexists with the image's own -monitor stdio (a second
+            ## -monitor would not). It allows keystrokes to be injected into the
+            ## desktop session when no other input path is available.
+            - name: EXTRA
+              value: -display none -vnc 0.0.0.0:99 -qmp tcp:127.0.0.1:4444,server,nowait
+          ports:
+            - name: vnc
+              containerPort: 5999
+              protocol: TCP
+            - name: ssh
+              containerPort: 10022
+              protocol: TCP
+          ## Readiness on VNC rather than on the guest's SSH port. Probing the
+          ## guest would look stricter but would withdraw the Service endpoint
+          ## whenever the guest is unhealthy -- removing the console at exactly
+          ## the moment it is needed to repair it. There is no liveness probe on
+          ## purpose: a macOS boot is slow and variable, and a liveness probe
+          ## would restart the VM mid-boot indefinitely.
+          readinessProbe:
+            tcpSocket:
+              port: 5999
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              ## Matches the memory actually handed to the guest. A request well
+              ## below real usage makes the pod an early eviction candidate
+              ## under node memory pressure.
+              memory: 6Gi
+              cpu: 500m
+              devices.kubevirt.io/kvm: "1"
+            limits:
+              ## Headroom over the guest allocation for QEMU's own overhead and
+              ## the framebuffer. Exceeding it kills the container, which is an
+              ## abrupt power cut for the guest.
+              memory: 8Gi
+              cpu: "6"
+              devices.kubevirt.io/kvm: "1"
+          volumeMounts:
+            - name: disk
+              mountPath: /disk
+      volumes:
+        - name: disk
+          persistentVolumeClaim:
+            claimName: macos-disk

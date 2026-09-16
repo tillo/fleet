@@ -1,0 +1,44 @@
+## Restic repository secret for the VolSync ReplicationSource that backs up
+## paperless-data-ceph (Ceph RBD — the document ORIGINALS/media; the DB is
+## separately covered by CNPG barman). Same Akeyless creds as the owncloud
+## VolSync (shared /mdapi/volsync/ceph-backup/*), per-PVC repo subpath in the
+## external Garage `ceph-backup` bucket; garage_offsite_backup replicates the
+## bucket to B2 + SFTP daily at 04:00. Added 2026-08-14 — PVC audit gap G2
+## (beads infra-jjb): the media dir was the cluster's worst unbacked volume.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## In-cluster transit/garage, NOT api.garage.home.tillo.ch: that hostname
+        ## resolves to the shared ingress VIP, so every backup hairpinned through
+        ## ingress-nginx and would fail exactly when the front door is degraded --
+        ## which is when a backup matters most. restic encrypts client-side and S3
+        ## auth is a SigV4 signature, so losing the ingress TLS costs no
+        ## confidentiality: Garage has no TLS listener of its own, and the ingress
+        ## already re-emitted plaintext to these same LAN hosts. Same bucket and
+        ## path, so the existing restic repository is untouched.
+        RESTIC_REPOSITORY: "s3:http://garage.transit.svc.cluster.local:30188/ceph-backup/paperless-data-ceph"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .access_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_access_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: access_key_id
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/access-key-id
+    - secretKey: secret_access_key
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/secret-access-key

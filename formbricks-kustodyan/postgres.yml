@@ -1,0 +1,78 @@
+# Shared Postgres for Formbricks, Hub and Cube (Formbricks ships the pgvector build of PG 18;
+# the 18.x image keeps its data under /var/lib/postgresql/18/docker, hence the parent mount).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: formbricks-postgres-data
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formbricks-postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: formbricks-postgres
+  template:
+    metadata:
+      labels:
+        app: formbricks-postgres
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg18
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: POSTGRES_DB
+              value: formbricks
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: formbricks-env, key: POSTGRES_PASSWORD } }
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, postgres]
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, postgres]
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 25m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+              subPath: pgdata
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: formbricks-postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks-postgres
+spec:
+  selector:
+    app: formbricks-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

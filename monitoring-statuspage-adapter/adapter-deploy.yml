@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statuspage-adapter
+  namespace: monitoring
+  annotations:
+    reloader.stakater.com/auto: "true"
+    ## Keel REMOVED 2026-09-02. policy=force on the moving tag python:3-alpine
+    ## force-replaced this pod whenever upstream re-pushed — on a single replica
+    ## with strategy=Recreate, i.e. a guaranteed hands-off gap on the process
+    ## that publishes the public statuspage. On 2026-09-01 that gap was 34
+    ## minutes (image pull; restartCount stayed 0 — the container never started,
+    ## it did not crash) and it ended with the adapter publishing its own
+    ## downtime as Platform=major_outage. There is no reason for the status
+    ## publisher to chase an auto-updating base image: it is ~300 lines of
+    ## stdlib Python with no dependencies, and its code lives in the ConfigMap
+    ## next door (reloader restarts the pod when that actually changes).
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: statuspage-adapter
+  ## Was Recreate: at replicas=1 that means "stop the only pod, then start the
+  ## replacement" — every roll is an outage of the publisher by construction.
+  ## maxSurge=1/maxUnavailable=0 brings the new pod to Ready BEFORE the old one
+  ## goes away, so a deliberate roll costs zero gap even at one replica. Two
+  ## adapters overlapping briefly is safe: PATCH is idempotent and both derive
+  ## the same status from the same Alertmanager.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: statuspage-adapter
+    spec:
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      imagePullSecrets:
+      - name: zot-pull
+      containers:
+      - name: adapter
+        ## Still the floating tag (Lane A), but nothing force-rolls it any more —
+        ## see the removed Keel annotations above. A pull now only happens on a
+        ## genuine pod restart, and thanks to maxUnavailable=0 a slow pull costs
+        ## no publishing gap: the old pod serves until the new one is Ready.
+        ## TODO worth doing when someone has zot credentials to hand: pin this by
+        ## digest outright. It could not be verified from the jump seat (zot
+        ## requires Basic auth) and shipping an image reference that might not
+        ## resolve would take the publisher down for real.
+        image: zot.mdapi.ch/library/python:3-alpine
+        imagePullPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        command: ["python3", "/etc/adapter/adapter.py"]
+        lifecycle:
+          preStop:
+            exec:
+              ## SIGTERM and Endpoints removal are not ordered: without this the
+              ## webhook Service can still route to a pod that has already begun
+              ## shutting down, and Alertmanager sees a 5xx it will not retry.
+              command: ["sleep", "5"]
+        envFrom:
+        - secretRef:
+            name: statuspage
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 4
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 30
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 5m
+            memory: 64Mi
+          limits:
+            memory: 192Mi
+        volumeMounts:
+        - mountPath: /etc/adapter
+          name: adapter-files
+          readOnly: true
+      volumes:
+      - name: adapter-files
+        configMap:
+          name: statuspage-adapter
+          defaultMode: 420
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statuspage-adapter
+  namespace: monitoring
+spec:
+  selector:
+    app: statuspage-adapter
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+    protocol: TCP

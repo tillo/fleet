@@ -1,0 +1,136 @@
+## Find My -> Home Assistant collector (ns `findmy`).
+##
+## Selectors are NAMESPACE-WIDE, per the rule that catches every coverage gap:
+## a name-pinned selector is how the second workload in a namespace is born
+## uncovered.
+##
+## severity: warning + statuspage: exclude -- deliberate. This feeds household
+## presence tracking; nothing outside the house observes it, so it has no
+## business on the public status page.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-findmy
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-findmy.workload
+    rules:
+    - alert: FindmyDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="findmy", deployment=~".+"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="findmy", deployment=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "findmy/{{ $labels.deployment }} unavailable"
+        description: |
+          The Find My collector has no available replica. Tag positions in Home
+          Assistant will stop refreshing and go stale.
+
+    ## ⚠️ Keep this arm even though it matches nothing today: the coverage probe
+    ## treats a namespace-only selector as covering both kinds, so a
+    ## Deployment-only file would silently claim coverage of a StatefulSet it
+    ## could never fire on.
+    - alert: FindmyStatefulSetUnavailable
+      expr: |
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace="findmy", statefulset=~".+"
+            }
+            - kube_statefulset_status_replicas_available{
+              namespace="findmy", statefulset=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "findmy/{{ $labels.statefulset }} unavailable"
+        description: |
+          A StatefulSet in this namespace has fewer available replicas than
+          desired.
+
+  - name: app-findmy.freshness
+    rules:
+    ## ⭐ The real health signal. The collector runs as a shell loop, so a failing
+    ## cycle neither crashes the pod nor changes its readiness -- the workload
+    ## arm above would stay green through a collector that has failed every cycle
+    ## for a day. What actually degrades is the age of the last SUCCESS.
+    ##
+    ## 1h against a 15m cycle: tolerates three consecutive failures, and tolerates
+    ## the macOS VM being briefly away, before saying anything.
+    - alert: FindmyCollectorStale
+      expr: |
+        time() - max(findmy_collector_last_success_timestamp_seconds) > 3600
+      for: 10m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Find My collector has not completed a cycle in over an hour"
+        description: |
+          Last successful cycle was
+          {{ $value | humanizeDuration }} ago. Tag positions in Home Assistant
+          are no longer being refreshed. Check
+          `kubectl -n findmy logs deploy/findmy-collector --tail=50`.
+
+    ## ⛔ Do not remove as redundant with the rule above. A staleness comparison
+    ## against a metric that has NEVER been published evaluates to empty, not to
+    ## true -- so a collector that starts and fails every single cycle would be
+    ## silent forever: the pod is Running, the Deployment is Available, and the
+    ## timestamp it would have gone stale against was never written.
+    ## Absence of the signal is only evidence when the signal would have existed.
+    - alert: FindmyCollectorNeverReported
+      expr: |
+        absent(findmy_collector_last_success_timestamp_seconds)
+      for: 1h
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Find My collector has never reported a successful cycle"
+        description: |
+          No findmy_collector_last_success_timestamp_seconds series exists at
+          all. Either the collector has never completed a cycle since being
+          deployed, or it cannot reach the push gateway.
+
+    - alert: FindmyPodCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="findmy"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "findmy/{{ $labels.pod }} crash-looping"
+        description: |
+          Container restart rate above 0.5/min for 10m. Check
+          `kubectl -n findmy logs {{ $labels.pod }} --previous`.

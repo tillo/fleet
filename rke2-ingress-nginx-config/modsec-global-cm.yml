@@ -1,0 +1,381 @@
+## Global ModSecurity rule set for rke2-ingress-nginx.
+##
+## Why a ConfigMap and not the `modsecurity-snippet` value directly:
+## nginx.tmpl emits the snippet inside `modsecurity_rules '...'`, a single
+## quoted nginx parameter, and nginx's config parser caps a quoted token at
+## its 4 KiB read buffer. A 17 KiB rule set fails to parse with
+##     [emerg] too long parameter, probably missing terminating "'" character
+## Verified 2026-09-15 by running `nginx -t` in a throwaway pod on the real
+## controller image. So the snippet is one `Include` line and the rules live
+## here, mounted at /etc/nginx/modsec-global/.
+##
+## Generated from the live ingress inventory; regenerate with
+## ~/hang-evidence-scripts/gen_modsec.py if hosts change.
+##
+## ⚠️ Changing this file reloads nginx but does NOT roll the pods. Changing the
+## VOLUME in the HelmChartConfig does roll them.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingress-modsec-global
+  namespace: kube-system
+data:
+  modsec-global.conf: |
+    # ===================================================================
+    # Global ModSecurity configuration for rke2-ingress-nginx.
+    #
+    # Generated from the live ingress inventory on 2026-09-15. Before this,
+    # 44 ingresses each carried their own snippet ending in a full CRS
+    # Include, so the generated nginx.conf held 80 modsecurity_rules blocks
+    # and the nginx master process alone was 4.69 GiB RSS. The CRS is now
+    # instantiated ONCE, here, via enable-owasp-modsecurity-crs.
+    #
+    # Ordering matters: this snippet is parsed BEFORE the CRS include, so
+    # id:900200 below wins over crs-setup.conf (ModSecurity is first-wins on
+    # duplicate rule IDs) and every ctl: action lands before a CRS rule runs.
+    # ===================================================================
+
+    # --- base, reproducing what the per-ingress snippets set ------------
+    SecRuleEngine On
+    SecAuditEngine RelevantOnly
+    SecAuditLogRelevantStatus "^(?:5|4(?!04))"
+    SecAuditLogParts ABIJDEFHZ
+    SecAuditLogType Serial
+    SecAuditLogFormat JSON
+    SecAuditLog /dev/stdout
+
+    # --- fail-safe: bound what is buffered, and never reject on size ----
+    # Registries and S3 are excluded below, but a 1 MiB inspection window
+    # plus ProcessPartial means even an unexpected large upload streams
+    # through instead of being buffered whole or rejected.
+    SecRequestBodyLimit 1048576
+    SecRequestBodyNoFilesLimit 1048576
+    SecRequestBodyLimitAction ProcessPartial
+
+    # --- global REST methods (must precede the CRS include) -------------
+    # Previously repeated in 14 ingresses. WebDAV verbs included because
+    # Nextcloud and sftpgo need them; 911100 reads this at phase 1.
+    SecAction "id:900200,phase:1,nolog,pass,t:none,\
+      setvar:tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE \
+      PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK REPORT"
+
+    # --- global allowed request content types ---------------------------
+    # Previously set by joplin and windmill only; harmless as a default.
+    SecAction "id:900201,phase:1,nolog,pass,t:none,\
+      setvar:tx.allowed_request_content_type=|application/x-www-form-urlencoded| \
+      |multipart/form-data| |text/xml| |application/xml| |application/soap+xml| \
+      |application/json| |application/reports+json| |application/csp-report| |application/octet-stream|"
+
+    # --- relaxed anomaly thresholds while the new hosts soak ------------
+    # CRS defaults are 5 inbound / 4 outbound (crs-setup.conf ships them
+    # commented out, so we were on stock). Raising them makes a single
+    # medium-severity hit stop being enough to block. Tighten back to 5/4
+    # once the DetectionOnly list below is empty.
+    SecAction "id:900110,phase:1,nolog,pass,t:none,\
+      setvar:tx.inbound_anomaly_score_threshold=10,setvar:tx.outbound_anomaly_score_threshold=8"
+
+    # ===================================================================
+    # Engine state per host.
+    # Only ever RELAXED here (On -> DetectionOnly -> Off): promoting back to
+    # On at runtime is not proven in this build, so the default is On and
+    # anything softer is explicit. An unmatched host ends in DetectionOnly.
+    # ===================================================================
+
+    # --- OFF: 19 hosts where a WAF is wrong, not merely untested ---
+    #   api.garage.home.tillo.ch
+    #   chat.mdapi.ch
+    #   console.garage.home.tillo.ch
+    #   crl.mdapi.ch
+    #   formbricks-kustodyan-mcp.mdapi.ch
+    #   gitlab.mdapi.ch
+    #   harvester.mdapi.ch
+    #   horizon-mcp.mdapi.ch
+    #   jump.mdapi.ch
+    #   k8s-mcp.mdapi.ch
+    #   kas.mdapi.ch
+    #   kustodyan-mcp.mdapi.ch
+    #   llm.mdapi.ch
+    #   rancher.mdapi.ch
+    #   registry.mdapi.ch
+    #   scrypted.mdapi.ch
+    #   shop.mdapi.ch
+    #   stream-mcp.mdapi.ch
+    #   zot.mdapi.ch
+    SecRule REQUEST_HEADERS:Host "@rx ^(api\.garage\.home\.tillo\.ch|chat\.mdapi\.ch|console\.garage\.home\.tillo\.ch|crl\.mdapi\.ch|formbricks\-kustodyan\-mcp\.mdapi\.ch|gitlab\.mdapi\.ch|harvester\.mdapi\.ch|horizon\-mcp\.mdapi\.ch|jump\.mdapi\.ch|k8s\-mcp\.mdapi\.ch|kas\.mdapi\.ch|kustodyan\-mcp\.mdapi\.ch|llm\.mdapi\.ch|rancher\.mdapi\.ch|registry\.mdapi\.ch|scrypted\.mdapi\.ch|shop\.mdapi\.ch|stream\-mcp\.mdapi\.ch|zot\.mdapi\.ch)$" \
+      "id:1900,phase:1,pass,nolog,t:lowercase,ctl:ruleEngine=Off"
+
+    # --- OFF: wildcard hosts --------------------------------------------
+    SecRule REQUEST_HEADERS:Host "@rx ^[^.]+\.pages\.mdapi\.ch$" \
+      "id:1901,phase:1,pass,nolog,t:lowercase,ctl:ruleEngine=Off"
+
+    # --- OFF: path-scoped, inside a host that is otherwise covered ------
+    SecRule REQUEST_HEADERS:Host "@streq mdapi.ch" \
+      "id:1910,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /api/v1/proxy" "ctl:ruleEngine=Off"
+    SecRule REQUEST_HEADERS:Host "@streq horizon.mdapi.ch" \
+      "id:1911,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /acme" "ctl:ruleEngine=Off"
+    SecRule REQUEST_HEADERS:Host "@streq horizon.mdapi.ch" \
+      "id:1912,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /.well-known/est" "ctl:ruleEngine=Off"
+
+    # --- DETECTION ONLY: 27 hosts -------------------------------
+    # 4 were already DetectionOnly; the rest had no WAF at all and are
+    # soaking. Promote by deleting from this list, one host at a time,
+    # after checking its audit log is clean.
+    #   *.pages.mdapi.ch
+    #   autobrr.mdapi.ch
+    #   bazarr.mdapi.ch
+    #   bussola.mdapi.ch
+    #   ceph.mdapi.ch
+    #   dns.mdapi.ch
+    #   docs.mdapi.ch
+    #   envuassu.ch
+    #   formbricks-kustodyan.mdapi.ch
+    #   gitjob.mdapi.ch
+    #   grafana-embed.mdapi.ch
+    #   mta-sts.mdapi.ch
+    #   notes.mdapi.ch
+    #   nsadmin.mdapi.ch
+    #   paperless-kustodyan.mdapi.ch
+    #   pfsense.mdapi.ch
+    #   prowlarr.mdapi.ch
+    #   pushgateway.mdapi.ch
+    #   radarr.mdapi.ch
+    #   santillo.tillo.ch
+    #   seerr.mdapi.ch
+    #   sonarr.mdapi.ch
+    #   tdarr.mdapi.ch
+    #   threadfin.mdapi.ch
+    #   transmission.mdapi.ch
+    #   vpnadmin.mdapi.ch
+    #   www.envuassu.ch
+    SecRule REQUEST_HEADERS:Host "@rx ^(\*\.pages\.mdapi\.ch|autobrr\.mdapi\.ch|bazarr\.mdapi\.ch|bussola\.mdapi\.ch|ceph\.mdapi\.ch|dns\.mdapi\.ch|docs\.mdapi\.ch|envuassu\.ch|formbricks\-kustodyan\.mdapi\.ch|gitjob\.mdapi\.ch|grafana\-embed\.mdapi\.ch|mta\-sts\.mdapi\.ch|notes\.mdapi\.ch|nsadmin\.mdapi\.ch|paperless\-kustodyan\.mdapi\.ch|pfsense\.mdapi\.ch|prowlarr\.mdapi\.ch|pushgateway\.mdapi\.ch|radarr\.mdapi\.ch|santillo\.tillo\.ch|seerr\.mdapi\.ch|sonarr\.mdapi\.ch|tdarr\.mdapi\.ch|threadfin\.mdapi\.ch|transmission\.mdapi\.ch|vpnadmin\.mdapi\.ch|www\.envuassu\.ch)$" \
+      "id:1913,phase:1,pass,nolog,t:lowercase,ctl:ruleEngine=DetectionOnly"
+
+    # --- DETECTION ONLY: anything not named above ------------------------
+    # The hostless catch-all server (cattle-system/rancher-expose routes it
+    # to Rancher) and any future ingress land here rather than being
+    # enforced against without anyone deciding to.
+    SecRule REQUEST_HEADERS:Host "!@rx ^(\*\.mdapi\.org|\*\.pages\.mdapi\.ch|api\.garage\.home\.tillo\.ch|appdaemon\.mdapi\.ch|auth\.mdapi\.ch|autobrr\.mdapi\.ch|autoconfig\.mdapi\.ch|backlog\.mdapi\.ch|bazarr\.mdapi\.ch|bussola\.mdapi\.ch|ceph\.mdapi\.ch|chat\.mdapi\.ch|cloud\.envuassu\.ch|cloud\.mdapi\.ch|coiffuredreams\.ch|console\.garage\.home\.tillo\.ch|cribl\.mdapi\.ch|crl\.mdapi\.ch|dellambrogio\.ch|dellambrogio\.com|dellambrogio\.net|dellambrogio\.org|dev\.spider3\.ch|dns\.mdapi\.ch|docs\.mdapi\.ch|documents\.mdapi\.ch|envuassu\.ch|esphome\.mdapi\.ch|formbricks\-kustodyan\-mcp\.mdapi\.ch|formbricks\-kustodyan\.mdapi\.ch|frigate\.mdapi\.ch|gitjob\.mdapi\.ch|gitlab\.mdapi\.ch|grafana\-embed\.mdapi\.ch|grafana\.mdapi\.ch|harvester\.mdapi\.ch|help\.mdapi\.ch|home\.mdapi\.ch|horizon\-mcp\.mdapi\.ch|horizon\.mdapi\.ch|idp\.mdapi\.ch|ivodellambrogio\.ch|jump\.mdapi\.ch|k8s\-mcp\.mdapi\.ch|kas\.mdapi\.ch|kustodyan\-mcp\.mdapi\.ch|lam\.mdapi\.ch|llm\.mdapi\.ch|login\.envuassu\.ch|logs\.mdapi\.ch|mdapi\.ch|mdapi\.org|mta\-sts\.mdapi\.ch|notes\-mcp\.mdapi\.ch|notes\.mdapi\.ch|nsadmin\.mdapi\.ch|paperless\-kustodyan\.mdapi\.ch|pfsense\.mdapi\.ch|prowlarr\.mdapi\.ch|pushgateway\.mdapi\.ch|radarr\.mdapi\.ch|rancher\.mdapi\.ch|registry\.mdapi\.ch|rspamd\.mdapi\.ch|santillo\.tillo\.ch|scrypted\.mdapi\.ch|seerr\.mdapi\.ch|shop\.mdapi\.ch|sonarr\.mdapi\.ch|spider3\.ch|spider3\.files\.mdapi\.ch|start\.mdapi\.ch|stream\-mcp\.mdapi\.ch|stream\.mdapi\.ch|tdarr\.mdapi\.ch|threadfin\.mdapi\.ch|tillo\.ch|transmission\.mdapi\.ch|tv\.files\.mdapi\.ch|vmalert\.mdapi\.ch|vmalertmanager\.mdapi\.ch|vpnadmin\.mdapi\.ch|webmail\.mdapi\.ch|windmill\.mdapi\.ch|www\.coiffuredreams\.ch|www\.dellambrogio\.ch|www\.dellambrogio\.com|www\.dellambrogio\.net|www\.dellambrogio\.org|www\.envuassu\.ch|www\.ivodellambrogio\.ch|www\.mdapi\.ch|www\.spider3\.ch|www\.tillo\.ch|zot\.mdapi\.ch)$" \
+      "id:1914,phase:1,pass,nolog,t:lowercase,ctl:ruleEngine=DetectionOnly"
+
+    # --- ENFORCING (49 hosts) --------------------------------
+    # Listed for the record only: these inherit the SecRuleEngine On above.
+    #   *.mdapi.org
+    #   appdaemon.mdapi.ch
+    #   auth.mdapi.ch
+    #   autoconfig.mdapi.ch
+    #   backlog.mdapi.ch
+    #   cloud.envuassu.ch
+    #   cloud.mdapi.ch
+    #   coiffuredreams.ch
+    #   cribl.mdapi.ch
+    #   dellambrogio.ch
+    #   dellambrogio.com
+    #   dellambrogio.net
+    #   dellambrogio.org
+    #   dev.spider3.ch
+    #   documents.mdapi.ch
+    #   esphome.mdapi.ch
+    #   frigate.mdapi.ch
+    #   grafana.mdapi.ch
+    #   help.mdapi.ch
+    #   home.mdapi.ch
+    #   horizon.mdapi.ch
+    #   idp.mdapi.ch
+    #   ivodellambrogio.ch
+    #   lam.mdapi.ch
+    #   login.envuassu.ch
+    #   logs.mdapi.ch
+    #   mdapi.ch
+    #   mdapi.org
+    #   notes-mcp.mdapi.ch
+    #   rspamd.mdapi.ch
+    #   spider3.ch
+    #   spider3.files.mdapi.ch
+    #   start.mdapi.ch
+    #   stream.mdapi.ch
+    #   tillo.ch
+    #   tv.files.mdapi.ch
+    #   vmalert.mdapi.ch
+    #   vmalertmanager.mdapi.ch
+    #   webmail.mdapi.ch
+    #   windmill.mdapi.ch
+    #   www.coiffuredreams.ch
+    #   www.dellambrogio.ch
+    #   www.dellambrogio.com
+    #   www.dellambrogio.net
+    #   www.dellambrogio.org
+    #   www.ivodellambrogio.ch
+    #   www.mdapi.ch
+    #   www.spider3.ch
+    #   www.tillo.ch
+
+    # ===================================================================
+    # Per-application exceptions.
+    #
+    # These were 25 separate per-ingress `modsecurity-snippet` annotations. Each one
+    # also carried a full CRS Include, which is what produced 80 rule-set copies.
+    # Lifted here so the CRS is parsed once and the exceptions still run BEFORE it.
+    #
+    # Two mechanical translations were needed:
+    #
+    #  * config-time directives cannot be host-scoped, so `SecRuleRemoveById N` and
+    #    `SecRuleUpdateTargetById N "!ARGS:x"` become the runtime equivalents
+    #    `ctl:ruleRemoveById=N` / `ctl:ruleRemoveTargetById=N;ARGS:x`, gated on Host.
+    #    Applying them at config level instead would disable the rule for the whole
+    #    estate, which is exactly the silent-WAF-loss this migration must not cause.
+    #
+    #  * chained rules are used for host+path scoping. `mdapi.ch`, `start.mdapi.ch`
+    #    and `horizon.mdapi.ch` each serve more than one app on different paths, so a
+    #    host-only match would apply one app exception to another app.
+    #
+    # Rule IDs 1920-1999 are reserved for this block.
+    # ===================================================================
+
+    # --- cribl.mdapi.ch: REST API metrics endpoint trips SQLi 942151 ----
+    SecRule REQUEST_HEADERS:Host "@streq cribl.mdapi.ch" \
+      "id:1920,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /api/v1/system/metrics" "ctl:ruleRemoveById=942151"
+
+    # --- dellambrogio.*: free-text contact form vs CRS 933160 -----------
+    # 933160 flags ordinary prose containing a PHP-function-like pattern, e.g. the
+    # word "file (". These are the form fields that carry sentences.
+    SecRule REQUEST_HEADERS:Host "@rx ^(www\.)?dellambrogio\.(ch|com|net|org)$" \
+      "id:1921,phase:1,pass,nolog,t:lowercase,\
+      ctl:ruleRemoveTargetById=933160;ARGS:request,\
+      ctl:ruleRemoveTargetById=933160;ARGS:name,\
+      ctl:ruleRemoveTargetById=933160;ARGS:city"
+
+    # start.mdapi.ch serves TWO apps: portal at / (no WAF) and start-request at
+    # /request (enforcing, same form fields). Path-scoped so they stay separate.
+    SecRule REQUEST_HEADERS:Host "@streq start.mdapi.ch" \
+      "id:1922,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /request" \
+        "ctl:ruleRemoveTargetById=933160;ARGS:request,\
+        ctl:ruleRemoveTargetById=933160;ARGS:name,\
+        ctl:ruleRemoveTargetById=933160;ARGS:city"
+
+    # --- Nextcloud (both instances): WebDAV + OAuth2 --------------------
+    SecRule REQUEST_HEADERS:Host "@rx ^(cloud\.mdapi\.ch|cloud\.envuassu\.ch)$" \
+      "id:1923,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /index.php/apps/oauth2/" "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    SecRule REQUEST_HEADERS:Host "@rx ^(cloud\.mdapi\.ch|cloud\.envuassu\.ch)$" \
+      "id:1924,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /remote.php/dav/" "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    SecRule REQUEST_HEADERS:Host "@streq cloud.mdapi.ch" \
+      "id:1925,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /core/mimeicon" "ctl:ruleRemoveById=932260"
+
+    # --- esphome.mdapi.ch: the editor/compile endpoints post YAML -------
+    SecRule REQUEST_HEADERS:Host "@streq esphome.mdapi.ch" \
+      "id:1926,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@rx ^/(wizard|edit|upload|compile|run|validate|delete|undo-delete|archive|unarchive|rename|import|ignore-device|update-all|clean|clean-all|clean-mqtt|vscode|ace|secret_keys|logs|events)(\?|/|$)" \
+        "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    # was `SecRuleRemoveById 920420 920430` (content-type enforcement)
+    SecRule REQUEST_HEADERS:Host "@streq esphome.mdapi.ch" \
+      "id:1927,phase:1,pass,nolog,t:lowercase,\
+      ctl:ruleRemoveById=920420,ctl:ruleRemoveById=920430"
+
+    # --- home.mdapi.ch: Home Assistant ----------------------------------
+    SecRule REQUEST_HEADERS:Host "@streq home.mdapi.ch" \
+      "id:1928,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /api/frigate/notifications/" "ctl:ruleRemoveByTag=attack-lfi"
+
+    SecRule REQUEST_HEADERS:Host "@streq home.mdapi.ch" \
+      "id:1929,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /auth/login_flow" "ctl:ruleRemoveById=949110"
+
+    # --- notes-mcp.mdapi.ch: Joplin MCP ---------------------------------
+    SecRule REQUEST_HEADERS:Host "@streq notes-mcp.mdapi.ch" \
+      "id:1930,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /mcp" "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    # was `SecRuleRemoveById 921110` (HTTP request smuggling)
+    SecRule REQUEST_HEADERS:Host "@streq notes-mcp.mdapi.ch" \
+      "id:1931,phase:1,pass,nolog,t:lowercase,ctl:ruleRemoveById=921110"
+
+    # --- idp.mdapi.ch: Keycloak authorization endpoint ------------------
+    SecRule REQUEST_HEADERS:Host "@streq idp.mdapi.ch" \
+      "id:1932,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@rx ^/realms/[^/]+/protocol/openid-connect/auth" "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    # --- rspamd.mdapi.ch: /checkv2 carries raw mail ---------------------
+    SecRule REQUEST_HEADERS:Host "@streq rspamd.mdapi.ch" \
+      "id:1933,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /checkv2" "ctl:ruleRemoveById=949110"
+
+    # --- webmail.mdapi.ch: Roundcube ------------------------------------
+    # was `SecRuleRemoveById 932235`
+    SecRule REQUEST_HEADERS:Host "@streq webmail.mdapi.ch" \
+      "id:1934,phase:1,pass,nolog,t:lowercase,ctl:ruleRemoveById=932235"
+
+    SecRule REQUEST_HEADERS:Host "@streq webmail.mdapi.ch" \
+      "id:1935,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@rx ^/\?_task=(?:login|mail&_unlock=loading)" "ctl:ruleRemoveById=949110"
+
+    # --- help.mdapi.ch: MeshCentral agent/relay websockets --------------
+    SecRule REQUEST_HEADERS:Host "@streq help.mdapi.ch" \
+      "id:1936,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@rx ^/(agent|meshrelay|control|desktoprelay)\.ashx" "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    # --- auth.mdapi.ch: the four oauth2-proxy instances -----------------
+    SecRule REQUEST_HEADERS:Host "@streq auth.mdapi.ch" \
+      "id:1937,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@rx ^/(admin|bussola|portal|tv)/oauth2/(?:start|auth)" "ctl:ruleRemoveById=949110"
+
+    # --- documents.mdapi.ch: paperless document upload ------------------
+    SecRule REQUEST_HEADERS:Host "@streq documents.mdapi.ch" \
+      "id:1938,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /api/documents/post_document" "ctl:ruleRemoveByTag=OWASP_CRS"
+
+    # --- mdapi.ch: showcase disabled method enforcement -----------------
+    # was `SecRuleRemoveById 911100`. NOTE the path guard: mdapi.ch also serves the
+    # Tor WebTunnel bridge at /api/v1/proxy, which rule id:1910 turns the engine off
+    # for entirely.
+    SecRule REQUEST_HEADERS:Host "@rx ^(www\.)?mdapi\.ch$" \
+      "id:1939,phase:1,pass,nolog,t:lowercase,ctl:ruleRemoveById=911100"
+
+    # --- windmill.mdapi.ch ----------------------------------------------
+    SecRule REQUEST_HEADERS:Host "@streq windmill.mdapi.ch" \
+      "id:1940,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /api/w/mdapi/workspaces/tarball" "ctl:ruleEngine=DetectionOnly"
+
+    SecRule REQUEST_HEADERS:Host "@streq windmill.mdapi.ch" \
+      "id:1941,phase:1,pass,nolog,t:lowercase,chain"
+      SecRule REQUEST_URI "@beginsWith /api/w/mdapi/" "ctl:ruleRemoveByTag=attack-lfi"
+
+    # ===================================================================
+    # CRS exclusion plugins.
+    #
+    # nextcloud-rule-exclusions is a CRS "-before" plugin and must be parsed ahead of
+    # the CRS rules, which is why it lives here rather than in a per-ingress snippet:
+    # a location-level Include would merge AFTER the http-level CRS and run too late.
+    #
+    # ⚠️ CORRECTION (2026-09-15, same day): an earlier version of this comment said
+    # the plugin was INERT because of its own guard
+    #   SecRule TX:nextcloud-rule-exclusions-plugin_enabled "@eq 0" ...ctl:ruleRemoveById=9508100-9508999
+    # That was WRONG and the distinction is easy to miss, so it is written down here.
+    #
+    # `TX:name` (value form) does NOT match when the variable was never set — there is
+    # no variable to test, so the operator never runs. Only `&TX:name` (count form)
+    # yields 0 and matches. Verified by running both forms against an unset var on the
+    # real controller image: the count form matched, the value form did not.
+    #
+    # So of the three guards at the top of the plugin:
+    #   id:9508099  TX:  ...plugin_enabled              -> does NOT fire -> ~170 exclusion rules ACTIVE
+    #   id:9508097  &TX: ...server_crawler_rules_enabled -> fires -> removes 9508514 (opt-in, off)
+    #   id:9508098  &TX: ...ios_workaround_enabled       -> fires -> removes 9508119 (opt-in, off)
+    #
+    # The plugin IS enabled and has been all along. The two opt-in sub-features are off
+    # by upstream design; enable one by setting its TX var to 1 BEFORE this Include, e.g.
+    #   SecAction "id:9508001,phase:1,nolog,pass,t:none,\
+    #     setvar:tx.nextcloud-rule-exclusions-plugin_ios_workaround_enabled=1"
+    # Not done here: as of 2026-09-15 there were no ModSecurity blocks on
+    # cloud.mdapi.ch / cloud.envuassu.ch to justify loosening anything.
+    # ===================================================================
+    Include /etc/nginx/modsec-plugins/nextcloud-rule-exclusions-before.conf

@@ -1,0 +1,65 @@
+# Public A records required for cert-manager http01 (the transit-namespace
+# letsencrypt-prod Issuer routes home.tillo.ch names to http01 because
+# the home.tillo.ch zone is on technitium-primary, not on ns.mdapi.ch, so
+# dns01 nsupdate is rejected as NOTAUTH). Added 2026-05-14 via:
+#   nsupdate -y "hmac-sha256:mdapi:$TSIG_SECRET" <<EOF
+#   server 31.3.128.59 53
+#   zone tillo.ch
+#   update add api.garage.home.tillo.ch.     300 IN A 31.3.128.50
+#   update add console.garage.home.tillo.ch. 300 IN A 31.3.128.50
+#   send
+#   EOF
+# Source of truth lives in the BIND9 zone file on ns.mdapi.ch (31.3.128.59);
+# this comment is a pointer for future operators.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: garage
+  namespace: transit
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # S3 multi-part PUTs need a generous body limit (registry images, big
+    # backups). Same value as console.minio.
+    nginx.ingress.kubernetes.io/proxy-body-size: 10g
+    # Publish api.garage + console.garage A records into home.tillo.ch
+    # (Technitium primary) pointing at the harvester-managed ingress VIP.
+    external-dns.alpha.kubernetes.io/manage: mdapi
+    # console.garage = khairul169/garage-webui on salt+pepper. webui keeps
+    # session state in-process; without cookie affinity the post-login GET /
+    # round-robins to the other backend, finds no session, and bounces back
+    # to /login. S3 clients on api.garage don't carry cookies so api load
+    # balancing is unaffected (falls back to nginx default LB).
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "garage-webui-affinity"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "86400"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "86400"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.garage.home.tillo.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port:
+                  number: 30188
+    - host: console.garage.home.tillo.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: garage
+                port:
+                  number: 30186
+  tls:
+    - hosts:
+        - api.garage.home.tillo.ch
+      secretName: garage-api-cert
+    - hosts:
+        - console.garage.home.tillo.ch
+      secretName: garage-console-cert

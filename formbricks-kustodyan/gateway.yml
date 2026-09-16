@@ -1,0 +1,123 @@
+# The Kustodyan gateway (gitlab mdapi/formbricks-kustodyan): the ingress sends the response
+# endpoints, the application pages that display responses and the role-management page here.
+# The proxy protects the answers of open-text / contact / address elements as DATA_STEWARD
+# before Formbricks stores them, and on the way out reveals each one according to the RPS role
+# of whoever is asking: a management API key through the role map, a signed-in colleague through
+# their Formbricks session and the role store on the volume below (seeded from KUSTODYAN_USER_ROLES,
+# edited afterwards on https://formbricks-kustodyan.mdapi.ch/kustodyan).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: formbricks-gateway-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: harvester-longhorn-2replicas
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formbricks-gateway
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    # Single writer: the role store sits on a ReadWriteOnce volume, so the old pod has to go
+    # before the new one starts. Not `Recreate`: switching an existing Deployment to it is
+    # rejected while the defaulted rollingUpdate block is still merged in.
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: formbricks-gateway
+  template:
+    metadata:
+      labels:
+        app: formbricks-gateway
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      securityContext:
+        fsGroup: 10001
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: formbricks-gateway-data
+      containers:
+        - name: gateway
+          image: zot.mdapi.ch/mdapi/formbricks-kustodyan:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          env:
+            - name: UPSTREAM_URL
+              value: http://formbricks-app:3000
+            - name: KUSTODYAN_IDENTITY_URL
+              value: https://dev.kustodyan.io/api/identity
+            - name: KUSTODYAN_ENGINE_URL
+              value: https://dev.kustodyan.io/api/engine
+            - name: KUSTODYAN_CLASS_NAME
+              value: ch.tillo.formbricks.Response
+            - name: KUSTODYAN_PROPERTY
+              value: answer
+            - name: KUSTODYAN_PROTECT_TYPES
+              value: openText,contactInfo,address
+            - name: KUSTODYAN_ROLE_STORE
+              value: /data/roles.json
+            - name: KUSTODYAN_SAMPLE_SURVEY
+              value: kstsurvey000000000000001
+            - name: LOG_LEVEL
+              value: info
+          envFrom:
+            - secretRef:
+                name: formbricks-gateway
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            failureThreshold: 30
+            periodSeconds: 3
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks-gateway
+spec:
+  selector:
+    app: formbricks-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+# `formbricks` is the proxy, not the application (which answers on formbricks-app). The ingress
+# resolves this name for every path it does not send to formbricks-gateway explicitly, so no
+# request reaches the application without passing through the protection — and the routing no
+# longer depends on an ingress controller having picked up the per-path rules.
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks
+spec:
+  selector:
+    app: formbricks-gateway
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 8080

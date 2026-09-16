@@ -1,0 +1,108 @@
+## Find My -> Home Assistant collector.
+##
+## A long-running loop rather than a CronJob, deliberately: dependencies are
+## installed once per pod start instead of on every run, and the Apple session
+## stays warm in memory between cycles. The cost is that a loop cannot report
+## failure by exit code -- so the collector pushes a success timestamp and the
+## alerting keys on that going stale (monitoring-rules/50-findmy.yml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: findmy-collector
+  namespace: findmy
+  labels:
+    app: findmy-collector
+spec:
+  replicas: 1
+  ## The state volume is ReadWriteOnce, so a rolling update would deadlock on
+  ## Multi-Attach waiting for a pod that is waiting for the volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: findmy-collector
+  template:
+    metadata:
+      labels:
+        app: findmy-collector
+    spec:
+      ## Needed only so the collector can write the refreshed session into a
+      ## Secret for PushSecret to carry to the store. The Role is namespace
+      ## scoped and covers secrets this pod already mounts.
+      serviceAccountName: findmy-collector
+      automountServiceAccountToken: true
+      initContainers:
+        ## Installed once per pod start into a shared volume rather than on every
+        ## cycle, which at this interval would be ~96 package-index fetches a day
+        ## and would make each cycle depend on the index being reachable.
+        - name: deps
+          image: python:3.13-slim
+          command:
+            - sh
+            - -c
+            - pip install --quiet --disable-pip-version-check --target /pydeps
+              findmy paho-mqtt paramiko
+          volumeMounts:
+            - name: pydeps
+              mountPath: /pydeps
+      containers:
+        - name: collector
+          image: python:3.13-slim
+          ## The loop lives here rather than inside the program so that a crash
+          ## in one cycle cannot take the workload down; the next cycle simply
+          ## runs. Persistent failure shows up as a stale success timestamp.
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                python /app/collector.py || echo "cycle failed, continuing"
+                sleep "${FINDMY_INTERVAL_S}"
+              done
+          env:
+            ## 15 minutes. A tag only moves when someone carries it, and Apple's
+            ## network is not a real-time feed -- polling harder mostly means
+            ## asking Apple the same question more often.
+            - name: FINDMY_INTERVAL_S
+              value: "900"
+            - name: PYTHONPATH
+              value: /pydeps
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: FINDMY_STATE_DIR
+              value: /state
+            - name: MAC_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: findmy-mac
+                  key: MAC_PASS
+          volumeMounts:
+            - name: pydeps
+              mountPath: /pydeps
+            - name: code
+              mountPath: /app
+            - name: state
+              mountPath: /state
+            - name: account
+              mountPath: /secrets
+              readOnly: true
+          resources:
+            requests:
+              memory: 192Mi
+              cpu: 50m
+            limits:
+              ## Headroom for the Apple library bundle and report decryption.
+              memory: 768Mi
+              cpu: "1"
+      volumes:
+        - name: pydeps
+          emptyDir: {}
+        - name: code
+          configMap:
+            name: findmy-code
+        - name: state
+          persistentVolumeClaim:
+            claimName: findmy-state
+        - name: account
+          secret:
+            secretName: findmy-account

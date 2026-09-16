@@ -1,0 +1,31 @@
+## CA01 certificate for the decoy's TLS services.
+##
+## The TrapEye agent generates a self-signed certificate for every TLS service, which
+## is a fingerprint: anyone who inspects it can tell the service is not real, which is
+## precisely what a decoy must not reveal. The agent has no setting for this — no
+## certificate path, no TLS environment variable, and the vendor's own server-driven
+## config message carries no certificate field — so mdapi/trapeye-image redirects the
+## two rcgen PEM functions to read the certificate and key mounted from this secret
+## instead. See that repo's README for the mechanism and its fail-safes.
+##
+## CN matches the decoy's cover story (an internal backend appliance) and the DNS
+## record that already points at it. A CA01 leaf makes the decoy indistinguishable
+## from a real internal service, so an attacker spends time on it.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: trapeye-tls
+  namespace: honeypot
+spec:
+  secretName: trapeye-tls
+  issuerRef:
+    group: horizon.evertrust.io
+    kind: ClusterIssuer
+    name: horizon-private              # private-tls -> CA01
+  commonName: shop-internal.mdapi.ch
+  dnsNames:
+    - shop-internal.mdapi.ch
+  renewBefore: 720h0m0s                # 30d before expiry; canonical Go-duration form so Fleet sees no drift
+  privateKey:
+    algorithm: RSA
+    size: 2048

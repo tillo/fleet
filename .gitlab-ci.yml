@@ -1,0 +1,214 @@
+# You can override the included template(s) by including variable overrides
+# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
+# Secret Detection customization: https://docs.gitlab.com/ee/user/application_security/secret_detection/pipeline/#customization
+# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
+# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
+# Note that environment variables can be set in several places
+# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+
+# All jobs run on the in-cluster mdapi runner. Set it as the default so inline
+# jobs (e.g. fleet-lint) that don't extend a shared template — which already
+# carry `tags: [mdapi]` — aren't left untagged and stuck pending with no
+# eligible runner. (The runner also accepts untagged jobs as of 2026-06-12, but
+# tagging is the durable guarantee independent of runner registration state.)
+default:
+  tags:
+    - mdapi
+
+stages:
+- lint
+- build
+- test
+- deploy
+- review
+- dast
+- staging
+- canary
+- production
+- incremental rollout 10%
+- incremental rollout 25%
+- incremental rollout 50%
+- incremental rollout 100%
+- performance
+- cleanup
+fleet-lint:
+  stage: lint
+  image: python:3.13-alpine
+  before_script:
+  - pip install --quiet --no-cache-dir pyyaml
+  script:
+  - python3 lint.py
+
+# Bundle validation — the three gates in tools/ci/ (read tools/ci/README.md first).
+#
+# Why this exists: until 2026-09-12 nothing in CI could see inside a Helm chart. lint.py
+# says so itself — it only sees RAW workload manifests, "NOT workloads whose
+# imagePullPolicy lives in Helm values". 31 of 154 bundles are chart-based and nothing
+# had ever checked what they render to. This is a CI technique, not an Argo CD feature:
+# plain `helm template` + `kubectl kustomize`.
+#
+# Binaries are pinned by version AND sha256 and verified before use — bump both together.
+# ⛔ Do NOT add `artifacts:` for the rendered directory. Three charts (horizon,
+# victoria-metrics-operator, vpa) mint a fresh CA and private key on every render, so
+# the output contains real private keys.
+fleet-validate:
+  stage: lint
+  image: alpine:3
+  variables:
+    # Track the cluster. Currently v1.35.2+rke2r1.
+    KUBE_VERSION: "1.35.2"
+    HELM_VERSION: "v4.3.0"
+    HELM_SHA256: "86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb"
+    KUBECTL_VERSION: "v1.36.3"
+    KUBECTL_SHA256: "ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336"
+    KUBECONFORM_VERSION: "v0.7.0"
+    KUBECONFORM_SHA256: "c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3"
+    FLEET_VERSION: "v0.16.1"
+    FLEET_SHA256: "188b5e69f2129c9599f10a13b33251c3c432edb569d1cee66856c8742850d987"
+  before_script:
+  - apk add --no-cache python3 py3-yaml curl tar git
+  - mkdir -p "$CI_PROJECT_DIR/.bin"
+  - curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+  - echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+  - tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm
+  - mv /tmp/linux-amd64/helm "$CI_PROJECT_DIR/.bin/helm"
+  - curl -fsSL -o "$CI_PROJECT_DIR/.bin/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+  - echo "${KUBECTL_SHA256}  $CI_PROJECT_DIR/.bin/kubectl" | sha256sum -c -
+  - curl -fsSL -o /tmp/kubeconform.tgz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+  - echo "${KUBECONFORM_SHA256}  /tmp/kubeconform.tgz" | sha256sum -c -
+  - tar -xzf /tmp/kubeconform.tgz -C "$CI_PROJECT_DIR/.bin" kubeconform
+  - curl -fsSL -o "$CI_PROJECT_DIR/.bin/fleet" "https://github.com/rancher/fleet/releases/download/${FLEET_VERSION}/fleet-linux-amd64"
+  - echo "${FLEET_SHA256}  $CI_PROJECT_DIR/.bin/fleet" | sha256sum -c -
+  - chmod +x "$CI_PROJECT_DIR/.bin/"*
+  script:
+  # 0. repo invariants (tests/README.md). Cheapest gate — ~15s, no binaries, no network —
+  #    so it runs first and fails before the 3-minute render. Each test encodes one
+  #    incident that actually happened, and each was proven to FAIL when violated before
+  #    it shipped.
+  - python3 -m unittest discover -s tests -v
+  # 1. every bundle must build offline, and fit in etcd
+  - FLEET="$CI_PROJECT_DIR/.bin/fleet" python3 tools/ci/bundle-gate.py
+  # 2. render the chart bundles (scratch dir holds generated Secrets — never an artifact)
+  - rm -rf "$CI_PROJECT_DIR/.rendered"
+  - HELM="$CI_PROJECT_DIR/.bin/helm" KUBECTL="$CI_PROJECT_DIR/.bin/kubectl" python3 tools/ci/render-bundles.py --output "$CI_PROJECT_DIR/.rendered" --kube-version "$KUBE_VERSION"
+  # 3. schema-check the rendered output AND every tracked manifest
+  - KUBECONFORM="$CI_PROJECT_DIR/.bin/kubeconform" python3 tools/ci/validate-manifests.py --rendered "$CI_PROJECT_DIR/.rendered" --kube-version "$KUBE_VERSION"
+  after_script:
+  - rm -rf "$CI_PROJECT_DIR/.rendered"
+
+include:
+  - project: mdapi/ci-templates
+    file: /secret-scan.yml
+    ref: main
+
+secret-scan:
+  extends: .secret-scan
+
+# Renovate — Lane-B image bumps + all Fleet Helm chart versions (config in
+# renovate.json). Runs ONLY on a pipeline
+# schedule or a manual web run, never on normal pushes/MRs. Minor/patch MRs
+# auto-merge after their soak window (renovate.json, owner decision 2026-06-29);
+# majors stay MR-only. Token from the masked RENOVATE_TOKEN CI variable (Akeyless
+# source of truth: /mdapi/renovate/gitlab-token). Part of the 2026-06 image-policy work.
+#
+# Release notes: Renovate runs on GitLab but several Lane-B deps (zot, Technitium,
+# keel) have sourceUrl on github.com. Fetching their changelogs needs a github.com
+# token — without it Renovate logs "Release Notes retrieval skipped … no github.com
+# credentials". Renovate auto-reads the GITHUB_COM_TOKEN env var, sourced from the
+# masked GITHUB_COM_TOKEN CI variable (read-only, no-scope PAT; Akeyless source of
+# truth: /mdapi/renovate/github-com-token). No variables: entry needed — GitLab
+# exposes masked CI variables to the job environment automatically.
+#
+# zot credentials: Bussola's image is pinned as zot.mdapi.ch/mdapi/bussola, and
+# zot serves /v2/ behind Basic auth. Without a host rule for that host Renovate
+# got a 401 and logged "Failed to look up docker package …: no-result" on every
+# run from 2026-08-29 (when the Bussola pin landed) to 2026-09-03 — the pin was
+# silently untracked the whole time. Read-only zot account, from the masked
+# ZOT_TOKEN CI variable (Akeyless source of truth: /mdapi/zot/zot-auth/password).
+renovate:
+  stage: lint
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  image:
+    name: ghcr.io/renovatebot/renovate:latest
+    entrypoint: [""]
+  tags:
+    - mdapi
+  variables:
+    RENOVATE_PLATFORM: gitlab
+    RENOVATE_ENDPOINT: https://gitlab.mdapi.ch/api/v4
+    RENOVATE_AUTODISCOVER: "false"
+    # This repo plus the image builders whose own pins Renovate owns. mdapi/trapeye-image
+    # rebuilds the TrapEye decoy agent from an upstream ghcr tag held in a Dockerfile
+    # ARG; bumping that ARG is its only version-specific edit, because the patch and the
+    # injection offsets are re-derived from the binary at build time and both are
+    # fail-closed. Its own renovate.json carries the rules; without listing it here
+    # Renovate never looks at it, since autodiscover is off.
+    RENOVATE_REPOSITORIES: $CI_PROJECT_PATH,mdapi/trapeye-image
+    RENOVATE_GIT_AUTHOR: "Renovate Bot <renovate@mdapi.ch>"
+    RENOVATE_HOST_RULES: '[{"matchHost":"registry.mdapi.ch","hostType":"docker","username":"renovate-bot","password":"$RENOVATE_TOKEN"},{"matchHost":"zot.mdapi.ch","hostType":"docker","username":"zot","password":"$ZOT_TOKEN"}]'
+    # Indirected through a project variable on purpose. A job-level `variables:`
+    # entry in this file OUTRANKS a schedule/manual pipeline variable, so with
+    # `LOG_LEVEL: info` hardcoded here there was no way to get a debug run
+    # without editing and merging this file first — verified 2026-09-03, when a
+    # scheduled run with LOG_LEVEL=debug still reported `run at log level
+    # "info"`. Default lives in the RENOVATE_LOG_LEVEL project variable (info);
+    # to debug once, play the schedule with RENOVATE_LOG_LEVEL=debug and delete
+    # the schedule variable only AFTER the job has finished. Schedule variables
+    # are resolved when the JOB starts, not when the pipeline record is created,
+    # so deleting straight after `play` silently gives a plain info run instead
+    # (that cost two wasted runs on 2026-09-03).
+    LOG_LEVEL: $RENOVATE_LOG_LEVEL
+  before_script:
+    # This GitLab recomputes MR mergeability only ON DEMAND: after any push to
+    # main, every open MR sits at detailed_merge_status=checking until something
+    # asks for a recheck, so Renovate's nightly automerge pass saw the MRs as
+    # unmergeable and never merged them (diagnosed 2026-07-03: four nights of
+    # green, conflict-free minor-bump MRs left open; sidekiq shows
+    # MergeRequestMergeabilityCheckWorker firing only for explicit API
+    # rechecks). Poke a synchronous recheck for every open renovate/* MR and
+    # give the workers a moment before Renovate evaluates automerge.
+    - |
+      node -e '
+      const base = process.env.CI_API_V4_URL, proj = process.env.CI_PROJECT_ID;
+      const h = {"PRIVATE-TOKEN": process.env.RENOVATE_TOKEN};
+      (async () => {
+        const mrs = await (await fetch(`${base}/projects/${proj}/merge_requests?state=opened&per_page=100`, {headers: h})).json();
+        for (const m of mrs.filter(m => m.source_branch.startsWith("renovate/"))) {
+          await fetch(`${base}/projects/${proj}/merge_requests/${m.iid}?with_merge_status_recheck=true`, {headers: h});
+          console.log(`mergeability recheck poked: !${m.iid} ${m.source_branch}`);
+        }
+        await new Promise(r => setTimeout(r, 20000));
+      })().catch(e => console.error("recheck poke failed (non-fatal):", e.message));
+      '
+  script:
+    - renovate
+
+# Public mirror — publishes a FILTERED snapshot of this repo to
+# github.com/tillo/fleet. This replaced the GitLab push mirror (remote mirror 85,
+# disabled 2026-09-05): a push mirror replicates refs, not subtrees, so it had no
+# way to withhold the hosting-tenant namespace.
+#
+# The published repo is a single orphan commit — no history is exported, so nothing
+# that ever sat in an old commit can leak later.
+#
+# Two fail-closed gates live in the script; read the header there before changing it.
+# Onboarding a tenant = add its name to .mirror/private-names.txt and its directory
+# to .mirror/private-paths.txt. Forget the second and GATE 1 fails this job.
+#
+# Inert until MIRROR_SSH_KEY exists (masked, protected file variable holding a
+# deploy key with write access to the GitHub repo).
+public-mirror:
+  stage: deploy
+  image: alpine:3
+  rules:
+  - if: '$CI_COMMIT_BRANCH == "main" && $MIRROR_SSH_KEY'
+  before_script:
+  - apk add --no-cache git openssh-client bash grep findutils sed tar
+  - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  - cp "$MIRROR_SSH_KEY" ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+  - ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+  - export MIRROR_REMOTE="git@github.com:tillo/fleet.git"
+  - bash .mirror/publish-public-mirror.sh "$CI_PROJECT_DIR"

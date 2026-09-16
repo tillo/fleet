@@ -1,0 +1,215 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: grafana
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      serviceAccountName: grafana
+      securityContext:
+        fsGroup: 472
+        runAsUser: 472
+        runAsGroup: 472
+      imagePullSecrets:
+      - name: zot-pull
+      containers:
+      - name: grafana
+        image: zot.mdapi.ch/grafana/grafana:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: GF_SERVER_ROOT_URL
+          value: https://grafana.mdapi.ch
+        # 2026-07-29 dashboard audit: the provisioned Kubernetes-folder dashboards
+        # default to 10s refresh (44-target dashboards) — floor it globally.
+        - name: GF_DASHBOARDS_MIN_REFRESH_INTERVAL
+          value: 30s
+        - name: GF_SERVER_DOMAIN
+          value: grafana.mdapi.ch
+        # oauth2-proxy-admin + Keycloak `mdapi-admin` role is the real access
+        # gate. Inside Grafana, treat any authenticated visitor as anonymous
+        # Viewer so dashboards render without a separate Grafana login.
+        # /login still works for editing as admin.
+        - name: GF_AUTH_ANONYMOUS_ENABLED
+          value: "true"
+        - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+          value: Viewer
+        - name: GF_AUTH_ANONYMOUS_ORG_NAME
+          value: "Main Org."
+        # Allow Ceph dashboard (ceph.mdapi.ch) to embed Grafana panels via iframe
+        # (d-solo). NOTE: the iframe target must be an endpoint the browser can reach
+        # WITHOUT the oauth2-proxy redirect (SSO cookies aren't sent cross-site in
+        # iframes) — see grafana embed endpoint decision.
+        - name: GF_SECURITY_ALLOW_EMBEDDING
+          value: "true"
+        ## Backend DB lives on ha-recorder-pg (CNPG). SQLite hits SQLITE_BUSY
+        ## storms on Grafana 13's unified-storage / job-driver / provisioning
+        ## concurrency. Postgres handles it natively. Password is pulled from
+        ## Akeyless via the ExternalSecret as GF_DATABASE_PASSWORD.
+        - name: GF_DATABASE_TYPE
+          value: postgres
+        - name: GF_DATABASE_HOST
+          ## Moved off ha-recorder-pg 2026-07-31 (decision 8b): the recorder
+          ## cluster's 07-30 WAL incident took Grafana down with it. Old
+          ## `grafana` DB stays there as rollback until cleanup.
+          value: grafana-pg-rw.monitoring.svc.cluster.local:5432
+        - name: GF_DATABASE_NAME
+          value: grafana
+        - name: GF_DATABASE_USER
+          value: grafana_rw
+        - name: GF_DATABASE_SSL_MODE
+          value: disable
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
+        - name: GF_INSTALL_PLUGINS
+          value: ""
+        envFrom:
+        - secretRef:
+            name: grafana-env-secret
+        resources:
+          requests:
+            cpu: 50m
+            memory: 512Mi
+          limits:
+            memory: 1Gi
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/grafana
+        - name: datasources
+          mountPath: /etc/grafana/provisioning/datasources
+          readOnly: true
+        - name: dashboards-provider
+          mountPath: /etc/grafana/provisioning/dashboards
+          readOnly: true
+        ## One mount per dashboard folder. Each becomes a Grafana folder via the
+        ## provider's foldersFromFilesStructure. Split from a single ConfigMap on
+        ## 2026-08-07: the combined CM had reached 83% of the 1 MiB cap.
+        ## Adding a folder = a dir under dashboards/, a mount here, and a volume below.
+        - name: dashboards-overview
+          mountPath: /var/lib/grafana/dashboards/mdapi/Overview
+          readOnly: true
+        - name: dashboards-ceph
+          mountPath: /var/lib/grafana/dashboards/mdapi/Ceph
+          readOnly: true
+        - name: dashboards-storage
+          mountPath: /var/lib/grafana/dashboards/mdapi/Storage
+          readOnly: true
+        - name: dashboards-network
+          mountPath: /var/lib/grafana/dashboards/mdapi/Network
+          readOnly: true
+        - name: dashboards-home
+          mountPath: /var/lib/grafana/dashboards/mdapi/Home
+          readOnly: true
+        - name: dashboards-platform
+          mountPath: /var/lib/grafana/dashboards/mdapi/Platform
+          readOnly: true
+        - name: dashboards-harvester
+          mountPath: /var/lib/grafana/dashboards/harvester
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          ## Grafana 13 plugin registration takes ~3 min on cold-cache boots
+          ## (exploretraces, lokiexplore, etc.). Liveness must outlive that or
+          ## the pod gets killed mid-init and never finishes.
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+      # Dashboard sidecar: live-imports the Harvester dashboards (cattle-dashboards
+      # ConfigMaps labelled grafana_dashboard=1) into the "Harvester" Grafana folder,
+      # replacing the embedded Grafana's sidecar after the rancher-monitoring server
+      # stack was retired (2026-06-24). RBAC (scoped read on cattle-dashboards CMs)
+      # is in the grafana-harvester-sidecar-rbac bundle. Image via zot pull-through
+      # (rancher/** is already allow-listed).
+      - name: dashboard-sidecar
+        image: zot.mdapi.ch/rancher/mirrored-kiwigrid-k8s-sidecar:1.30.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: LABEL
+          value: grafana_dashboard
+        - name: LABEL_VALUE
+          value: "1"
+        - name: FOLDER
+          value: /var/lib/grafana/dashboards/harvester
+        # Route each dashboard CM into a subfolder named by its `grafana_folder`
+        # annotation (kube-prom set -> "Kubernetes", Rancher -> "Rancher",
+        # Longhorn -> "Longhorn"); un-annotated CMs (the Harvester ones) stay at
+        # the root. Paired with provider foldersFromFilesStructure: true.
+        - name: FOLDER_ANNOTATION
+          value: grafana_folder
+        - name: RESOURCE
+          value: configmap
+        - name: NAMESPACE
+          value: cattle-dashboards
+        - name: METHOD
+          value: WATCH
+        - name: UNIQUE_FILENAMES
+          value: "true"
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+        volumeMounts:
+        - name: dashboards-harvester
+          mountPath: /var/lib/grafana/dashboards/harvester
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: grafana-data
+      - name: datasources
+        configMap:
+          name: grafana-datasources
+      - name: dashboards-provider
+        configMap:
+          name: grafana-dashboards-provider
+      - name: dashboards-overview
+        configMap:
+          name: grafana-dashboards-overview
+      - name: dashboards-ceph
+        configMap:
+          name: grafana-dashboards-ceph
+      - name: dashboards-storage
+        configMap:
+          name: grafana-dashboards-storage
+      - name: dashboards-network
+        configMap:
+          name: grafana-dashboards-network
+      - name: dashboards-home
+        configMap:
+          name: grafana-dashboards-home
+      - name: dashboards-platform
+        configMap:
+          name: grafana-dashboards-platform
+      - name: dashboards-harvester
+        emptyDir: {}
