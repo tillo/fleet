@@ -1,0 +1,16 @@
+defaultNamespace: cephfs-kmod
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # Privileged module-loader DaemonSet — relax PodSecurity for this ns.
+  pod-security.kubernetes.io/enforce: privileged
+helm:
+  maxHistory: 25
+# Auto-builder for the CephFS kernel module (ceph.ko). The SUSE Linux Micro 6.2 kernel
+# (6.12.0-160000.28-default) is built with CONFIG_CEPH_FS=n — libceph + rbd exist but the
+# CephFS kernel client module does not, and no SUSE package ships it. This DaemonSet builds
+# ceph.ko from the matching kernel-source against the exact running kernel, installs it to
+# /usr/local/lib/ceph-kmod (COS_PERSISTENT), and loads it — rebuilding after kernel upgrades.
+# Lets the Rook ceph-csi cephfs driver (cephFsClientType: autodetect) use the fast kernel
+# client instead of ceph-fuse. Validated build 2026-06-14 (vermagic-matched, loads, cephfs
+# registered). NOT Keel/Renovate-tracked (base image opensuse/leap:16.0 floats with the OS).

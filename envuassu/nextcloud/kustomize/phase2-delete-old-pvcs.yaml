@@ -1,0 +1,34 @@
+# Phase-2 storage migration (2026-08-03): the AIO chart still renders the
+# original Longhorn PVCs, but data moved to the -ceph claims (see
+# phase2-ceph-pvcs.yaml) and the old live PVCs were deleted in the final
+# sweep. Delete-patch them out of the render so Fleet stops reporting
+# "pvc ... missing" — and so a forced redeploy can't recreate 225Gi of
+# orphaned Longhorn volumes. (nextcloud-aio-database is NOT here: it still
+# lives on Longhorn by design.)
+#
+# `$patch: delete` belongs at the DOCUMENT ROOT, not under metadata: nested
+# under metadata it silently no-ops and the PVC stays in the render — which is
+# what kept this bundle Modified from 2026-08-04 to 2026-08-08.
+# Unlike the cribl chart, the AIO chart DOES render namespace: on its PVCs,
+# so the namespace stays here — a strategic-merge patch must match it.
+# Verified with `helm template ... | kubectl kustomize`: all three disappear.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-aio-clamav
+  namespace: envuassu
+$patch: delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-aio-database-dump
+  namespace: envuassu
+$patch: delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nextcloud-aio-nextcloud-data
+  namespace: envuassu
+$patch: delete

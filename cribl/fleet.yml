@@ -1,0 +1,28 @@
+defaultNamespace: cribl
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+# ⚠️ This chart is pulled from an EXTERNAL Helm repo at BUNDLING time, and Fleet
+# bundles the whole GitRepo as a unit: when criblio.github.io is unavailable the
+# GitRepo goes Stalled=True and bundling freezes for EVERY bundle in this repo,
+# not just this one. Nothing else can deploy until it clears, and Fleet does not
+# retry the same commit — a new commit (or a forceSyncGeneration bump) is what
+# unsticks it. Seen 2026-08-28: a transient 503 on the repo index froze an
+# unrelated monitoring-rules change. If this recurs often enough to be a
+# nuisance, the fix is to vendor the chart into this repo rather than resolve it
+# upstream on every bundling run.
+helm:
+  maxHistory: 25
+  releaseName: logstream-leader
+  repo: https://criblio.github.io/helm-charts/
+  chart: logstream-leader
+  version: 4.19.2  # Renovate-managed (renovate.json)
+  valuesFiles:
+    - values.yml
+# Post-render the chart with kustomize to add Keel annotations to the leader
+# Deployment's METADATA - the logstream-leader chart only exposes podAnnotations
+# (pod template), which Keel does not read, so Keel never watched the workload.
+# Same helm+kustomize pattern as envuassu/nextcloud; verified locally with
+# `helm template | kubectl kustomize` before committing.
+kustomize:
+  dir: kustomize

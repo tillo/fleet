@@ -1,0 +1,46 @@
+## ObjectBucketClaim backing the zot registry with the IN-CLUSTER Ceph RGW
+## object store, replacing the external Garage cluster on salt/pepper.
+##
+## WHY THIS MOVED (2026-09-17)
+## zot's blobs lived in the external Garage on salt+pepper. The stated reason was
+## bootstrap independence: keep the registry off Ceph/Longhorn so it can serve the
+## images that bring those back up. Measured, that guarantee did not exist:
+##   - zot's sync list contains NO rook or ceph prefix, so it could never have
+##     bootstrapped Ceph;
+##   - only 52 of 628 running container images (~8%) are pulled from zot at all;
+##   - zot is `onDemand: true`, a pull-through cache, so a miss needs the upstream
+##     registry anyway.
+## Meanwhile the cost was real: salt/pepper are being decommissioned, pepper stalls
+## for 80-160s at a time (see ~/pepper-garage-stall-20260917.md), and zot-images was
+## the ONE bucket with no offsite copy.
+##
+## A registry can never be the bottom of the bootstrap stack anyway — starting the
+## registry requires the registry's own image. That guarantee now lives where it
+## belongs: image tarballs seeded on each node under
+## /var/lib/rancher/rke2/agent/images/, which RKE2 imports at agent start and which
+## depend on nothing but local disk.
+##
+## So zot's backend is now an ordinary availability decision, and the in-cluster
+## RGW (CephObjectStore `ceph-objectstore`, 2 replicas, Ready since ~2026-06) is the
+## cheapest correct answer: no new component, HA, and no external hardware.
+##
+## ⚠️ Nothing is migrated. zot is a pull-through cache whose contents are entirely
+## reproducible (upstream mirrors + CI-built images rebuildable from GitLab), so the
+## new bucket starts EMPTY and refills on demand. The old 25 GB is discardable.
+##
+## Rook creates both the bucket and its S3 user from this claim, and publishes:
+##   ConfigMap/zot-images -> BUCKET_NAME, BUCKET_HOST, BUCKET_PORT
+##   Secret/zot-images    -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+## Those values are then mirrored into Akeyless (/mdapi/zot/ceph-s3-*) so the
+## existing ExternalSecret keeps templating config.json from a single source of
+## truth, as everything else on this estate does.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: zot-images
+  namespace: zot
+spec:
+  ## generateBucketName (not bucketName) so Rook owns the lifecycle and we never
+  ## collide with a pre-existing bucket.
+  generateBucketName: zot-images
+  storageClassName: ceph-bucket

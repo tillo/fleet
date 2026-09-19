@@ -1,0 +1,23 @@
+## Open WebUI's whole state: SQLite (users, chats, prompts, model presets),
+## uploaded documents and the Chroma vector store, all under DATA_DIR.
+## Without this the app is amnesiac — every rollout drops all accounts and
+## history, which is how the first draft of this bundle was written.
+##
+## Longhorn recurring-job backup labels are NOT set here: longhorn-backup-labels.sh
+## and the Windmill backup_label_enforcer apply them by namespace. `openwebui`
+## is in neither the no-backup namespace list nor the excluded-PVC list, so it
+## picks up the default group automatically.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwebui-data
+  namespace: openwebui
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # SQLite + config is tens of MB; the headroom is for RAG uploads and the
+      # embedding cache, which is what actually grows.
+      storage: 20Gi

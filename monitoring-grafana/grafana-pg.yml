@@ -1,0 +1,208 @@
+## Dedicated tiny CNPG Postgres for Grafana's backend DB (user decision 8b,
+## 2026-07-31). Until now Grafana used a `grafana` database ON the
+## home-assistant/ha-recorder-pg cluster — which chained monitoring
+## availability to the smart-home recorder DB: the 07-29/30 purge-night WAL
+## incident on ha-recorder-pg took Grafana down ~32h (48 crash-loop
+## restarts; DB connection refused at boot is fatal for Grafana).
+##
+## Sizing rationale: the DB is small and mostly disposable — 63/64
+## dashboards + all recording rules are fleet-provisioned; unified storage
+## holds little beyond sessions/annotations/short-urls. Hence: no barman.
+## Durability = Longhorn 2-replica volumes + the recurring Longhorn backup
+## groups (backup_label_enforcer labels the PVCs automatically).
+## Rollback: the old `grafana` DB stays untouched on ha-recorder-pg until a
+## later cleanup (see nightwindow-next/WORKLIST.md).
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: grafana-pg
+  namespace: monitoring
+spec:
+  backup:
+    ## G6 (infra-jjb, 2026-08-15): barman to the external Garage — this
+    ## cluster previously had NO offsite story at all.
+    barmanObjectStore:
+      destinationPath: s3://cnpg-grafana-pg
+      ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the IN-CLUSTER Ceph
+      ## RGW, as part of retiring both those hosts. This is the "local" half of
+      ## the backup architecture: short-window PITR and granular restore live
+      ## here; the offsite copy is a separate, client-side-encrypted channel.
+      ##
+      ## ⛔ NEW bucket name on purpose. The Garage bucket was `grafana-pg-backup`;
+      ## reusing it would mean a half-applied change (new store, stale
+      ## endpointURL) kept writing to Garage and SUCCEEDED, silently. With a
+      ## distinct name that mistake fails closed with NoSuchBucket.
+      ##
+      ## ⛔⛔ Changing destinationPath starts an EMPTY archive. WAL archiving
+      ## alone is not a backup -- paperless-pg proved that with 33k objects and
+      ## zero base backups. A one-shot Backup is taken immediately after this
+      ## lands, and `lastSuccessfulBackup` is the only acceptable evidence.
+      ##
+      ## ⭐ TLS restored. !369 landed this store on plain http, which handed
+      ## back exactly the property the Garage terminator was built for on
+      ## 2026-09-05: pods on qui/quo/qua reach an RGW pod on another node across
+      ## the physical LAN, over an UNENCRYPTED VXLAN overlay, and barman does not
+      ## encrypt. "It stays in the cluster" was the wrong reassurance -- the
+      ## cluster is three separate machines. RGW now carries its own house-PKI
+      ## leaf (rook-ceph-objectstore-users/rgw-tls-cert.yml) and this dials it.
+      endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+      ## The CA here is the house chain (MDAPI Root + MDAPI Issuing CA 01), which
+      ## is what a Horizon-issued RGW leaf chains to. The secret's NAME still says
+      ## garage-transit because that is where this chain was first needed; the
+      ## contents are correct and unchanged. Renaming it across six namespaces is
+      ## a separate change from fixing the transport.
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-grafana-pg
+          key: AWS_ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-grafana-pg
+          key: AWS_SECRET_ACCESS_KEY
+        region:
+          name: cnpg-rgw-region
+          key: REGION
+      ## ⛔ `data:` and `wal:` were both absent, so CNPG's defaults applied: ONE
+      ## upload worker and NO compression anywhere. This bucket is **70.6 GiB**
+      ## for a Grafana database — the same symptom ha-recorder-pg showed at
+      ## 1.68 TiB for 17 GB, where a base backup crawled at 0.3-1.0 MiB/s while
+      ## the storage, the TLS terminator and Garage all sat idle.
+      ## bootstrap/gitlab-pg has carried jobs + gzip all along without either
+      ## problem. jobs: 2 matches it and fits this pod's 1-CPU limit.
+      ## ⚠️ Compression is recorded PER BACKUP — existing backups stay
+      ## restorable, and nothing shrinks retroactively; the 70.6 GiB needs the
+      ## 14d retention to actually run.
+      data:
+        compression: gzip
+        jobs: 2
+      wal:
+        compression: gzip
+    retentionPolicy: "14d"
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  ## Same lesson as ha-recorder-pg (2026-06-15): soft anti-affinity let both
+  ## instances co-locate; `required` is always satisfiable (2 instances,
+  ## 3 nodes) and guarantees real node-failure protection.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    ## DB is ~tens of MB; 5Gi leaves a deep WAL cushion (the ha-recorder
+    ## 07-30 disk-full lesson: pg_wal bursts eat headroom fast).
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    ## Lossless failover, same pattern as ha-recorder-pg: preferred keeps
+    ## availability when the standby is down.
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: grafana
+      owner: grafana_rw
+      secret:
+        name: grafana-pg-app
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int
+      # renders as a perpetual Fleet "Modified" diff (1 vs "1").
+      cpu: "1"
+      memory: 1Gi
+---
+## App-role credentials. Same Akeyless key Grafana's deployment already
+## consumes as GF_DATABASE_PASSWORD (grafana-es.yml) — CNPG initdb sets the
+## grafana_rw role password from here, so the migration is host-swap only.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: grafana-pg-app
+  namespace: monitoring
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: grafana-pg-app
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      data:
+        username: grafana_rw
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/grafana/pg-password
+      secretKey: password
+---
+## S3 creds for grafana-pg barman backups (G6, beads infra-jjb, 2026-08-15).
+## Key GK3afd8019c7a64b6ebe8b49d5 scoped RW to the grafana-pg-backup bucket on the external Garage;
+## offsite-swept to B2/SFTP by garage_offsite_backup.
+## ⚠️ 2026-09-19: NO LONGER REFERENCED by the cluster above -- the barman store
+## moved to the in-cluster Ceph RGW and now uses the OBC-written secret instead.
+## This is kept ONLY so the abandoned Garage store on salt stays readable while
+## that host is still up: it holds the sole pre-cutover PITR history, and the
+## credentials to reach it exist nowhere else in git. Delete it together with
+## the Garage buckets when salt is powered off -- an ExternalSecret nothing
+## consumes is exactly the kind of config that rots into a false sense of cover.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: grafana-pg-backup-s3
+  namespace: monitoring
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: grafana-pg-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ACCESS_KEY_ID: "{{ .access_key }}"
+        ACCESS_SECRET_KEY: "{{ .secret_key }}"
+        ## Garage validates the SigV4 region scope; barman defaults us-east-1.
+        REGION: "garage"
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/monitoring/grafana-pg-backup-s3/access_key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/monitoring/grafana-pg-backup-s3/secret_key
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: grafana-pg-daily
+  namespace: monitoring
+spec:
+  schedule: "0 30 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: grafana-pg

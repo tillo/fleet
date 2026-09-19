@@ -1,0 +1,38 @@
+## Barman object store for bussola-pg, on the in-cluster Ceph RGW.
+##
+## Replaces the bucket of the same purpose on the salt/pepper Garage, which is
+## being decommissioned. The ObjectBucketClaim is what makes this declarative:
+## it creates BOTH the bucket and a credential scoped to just that bucket, so
+## nothing has to be created out-of-band or mirrored through Akeyless.
+##
+## ⭐ `bucketName` (not `generateBucketName`): verified 2026-09-19 that Rook
+## honours it verbatim -- the ConfigMap came back with BUCKET_NAME exactly as
+## asked. That matters because CNPG's destinationPath is a literal string and
+## cannot be templated from the OBC's ConfigMap.
+##
+## The OBC writes secret/cnpg-bussola-pg in this namespace with AWS_ACCESS_KEY_ID and
+## AWS_SECRET_ACCESS_KEY.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-bussola-pg
+  namespace: bussola
+spec:
+  bucketName: cnpg-bussola-pg
+  storageClassName: ceph-bucket
+---
+## ⚠️ NOT a credential. `us-east-1` is RGW's default zonegroup and is public
+## knowledge; it lives in a Secret only because CNPG types `region` as a
+## SecretKeySelector, so a constant has no other way to be referenced. Rook's
+## OBC secret carries only the two key fields, which is why this cannot simply
+## ride along there.
+##
+## barman-cloud signs with SigV4 and botocore refuses to sign without a region,
+## so leaving it unset fails at the first WAL upload, not at apply time.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: bussola
+stringData:
+  REGION: us-east-1

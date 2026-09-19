@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: garage
+  namespace: transit
+## ⛔⛔ PEPPER (192.168.1.219) REMOVED 2026-09-18 — it was retired and powered off.
+##
+## This is a MANUALLY MANAGED Endpoints object: it has no selector, so nothing
+## health-checks it and kube-proxy keeps load-balancing to whatever is listed.
+## Leaving a dead address here does not degrade gracefully — it fails a share of
+## every request through garage.transit.svc. Measured right after pepper went
+## down: 3 of 12 TCP connects to the ClusterIP failed, and the consumers include
+## ha-recorder-pg's barman backups and the esphome volsync repo.
+##
+## ⇒ Whenever a host behind a hand-written Endpoints is taken out of service, this
+## file has to change in the SAME operation. There is no controller to notice.
+##
+## Put pepper back only together with bringing the node back up (IPMI:
+## chassis power on, 192.168.1.195 — see memory
+## salt_pepper_imm_ipmi_out_of_band_power_2026_09_17).
+subsets:
+  - addresses:
+      - ip: 192.168.1.207   # salt
+    ports:
+      - name: api
+        port: 30188
+      ## nginx TLS terminator on each Garage host -- see garage-svc.yml.
+      - name: api-tls
+        port: 30288
+      - name: console
+        port: 30186

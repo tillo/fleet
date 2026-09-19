@@ -1,0 +1,91 @@
+## Weekly maintenance for the Joplin events table.
+##
+## CORRECTION 2026-08-06: `events` is Joplin Server's generic event log —
+## it is NOT the sync-delta feed. Client sync cursors read the changes
+## table (`changes_2` since the 3.x `split_changes` migration ran on
+## 2026-05-18; the old `changes` table is a frozen pre-split archive).
+## Pruning `events` therefore cannot invalidate any client's sync cursor.
+## Old event rows are just dead weight — Joplin Server has no built-in
+## retention path for them.
+##
+## Background:
+## On 2026-05-14 the events table had 273,502 rows going back to
+## 2023-12-22 (17 months unvacuumed, 2.5 GB on a 5 GiB PVC). Postgres
+## defaults of work_mem=4 MB couldn't hold a GROUP BY of that size,
+## TaskService #11 ("Process shared items") hung, and every MCP call
+## timed out as "retry later".
+##
+## This CronJob keeps `events` to a 30-day rolling window so the bloat
+## can't return. VACUUM (regular, not FULL) marks dead pages reusable
+## without rewriting the file or locking it long.
+##
+## Schedule: Sundays 02:30 UTC ≈ 03:30 CET / 04:30 CEST. Still in the cheap,
+## low-traffic window either side of DST. Originally set with
+## `timeZone: Europe/Zurich` (CronJob.spec.timeZone, k8s 1.27+) but
+## kube-state-metrics ships without tzdata in its container image and
+## panics with `unknown time zone Europe/Zurich` when it tries to render
+## the cron schedule metric — taking the whole kube_state_metrics scraper
+## down and silently breaking every kube_* alert. Set the schedule in
+## UTC to sidestep the issue. (Upstream tracking: a tzdata-loaded
+## kube-state-metrics image would let us go back to spec.timeZone.)
+##
+## Safety: DELETE is bounded to created_time < now - 30d. Sync cursors
+## are unaffected (they live on the changes_2 table, see the correction
+## above), so this window only limits how far back the event log reaches.
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-events-cleanup
+  namespace: joplin
+spec:
+  schedule: "30 2 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: OnFailure
+          imagePullSecrets:
+          - name: zot-pull
+          containers:
+          - name: cleanup
+            image: zot.mdapi.ch/library/postgres:17
+            imagePullPolicy: Always
+            env:
+            - name: PGHOST
+              value: postgres.joplin.svc.cluster.local
+            - name: PGUSER
+              value: joplin
+            - name: PGDATABASE
+              value: joplin
+            # psql reads PGPASSWORD; the secret stores it under POSTGRES_PASSWORD
+            # (shared key name with the postgres StatefulSet's own env). Map it
+            # explicitly so the cleanup script doesn't prompt for a password and
+            # silently fail with "fe_sendauth: no password supplied".
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-env-secret
+                  key: POSTGRES_PASSWORD
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              cutoff_ms=$(date -d '30 days ago' +%s)000
+              echo "Deleting events older than $(date -d '30 days ago' -Is) (cutoff=$cutoff_ms)..."
+              psql -v ON_ERROR_STOP=1 -c "DELETE FROM events WHERE created_time < $cutoff_ms;"
+              echo "VACUUM ANALYZE events..."
+              psql -v ON_ERROR_STOP=1 -c "VACUUM (ANALYZE) events;"
+              echo "Stats after cleanup:"
+              psql -v ON_ERROR_STOP=1 -c "SELECT pg_size_pretty(pg_total_relation_size('events')) AS size, (SELECT count(*) FROM events) AS rows;"
+            resources:
+              requests:
+                cpu: 25m
+                memory: 64Mi
+              limits:
+                memory: 128Mi

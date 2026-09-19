@@ -1,0 +1,114 @@
+## External vantage point — crossing what the world sees with what we see.
+##
+## Every synthetic probe in 10-blackbox-probes.yml runs INSIDE the estate, so by
+## construction none of them can tell "the service is broken" apart from "the
+## path to the service is broken". The existing dns_external_google reference
+## probe covers the OUTBOUND direction (can we reach the Internet); these rules
+## cover the INBOUND direction (can the Internet reach us), which nothing else
+## measures.
+##
+## Source: f/probe/ripe_atlas_measurements, fed by the six RIPE Atlas
+## measurements described in ~/ripe-atlas-measurements-plan.md.
+##
+## ⭐ mdapi.ch is used as the edge proxy deliberately: it resolves to
+## 31.3.128.50 → the prod ingress 192.168.1.191, which is the common path every
+## https://*.mdapi.ch synthetic probe already traverses. So "can the world reach
+## mdapi.ch" is the shared prefix of almost every internal probe's path.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: external-vantage
+  namespace: monitoring
+  labels:
+    ## Without this selector vmalert never loads the rules — they would sit in
+    ## git and in the CR looking deployed, and could never fire. lint.py checks
+    ## for exactly this.
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-external-vantage.recording
+    rules:
+    ## External reachability of our edge, one series per address family.
+    - record: mdapi:atlas_edge_reachable:ratio
+      expr: ripe_atlas_msm_success_ratio{target="mdapi.ch", type="ping"}
+    ## Median RTT to the edge from probes worldwide, per address family.
+    ## Recorded, not alerted: RTT legitimately differs between the v4 and v6
+    ## probe sets, so it informs a dashboard rather than a page.
+    - record: mdapi:atlas_edge_rtt:median_ms
+      expr: ripe_atlas_msm_rtt_median_ms{target="mdapi.ch", type="ping"}
+    ## How many internal synthetic probes are currently unhealthy. Mirrors the
+    ## SyntheticProbeFailing expression in 11-blackbox-alerts.yml (same 5m
+    ## window, same 0.8 threshold, same exclusion of the outbound reference
+    ## probe) so the two signals cannot disagree about what "failing" means.
+    ## `or vector(0)` because count() over an empty set returns nothing, and a
+    ## missing series would break the attribution below.
+    - record: mdapi:synthetic_probes_failing:count
+      expr: |
+        count(
+          avg_over_time(probe_success{component!="", team="mdapi", probe!="dns_external_google"}[5m]) < 0.8
+        ) or vector(0)
+
+  - name: app-external-vantage.attribution
+    rules:
+    - alert: EdgeUnreachableFromInternetOnly
+      ## ⭐ THE case nothing else in this estate can see: probes worldwide cannot
+      ## reach our edge, while every internal synthetic probe is green. The
+      ## services are fine; the path to them is not — an upstream, routing or
+      ## ISP-side fault.
+      ##
+      ## Diagnostically this is the opposite of the usual incident, and it is
+      ## also the one most likely to be misread: without this rule the estate
+      ## looks perfectly healthy from inside while nobody outside can reach it.
+      ##
+      ## Thresholds from the measured baseline (first real sample 64/65 = 0.985,
+      ## with single-probe failures being ordinary Internet weather): 0.5 is far
+      ## below anything normal, and 30m rides out a transient.
+      expr: |
+        (min(mdapi:atlas_edge_reachable:ratio) < 0.5)
+        and on() (mdapi:synthetic_probes_failing:count == 0)
+      for: 30m
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "The Internet cannot reach our edge, but every internal probe is green"
+        description: |
+          RIPE Atlas probes worldwide are failing to reach mdapi.ch while the
+          internal synthetic probes all pass. That combination means the fault
+          is between us and the world — upstream, routing, or the ISP — not in
+          the services themselves.
+          Do not start by debugging the applications. Check the edge:
+            ssh bpi 'ip -4 route get 1.1.1.1; ip -6 route get 2606:4700:4700::1111'
+          and compare address families in mdapi:atlas_edge_reachable:ratio — a
+          v4-only or v6-only failure narrows it immediately.
+          Per-probe detail: https://atlas.ripe.net/measurements/ (tag mdapi-selfmon)
+    - alert: IPv6ReachabilityLagsIPv4
+      ## v6 can rot silently while v4 stays perfect: the services answer, the
+      ## internal probes pass, and only the part of the Internet that reaches us
+      ## over v6 is affected. That matters here specifically — the dual-stack
+      ## vantage point is the scarce thing this site contributes in AS212865.
+      ##
+      ## ⚠ Methodological caveat, deliberately handled by wide thresholds: the
+      ## v4 and v6 measurements select their ~10 probes INDEPENDENTLY, so they
+      ## are different hosts in different places. A small ratio gap is probe
+      ## selection, not path quality. Only an unambiguous divergence — v6 in the
+      ## floor while v4 is healthy — is real, hence 0.5 vs 0.9 and a full hour.
+      expr: |
+        (mdapi:atlas_edge_reachable:ratio{af="6"} < 0.5)
+        and on() (mdapi:atlas_edge_reachable:ratio{af="4"} > 0.9)
+      for: 1h
+      labels:
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "IPv6 reachability to our edge has fallen well behind IPv4"
+        description: |
+          Probes worldwide reach mdapi.ch over IPv4 but largely fail over IPv6.
+          The services are up; the v6 path is not. Check the edge still holds its
+          delegation and is advertising it:
+            ssh bpi 'ip -6 addr show dev pppoe-wan; ip -6 route show default'
+          and confirm the ingress still answers on 2a0d:d05:401:e900::3.
+          Compare mdapi:atlas_edge_rtt:median_ms across af for a path change.
+          Context: memory bpi-r4-wan-ip-architecture.

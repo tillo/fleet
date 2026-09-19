@@ -1,0 +1,126 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gitlab-pg
+  namespace: bootstrap
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  primaryUpdateStrategy: unsupervised
+
+  ## Keep primary + replica on different nodes. CNPG defaults to *soft*
+  ## (preferred) anti-affinity, which can let both copies co-locate on one
+  ## node during a rolling restart -- then a node loss takes out both and the
+  ## replica buys zero protection (the trap ha-recorder-pg hit 2026-06-15).
+  ## required is always satisfiable here (2 instances, 3 nodes).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "400"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+    # GitLab's required extensions, plus pg_stat_statements which our
+    # bundled bitnami install already has loaded.
+    shared_preload_libraries:
+    - pg_stat_statements
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the standby to confirm each commit. Default async
+    ## drops the last unreplicated writes on promotion. dataDurability:
+    ## preferred falls back to async if the standby is down so GitLab writes
+    ## never stall on a missing replica. (Mirrors ha-recorder-pg; CNPG >=1.25.)
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: gitlabhq_production
+      owner: gitlab
+      # CNPG auto-creates a Secret `gitlab-pg-app` with the generated
+      # password. We read it post-deploy and stage it in akeyless / GitLab
+      # values for the cutover.
+      postInitTemplateSQL:
+      - CREATE EXTENSION IF NOT EXISTS pg_trgm
+      - CREATE EXTENSION IF NOT EXISTS btree_gist
+      - CREATE EXTENSION IF NOT EXISTS amcheck
+      - CREATE EXTENSION IF NOT EXISTS pg_stat_statements
+
+  backup:
+    barmanObjectStore:
+      # WAL + base backups land in Garage on salt/pepper (independent of
+      # the prod cluster's storage layer). Switched 2026-05-13 from
+      # api.minio.home.tillo.ch as part of MinIO retirement (#19).
+      destinationPath: s3://cnpg-gitlab-pg
+      ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the IN-CLUSTER Ceph
+      ## RGW, as part of retiring both those hosts. This is the "local" half of
+      ## the backup architecture: short-window PITR and granular restore live
+      ## here; the offsite copy is a separate, client-side-encrypted channel.
+      ##
+      ## ⛔ NEW bucket name on purpose. The Garage bucket was `gitlab-pg-backup`;
+      ## reusing it would mean a half-applied change (new store, stale
+      ## endpointURL) kept writing to Garage and SUCCEEDED, silently. With a
+      ## distinct name that mistake fails closed with NoSuchBucket.
+      ##
+      ## ⛔⛔ Changing destinationPath starts an EMPTY archive. WAL archiving
+      ## alone is not a backup -- paperless-pg proved that with 33k objects and
+      ## zero base backups. A one-shot Backup is taken immediately after this
+      ## lands, and `lastSuccessfulBackup` is the only acceptable evidence.
+      ##
+      ## ⭐ TLS restored. !369 landed this store on plain http, which handed
+      ## back exactly the property the Garage terminator was built for on
+      ## 2026-09-05: pods on qui/quo/qua reach an RGW pod on another node across
+      ## the physical LAN, over an UNENCRYPTED VXLAN overlay, and barman does not
+      ## encrypt. "It stays in the cluster" was the wrong reassurance -- the
+      ## cluster is three separate machines. RGW now carries its own house-PKI
+      ## leaf (rook-ceph-objectstore-users/rgw-tls-cert.yml) and this dials it.
+      endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+      ## The CA here is the house chain (MDAPI Root + MDAPI Issuing CA 01), which
+      ## is what a Horizon-issued RGW leaf chains to. The secret's NAME still says
+      ## garage-transit because that is where this chain was first needed; the
+      ## contents are correct and unchanged. Renaming it across six namespaces is
+      ## a separate change from fixing the transport.
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-gitlab-pg
+          key: AWS_ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-gitlab-pg
+          key: AWS_SECRET_ACCESS_KEY
+        # Garage validates the SigV4 region scope on HeadBucket; barman
+        # defaults to us-east-1, so the region must be set explicitly.
+        region:
+          name: cnpg-rgw-region
+          key: REGION
+      wal:
+        compression: gzip
+      data:
+        compression: gzip
+        immediateCheckpoint: false
+        jobs: 2
+    retentionPolicy: "14d"
+---
+# Daily base backup at 03:00 Europe/Zurich.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: gitlab-pg-daily
+  namespace: bootstrap
+spec:
+  cluster:
+    name: gitlab-pg
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  immediate: false

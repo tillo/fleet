@@ -1,0 +1,262 @@
+## VolSync backup alerting — scrapes the operator's controller-runtime "secure
+## metrics" (8443, TLS+authz, no rbac-proxy in 0.16) and alerts on failed/missed
+## Ceph-PVC backups to the external Garage ceph-backup bucket.
+##
+## SCOPE: catches VolSync-DETECTED failures (out-of-sync, missed schedules) +
+## the scrape being down + the restic cache filling before it wedges the mover.
+## It does NOT catch the "mover exits 0 but writes no objects" silent case
+## (VolSync self-reports success) — that needs an independent restic
+## snapshot-freshness probe.
+##
+## 2026-09-16: the old note here said "No ReplicationSources exist yet, so the
+## backup alerts below are forward-looking". That has been false for a while —
+## there are 11 live ReplicationSources and these alerts fire on real series.
+---
+# vmagent's SA must be authorized to GET the /metrics nonResourceURL.
+# NOTE: the `volsync-metrics-reader` ClusterRole (nonResourceURLs /metrics: get)
+# is ALREADY created by the volsync helm chart itself — do NOT redefine it here
+# or the two Fleet bundles collide on ownership (monitoring-rules went Modified,
+# "ClusterRole volsync-metrics-reader is not owned by", 2026-06-15). We only add
+# the binding from vmagent's SA to that chart-provided role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volsync-metrics-reader-vmagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: volsync-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: vmagent-mdapi
+    namespace: monitoring
+---
+# VolSync's metrics server authenticates the scraper via TokenReview +
+# SubjectAccessReview, which requires its SA to have the auth-delegator role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volsync-metrics-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: volsync
+    namespace: volsync-system
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: volsync
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [volsync-system]
+  selector:
+    matchLabels:
+      control-plane: volsync-controller
+  endpoints:
+    - port: https
+      scheme: https
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-volsync
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: volsync-backups
+      rules:
+        - alert: VolSyncBackupOutOfSync
+          expr: volsync_volume_out_of_sync == 1
+          for: 6h
+          labels:
+            severity: warning
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync backup out of sync: {{ $labels.obj_namespace }}/{{ $labels.obj_name }}"
+            description: >-
+              VolSync {{ $labels.role }} {{ $labels.obj_namespace }}/{{ $labels.obj_name }}
+              has been out of sync for >6h (its last Ceph->Garage backup failed or is overdue).
+        ## Escalation tier, added 2026-09-16. The 6h warning above WORKED during the
+        ## jump-home-ceph cache-full wedge (fired 09-15T11:17Z, correctly, on the
+        ## operator's own gauge) — and then nothing changed for 21h, because a
+        ## `severity: warning` goes to the dashboard and does not page. The failure
+        ## was found by eyeballing pods in `kubectl get pods`, not by being told.
+        ## A backup that has not run for a FULL DAY is a different category of
+        ## problem from one that missed its last window, so it gets its own tier.
+        ## Deliberately the same expression, only a longer `for:` — it inherits the
+        ## gauge's property of clearing on the first successful catch-up, and it is
+        ## cause-agnostic: cache full, stale lock, bad credentials, repo unreachable
+        ## all land here. That matters because the specific causes are exactly what
+        ## we keep failing to predict.
+        - alert: VolSyncBackupOutOfSyncSustained
+          expr: volsync_volume_out_of_sync == 1
+          for: 24h
+          labels:
+            severity: critical
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync backup DEAD for >24h: {{ $labels.obj_namespace }}/{{ $labels.obj_name }}"
+            description: >-
+              VolSync {{ $labels.role }} {{ $labels.obj_namespace }}/{{ $labels.obj_name }}
+              has produced no successful backup for over 24 hours. Every restore point
+              newer than that does not exist. Check the newest mover pod's logs
+              (`kubectl -n {{ $labels.obj_namespace }} logs $(kubectl -n {{ $labels.obj_namespace }}
+              get pods -o name | grep volsync-src | tail -1)`) and
+              `.status.latestMoverStatus.result` on the ReplicationSource.
+        ## A missed interval is only a problem while the source is STILL behind.
+        ## `increase(...[1d])` alone stays >0 for a full day after the miss, so a
+        ## single interval lost to a node reboot kept the public Backups component
+        ## degraded for 24h while every later run had already succeeded. Gating on
+        ## volsync_volume_out_of_sync (the operator's own "last sync failed or is
+        ## overdue" gauge) makes the alert clear on the first successful catch-up
+        ## and fire, faster than OutOfSync's 6h, when the miss is not recovering.
+        - alert: VolSyncBackupMissedIntervals
+          expr: >-
+            increase(volsync_missed_intervals_total[1d]) > 0
+            and on (obj_namespace, obj_name, role) volsync_volume_out_of_sync == 1
+          for: 5m
+          labels:
+            severity: warning
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync missed a scheduled backup and is still behind: {{ $labels.obj_namespace }}/{{ $labels.obj_name }}"
+            description: >-
+              VolSync {{ $labels.obj_namespace }}/{{ $labels.obj_name }} missed
+              {{ $value }} scheduled backup interval(s) in the last day and has not
+              caught up yet (volume still out of sync).
+    ## The restic mover's /cache PVC, added 2026-09-16 after jump-home-ceph wedged
+    ## on a FULL one for 21h ("Fatal: unable to save snapshot: Copy: write
+    ## /cache/<repoid>/data/ff/tmp-...: no space left on device").
+    ##
+    ## ⛔ The generic PVC rules in 20a-pvc-growth.yml are STRUCTURALLY BLIND to these
+    ## volumes, and that is not a tuning problem. A cache PVC is mounted only while a
+    ## mover pod runs — minutes per day for a daily source — so kubelet_volume_stats
+    ## exists only in those windows. Measured 2026-09-16 while jump was retrying every
+    ## few minutes (its BEST case): 12 and 382 samples per 6h against ~720 for a
+    ## continuously-mounted volume. PVCNearFull needs `for: 15m` of SUSTAINED samples
+    ## above 90%; it went `pending` on this very PVC and never fired. An instant query
+    ## across the estate saw 1 of the 11 cache PVCs. The same query wrapped in
+    ## max_over_time([6h:]) saw 6.
+    ##
+    ## Hence max_over_time over a long lookback: it reads the peak across the gaps
+    ## rather than requiring the volume to be mounted right now. `max by` collapses the
+    ## duplicate series a mover leaves behind when it lands on a different node between
+    ## runs (jump had both quo and qua series live).
+    ##
+    ## 0.75 is chosen for LEAD TIME, not for "nearly full": the cost of acting is one
+    ## `cacheCapacity` bump, while the cost of arriving late is a wedged backup that
+    ## cannot self-clear — restic runs `prune` only AFTER a successful backup, so a
+    ## cache-full failure also skips the prune that would have reclaimed the space.
+    - name: volsync-cache
+      rules:
+        - alert: VolSyncCacheFilling
+          expr: >-
+            max by (namespace, persistentvolumeclaim) (
+              max_over_time(
+                (
+                  kubelet_volume_stats_used_bytes{persistentvolumeclaim=~"volsync-.*-cache"}
+                  / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~"volsync-.*-cache"}
+                )[6h:]
+              )
+            ) > 0.75
+          for: 10m
+          labels:
+            severity: warning
+            team: mdapi
+            component: Backups
+            ## Ops capacity signal, not a user-visible backup outage — the backup is
+            ## still succeeding at this point. Same reasoning as PVCWillFillIn24h.
+            statuspage: exclude
+          annotations:
+            summary: "VolSync restic cache {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+            description: |
+              The restic mover's cache volume peaked above 75% in the last 6h. When it
+              reaches 100% the mover dies with ENOSPC on /cache and the backup stops,
+              and it will NOT recover on its own.
+
+              ⭐ Size this from FILE COUNT and snapshot churn, not from the size of the
+              data being backed up — restic's cache holds the repo index plus every
+              TREE pack. jump-home-ceph filled 4Gi of cache while its 49G source volume
+              was only 17% used.
+
+              Fix: raise `.spec.restic.cacheCapacity` on the ReplicationSource in
+              ~/fleet. VolSync patches the cache PVC in place and Longhorn/Ceph expand
+              it online (verified 2026-09-16, 4Gi -> 16Gi with a mover running, no
+              restart and no deletion). Nothing is lost by resizing — the cache is
+              disposable; a cold cache costs one slower run.
+    - name: volsync-stale-lock
+      ## f/heal/volsync_restic_stale_lock (every 15 min) clears an orphaned
+      ## restic repo lock by setting spec.restic.unlock on the ReplicationSource.
+      ## Info while it is auto-solving; warning only when the unlock demonstrably
+      ## is NOT holding, i.e. the same RS needed unlocking more than once inside
+      ## 24h. Deliberately min_over_time rather than a long `for:` so a vmalert
+      ## restart cannot reset the clock.
+      rules:
+        - alert: VolSyncStaleResticLock
+          expr: volsync_stale_lock_active == 1
+          for: 20m
+          labels:
+            severity: info
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync repo lock being auto-cleared: {{ $labels.rs }}"
+            description: >-
+              ReplicationSource {{ $labels.rs }} is wedged on an orphaned restic
+              lock (backups still succeed; forget/retention does not).
+              f/heal/volsync_restic_stale_lock is clearing it via
+              spec.restic.unlock — info while auto-solving.
+        - alert: VolSyncStaleResticLockNotHolding
+          expr: volsync_stale_lock_unlocks_24h > 1
+          for: 15m
+          labels:
+            severity: warning
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync auto-unlock is not holding: {{ $labels.rs }}"
+            description: >-
+              {{ $labels.rs }} has needed {{ $value }} auto-unlocks in 24h, so
+              something is re-taking the lock (a live mover, or a genuinely busy
+              repo) and the heal is papering over it. The heal holds off for 24h
+              per source by design — this needs a human.
+        - alert: VolSyncStaleLockHealStale
+          expr: time() - volsync_restic_stale_lock_last_run_timestamp_seconds > 3600
+          for: 30m
+          labels:
+            severity: warning
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync stale-lock autoheal has not run in over an hour"
+            description: >-
+              The 15-min f/heal/volsync_restic_stale_lock schedule has not pushed
+              in >1h, so a wedged ReplicationSource would now go unnoticed until
+              VolSyncBackupOutOfSync fires 6h later.
+    - name: volsync-operator
+      rules:
+        - alert: VolSyncMetricsScrapeDown
+          expr: up{job="volsync-metrics"} == 0
+          for: 1h
+          labels:
+            severity: warning
+            team: mdapi
+            component: Backups
+          annotations:
+            summary: "VolSync operator metrics unreachable"
+            description: >-
+              vmagent has been unable to scrape the VolSync operator metrics for >1h —
+              backup health alerting (out-of-sync / missed intervals) is blind.

@@ -1,0 +1,57 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: litellm-env-secret
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: litellm-env-secret
+    creationPolicy: Owner
+
+  data:
+    # Backend URLs live in Akeyless (not this public repo) so the laptop's
+    # internal hostnames are never committed. Values, e.g.:
+    #   LMSTUDIO_WIRED_URL = http://mbp-mda.home.tillo.ch:1234/v1
+    #   LMSTUDIO_WIFI_URL  = http://mbp-mda-wifi.home.tillo.ch:1234/v1
+    #   LMSTUDIO_WG_URL    = the laptop's WireGuard road-warrior address
+    #                        (bpi-r4 wg_iot peer, reachable when it's away)
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_WIRED_URL
+      secretKey: LMSTUDIO_WIRED_URL
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_WIFI_URL
+      secretKey: LMSTUDIO_WIFI_URL
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_WG_URL
+      secretKey: LMSTUDIO_WG_URL
+    # LM Studio API token ("Require Authentication" in its Developer server
+    # settings, 2026-08-19) — the laptop serves an unauthenticated OpenAI API
+    # on whatever LAN it sits on otherwise.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_API_KEY
+      secretKey: LMSTUDIO_API_KEY
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/ANTHROPIC_API_KEY
+      secretKey: ANTHROPIC_API_KEY
+    # DeepSeek platform key (2026-08-24) for the ds-flash / ds-pro aliases.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/DEEPSEEK_API_KEY
+      secretKey: DEEPSEEK_API_KEY
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LITELLM_MASTER_KEY
+      secretKey: LITELLM_MASTER_KEY
+    # Admin-UI login (2026-08-26). Without these the /ui login form only accepts
+    # the master key, which means pasting the proxy's most privileged credential
+    # into a browser on every visit. UI_USERNAME defaults to "admin" upstream
+    # (proxy/auth/login_utils.py:71) -- set both explicitly.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/UI_USERNAME
+      secretKey: UI_USERNAME
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/UI_PASSWORD
+      secretKey: UI_PASSWORD

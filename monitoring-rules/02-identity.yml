@@ -1,0 +1,152 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-identity
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-identity.workload
+    rules:
+    - alert: IdentityKeycloakUnavailable
+      ## TWO INSTANCES, TWO WORKLOAD KINDS. The tilloch realm's Keycloak is a
+      ## Deployment in `keycloak`; envuassu's is a StatefulSet. Until 2026-08-29 this
+      ## rule read `namespace=~"keycloak|envuassu", deployment="keycloak"`, which LOOKS
+      ## like two-instance coverage but cannot be: a StatefulSet emits no
+      ## kube_deployment_* series, so the envuassu half never produced a sample and that
+      ## instance had no availability alert at all.
+      ## It hid well because IdentityKeycloakCrashLooping below selects on
+      ## `pod=~"keycloak-.*"`, which DOES match keycloak-0/1 — so envuassu was not
+      ## wholly invisible, just invisible in the way that mattered.
+      ## Verified after the fix: the deployment clause matches 1 series, the statefulset
+      ## clause 1. Re-check both return series before touching this again.
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace=~"keycloak|envuassu", deployment="keycloak"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace=~"keycloak|envuassu", deployment="keycloak"
+            }
+          ) > 0
+        )
+        or
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace=~"keycloak|envuassu", statefulset="keycloak"
+            }
+            - kube_statefulset_status_replicas_ready{
+              namespace=~"keycloak|envuassu", statefulset="keycloak"
+            }
+          ) > 0
+        )
+      for: 3m
+      labels:
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/keycloak: {{ $value }} replicas unavailable"
+        description: |
+          Keycloak (SSO) is down or degraded. ALL apps gated by oauth2-proxy/OIDC
+          will start failing logins. Check: kubectl -n {{ $labels.namespace }} logs deployment/keycloak
+
+    - alert: IdentityKeycloakCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace=~"keycloak|envuassu", pod=~"keycloak-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} keycloak restarting frequently"
+
+    - alert: IdentityOpenLDAPUnavailable
+      ## Keycloak federates against openldap for primary user storage; if
+      ## openldap is down, Keycloak token-issue still works for cached
+      ## users but new logins and group lookups break.
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="openldap", deployment=~"openldap|lam"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="openldap", deployment=~"openldap|lam"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.deployment }} unavailable"
+        description: |
+          {{ $labels.deployment }} in openldap ns is down. Keycloak's user
+          federation lookups will fail; new SSO logins won't be able to
+          resolve users. `lam` is the web UI for openldap admin only —
+          openldap itself is the load-bearing one.
+
+    - alert: IdentityOpenLDAPCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="openldap", pod=~"openldap-.*|lam-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} restarting frequently"
+
+    - alert: IdentityOpenLDAPSocketLeak
+      ## 2026-07-02: Joplin's LDAP SSO leaked one slapd socket per auth attempt
+      ## until slapd hit its fd ceiling (then 1024, ULIMIT_N now 8192) — postfix
+      ## LDAP lookups timed out and inbound mail 451-tempfailed for ~15h.
+      ## Healthy baseline is ~10–30 sockets; the incident peaked at 1017.
+      expr: |
+        max by (pod) (
+          container_sockets{namespace="openldap", container="openldap"}
+        ) > 500
+      for: 30m
+      labels:
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} holding {{ $value }} sockets — client connection leak"
+        description: |
+          Some LDAP client is leaking connections (2026-07-02 culprit: Joplin
+          LDAP SSO — sessions from the owner-share-sync cron + MCP). At the
+          ULIMIT_N=8192 ceiling slapd stops answering and mail tempfails.
+          Find the leaker: decode /proc/net/tcp in the openldap pod, group
+          remote IPs, map to pods. Fix: rollout restart the leaking client
+          (e.g. kubectl -n joplin rollout restart deploy/joplin).
+
+    - alert: IdentityOpenLDAPSocketExhaustionNear
+      expr: |
+        max by (pod) (
+          container_sockets{namespace="openldap", container="openldap"}
+        ) > 6000
+      for: 10m
+      labels:
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} at {{ $value }} sockets — nearing the 8192 fd ceiling"
+        description: |
+          slapd is close to its ULIMIT_N=8192 file-descriptor ceiling; binds
+          will start timing out (Keycloak logins + postfix recipient lookups
+          -> mail 451). Restart the leaking client pod NOW (see
+          IdentityOpenLDAPSocketLeak) or restart openldap as a stopgap.

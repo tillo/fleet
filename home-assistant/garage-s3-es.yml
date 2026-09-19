@@ -1,0 +1,56 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: garage-ha-backup-s3
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: garage-ha-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the in-cluster
+        ## Ceph RGW, as those two hosts are decommissioned. History:
+        ## 2026-06-22 bootstrap/garage -> external salt/pepper Garage;
+        ## 2026-09-04 http -> https.
+        ##
+        ## ⛔ STILL https, and that is not optional. Home Assistant's backup
+        ## tarballs are NOT encrypted by anything before they leave this pod --
+        ## that is exactly why home-assistant-backups sits in the offsite job's
+        ## ENCRYPT_BUCKETS rather than its NO_ENCRYPT set, and it made this the
+        ## estate's largest plaintext backup stream until 2026-09-04. RGW's :80
+        ## listener would undo that: pods on qui/quo/qua reach an RGW pod on
+        ## another node ACROSS THE PHYSICAL LAN over an unencrypted VXLAN
+        ## overlay. "In-cluster" is not a substitute for encrypted here.
+        ##
+        ## ⭐ The remote is renamed garage -> rgw. The old name would have kept
+        ## working (it is only an rclone alias) and would have been one more
+        ## place claiming this data goes somewhere it does not. The consumer's
+        ## `rclone copy ... rgw:${BUCKET}` in home-assistant-deploy.yml is
+        ## changed in the same commit -- they are one unit.
+        RCLONE_CONFIG_RGW_TYPE: "s3"
+        RCLONE_CONFIG_RGW_PROVIDER: "Ceph"
+        RCLONE_CONFIG_RGW_ENDPOINT: "https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443"
+        ## Same mounted bundle, same house chain (MDAPI Root + Issuing CA 01) --
+        ## which is what a Horizon-issued RGW leaf chains to. Only the secret's
+        ## NAME still says garage; renaming it is a separate change.
+        RCLONE_CA_CERT: "/etc/garage-tls/ca.crt"
+        RCLONE_CONFIG_RGW_REGION: "us-east-1"
+        RCLONE_CONFIG_RGW_ACCESS_KEY_ID: "{{ .access_key }}"
+        RCLONE_CONFIG_RGW_SECRET_ACCESS_KEY: "{{ .secret_key }}"
+        BUCKET: "home-assistant-backups"
+
+  data:
+    ## Keys minted by the ha-backup CephObjectStoreUser (!373) and mirrored here.
+    - remoteRef:
+        key: /mdapi/home-assistant/rgw/access-key
+      secretKey: access_key
+    - remoteRef:
+        key: /mdapi/home-assistant/rgw/secret-key
+      secretKey: secret_key

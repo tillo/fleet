@@ -1,0 +1,50 @@
+## rancher-mgmt management-plane guards (2026-08-20, after the mgmt-2
+## memory-stall: the VMs' virt-launcher pods ran with limits == guest
+## memory, so a guest reaching its ceiling — which Linux pagecache always
+## does — squeezed qemu at the host cgroup and froze the whole VM (kubelet
+## stall 13:32-13:40 local, Rancher 503 ~15min, second occurrence of the
+## 08-17 collapse family). Fixed with guest=8Gi/limits=9Gi headroom; this
+## rule pages if a launcher ever creeps toward its limit again — from the
+## PROD stack, so it works while the mgmt plane itself is down.
+## Companion: the rancher-mgmt-ui blackbox probe (10-blackbox-probes.yml)
+## catches the user-facing 503 through the generic SyntheticProbeFailing
+## rule. Ledger: ext:rancher-mgmt-memory-saturation.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-rancher-mgmt
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-rancher-mgmt.vm-memory
+    rules:
+    - alert: RancherMgmtVMMemorySqueeze
+      expr: |
+        max by (pod) (
+          container_memory_working_set_bytes{namespace="rancher-mgmt", container="compute"}
+        )
+          / on (pod) group_left()
+        max by (pod) (
+          kube_pod_container_resource_limits{namespace="rancher-mgmt", resource="memory", container="compute"}
+        )
+        > 0.97
+      for: 10m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.pod }}: VM memory at {{ $value | humanizePercentage }} of its pod limit"
+        description: |
+          A rancher-mgmt virt-launcher is within 3% of its host-side memory
+          limit for 10m+. When it reaches the limit, the host cgroup squeezes
+          qemu and the GUEST WORLD-FREEZES (kubelet stall, Rancher outage,
+          fleet-agent disconnect) — 2026-08-17 and 2026-08-20 incidents.
+          Expected posture: guest=8Gi, limits=9Gi (1Gi qemu headroom); the
+          gap between guest ceiling and pod limit should keep this quiet.
+          Check: kubectl --context mdapi-prod-direct -n rancher-mgmt get vm
+          -o yaml | grep -A3 'memory\|limits' ; guest RSS growth inside the
+          VM (rancher pods have 3Gi limits since 2026-08-20 — a leak beyond
+          that OOM-restarts one pod instead of starving the node).

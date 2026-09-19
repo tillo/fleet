@@ -1,0 +1,50 @@
+## VMAgent scrapes everything the bundled Rancher Prometheus scrapes today.
+## Phase 3 will narrow this to label `monitoring-stack: mdapi` so the
+## Rancher Prometheus reverts to vendor-default scope (no double scrape).
+## remoteWrite points at the vmsingle Service above.
+##
+## scrapeInterval 30s matches kube-prometheus-stack default.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAgent
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  ## Pull via the in-cluster Zot cache; see vmsingle.yml for the pattern.
+  image:
+    repository: zot.mdapi.ch/victoriametrics/vmagent
+  imagePullSecrets:
+    - name: zot-pull
+  scrapeInterval: 30s
+
+  ## Empty selectors = scrape everything cluster-wide. Phase 3 will tighten.
+  serviceScrapeNamespaceSelector: {}
+  serviceScrapeSelector: {}
+  podScrapeNamespaceSelector: {}
+  podScrapeSelector: {}
+  probeNamespaceSelector: {}
+  probeSelector: {}
+  staticScrapeNamespaceSelector: {}
+  staticScrapeSelector: {}
+
+  remoteWrite:
+    - url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8429/api/v1/write"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      ## 512Mi was OOMKilling vmagent ~once per hour (6 restarts in 4h).
+      ## 1Gi then OOMKilled again (2026-06-21) — scrape buffer + remote-write
+      ## queue spike past 1Gi when apiserver/cadvisor targets are fattest.
+      memory: 2Gi
+
+  extraArgs:
+    ## Survive vmsingle restarts without dropping data.
+    remoteWrite.tmpDataPath: "/tmp/vmagent-remotewrite-data"
+    remoteWrite.maxDiskUsagePerURL: "1GiB"
+    ## Default 16 MiB; multiple kubelet/cadvisor + apiserver scrapes
+    ## breach it on every scrape, silently dropping the response. 64 MiB
+    ## gives ~4x headroom for kubelet on the busier nodes.
+    promscrape.maxScrapeSize: "64MiB"

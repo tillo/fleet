@@ -1,0 +1,78 @@
+# In-cluster end of the DMZ<->cluster WireGuard bridge.
+# - wireguard container: dials OUT to bpi-r4 wg_csm (zero cluster exposure), tunnel IP 10.99.0.2
+# - socat sidecar: forwards tunnel :5432 -> paperless-pg-rw (the CNPG primary)
+# The CM-VM gateway reaches 10.99.0.2:5432 via its default route -> bpi-r4 -> wg_csm.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: akeyless-pg-bridge
+  namespace: akeyless-pg-bridge
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: akeyless-pg-bridge
+  template:
+    metadata:
+      labels:
+        app: akeyless-pg-bridge
+    spec:
+      initContainers:
+        # net.ipv4.ip_forward is a namespaced sysctl but "unsafe" in k8s, so NET_ADMIN
+        # can't set it from PostUp. A one-shot privileged init sets it on the shared pod
+        # netns (persists for the pod's life); the main container stays NET_ADMIN-only.
+        - name: enable-forwarding
+          image: busybox
+          command: ["sh", "-c", "sysctl -w net.ipv4.ip_forward=1"]
+          securityContext:
+            privileged: true
+        - name: config
+          image: busybox
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /config/wg_confs
+              cat > /config/wg_confs/wg0.conf << EOF
+              [Interface]
+              Address = 10.99.0.2/32
+              PrivateKey = $(cat /secrets/private-key)
+              # Bridge router: forward so the CM-VM gateway reaches ANY in-cluster
+              # ClusterIP (service CIDR 10.53.0.0/16); producers target ClusterIPs directly.
+              PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
+              PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.99.0.0/24 ! -d 10.99.0.0/24 -j MASQUERADE
+
+              [Peer]
+              PublicKey = lxw2utAc7/th3rLtm7Ga+78U9iSZBzbLT53j9bY1D00=
+              PresharedKey = $(cat /secrets/psk)
+              Endpoint = 192.168.1.254:51822
+              AllowedIPs = 10.99.0.1/32
+              PersistentKeepalive = 25
+              EOF
+          volumeMounts:
+            - { name: config, mountPath: /config }
+            - { name: secrets, mountPath: /secrets }
+      containers:
+        - name: wireguard
+          image: lscr.io/linuxserver/wireguard:latest
+          securityContext:
+            capabilities:
+              add: [NET_ADMIN]
+          env:
+            - { name: PUID, value: "1000" }
+            - { name: PGID, value: "1000" }
+          volumeMounts:
+            - { name: config, mountPath: /config }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+      volumes:
+        - { name: config, emptyDir: {} }
+        - name: secrets
+          secret:
+            secretName: wg-csm-bridge

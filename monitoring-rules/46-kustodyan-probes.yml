@@ -1,0 +1,224 @@
+## Blackbox probes for the Kustodyan stack — the four public hosts that 45 and
+## 45a watch only from the inside.
+##
+## WHY. 45-formbricks-kustodyan.yml and 45a-kustodyan-mcp-and-paperless.yml both
+## say, in their own runbooks, "there is no blackbox probe on either host". That
+## was true and it left a specific hole: the workload rules read kube-state-metrics,
+## so they see replicas, not reachability. Every failure BETWEEN the visitor and a
+## healthy pod — DNS, the ingress, a cert, oauth/bearer gating, a NetworkPolicy —
+## keeps every replica Available and fires nothing. These four probes close that
+## half; the workload rules keep the other half (a probe cannot tell you WHICH
+## deployment died, and the de-tokenising gateway can fail while the site still
+## serves 200s).
+##
+## ⚠️ FOUR HOSTS, NOT THREE. The `formbricks-kustodyan` namespace carries TWO
+## ingresses — the showcase itself AND a second MCP endpoint on
+## `formbricks-kustodyan-mcp.mdapi.ch`, which is a different host from the
+## `kustodyan-mcp` namespace's `kustodyan-mcp.mdapi.ch`. Enumerating "one host per
+## namespace" would have left it unprobed. Read the Ingress objects, not the
+## namespace names:
+##   kubectl -n <ns> get ingress -o custom-columns=NAME:.metadata.name,HOSTS:.spec.rules[*].host
+##
+## MODULES were chosen from what each host actually answered on 2026-09-05, not
+## from what it ought to answer:
+##   formbricks-kustodyan        200  -> http_2xx (strict on purpose: this one is
+##                                      genuinely public and unauthenticated, so a
+##                                      future 401/302 here is a REGRESSION worth
+##                                      firing on, not a module mismatch)
+##   formbricks-kustodyan-mcp    401  -> http_any_redirect (bearer-gated; the 401 IS
+##   kustodyan-mcp               401     the app answering. http_any_redirect already
+##                                      accepts 401/403 — see monitoring-blackbox
+##                                      values.yml — so no new module is needed)
+##   paperless-kustodyan         302  -> http_any_redirect (redirects to
+##                                      /accounts/login/; follow_redirects is false
+##                                      in that module, so the 302 is the assertion)
+##
+## ⛔ DELIBERATELY NO `component` / `team` LABEL ON THE TARGETS, and that has a
+## cost this file then pays back. The three SyntheticProbe* rules in
+## 11-blackbox-alerts.yml select on `{component!="", team="mdapi"}` and are
+## CRITICAL (Pushover priority 1, interrupts at 3am) and statuspage-coupled.
+## 45/45a already made the judgement that this stack is a demonstration
+## environment: warning tier, `statuspage: exclude`. Inheriting a critical page
+## from the probe would quietly overrule that decision. So the targets stay
+## unlabelled and the alerts below re-provide the coverage at the right tier —
+## the same shape RackKioskUnreachable uses for the rack display.
+##
+## What that costs, stated rather than left to be discovered:
+##   * SyntheticProbeFailing        -> re-provided below (KustodyanEndpointUnreachable)
+##   * SyntheticProbeTLSExpiringSoon-> re-provided below. This one matters: that rule
+##                                     also keys on `component!=""`, so WITHOUT the
+##                                     alert below these four LE certs would have a
+##                                     probe measuring expiry and nothing alerting on
+##                                     it — coverage that looks present and is not.
+##   * SyntheticProbeSlowResponse   -> NOT re-provided, on purpose. A demo stack being
+##                                     slow is not an incident, and cube/valkey make
+##                                     first-load latency genuinely variable here.
+##
+## The `release: rancher-monitoring` label carried by most Probes in
+## 10-blackbox-probes.yml is NOT required any more: that header describes the old
+## Prometheus's `probeSelector`. vmagent (monitoring-vm/vmagent.yml) has
+## `probeSelector: {}` + `probeNamespaceSelector: {}` and selects every Probe in
+## every namespace — which is why rack-kiosk-bone, carrying no such label, is
+## scraped and alerting today. It is included below anyway, for consistency with
+## its neighbours and so nothing depends on knowing this.
+
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: kustodyan-formbricks
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: kustodyan-formbricks
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - https://formbricks-kustodyan.mdapi.ch
+      labels:
+        probe: kustodyan_formbricks
+        purpose: kustodyan
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: kustodyan-formbricks-mcp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: kustodyan-formbricks-mcp
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        ## The MCP endpoint that lives INSIDE the formbricks-kustodyan namespace
+        ## (ingress `kustodyan-mcp` there) — not the same service as the host below.
+        - https://formbricks-kustodyan-mcp.mdapi.ch
+      labels:
+        probe: kustodyan_formbricks_mcp
+        purpose: kustodyan
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: kustodyan-mcp
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: kustodyan-mcp
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        ## Bearer-gated MCP server in its own namespace. Probing `/` rather than
+        ## `/mcp` on purpose: `/mcp` expects a session-initialising POST, so a GET
+        ## there proves less than the 401 the root already gives us.
+        - https://kustodyan-mcp.mdapi.ch
+      labels:
+        probe: kustodyan_mcp
+        purpose: kustodyan
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: kustodyan-paperless
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: kustodyan-paperless
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        ## ⚠️ NOT documents.mdapi.ch. That is the household DMS in the `paperless`
+        ## namespace, already probed as files-paperless in 10-blackbox-probes.yml.
+        ## This is the separate integration instance; the shared first word is the
+        ## same trap that made `namespace=~"...|paperless|..."` look like coverage
+        ## for `paperless-kustodyan` when PromQL anchoring means it never was.
+        - https://paperless-kustodyan.mdapi.ch
+      labels:
+        probe: kustodyan_paperless
+        purpose: kustodyan
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-kustodyan-probes
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-kustodyan.synthetic
+    rules:
+    ## Selects on `purpose`, not on a list of instances, for the same reason 45/45a
+    ## select by namespace: a fifth Kustodyan host added to this file is then born
+    ## covered instead of born silent.
+    ##
+    ## avg_over_time gives hysteresis on both edges — the 2026-07-13 flap fix that
+    ## turned 140 firing episodes in 13 days into a stable signal. 5m window plus
+    ## for:10m is ~11m to notify: longer than SyntheticProbeFailing's 8m because
+    ## nothing here is user-facing enough to justify a faster page, short enough
+    ## that a demo is not dead for half an hour before anyone hears.
+    - alert: KustodyanEndpointUnreachable
+      expr: avg_over_time(probe_success{purpose="kustodyan"}[5m]) < 0.8
+      for: 10m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Kustodyan: {{ $labels.instance }} unreachable from outside for 10m"
+        description: |
+          A blackbox probe against a public Kustodyan host has been mostly failing
+          for ten minutes. This is the OUTSIDE view: DNS, ingress, TLS, gating and
+          NetworkPolicy are all in this path, and every one of them can break while
+          the workload rules in 45/45a stay green because the replicas are fine.
+
+          If the matching *WorkloadUnavailable alert is NOT also firing, the pods
+          are up and the fault is in front of them. Check, in that order:
+            kubectl -n <ns> get ingress,certificate
+            kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=50 | grep -i <host>
+            curl -sSo /dev/null -w '%{http_code} %{ssl_verify_result}\n' https://{{ $labels.instance }}
+
+          Expected healthy answers (a CHANGE here is the finding, not the alert):
+            formbricks-kustodyan.mdapi.ch        200
+            formbricks-kustodyan-mcp.mdapi.ch    401  (bearer-gated)
+            kustodyan-mcp.mdapi.ch               401  (bearer-gated)
+            paperless-kustodyan.mdapi.ch         302 -> /accounts/login/
+
+    ## Re-provides SyntheticProbeTLSExpiringSoon for these four, which that rule
+    ## cannot see because it keys on `component!=""`. Same 14d threshold and 30m
+    ## for: as the original, so this behaves identically — it is a selector change,
+    ## not a policy change.
+    - alert: KustodyanEndpointTLSExpiringSoon
+      expr: |
+        probe_ssl_earliest_cert_expiry{purpose="kustodyan"} - time() < 14 * 24 * 3600
+      for: 30m
+      labels:
+        severity: warning
+        component: Websites
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Kustodyan: TLS cert for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+        description: |
+          cert-manager renews at 30d remaining; under 14d means renewal has stalled.
+          These hosts use the namespaced `letsencrypt-prod` Issuer with a DNS-01
+          challenge, so a stalled renewal is usually the TSIG secret or the zone,
+          not the ingress:
+            kubectl -n <ns> get certificate,certificaterequest,order,challenge
+            kubectl -n <ns> describe certificate <name> | tail -30

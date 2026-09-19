@@ -1,0 +1,20 @@
+## RGW S3 identity for Home Assistant's full-backup tarballs, moving off the
+## salt/pepper Garage. Rook writes the keys to secret
+## rook-ceph-object-user-ceph-objectstore-ha-backup; they are mirrored to
+## Akeyless /mdapi/home-assistant/rgw/{access-key,secret-key}, where the
+## existing ExternalSecret in home-assistant/garage-s3-es.yml picks them up.
+##
+## ⚠️ These tarballs are NOT encrypted by anything before they leave the HA pod
+## -- that is precisely why home-assistant-backups sits in the offsite job's
+## GARAGE_OFFSITE_ENCRYPT_BUCKETS rather than its NO_ENCRYPT set, and why the
+## client was moved to https on 2026-09-04. It was the estate's largest
+## plaintext backup stream. Its replacement endpoint must therefore be the RGW
+## TLS listener (:443, house-PKI leaf), never :80.
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: ha-backup
+  namespace: rook-ceph
+spec:
+  store: ceph-objectstore
+  displayName: Home Assistant backup tarballs

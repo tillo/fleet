@@ -1,0 +1,52 @@
+## Solver order matters — cert-manager picks the MOST-SPECIFIC dnsZones match:
+##  1. home.tillo.ch is delegated to technitium-primary, NOT to the BIND9
+##     below; a TSIG nsupdate for *.home.tillo.ch is rejected NOTAUTH
+##     ("dns: bad authentication"). Listing it on an http01 solver routes
+##     those names through the public ingress challenge instead.
+##  2. dns01 rfc2136 against BIND (31.3.128.59, key "mdapi") for every zone
+##     it is authoritative for — the union of what the 42 retired
+##     per-namespace Issuers declared.
+##  3. selector-less http01 fallback for anything else.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    email: tillo@tillo.ch
+    privateKeySecretRef:
+      name: letsencrypt-prod-clusterissuer
+    server: https://acme-v02.api.letsencrypt.org/directory
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+        selector:
+          dnsZones:
+            - home.tillo.ch
+      - dns01:
+          rfc2136:
+            nameserver: 31.3.128.59:53
+            tsigKeyName: mdapi
+            tsigAlgorithm: HMACSHA256
+            tsigSecretSecretRef:
+              name: tsig-secret
+              key: tsig-secret-key
+        selector:
+          dnsZones:
+            - coders.ch
+            - coiffuredreams.ch
+            - dellambrogio.ch
+            - dellambrogio.com
+            - dellambrogio.net
+            - dellambrogio.org
+            - envuassu.ch
+            - ivodellambrogio.ch
+            - lithia.eu
+            - mdapi.ch
+            - mdapi.org
+            - spider3.ch
+            - tillo.ch
+      - http01:
+          ingress:
+            class: nginx

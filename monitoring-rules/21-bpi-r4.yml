@@ -1,0 +1,816 @@
+## BPI-R4 router health alerts.
+##
+## Metrics are pushed every minute from the router by
+## /usr/local/bin/metrics-push.sh (and chrony-metrics.sh, onu-metrics.sh)
+## into Pushgateway under jobs `bpi_r4`, `bpi_r4_chrony`, `bpi_r4_onu`,
+## `bpi_r4_emmc`, `bpi_r4_nlbwmon`, `bpi_r4_pppoe`.
+## See ~/openwrt-25.12-tillo for the producer side.
+##
+## All thresholds chosen from observed steady-state baselines (see
+## /etc/last_health.jsonl + /etc/last_ddm.jsonl on the router for
+## historical traces).
+##
+## ──────────────────────────────────────────────────────────────────────
+## Synthetic alert canary — monthly validation procedure
+## ──────────────────────────────────────────────────────────────────────
+## Goal: prove that an alert here actually reaches Pushover end-to-end
+## (Prom rule → Alertmanager → Pushover gateway). Run on the 1st of each
+## month during a quiet window:
+##
+## 1. SSH the router. Stop the cron job whose stale-push will fire
+##    BpiR4PushgatewayJob5mStale fastest:
+##        /etc/init.d/cron stop && killall -STOP chrony-metrics.sh
+##    Wait ~16 minutes (5m cron + 15m threshold + a buffer).
+## 2. Confirm Pushover alert "BPI-R4 Pushgateway job bpi_r4_chrony stale"
+##    arrives on the on-call phone.
+## 3. Restore: `/etc/init.d/cron start; killall -CONT chrony-metrics.sh`.
+##    Alert should auto-resolve within one scrape interval.
+##
+## If step 2 fails, escalate — Alertmanager routing or Pushover gateway
+## is broken and *every* router alert is also blocked.
+##
+## DO NOT run a real PPPoE flap (e.g. `ifdown wan`) — household impact
+## is real, and the stale-push canary exercises the same path.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-bpi-r4
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  ## Recording rules — pre-computed aggregates so alerts and dashboard
+  ## panels read cheaper, stable derived series instead of recomputing
+  ## rate() at every query. Convention: bpi_r4:<name>:<op><window>
+  - name: app-bpi-r4.recording
+    interval: 30s
+    rules:
+    - record: bpi_r4:wan_tx_bps:rate5m
+      expr: rate(bpi_r4_wan_tx_bytes_total[5m]) * 8
+    - record: bpi_r4:wan_rx_bps:rate5m
+      expr: rate(bpi_r4_wan_rx_bytes_total[5m]) * 8
+    - record: bpi_r4:sfp_tx_fault_per_min:rate1m
+      expr: rate(bpi_r4_irq_sfp1_tx_fault_total[1m]) * 60
+    - record: bpi_r4:iface_tx_bps:rate1m
+      expr: rate(bpi_r4_iface_tx_bytes_total[1m]) * 8
+    - record: bpi_r4:iface_rx_bps:rate1m
+      expr: rate(bpi_r4_iface_rx_bytes_total[1m]) * 8
+    - record: bpi_r4:softnet_drops_per_s:rate1m
+      expr: rate(bpi_r4_softnet_drop_total[1m])
+    - record: bpi_r4:onu_bip_errors_per_s:rate5m
+      expr: rate(bpi_r4_onu_bip_errors_total[5m])
+    - record: bpi_r4:tcp_retrans_per_s:rate5m
+      expr: rate(bpi_r4_tcp_retrans_segs_total[5m])
+    - record: bpi_r4:conntrack_full_ratio
+      expr: bpi_r4_conntrack_count / bpi_r4_conntrack_max
+    - record: bpi_r4:tcp_retrans_ratio:rate5m
+      ## Retransmits as a fraction of total OutSegs — robust to traffic volume.
+      ## We don't push OutSegs (yet) so this is here for when we do.
+      expr: rate(bpi_r4_tcp_retrans_segs_total[5m]) / clamp_min(rate(bpi_r4_tcp_passive_opens_total[5m]) + rate(bpi_r4_tcp_active_opens_total[5m]), 1)
+    - record: bpi_r4:emmc_write_bytes_per_s:rate5m
+      ## sector-units (512 B) → bytes; useful for write-amplification trending.
+      expr: rate(bpi_r4_emmc_sectors_written_total[5m]) * 512
+
+  - name: app-bpi-r4.optical
+    rules:
+    - alert: BpiR4SfpRxPowerLow
+      ## XGS-PON downstream sensitivity threshold for the OEM
+      ## XGSPONST2001 module. Baseline -15 dBm; -22 dBm is where
+      ## bit-error rate starts climbing.
+      expr: bpi_r4_sfp_rx_dbm < -22
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP RX optical power low ({{ $value }} dBm)"
+        description: |
+          Downstream optical receive power below sensitivity threshold.
+          Check fibre splice, ONU laser drift, or upstream OLT issue.
+          Run `ethtool -m sfp-wan` on the router for full DDM dump.
+
+    - alert: BpiR4SfpTxPowerLow
+      ## Baseline +5 dBm; +2 dBm is the alarm threshold per module
+      ## datasheet.
+      expr: bpi_r4_sfp_tx_dbm < 2
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP TX optical power low ({{ $value }} dBm)"
+        description: |
+          Module laser bias may be failing or the laser itself is
+          ageing out. Module death is the next step.
+
+    - alert: BpiR4SfpHot
+      expr: bpi_r4_sfp_temp_c > 70
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP module hot ({{ $value }}°C)"
+        description: |
+          SFP module above 70 °C. Sustained operation here shortens
+          laser lifetime. Check rack airflow / module heatsink.
+
+    - alert: BpiR4SfpAlarmActive
+      ## DDM module reports its own alarms; any one is worth surfacing.
+      expr: bpi_r4_sfp_alarms > 0
+      for: 2m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP module reports {{ $value }} active alarm(s)"
+        description: "Check `ethtool -m sfp-wan` for which thresholds are tripped."
+
+  - name: app-bpi-r4.optical-link
+    rules:
+    - alert: BpiR4OnuPloamDegraded
+      ## PLOAM state is encoded by Lantiq/MaxLinear firmware as state*10 +
+      ## substate. 51 = O5.1 (operational, datapath active) is the only
+      ## healthy steady state. Anything else for > 2 min indicates ranging
+      ## loss, intermittent LODS (52), emergency stop (60), or stuck
+      ## ranging (40). The HA-side power-cycle automation handles the
+      ## persistent case; this alert flags any deviation for inspection.
+      ## for: 2m -> 20m, 2026-08-29. HA's onu_watchdog_power_cycle_if_ploam_not_in_o5
+      ## soft-reboots the PON via ubus at 7 min out of O5 and falls back to a Hue-plug
+      ## cycle 3 min later, so a 2-minute page landed squarely inside the automation's
+      ## own window — every transient LODS excursion woke someone to watch the
+      ## watchdog work. 20 minutes means the soft reboot AND the power cycle have both
+      ## been tried and the ONU is still not in O5.1, which is the state a human can
+      ## actually do something about.
+      expr: bpi_r4_onu_ploam_state != 51
+      for: 20m
+      ## statuspage: exclude (2026-07-30, user-approved): PLOAM-not-O5.1 is
+      ## an inspection signal — intermittent LODS keeps the datapath mostly
+      ## up. A real user-visible internet outage fires the synthetic/WAN
+      ## probes, which own the public Internet component.
+      labels: { severity: warning, team: mdapi, component: Internet, statuspage: exclude }
+      annotations:
+        summary: "BPI-R4 ONU PLOAM in state {{ $value }} (not O5.1)"
+        description: |
+          ONU is not in O5.1 (operational). Encoding: state*10 + substate.
+            10/11/12 = O1, 20 = O2 standby, 30 = O3 serial number,
+            40 = O4 ranging, 50/51/52 = O5 operational, 52 = intermittent
+            LODS, 60 = O6 emergency stop, 70 = O7 stop, 80/81/82 = O8/O9.
+          Check ONU optical link, fibre splice, OLT-side provisioning.
+
+  - name: app-bpi-r4.connectivity
+    rules:
+    - alert: BpiR4PppoeFlappy
+      ## > 3 flaps over 24h indicates either a flaky ISP session or
+      ## SFP-side carrier glitching forcing PPPoE re-dial.
+      ##
+      ## Uses max_over_time - min_over_time instead of increase(): the
+      ## counter lives in /etc and survives reboot, but during ops bursts
+      ## (sysupgrade-flash sequences) it can still reset, and increase()
+      ## reset-compensation produces 24h totals that include each reset
+      ## as a phantom flap (caught us 2026-05-15 and 2026-05-16 with
+      ## values 3.000051… just past the > 3 threshold). The delta of
+      ## (max - min) over the window is reset-resilient: max reflects
+      ## the highest peak in the window, min reflects the lowest
+      ## post-reset trough, and the difference is the real net growth.
+      expr: (max_over_time(bpi_r4_pppoe_flap_count[24h]) - min_over_time(bpi_r4_pppoe_flap_count[24h])) > 3
+      for: 30m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE flapped {{ $value }}x in 24h"
+        description: |
+          PPPoE session has reconnected unusually often. Cross-check
+          `bpi_r4_irq_sfp1_tx_fault_total` rate (SFP wedge precursor)
+          and ONU PLOAM state.
+
+    - alert: BpiR4WanCarrierDown
+      ## Direct WAN link-down, distinct from PPPoE staleness.
+      expr: bpi_r4_wan_carrier == 0
+      for: 2m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 WAN carrier down"
+        description: "sfp-wan reports carrier=0. SFP unplugged or ONU/fibre fault."
+
+    - alert: BpiR4DnsFallbackActive
+      ## Technitium probe failing means dnsmasq is falling back to
+      ## NextDNS. Functional but loses local zone resolution.
+      expr: bpi_r4_dns_fallback_active == 1
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: DNS }
+      annotations:
+        summary: "BPI-R4 DNS in fallback mode (Technitium unreachable)"
+        description: |
+          dnsmasq is serving via NextDNS because Technitium
+          (192.168.1.54) is not answering. Local zone names like
+          home.tillo.ch will fail until Technitium recovers.
+
+  - name: app-bpi-r4.platform
+    rules:
+    - alert: BpiR4SfpTxFaultStorm
+      ## Baseline ~2/min (we measure 6/min steady). Storm is 100+/min
+      ## sustained. 1000+/min is the wedge-precursor regime where the
+      ## router-side sysrq-c escalation fires.
+      ## for: 3m -> 20m, 2026-08-29. Three separate automations act inside the old
+      ## window: the router's storm-watch sysrq-t at 3 consecutive minutes and sysrq-c
+      ## at 5, and HA's carrier-down ONU power-cycle (2-min hysteresis, ~5 min to
+      ## recover). Paging at 3 minutes announced a wedge that was already being handled
+      ## three different ways. At 20 minutes all three have failed, which is both rarer
+      ## and genuinely actionable — and per the 2026-05-09 finding an SoC reboot is a
+      ## no-op for this fault, so the human step is the ONU power cycle.
+      expr: bpi_r4:sfp_tx_fault_per_min:rate1m > 100
+      for: 20m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 SFP1 TX-fault IRQs storming ({{ $value }}/min)"
+        description: |
+          Sustained TX-fault IRQ storm — known wedge precursor on this
+          MT7988a SFP driver. Storm-watch on the router will sysrq-t at
+          3 consec min and sysrq-c at 5 consec min (gate armed).
+
+    - alert: BpiR4PagePoolStall
+      ## MTK page_pool leak — known kernel bug. age > 0 means a release
+      ## has been pending; growing age means leak escalating.
+      ## Threshold 60s -> 2400s, 2026-08-29. HA's bpi_r4_page_pool_stall_mtk_leak
+      ## fires at stall age 600s, waits 20 minutes, then reboots the router — so it
+      ## acts at roughly 1800s. The old rule fired at 60s held for 5 min, i.e. ~24
+      ## minutes before the remediation it was warning about. A stall still climbing
+      ## past 2400s means the reboot did not happen or did not clear it, and the metric
+      ## would have reset if it had.
+      expr: bpi_r4_page_pool_stall_seconds > 2400
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 page_pool stall age {{ $value }}s"
+        description: |
+          MTK eth_soc page_pool has been unable to release a buffer for
+          {{ $value }}s. Router-side page-pool-watch will sysrq-t at
+          600s and sysrq-c at 720s if gate armed. Manual investigation
+          via /etc/last_stall.txt if it triggered there.
+
+    - alert: BpiR4WatchdogStuck
+      ## Any per-minute cron watchdog gone silent — could be cron
+      ## starvation, FS corruption, or a script bug. Detected when
+      ## heartbeat-file age exceeds 3 minutes.
+      expr: bpi_r4_watchdog_age_seconds > 180
+      for: 2m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 watchdog '{{ $labels.name }}' stuck ({{ $value }}s)"
+        description: |
+          The {{ $labels.name }} watchdog hasn't touched its heartbeat
+          file in {{ $value }}s. Cron starvation, FS read-only, or the
+          script crashed without procd respawn. Check
+          `logread | grep {{ $labels.name }}` on the router.
+
+    - alert: BpiR4CrashCaptured
+      ## Heads-up only — pstore-archive.sh has already uploaded the
+      ## dump to OpenObserve stream `bpi_r4_crashes`. Use this alert as
+      ## a "go read the dump" notification, not as a fault to fix.
+      expr: bpi_r4_pstore_record_count > 0 and changes(bpi_r4_pstore_record_count[5m]) > 0
+      for: 1m
+      labels: { severity: info, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 captured a crash on last boot ({{ $value }} record)"
+        description: |
+          Pstore record present after reboot. Full dump uploaded to
+          OpenObserve under stream `bpi_r4_crashes`. Snapshot copy
+          preserved at /etc/pstore-snapshots/<ts>/ on the router.
+
+    - alert: BpiR4SoftnetDropsGrowing
+      ## Drops can happen at NIC bring-up (we observed 111 baseline
+      ## post-boot); only alert if the rate is non-trivial sustained.
+      expr: bpi_r4:softnet_drops_per_s:rate1m > 10
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 softnet dropping {{ $value }} packets/s"
+        description: |
+          Sustained softnet backlog drops — CPU is the bottleneck or
+          a softirq is starving. Drill into `cat /proc/net/softnet_stat`
+          on the router.
+
+  - name: app-bpi-r4.chrony
+    rules:
+    - alert: BpiR4ChronyUnsynchronised
+      ## stratum 0 reported when chrony itself is the source (GPS PPS);
+      ## any value >= 4 means we've cascaded far away from a real source.
+      expr: bpi_r4_chrony_stratum >= 4
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 chrony stratum {{ $value }} (degraded)"
+        description: |
+          chronyd has lost or backed off from its preferred upstream.
+          Cross-check whether GPS PPS / chrony peers are reachable.
+
+    - alert: BpiR4ChronyOffsetHigh
+      ## ±5 ms is generous for a LAN-served NTP source.
+      expr: abs(bpi_r4_chrony_last_offset_seconds) > 0.005
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 chrony offset {{ $value }}s vs upstream"
+        description: |
+          Local clock drift exceeds 5 ms vs the chosen reference.
+          Investigate jitter, GPS lock loss, or thermal effects.
+
+  - name: app-bpi-r4.wireguard
+    rules:
+    - alert: BpiR4WireguardPeerStale
+      ## > 1h since last handshake usually means a peer is unreachable.
+      ## Wireguard re-keys every ~2 min when active.
+      ##
+      ## Upper bound (1 year) excludes peers that have NEVER handshaken
+      ## — the producer pushes age = now - 0 for those, surfacing as
+      ## ~1157 days. Configured-but-never-connected peers are router
+      ## hygiene, not a tunnel-down condition.
+      ##
+      ## peer!~ excludes intentionally-intermittent / decommissioned peers
+      ## (the metric carries only a 12-char pubkey prefix, no name label):
+      ##   MngKslaCTeXM = gum          (wg_s2s, Exion S2S link decommissioned)
+      ##   pYweSYJkNAgW = s23ultra     (phone, roams off-VPN by design)
+      ##   cAVi3G/joG34 = mbp-mda      (laptop road-warrior, on-demand tunnel —
+      ##                                peer rebuilt 2026-08-19 with a fresh key,
+      ##                                which dropped it out of this exclusion)
+      ##   l+ka4hrO9vTr = displaytest   } near flaky AP APIN0325 —
+      ##   43iXioKHwISZ = skylightnorth } expected to flap, ignore
+      expr: 'bpi_r4_wireguard_last_handshake_age_seconds{peer!~"MngKslaCTeXM|pYweSYJkNAgW|cAVi3G/joG34|l\\+ka4hrO9vTr|43iXioKHwISZ"} > 3600 < 31536000'
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Smart Home }
+      annotations:
+        summary: "BPI-R4 WG peer {{ $labels.iface }}/{{ $labels.peer }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          No handshake from this WireGuard peer in over an hour. Either
+          the peer is offline, its public IP changed, or the tunnel
+          MTU is broken.
+
+  - name: app-bpi-r4.ipv6
+    rules:
+    - alert: BpiR4Ipv6PdLost
+      ## IA_PD lease present means ISP is still delegating the /56.
+      ## If this drops to 0 while WAN carrier+PPPoE are up, the ISP
+      ## stopped delegating us a prefix — internal IPv6 will break
+      ## within the previous prefix's valid lifetime.
+      expr: bpi_r4_ipv6_pd_present == 0 and bpi_r4_wan_carrier == 1
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 IPv6 prefix delegation lost (WAN up)"
+        description: |
+          `ubus call network.interface.wan_6 status` reports no
+          ipv6-prefix. Internal IPv6 will continue to work until
+          existing leases expire (~24h) then drop. Investigate odhcp6c
+          or upstream PPPoE re-establishment.
+
+    - alert: BpiR4OdhcpdDown
+      ## odhcpd dying = no RAs and no DHCPv6. Clients lose IPv6 default
+      ## route as their current RA's lifetime expires (default 1800s).
+      expr: bpi_r4_odhcpd_running == 0
+      for: 2m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 odhcpd down (no RAs / DHCPv6 server)"
+        description: |
+          odhcpd process not running. Internal LAN clients will lose
+          IPv6 default routes as their RA lifetimes expire. SSH and
+          `/etc/init.d/odhcpd start`.
+
+  - name: app-bpi-r4.platform-resources
+    rules:
+    - alert: BpiR4ConntrackHigh
+      ## Approaching nf_conntrack_max forces older entries to be evicted
+      ## and degrades connection setup latency. /etc/config/firewall
+      ## tuning is the fix; alert when we're at 70%.
+      expr: bpi_r4:conntrack_full_ratio > 0.70
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 conntrack table {{ $value | humanizePercentage }} full"
+        description: |
+          nf_conntrack_count / nf_conntrack_max exceeded 70%. Bump
+          /proc/sys/net/netfilter/nf_conntrack_max or shorten flow
+          timeouts. Check bpi_r4_active_flows for top sources.
+
+    - alert: BpiR4TcpRetransmitsHigh
+      ## Baseline is < 0.2 retransmits/s on this device. A sustained
+      ## spike usually means WAN-side packet loss or routing instability.
+      ## 2026-07-30 (infra-health, user-approved): 5-10min self-resolving
+      ## spikes (4 episodes since 07-21, mostly during PON/OnuPloam
+      ## degradation) paged warning and were gone before anyone could look.
+      ## min_over_time[15m] requires the rate to stay above threshold for
+      ## 15 continuous minutes; the instant clause keeps the rule off dead
+      ## series after exporter/label churn.
+      expr: |
+        bpi_r4:tcp_retrans_per_s:rate5m > 5
+        and min_over_time(bpi_r4:tcp_retrans_per_s:rate5m[15m]) > 5
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 TCP host-stack retransmits {{ $value }}/s"
+        description: |
+          Local TCP stack on the router is retransmitting unusually
+          often (mostly outbound from the router itself: ssh, acme,
+          chrony peers). Check WAN packet loss.
+
+  - name: app-bpi-r4.storage
+    rules:
+    - alert: BpiR4EmmcPreEolWarning
+      ## pre_eol_info enum:
+      ##   1 = Normal (>80% reserves) — healthy
+      ##   2 = Warning (<80%)         — flag
+      ##   3 = Urgent  (<20%)         — replace soon
+      expr: bpi_r4_emmc_pre_eol_info >= 2
+      for: 1h
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 eMMC pre-EOL state {{ $value }} (1=Normal,2=Warning,3=Urgent)"
+        description: |
+          eMMC reserved-block pool is depleting. Plan replacement
+          (Kingston 8GTF4R-class). `mmc extcsd read /dev/mmcblk0` for
+          full health dump (mmc-utils landed in build c489b57).
+
+    - alert: BpiR4EmmcLifeHigh
+      ## life_used_pct is the midpoint of the EXT_CSD 10% bucket
+      ## (5/15/.../95) or 100 if exceeded. Either Type A (SLC) or
+      ## Type B (MLC) above 80 = approaching wear-out.
+      expr: bpi_r4_emmc_life_used_pct > 80
+      for: 1h
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 eMMC type-{{ $labels.type }} {{ $value }}% used"
+        description: |
+          eMMC lifetime estimate exceeded 80% on at least one zone
+          (A = SLC reserve, B = MLC main). Plan replacement.
+
+  - name: app-bpi-r4.pppoe-session
+    rules:
+    - alert: BpiR4PppoeSessionThrashing
+      ## Counter increments only on session-id transitions (LCP up after
+      ## a real re-auth or BRAS-side reset). > 2 per hour = thrashing.
+      ##
+      ## Use increase() rather than max-min: increase() is reset-aware (it
+      ## extrapolates from the post-reset slope and ignores the pre-reset
+      ## peak), so a router reboot — which IS one legitimate session
+      ## change — counts as exactly 1, not as `pre_reboot_counter`.
+      ## Observed 2026-05-25: pre-reboot counter was 5 (5 changes over
+      ## the prior 4-day uptime, ~1.25/day, normal); reboot reset it to
+      ## 0; the old max-min interpretation read that as a 5-flap thrash
+      ## and fired the alert for an hour while the pre-reboot peak aged
+      ## out of the [1h] window.
+      expr: |
+        increase(bpi_r4_pppoe_session_changes_total[1h]) > 2
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE session re-established {{ $value }} times in 1h"
+        description: |
+          PPP session-id is changing too often. Indicates BRAS-side
+          tear-downs, LCP keepalive failures, or local pppd respawn loop.
+          Check `logread | grep -i pppd` on the router.
+
+    - alert: BpiR4WanDropCaptured
+      ## Fires on EACH WAN/PPPoE drop (lower bar than the >2/1h thrashing
+      ## alert) so the event recorder gets consulted promptly. On every drop
+      ## /etc/hotplug.d/iface/90-wandrop writes a full forensic record (optics,
+      ## both SFP carriers, PLOAM/LODS/BIP, session-id) to
+      ## /etc/last_wandrop.jsonl and the disconnect reason (LCP/PADT/link-down)
+      ## to /etc/last_wandrop.context. Investigation: ~/bpi-r4-wan-drop-report-2026-06-21.md
+      ## info (2026-07-09): event record of a drop the automations already
+      ## handle (Hue/ONU cycles, wandrop forensic recorder); nothing pending.
+      ## BpiR4PppoeFlappy/SessionThrashing stay warning for repeat offenders.
+      expr: |
+        increase(bpi_r4_pppoe_session_changes_total[15m]) >= 1
+      for: 0m
+      labels: { severity: info, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 WAN dropped (netconnect) — {{ $value }} PPPoE reset(s)/15m"
+        description: |
+          The netconnect PPPoE line dropped and re-established. Read the
+          captured context (sub-minute optics + disconnect reason):
+            ssh root@bpi-r4 'tail -4 /etc/last_wandrop.jsonl; cat /etc/last_wandrop.context'
+          If BpiR4OnuDownstreamLoss is ALSO firing -> PON/line-side (provider).
+          If NOT -> higher-layer (BNG/LCP) or router; check the recorder for
+          sfp_lan_carrier also down (router-side) vs only sfp_wan (PON-side).
+
+    - alert: BpiR4OnuDownstreamLoss
+      ## ONU Loss-Of-Downstream-Sync counter incremented = a brief downstream
+      ## PON-signal interruption. With healthy optics + PLOAM staying O5, this
+      ## is the provider/OLT-side micro-interruption signature behind the
+      ## 2026-06 netconnect drops (see ~/bpi-r4-wan-drop-report-2026-06-21.md).
+      ## info (2026-07-09): same rationale as BpiR4WanDropCaptured — recorded
+      ## and auto-mitigated event; repeat offenders escalate via the
+      ## thrashing/flappy warnings.
+      expr: |
+        increase(bpi_r4_onu_lods_events_total[15m]) >= 1
+      for: 0m
+      labels: { severity: info, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 ONU downstream-sync loss (LODS +{{ $value }}) — PON/line-side"
+        description: |
+          The ONU briefly lost downstream sync. Optics are healthy and PLOAM
+          stays O5, so this is a line/OLT-side interruption, not local fibre
+          degradation (and not the freshly-swapped ONU). Ticket netconnect with
+          ONU serial AVMG7B4114F1 + the timestamp. Full context on the router:
+          /etc/last_wandrop.jsonl.
+
+  - name: app-bpi-r4.pppoe-rtt
+    rules:
+    - alert: BpiR4PppoePeerLoss
+      ## Per-minute 5-ping sample; loss > 0 sustained means real WAN path issues.
+      expr: bpi_r4_pppoe_packet_loss_pct > 0
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE peer packet loss {{ $value }}%"
+        description: |
+          ICMP loss to the PPPoE peer ({{ $labels.peer }}) sustained
+          over 5 min. Usually upstream / ISP-side rather than the
+          router itself. Cross-check ONU optical Rx + carrier.
+
+    - alert: BpiR4PppoeRttHigh
+      ## Baseline 4-5 ms over LAN→PPPoE→ISP edge. > 50 ms sustained is
+      ## indicative of bufferbloat or upstream congestion.
+      expr: bpi_r4_pppoe_rtt_ms{stat="avg"} > 50
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 PPPoE peer RTT {{ $value }} ms (baseline 4-5 ms)"
+        description: |
+          Avg RTT to PPPoE peer 10× baseline. Likely upstream
+          congestion or bufferbloat on the SQM path.
+
+  - name: app-bpi-r4.hue-plug
+    rules:
+    - alert: BpiR4HuePlugUnavailable
+      ## The Internet Hue plug is the only path to power-cycle ONU+router
+      ## from HA. If unavailable, ALL of our recovery automations are dead.
+      expr: max(hass_entity_available{entity="light.hue_smart_plug_1"}) == 0
+      for: 10m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Internet Hue plug unavailable (HA can't talk to it)"
+        description: |
+          HA reports the Internet Hue plug as unavailable for >10 min.
+          All router/ONU power-cycle automations are non-functional
+          until this clears. Check Hue bridge + ZigBee mesh; the plug
+          itself may need to be unplugged-replugged.
+
+  - name: app-bpi-r4.cron-runtime
+    rules:
+    - alert: BpiR4CronSlow
+      ## Surfacing cron-script overruns. A minute-cadence script taking
+      ## > 30s burns 50% of its slot just on bookkeeping. conntrack-state-
+      ## metrics walks /proc/net/nf_conntrack which the kernel locks; at
+      ## 30k+ entries a single pass costs ~90s sys time, so it lives on a
+      ## 5-min cron and is excluded here — see BpiR4ConntrackCronSlow.
+      expr: bpi_r4_cron_runtime_seconds{script!="conntrack-state-metrics"} > 30
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 cron script {{ $labels.script }} runtime {{ $value }}s"
+        description: |
+          /usr/local/bin/{{ $labels.script }}.sh took >30s in its last run.
+          Check for proc-walking loops (busybox awk on /proc/net/nf_conntrack
+          can hit 100s on a busy router; see the dropped flow-metrics.sh).
+
+    - alert: BpiR4ConntrackCronSlow
+      ## conntrack-state-metrics on a 5-min cron walks 30-50k entries —
+      ## ~90s at steady state. Alert if it overruns its slot (>240s = 80% of
+      ## interval), which usually means table runaway.
+      expr: bpi_r4_cron_runtime_seconds{script="conntrack-state-metrics"} > 240
+      for: 15m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 conntrack state metrics taking {{ $value }}s — table runaway?"
+        description: |
+          conntrack-state-metrics is exceeding 240s. Either nf_conntrack
+          has grown past safe levels or PPE offload broke (everything
+          falling back to slow path). Check bpi_r4_conntrack_count.
+
+  - name: app-bpi-r4.pushgateway-staleness
+    ## Detects total cron-daemon failure or network partition between router
+    ## and Pushgateway — local cron_last_completion_age can't catch this
+    ## because the gauge itself stops being pushed. Threshold is 2× the cron
+    ## interval to allow one missed cycle without paging.
+    rules:
+    - alert: BpiR4PushgatewayJobStale1m
+      expr: time() - push_time_seconds{job=~"bpi_r4|bpi_r4_pppoe"} > 300
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Pushgateway job {{ $labels.job }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          The {{ $labels.job }} 1-minute cron hasn't pushed in >5min.
+          Either cron is dead, the script crashed, or network/Pushgateway
+          is unreachable from the router. SSH the router and check cron+
+          `/var/log` for failures.
+
+    - alert: BpiR4PushgatewayJob5mStale
+      expr: time() - push_time_seconds{job=~"bpi_r4_chrony|bpi_r4_nlbwmon|bpi_r4_onu"} > 900
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Pushgateway job {{ $labels.job }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          5-minute cron hasn't pushed in >15min. Same triage as 1m alert.
+
+    - alert: BpiR4PushgatewayJobHourlyStale
+      expr: time() - push_time_seconds{job="bpi_r4_emmc"} > 7200
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 Pushgateway job {{ $labels.job }} stale ({{ $value | humanizeDuration }})"
+        description: |
+          Hourly cron hasn't pushed in >2h. Same triage as 1m alert.
+
+  - name: app-bpi-r4.conntrack
+    rules:
+    - alert: BpiR4SynFlood
+      ## Normal load ~100–300 SYN_RECV; sustained >1500 = backlog of
+      ## half-open conns, classic SYN-flood symptom.
+      ## 2026-07-13: for 5m→15m — scanner bursts crossing 1500 for a few
+      ## minutes produced 46 firing episodes in 13d, none actionable
+      ## (syncookies held every time). A real flood sustains well past 15m.
+      expr: bpi_r4_conntrack_tcp_state{state="SYN_RECV"} > 1500
+      for: 15m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 TCP SYN_RECV {{ $value }} sustained — possible flood"
+        description: |
+          Half-open connection table is growing. Likely external scan or
+          SYN-flood. Confirm via per-port destination distribution in
+          /proc/net/nf_conntrack and consider tightening syncookies.
+
+    - alert: BpiR4HwOffloadStalled
+      ## ppe1/ppe2 entries normally grow with traffic; a sustained 0 on
+      ## both means HW offload disabled (config drift, kernel oops, or
+      ## flow_offload init failed).
+      expr: bpi_r4_mtk_ppe_entries{engine="ppe1"} + bpi_r4_mtk_ppe_entries{engine="ppe2"} == 0
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 MTK PPE flow-offload engine has zero entries"
+        description: |
+          Both PPE engines empty for 10m — HW NAT/flow offload is
+          inactive. Throughput will fall back to slow-path and CPU usage
+          will spike. Check `dmesg | grep -i mtk_ppe` and the nftables
+          flowtable definition.
+
+  - name: app-bpi-r4.psi
+    ## Pressure Stall Information — CPU/memory/IO/IRQ contention.
+    ## `some` = at least one task stalled; `full` = all tasks stalled
+    ## (catastrophic for non-CPU resources). Thresholds tuned for a
+    ## router that should rarely block — 30% sustained = saturation.
+    rules:
+    - alert: BpiR4CpuPressureHigh
+      expr: bpi_r4_psi_pressure_pct{resource="cpu",kind="some",window="60"} > 30
+      for: 10m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 CPU pressure {{ $value }}% (some-60s) > 30 for 10m"
+        description: |
+          Router CPU is saturated — at least one task stalled >30% of the
+          time over a 60s window. Suspect a runaway cron or DDoS-class
+          packet rate. Check /proc/loadavg, top, and the cron-runtime panel.
+
+    - alert: BpiR4MemPressureFull
+      expr: bpi_r4_psi_pressure_pct{resource="memory",kind="full",window="60"} > 5
+      for: 10m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 memory FULL pressure {{ $value }}% — OOM imminent"
+        description: |
+          ALL tasks stalled on memory >5% of the time. On a router with
+          4 GiB RAM this means a leak or huge conntrack table. Inspect
+          /proc/meminfo and conntrack count immediately — OOM-kill of
+          netifd/dnsmasq imminent.
+
+    - alert: BpiR4IoPressureHigh
+      expr: bpi_r4_psi_pressure_pct{resource="io",kind="some",window="300"} > 20
+      for: 15m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 IO pressure {{ $value }}% sustained — eMMC stress"
+        description: |
+          IO some-300s > 20% sustained 15m. Likely heavy log/pstore write
+          activity or eMMC wear-leveling thrashing. Cross-reference
+          bpi_r4_emmc_writes_completed_total rate and life_used_pct.
+
+  - name: app-bpi-r4.nlbwmon
+    rules:
+    - alert: BpiR4NlbwmonEnobufs
+      ## nlbwmon prints "Netlink receive failure: Out of memory" when the
+      ## netlink recv buffer overflows — every event is a lost batch of
+      ## flow updates. Use increase() instead of max-min so a router
+      ## reboot (which resets the counter from N to 0) doesn't fire this
+      ## alert for an hour while N ages out of the window — see the
+      ## BpiR4PppoeSessionThrashing comment above for the full pattern.
+      expr: |
+        increase(bpi_r4_nlbwmon_enobufs_total[1h]) > 10
+      for: 15m
+      ## statuspage: exclude (2026-07-30, same approved hardening as the
+      ## OnuPloam exclude): lost nlbwmon accounting batches are an internal
+      ## tune-signal, not a user-visible Internet outage. Observed degrading
+      ## the public page 07-30 via a pushgateway-wipe series reset (VM
+      ## counts a reappearing counter's first value as increase()).
+      ## severity: info since 2026-08-01 (approved): drops are accounting-only
+      ## and self-recover; root-caused to flow-churn storms (e.g. cluster CI
+      ## cold-build downloads egressing through the router) that overflow the
+      ## netlink buffer regardless of size — 16 MiB was live during the 08-01
+      ## 12:20Z firing. Persistent loss escalates via the Persistent rule below.
+      ## threshold >0 -> >10 (2026-08-10, approved re-tune): the 08-08..08-10
+      ## firings were all single lost batches (increase == 1 in every nonzero
+      ## hour over 72h), and one blip holds increase[1h] > 0 for a full hour so
+      ## `for: 15m` filters nothing. >10/h only fires on an actual churn storm;
+      ## scattered singles stay visible in the metric, and sustained loss still
+      ## escalates via the Persistent rule regardless of burst size.
+      labels: { severity: info, team: mdapi, component: Internet, statuspage: exclude }
+      annotations:
+        summary: "BPI-R4 nlbwmon dropped netlink batches ({{ $value }} in 1h)"
+        description: |
+          nlbwmon NETLINK_ENOBUFS — flow accounting lost a batch (transient,
+          self-recovering; typically a flow-churn storm such as a cluster CI
+          cold-build download). Buffer is 16 MiB and package-owned. Only the
+          Persistent variant below warrants action.
+
+    - alert: BpiR4NlbwmonEnobufsPersistent
+      ## Escalation per the severity policy: warning only when demonstrably
+      ## stuck — drops present in EVERY 5m window for 15m (min_over_time over
+      ## a bool subquery, not a long for:). A pushgateway series reset fakes
+      ## one window's increase(), never three consecutive ones.
+      expr: |
+        min_over_time((increase(bpi_r4_nlbwmon_enobufs_total[5m]) > bool 0)[15m:5m]) == 1
+      labels: { severity: warning, team: mdapi, component: Internet, statuspage: exclude }
+      annotations:
+        summary: "BPI-R4 nlbwmon losing netlink batches for 15m+ (persistent)"
+        description: |
+          nlbwmon NETLINK_ENOBUFS increasing in three consecutive 5m windows —
+          not a transient churn blip. Inspect logread on bpi-r4 and consider
+          lowering refresh_interval or shedding accounted subnets.
+
+  - name: app-bpi-r4.speedtest
+    rules:
+    - alert: BpiR4SpeedtestStale
+      ## Producer changed 2026-08-03: Windmill f/probe/wan_speedtest, every
+      ## 6h from a node's 10G NIC (the router-cron producer measured its own
+      ## CPU softpath and is retired). push_time_seconds updates on EVERY
+      ## push, success or not — >26h means 4 missed cycles, the schedule or
+      ## the probe itself is broken. Failed-but-running is the info rule below.
+      expr: time() - push_time_seconds{job="bpi_r4_speedtest"} > 93600
+      for: 1h
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "WAN speedtest probe hasn't pushed in 26h+"
+        description: |
+          f/probe/wan_speedtest (Windmill schedule, every 6h) isn't pushing.
+          Check the schedule and recent job logs in Windmill; run the script
+          manually with a pinned node to debug.
+    - alert: BpiR4SpeedtestFailing
+      ## Probe runs but produces no measurement (Ookla AND iperf3 both
+      ## failed) for 2+ consecutive cycles. Pushgateway retains the last
+      ## value, so a single failed run keeps success=0 until the next push —
+      ## the 13h max_over_time window requires two.
+      expr: max_over_time(bpi_r4_speedtest_success[13h]) == 0
+      labels: { severity: info, team: mdapi, component: Internet }
+      annotations:
+        summary: "WAN speedtest failing for 13h+ (2+ consecutive runs)"
+        description: |
+          The measurement pod runs but Ookla and the iperf3 fallbacks all
+          failed. Read the pod tail in the Windmill job output; likely a
+          server-list or egress problem rather than a schedule problem.
+
+  ## ─────────────────────────────────────────────────────────────────────
+  ## NAT64 (Jool) — translates IPv6-only client traffic to IPv4 so that
+  ## hosts on the BPI-R4's IPv6-only segments can reach IPv4-only sites.
+  ## When NAT64 breaks, those clients lose connectivity to most of the
+  ## v4 internet. Backing metrics are pushed minutely by
+  ## /usr/local/bin/nat64-watch.sh on the router (queries Jool inside the
+  ## dedicated 'jool' netns via `ip netns exec jool jool ...`).
+  ##
+  ## Note: a synthetic 64:ff9b::1.1.1.1 ping6 probe was considered but
+  ## doesn't work from the router shell — the well-known prefix is only
+  ## routed to Jool's translator inside the netns, so router-originated
+  ## packets bypass it. Instance-presence + watcher-freshness covers the
+  ## "Jool config wiped / module unloaded / init script broken" failure
+  ## modes which are the only ones we've actually seen.
+  ## ─────────────────────────────────────────────────────────────────────
+  - name: app-bpi-r4.nat64
+    rules:
+    - alert: BpiR4Nat64InstanceMissing
+      expr: bpi_r4_nat64_instance_present == 0
+      for: 5m
+      labels: { severity: critical, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 NAT64: Jool instance missing"
+        description: |
+          The Jool stateful NAT64 instance is no longer registered. IPv6-only
+          clients lose v4 connectivity through this router. Check
+          `/etc/init.d/jool status`, `ip netns list` for the jool netns, and
+          dmesg for jool module load errors.
+
+    - alert: BpiR4Nat64WatcherStale
+      expr: time() - bpi_r4_nat64_last_run_timestamp_seconds > 300
+      for: 5m
+      labels: { severity: warning, team: mdapi, component: Internet }
+      annotations:
+        summary: "BPI-R4 NAT64 watcher hasn't pushed in >5m"
+        description: |
+          /usr/local/bin/nat64-watch.sh stopped pushing to Pushgateway.
+          Either the minute-cron is removed/disabled or the router can't
+          reach Pushgateway. BpiR4Nat64InstanceMissing is silently broken
+          until this resolves.

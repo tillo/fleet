@@ -1,0 +1,104 @@
+## Wyoming speech-to-text for Home Assistant Assist (ns `wyoming`).
+##
+## Selectors are NAMESPACE-WIDE on purpose. ns `wyoming` holds exactly one
+## workload today (whisper/STT), but the whole point of this namespace is that
+## piper (TTS) and openwakeword land beside it later -- and a name-pinned rule
+## is precisely how workload #2 gets born uncovered. That gap is real next
+## door: 08-home.yml pins deployment="home-assistant" by name, which is why
+## this service was given its own namespace rather than being dropped into
+## ns home-assistant under a rule that would never have matched it.
+##
+## severity: warning + statuspage: exclude -- a deliberate call, not a default.
+## Losing STT does not stop Home Assistant, any automation, or any alarm: voice
+## control simply falls back to the phone/watch's own recogniser, in whatever
+## language that device is set to. It degrades a household convenience that no
+## one outside the house can observe, so it has no business degrading the
+## public mdapi.statuspage.io page. (A namespace-only selector once put a
+## private volume on that page for 30h -- the lesson stuck.)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-wyoming
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-wyoming.workload
+    rules:
+    ## Subtracting rather than testing == 0 keeps a deliberate scale-to-zero
+    ## silent. 15m rather than 5m because Recreate takes the pod fully down.
+    - alert: WyomingDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="wyoming", deployment=~".+"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="wyoming", deployment=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "wyoming/{{ $labels.deployment }} unavailable"
+        description: |
+          A Wyoming voice service has no available replica. Assist keeps
+          working, but speech-to-text falls back to the device's own
+          recogniser -- which on the Wear OS watch means transcription in the
+          WATCH's locale, not Italian. Check
+          `kubectl -n wyoming describe deploy {{ $labels.deployment }}`; a
+          first start after a PVC loss re-downloads the model and can legitimately
+          take several minutes.
+
+    ## ⚠️ Do NOT tidy this arm away because it matches nothing today. It is what
+    ## makes the namespace-wide claim honest: the coverage probe treats a
+    ## namespace-only selector as covering BOTH kinds, so a Deployment-only file
+    ## would silently claim coverage of a StatefulSet it could never fire on.
+    - alert: WyomingStatefulSetUnavailable
+      expr: |
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace="wyoming", statefulset=~".+"
+            }
+            - kube_statefulset_status_replicas_available{
+              namespace="wyoming", statefulset=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "wyoming/{{ $labels.statefulset }} unavailable"
+        description: |
+          A Wyoming StatefulSet has fewer available replicas than desired.
+
+    ## The socket probe in the Deployment only proves something is accepting on
+    ## 10300. This catches the more likely failure: the model failing to load or
+    ## the process wedging, which shows up as a restart loop rather than a
+    ## closed port.
+    - alert: WyomingPodCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="wyoming"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "wyoming/{{ $labels.pod }} crash-looping"
+        description: "Container restart rate > 0.5/min for 10m. Check `kubectl -n wyoming logs {{ $labels.pod }} --previous`."

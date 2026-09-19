@@ -1,0 +1,101 @@
+## Wake-word detection for Home Assistant Assist (Wyoming protocol, TCP 10400).
+##
+## Why this exists: both Assist pipelines had wake_word_entity: null, which is
+## why voice here has always been push-to-talk from a phone or watch. A wake
+## word is what turns a pipeline into a SATELLITE you can talk to across a
+## room, and it is the last server-side piece missing for that.
+##
+## Where detection runs, and why this is still needed:
+##   - An ESP32-S3 satellite (esphome voice_assistant / micro_wake_word) can
+##     detect its wake word ON DEVICE and only then stream audio.
+##   - A wyoming-satellite (e.g. a Pi, or HA Voice PE in server mode) streams
+##     audio continuously and asks HA to detect -- that is this service.
+## Running it costs ~nothing while no satellite streams, so it is provisioned
+## up front rather than being the thing that blocks the first satellite.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyoming-openwakeword
+  namespace: wyoming
+  labels:
+    app: wyoming-openwakeword
+  ## ⛔ NO keel annotations on purpose. This image carries a PINNED tag, and a
+  ## pinned tag + Keel is the broken middle between the two lanes: Keel bumps the
+  ## live Deployment while git keeps claiming the old version, so the Fleet bundle
+  ## sits Modified forever and GitOps stops telling the truth. Measured here on
+  ## 2026-09-10: Keel took wyoming-piper 2.4.3 -> 2.5.0 at 00:06 and the bundle
+  ## went Modified(1) within hours of the bundle being created.
+  ##   Lane-A = floating tag (:latest/:stable/...) + Keel  -> cannot drift
+  ##   Lane-B = pinned tag + Renovate                      -> git stays the truth
+  ## These are Lane-B; renovate.json carries the matching rule. Same move as
+  ## joplin/server, caddy and eclipse-mosquitto before them.
+spec:
+  replicas: 1
+  ## RollingUpdate: no volumes at all, so nothing to hand over between pods.
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: wyoming-openwakeword
+  template:
+    metadata:
+      labels:
+        app: wyoming-openwakeword
+    spec:
+      containers:
+      - name: wyoming-openwakeword
+        image: rhasspy/wyoming-openwakeword:2.1.0
+        ## The image ENTRYPOINT already supplies --uri and --custom-model-dir
+        ## and appends these after them -- same trap as whisper and piper.
+        args:
+          ## Models ship INSIDE the image (ok_nabu, hey_jarvis, alexa,
+          ## hey_mycroft, hey_rhasspy), which is why this deployment needs no
+          ## volume and no download budget in its startupProbe.
+          ##
+          ## ok_nabu is HA's own default wake word. It stays English on
+          ## purpose even though the pipelines are Italian: the wake word is a
+          ## fixed acoustic pattern, not speech that gets transcribed, so it
+          ## is unrelated to the pipeline language. Nothing downstream pins
+          ## this name -- a satellite selects its wake word per device.
+          - --preload-model
+          - ok_nabu
+        ports:
+        - name: wyoming
+          containerPort: 10400
+          protocol: TCP
+        ## Socket-open probes, for the same reason as whisper and piper: the
+        ## Wyoming protocol offers no cheaper health signal. Real coverage is
+        ## HA's wake_word entity.
+        startupProbe:
+          tcpSocket:
+            port: 10400
+          periodSeconds: 5
+          ## 1 min is plenty: models are baked in, so start is just process
+          ## boot -- no network fetch to wait for.
+          failureThreshold: 12
+        readinessProbe:
+          tcpSocket:
+            port: 10400
+          periodSeconds: 20
+        livenessProbe:
+          tcpSocket:
+            port: 10400
+          periodSeconds: 30
+          failureThreshold: 5
+        resources:
+          requests:
+            ## Idle unless a satellite is actively streaming audio; the ONNX
+            ## models are small and stay resident.
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            ## Detection is continuous WHILE streaming, so this needs more than
+            ## a burst allowance -- but a limit reserves nothing, and there are
+            ## no satellites streaming yet.
+            cpu: "2"
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL

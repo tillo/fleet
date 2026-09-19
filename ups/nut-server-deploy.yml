@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nut-server
+  labels:
+    app: nut-server
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nut-server
+  template:
+    metadata:
+      labels:
+        app: nut-server
+    spec:
+      nodeSelector:
+        mdapi.ch/has-ups: "true"
+      containers:
+        - name: nut
+          image: instantlinux/nut-upsd:latest
+          imagePullPolicy: Always
+          # The image's upsmon executes its own power-fail shutdown at LB
+          # (sets FSD, calls the absent /sbin/shutdown, container exits —
+          # crash-looping upsd exactly during the low-battery endgame and
+          # blinding the HA choreography; observed 2026-07-12 run 2a, 4
+          # restarts). Neuter SHUTDOWNCMD in the stock config BEFORE the
+          # entrypoint appends its MONITOR line: this pod only observes,
+          # Home Assistant owns all shutdown decisions.
+          command: ["/bin/sh", "-c", "sed -i 's|^SHUTDOWNCMD.*|SHUTDOWNCMD \"/bin/true\"|' /etc/nut/upsmon.conf && exec /usr/local/bin/entrypoint.sh"]
+          resources: {}
+          securityContext:
+            privileged: true
+          env:
+            - name: SERIAL
+              value: "3C89382208"
+            - name: UPS_NAME
+              value: "hp-rt3000"
+            - name: UPS_DESC
+              value: "HP R/T3000 (3000VA, 2700W, 230V)"
+            - name: API_USER
+              value: "monuser"
+            - name: API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nut-creds
+                  key: mon_password
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nut-creds
+                  key: admin_password
+            - name: SHUTDOWN_TIMER
+              value: "180"
+            - name: NETMASK
+              value: "10.0.0.0/8"
+          ports:
+            - name: nut
+              containerPort: 3493
+              protocol: TCP
+          volumeMounts:
+            - name: dev-bus-usb
+              mountPath: /dev/bus/usb
+          readinessProbe:
+            tcpSocket:
+              port: 3493
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3493
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: dev-bus-usb
+          hostPath:
+            path: /dev/bus/usb
+            type: Directory

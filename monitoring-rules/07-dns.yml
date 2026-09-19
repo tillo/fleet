@@ -1,0 +1,680 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-dns
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-dns.workload
+    rules:
+    - alert: TechnitiumUnavailable
+      ## Fires only on TOTAL internal-DNS outage: neither technitium-primary nor
+      ## technitium-secondary has an available replica. Previously keyed on a
+      ## non-existent deployment="technitium" (the workloads are
+      ## technitium-primary / -secondary, both Recreate/1-replica behind the
+      ## role:dns LB at 192.168.1.54) so it never fired -- fixed 2026-06-23.
+      expr: |
+        sum(
+          kube_deployment_status_replicas_available{
+            namespace="technitium", deployment=~"technitium-(primary|secondary)"
+          }
+        ) == 0
+      for: 2m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium internal DNS fully down (no available primary or secondary)"
+        description: |
+          Neither technitium-primary nor technitium-secondary has an available
+          replica. dns.mdapi.ch (192.168.1.54) will not resolve. Cluster-internal
+          queries fall back to coredns recursion, but LAN clients pointed at
+          192.168.1.54 and external resolution break immediately.
+
+    - alert: TechnitiumDeploymentDegraded
+      ## One of the two DNS pods is unavailable (the other still answers from its
+      ## AXFR copy). for:5m tolerates the Recreate-strategy gap during updates.
+      expr: |
+        (
+          kube_deployment_spec_replicas{
+            namespace="technitium", deployment=~"technitium-(primary|secondary)"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="technitium", deployment=~"technitium-(primary|secondary)"
+          }
+        ) > 0
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.deployment }} unavailable (DNS degraded, one pod down)"
+        description: |
+          {{ $labels.deployment }} has no available replica for >5m. The other
+          Technitium pod still answers queries from its AXFR copy, but redundancy
+          is lost; if it is the primary, external-dns RFC2136 writes + DHCP-driven
+          record updates fail until it returns.
+
+    - alert: TechnitiumPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="technitium", pod=~"technitium-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} restarting frequently"
+
+    - alert: TechnitiumNotifyRefused
+      expr: technitium_notify_refused_log_5m > 0
+      for: 10m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary→secondary NOTIFY refused ({{ $value }} in last 5m)"
+        description: |
+          Primary's DNS NOTIFY is being refused by the secondary. Zone changes
+          (incl. DHCP-driven A/PTR updates) will only propagate on SOA refresh
+          (15min), causing stale records on the secondary.
+          Check secondary's notifyAllowedNetworks setting (must include pod CIDR).
+
+    - alert: TechnitiumNotifyFailedZones
+      expr: technitium_notify_failed_zones{instance="primary"} > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary has {{ $value }} zones with NOTIFY failures"
+        description: |
+          Zones flagged notifyFailed=true on primary. Replication to secondary
+          may be lagging up to SOA refresh interval.
+
+    - alert: TechnitiumLowSoaExpire
+      expr: technitium_min_soa_expire_seconds{instance="primary"} > 0 < 86400
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "A Technitium zone has SOA expire={{ $value }}s (< 1 day)"
+        description: |
+          The lowest SOA expire across authoritative zones is under 1 day.
+          Secondaries stop serving a zone once they cannot reach the primary for
+          'expire' seconds, so a low value means the domain goes dark shortly
+          after a primary/cluster outage — root cause of the 2026-06-06 tillo.ch
+          / mdapi.ch outage (expire was 300s; secondaries gave up in 5 min).
+          Raise the SOA expire to 1209600 (2 weeks) via nsupdate to match the
+          other zones.
+
+    - alert: TechnitiumZoneCountMismatch
+      expr: |
+        abs(
+          technitium_zone_count{instance="primary"}
+          - on() technitium_zone_count{instance="secondary"}
+        ) > 1
+      for: 30m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary/secondary zone count differs by {{ $value }}"
+        description: |
+          Number of zones on primary vs secondary diverged for >30m. Check
+          secondary's AXFR pull from primary and notifyAllowedNetworks ACL.
+
+    - alert: TechnitiumZoneListDrift
+      ## Catches the case TechnitiumZoneCountMismatch misses: same total but
+      ## different sets (one zone dropped on a side, another added) — e.g.
+      ## the 77.168.192.in-addr.arpa reverse-zone drift surfaced in the
+      ## 2026-05-17 DNS audit. Source: Windmill technitium_zone_diff,
+      ## scheduled 03:15 Zurich nightly.
+      expr: (technitium_zone_diff_primary_only + technitium_zone_diff_secondary_only) > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium zone-list drift: {{ $value }} zones differ between pods"
+        description: |
+          Primary and secondary disagree on which zones exist. Run the
+          technitium_zone_diff Windmill script to see which side has what;
+          most likely fix is adding the missing zone as Secondary on the
+          pod that lacks it (or Catalog Zone if you have appetite for the
+          structural fix).
+
+    - alert: TechnitiumZoneDiffStale
+      expr: time() - technitium_zone_diff_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium zone-diff probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill technitium_zone_diff hasn't successfully pushed in >48h.
+          The zone-list drift alert is silently broken until this resolves.
+
+    - alert: TechnitiumPrimaryZonesWiped
+      ## The primary has lost ALL custom authoritative zones (home.tillo.ch +
+      ## the reverse zones) -- the 2026-06-14 rebuild-onto-empty-PVC failure
+      ## mode. The Windmill technitium_zone_restore_guard (every 5m) auto-
+      ## restores from the latest Garage backup; this fires only if the wipe
+      ## PERSISTS (restore errored, or the latest backup is >72h old and the
+      ## guard refused). Source: technitium_zone_restore_guard.
+      expr: technitium_restore_guard_primary_empty == 1
+      for: 5m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary lost all custom zones and auto-restore has not cleared it"
+        description: |
+          The primary is missing home.tillo.ch + the reverse zones and the
+          auto-restore guard has not recovered it within 5m. Internal DNS +
+          LAN PTRs are broken (the secondary serves AXFR copies but external-dns
+          RFC2136 writes go to the primary). Check the technitium_zone_restore_guard
+          job logs: likely the /api/settings/restore failed or the newest
+          config-backups/technitium backup is >72h old. Restore manually if so.
+
+    - alert: TechnitiumAutoRestoreFired
+      ## info: by the time this fires the guard has ALREADY restored the
+      ## primary — it's a record of automation acting, not a pending problem.
+      ## The failure modes stay warnings: TechnitiumRestoreGuardStale (guard
+      ## dead) and the zone-diff/notify alerts (restore didn't converge).
+      expr: technitium_restore_guard_restore_fired == 1
+      for: 0m
+      labels:
+        severity: info
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary was auto-restored from backup"
+        description: |
+          technitium_zone_restore_guard detected an empty primary and restored
+          it from the latest Garage backup. Expected after a primary rebuild,
+          but confirm: zones repopulated, the secondary re-synced, and any
+          dynamic DHCP/external-dns records added since the backup re-converged.
+
+    - alert: TechnitiumRestoreGuardStale
+      expr: time() - technitium_restore_guard_last_run_timestamp_seconds > 1800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium restore-guard probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill technitium_zone_restore_guard (every 5m) hasn't pushed in
+          >30m. Auto-restore protection for the primary is silently off until
+          this resolves.
+
+    - alert: DNSSECRRSIGNearExpiry
+      ## Earliest DNSKEY RRSIG signature expiry per signed zone. Source:
+      ## Windmill dnssec_rrsig_expiry, scheduled 06:30 Zurich daily.
+      ## 9 owned signed zones tracked (5 in-house BIND9 + 4 Infomaniak).
+      expr: dnssec_rrsig_expiry_seconds < 7 * 24 * 3600 and dnssec_rrsig_expiry_seconds >= 0
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC RRSIG for {{ $labels.zone }} expires in {{ $value | humanizeDuration }}"
+        description: |
+          The earliest DNSKEY RRSIG for {{ $labels.zone }} will expire in
+          less than 7 days. Roll the signing key (in-house: BIND9 inline
+          re-sign; Infomaniak: automatic but re-validate after).
+
+    - alert: DNSSECRRSIGExpired
+      expr: dnssec_rrsig_expiry_seconds < 0
+      for: 10m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC RRSIG for {{ $labels.zone }} has expired"
+        description: |
+          Resolvers doing DNSSEC validation will return SERVFAIL for
+          {{ $labels.zone }}. Re-sign the zone immediately.
+
+    - alert: DNSSECRRSIGLookupFailing
+      expr: dnssec_rrsig_lookup_ok == 0
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC DNSKEY lookup failing for {{ $labels.zone }}"
+        description: |
+          dig DNSKEY against 9.9.9.9 returned no RRSIG for {{ $labels.zone }}
+          for >1h. Either DNSSEC was disabled at the zone, the zone is
+          unreachable, or 9.9.9.9 is blocking the query.
+
+    - alert: DNSSECRRSIGExpiryProbeStale
+      expr: time() - dnssec_rrsig_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "DNSSEC RRSIG expiry probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill dnssec_rrsig_expiry hasn't successfully pushed in >48h.
+          The expiry alerts are silently broken until this resolves.
+
+    - alert: TechnitiumHealthProbeStale
+      expr: time() - technitium_health_last_run_timestamp_seconds > 900
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium health probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill technitium_health probe hasn't pushed in >15m. Either the
+          probe is failing or Pushgateway is down. Other Technitium alerts
+          using these metrics will be silently broken until this resolves.
+
+    - alert: TechnitiumBackupStale
+      expr: time() - technitium_backup_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium backup older than 2 days"
+        description: |
+          Daily zone-backup probe hasn't successfully run in >48h. Garage
+          unreachable, credentials wrong, or the Windmill schedule disabled.
+
+    - alert: TechnitiumBackupFailed
+      expr: technitium_backup_last_run_success == 0
+      for: 30m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Last Technitium backup run failed"
+        description: |
+          technitium_zone_backup completed but reported failure. Check Windmill
+          job output for the upload error (Garage creds, bucket, network).
+
+    - alert: TechnitiumVipDnsDown
+      expr: probe_success{probe="technitium_vip"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium LoadBalancer VIP (192.168.1.54) not resolving"
+        description: |
+          Blackbox DNS probe against the technitium-dns LB VIP failed for >2m.
+          Clients pointed at 192.168.1.54 (BPI-R4 conditional forward,
+          DHCP-assigned resolvers) are not getting answers.
+
+    - alert: TechnitiumPrimaryPodDnsDown
+      expr: probe_success{probe="technitium_primary_pod"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary pod not answering DNS"
+        description: |
+          Blackbox DNS probe against technitium-primary service failed for >2m.
+          The authoritative pod for home.tillo.ch is unresponsive.
+
+    - alert: TechnitiumSecondaryPodDnsDown
+      expr: probe_success{probe="technitium_secondary_pod"} == 0
+      for: 10m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium secondary pod not answering DNS"
+        description: |
+          Blackbox DNS probe against technitium-secondary service failed for
+          >10m. Failover replica unavailable — primary is a SPOF until the
+          secondary recovers. Lower severity because clients currently route
+          to primary only (externalTrafficPolicy=Local).
+
+    - alert: TechnitiumServFailHigh
+      ## Exporter publishes the rolling last-hour SERVFAIL count; alert when
+      ## the upstream-resolver error rate breaches our normal background.
+      ## Baseline observed is single-digit/hour, so >30/h is anomalous.
+      expr: technitium_dns_request_result_count{server="primary", result="server_failure"} > 30
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium primary: {{ $value }} SERVFAILs in the last hour"
+        description: |
+          Upstream forwarder (NextDNS UDP failover) is returning SERVFAIL at
+          a higher-than-normal rate. Check forwarder reachability and the
+          recursive resolver path. Drill in via OpenObserve stream
+          technitium_queries with rcode='ServerFailure' for the affected
+          qnames/clients.
+
+    - alert: TechnitiumQueryLogLagging
+      ## Pushgateway metric pushed by Windmill technitium_query_log_to_o2.
+      ## Steady-state lag should track the schedule interval (60s); >5min
+      ## means the cursor is stuck or OpenObserve ingest is failing.
+      expr: technitium_query_log_lag_seconds > 300
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium → OpenObserve ingest lag {{ $value | humanizeDuration }}"
+        description: |
+          The Windmill technitium_query_log_to_o2 job is reporting a
+          steady-state lag >5min. Either Technitium /api/logs/query is slow,
+          OpenObserve _json ingest is failing, or the cursor is stuck.
+          Look at the job's recent runs in Windmill and tail the OpenObserve
+          ingester logs.
+
+    - alert: TechnitiumQueryLogStale
+      expr: time() - technitium_query_log_last_run_timestamp_seconds > 600
+      for: 5m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium query-log probe hasn't pushed in >10min"
+        description: |
+          Windmill technitium_query_log_to_o2 stopped pushing to Pushgateway.
+          Either the schedule was disabled, the worker is stuck, or
+          Pushgateway is unreachable. Other Technitium query-log alerts will
+          be silently broken until this resolves.
+
+    - alert: TechnitiumDhcpNoEndpoints
+      ## technitium-dhcp Service has selector app=technitium-primary, so its
+      ## endpoint set is empty whenever the primary pod is not Ready. The
+      ## existing TechnitiumPrimaryPodDnsDown catches DNS on port 53 but the
+      ## DHCP service on UDP/67 has no blackbox equivalent. Use the kube-state
+      ## endpoint metric to detect zero ready DHCP backends.
+      expr: |
+        sum by (namespace, service) (
+          kube_endpoint_address{
+            namespace="technitium", endpoint="technitium-dhcp", ready="true"
+          }
+        ) < 1
+      for: 3m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Technitium DHCP service has no ready endpoints (LAN leases stop renewing)"
+        description: |
+          The LoadBalancer 192.168.1.55 on UDP/67 will silently drop client
+          packets — DHCPDISCOVER/REQUEST get no answer, existing leases keep
+          working until expiry, then clients lose addresses.
+          Single-active by design (Technitium has no DHCP failover protocol).
+          Manual cutover: see fleet/technitium/DHCP-FAILOVER-RUNBOOK.md.
+
+  ## ─────────────────────────────────────────────────────────────────────
+  ## Adjacent DNS-stack components beyond Technitium. Each is independent
+  ## but a failure of any one degrades a DNS-related user surface:
+  ##   nameserver  -> ns.mdapi.ch (BIND9, public auth zone)
+  ##   external-dns -> RFC2136 sync into Technitium (new Ingresses + ACME)
+  ##   opennic     -> public OpenNIC tier-2 resolver
+  ##   unbound     -> split-horizon view (internal-vs-public resolution)
+  ## ─────────────────────────────────────────────────────────────────────
+
+  - name: app-dns.stack
+    rules:
+    - alert: NameserverBindUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="nameserver", deployment="nameserver"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="nameserver", deployment="nameserver"
+          }
+        ) > 0
+      for: 3m
+      labels:
+        severity: critical
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "nameserver/nameserver (ns.mdapi.ch BIND9): {{ $value }} replicas unavailable"
+        description: |
+          Authoritative BIND9 for the public mdapi.ch zone is down. External
+          resolvers will get SERVFAIL once their cache expires. Inbound
+          mail/web/etc. for *.mdapi.ch breaks. The dns-public blackbox probe
+          (ns.mdapi.ch:53 UDP/TCP/DNSSEC) will already be reporting
+          probe_success=0 — this alert names the pod-side cause.
+
+    - alert: ExternalDnsUnavailable
+      ## THERE ARE TWO external-dns INSTANCES. Until 2026-08-29 this pinned only the
+      ## first (external-dns/external-dns), so split-horizon/external-dns-mdapi — the
+      ## SOLE writer of the unbound split-horizon ConfigMap, replicas 1, strategy
+      ## Recreate — had no alert at all.
+      ## Its failure is quiet in a way the first one's is not: existing internal names
+      ## keep resolving from what unbound already holds, and only NEW ingress hostnames
+      ## stop being pinned internally and start hairpinning out through the WAN.
+      ## Verified after the fix: the selector matches 2 series, one per instance.
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace=~"external-dns|split-horizon", deployment=~"external-dns.*"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace=~"external-dns|split-horizon", deployment=~"external-dns.*"
+          }
+        ) > 0
+      for: 15m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "external-dns: {{ $value }} replicas unavailable for >15m"
+        description: |
+          external-dns is the RFC2136 bridge that pushes Ingress/Service
+          hostnames into Technitium. While it is down, new ingress hostnames
+          (and any DNS-01 ACME challenges depending on freshly-published
+          TXT records) stop working. Existing records continue to resolve.
+
+    - alert: OpennicTier2Down
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="opennic", deployment="opennic-tier2"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="opennic", deployment="opennic-tier2"
+          }
+        ) > 0
+      for: 3m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "opennic/opennic-tier2: {{ $value }} replicas unavailable"
+        description: |
+          Public OpenNIC tier-2 resolver is down. End-users on the open
+          internet querying our advertised tier-2 IP for OpenNIC TLDs
+          (.geek, .libre, etc.) will fail over to other tier-2 operators.
+          Severity warning (not critical) because (a) we are one of many
+          tier-2 operators by design and (b) failover is automatic for
+          clients with multiple resolvers.
+
+    - alert: UnboundSplitHorizonDown
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="split-horizon", deployment="unbound"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="split-horizon", deployment="unbound"
+          }
+        ) > 0
+      for: 3m
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "split-horizon/unbound: {{ $value }} replicas unavailable"
+        description: |
+          Unbound split-horizon resolver is degraded. With 2 replicas
+          desired (anti-affinity), a single-pod outage is tolerable;
+          this alert fires when both go down or one is unrecoverable.
+          Internal vs external split-view resolution will fall through
+          to the next resolver (Technitium primary) which serves the
+          internal view to everyone — typically benign but worth noting.
+
+  ## Public BIND replication health — added 2026-08-29.
+  ##
+  ## Why this group exists: this file carried 26 Technitium alerts (notify refused,
+  ## notify-failed zones, zone list drift, zone count mismatch, secondary pod down…)
+  ## and exactly ONE for BIND — NameserverBindUnavailable, which compares desired vs
+  ## available replicas. The INTERNAL resolver had full replication coverage while the
+  ## PUBLIC authoritative server had none, even though 2 of its 3 delegated
+  ## nameservers are third parties we do not control. Silent AXFR/NOTIFY breakage
+  ## would have left them serving stale zones indefinitely.
+  ##
+  ## Severities follow the house rule that an auto-solving condition is not a page.
+  ## ns2.afraid.org is a FREE secondary and is measurably flaky, so "a secondary did
+  ## not answer" is INFO and is asked per-SERVER over a THREE-DAY window: a peer that
+  ## answered even one zone in three days is flaky, not gone, and flaky is not
+  ## actionable on a free service at 03:00.
+  ## What is genuinely actionable, and never self-heals, is a secondary serving a
+  ## DIFFERENT serial than the primary: that means replication is broken, and it stays
+  ## broken until someone looks.
+  ##
+  ## Fed by Windmill f/probe/bind_zone_transfer_check (every 6h Zurich). Job failure is
+  ## already covered by the generic BatchJobLastRunFailed via *_last_run_success.
+  - name: app-dns.bind-replication
+    rules:
+    - alert: BindZoneSerialStale
+      ## THE actionable one. A secondary answering a different serial than the primary
+      ## means NOTIFY/AXFR is not getting through. It does not recover on its own.
+      ## 2h rides out the normal case: cert-manager DNS-01 bumps serials constantly and
+      ## a transfer in flight is briefly divergent by design.
+      expr: bind_zone_transfer_stale == 1
+      for: 2h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.server }} is serving a stale serial for {{ $labels.zone }}"
+        description: |
+          A delegated secondary has been answering a different SOA serial than the
+          primary for over two hours, so zone transfer is not reaching it. Public
+          resolvers may get old answers for this zone from that nameserver.
+
+          Compare, then nudge the primary to re-notify:
+            dig +short SOA {{ $labels.zone }} @192.168.1.53
+            dig +short SOA {{ $labels.zone }} @{{ $labels.server }}
+            kubectl -n nameserver exec deploy/nameserver -- rndc notify {{ $labels.zone }}
+          Check named.conf allow-transfer still lists this peer, and that the peer
+          still has the zone configured on its side.
+
+    - alert: BindSecondaryUnreachable
+      ## Rewritten 2026-09-04 — it was per-ZONE with `for: 6h` and fired on ~11 of 14
+      ## days against a secondary that was serving correct, in-sync data the entire
+      ## time (every serial matched the primary). Two causes, both fixed in the probe:
+      ## it queried TCP-only while afraid.org rate-limits TCP/53 but answers UDP
+      ## (measured interleaved, same zone, same minute: UDP 8/8, TCP 3/8), and its
+      ## circuit breaker pushed answer_ok=0 for zones it had never queried — turning
+      ## one throttling episode into 14 identical alerts. Signature of that bug, if it
+      ## ever returns: 14 zeros and exactly 1 one on the same server.
+      ##
+      ## Now per-SERVER, and it asks the only question worth acting on: has this
+      ## secondary answered NOTHING AT ALL for three days? max_over_time also spans the
+      ## 6h push interval, so a single unlucky run can no longer fire anything, and a
+      ## peer that is merely throttled clears itself by answering any one zone.
+      expr: |
+        max by (server) (
+          max_over_time(bind_zone_transfer_answer_ok{role="secondary"}[3d])
+        ) == 0
+      for: 1h
+      labels:
+        severity: info
+        component: DNS
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Secondary {{ $labels.server }} has answered nothing for 3 days"
+        description: |
+          This delegated secondary has not answered a SOA query for ANY zone in three
+          days, so it is presumed gone rather than throttled. Resolution still works
+          via the primary and the other secondary, so this stays informational — it
+          becomes real if BindAllSecondariesUnreachable joins it.
+
+          Confirm over UDP, never TCP — afraid.org rate-limits TCP/53:
+            dig @{{ $labels.server }} mdapi.ch SOA +norecurse
+          An `aa` flag plus a serial equal to `dig @192.168.1.53 mdapi.ch SOA` means the
+          secondary is healthy and this is a probe artifact, not an outage. Note that
+          allow-transfer holds the address AXFR arrives FROM, which for afraid.org is
+          not the address ns2.afraid.org resolves to — so check the delegated NS name
+          too before concluding the peer is gone.
+
+    - alert: BindAllSecondariesUnreachable
+      ## Actionable: every external secondary is down at once, so ns.mdapi.ch is the
+      ## only nameserver left answering and a primary outage would take public DNS
+      ## with it. Distinct from the info alert above, which is one flaky peer.
+      expr: |
+        sum(bind_zone_transfer_answer_ok{role="secondary"}) == 0
+        and sum(bind_zone_transfer_secondaries) > 0
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "Every external DNS secondary is unreachable — no delegation redundancy left"
+        description: |
+          Neither delegated secondary is answering. Public resolution now depends
+          entirely on ns.mdapi.ch, so a primary restart becomes a public outage
+          rather than something resolvers ride out.
+          Check WAN egress first (both peers failing at once is more likely our side
+          than two independent third parties), then each peer.
+
+    - alert: BindZoneTransferCheckStale
+      expr: time() - bind_zone_transfer_check_last_run_timestamp_seconds > 86400
+      for: 1h
+      labels:
+        severity: warning
+        component: DNS
+        team: mdapi
+      annotations:
+        summary: "BIND zone-transfer probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          f/probe/bind_zone_transfer_check has not pushed in over a day (it runs every
+          6h). The replication alerts above are silently blind until this resolves.

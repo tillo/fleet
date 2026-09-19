@@ -1,0 +1,178 @@
+## Postgres per Bussola.
+##
+## A DIFFERENZA di litellm-pg, questo database NON è ricostruibile: contiene
+## l'unica copia di quello che le persone ci hanno scritto dentro. Quindi ha
+## barman verso Garage dal primo deploy, non "poi" — è esattamente l'errore
+## commesso con il PVC di Open WebUI il 26 agosto, che ha girato giorni senza
+## uno snapshot.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: bussola-pg
+  namespace: bussola
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+
+  ## `required` e non `preferred`: con 2 istanze su 3 nodi è sempre
+  ## soddisfacibile, ed è l'unica forma che sopravvive davvero alla perdita di
+  ## un nodo (lezione ha-recorder-pg 2026-06-15, poi grafana-pg e litellm-pg).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    ## Il database è di pochi MB; 5Gi è tutto cuscino per il WAL (lezione
+    ## ha-recorder 2026-07-30: pg_wal si mangia il margine in fretta).
+    size: 5Gi
+
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://cnpg-bussola-pg
+      ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the IN-CLUSTER Ceph
+      ## RGW, as part of retiring both those hosts. This is the "local" half of
+      ## the backup architecture: short-window PITR and granular restore live
+      ## here; the offsite copy is a separate, client-side-encrypted channel.
+      ##
+      ## ⛔ NEW bucket name on purpose. The Garage bucket was `bussola-pg-backup`;
+      ## reusing it would mean a half-applied change (new store, stale
+      ## endpointURL) kept writing to Garage and SUCCEEDED, silently. With a
+      ## distinct name that mistake fails closed with NoSuchBucket.
+      ##
+      ## ⛔⛔ Changing destinationPath starts an EMPTY archive. WAL archiving
+      ## alone is not a backup -- paperless-pg proved that with 33k objects and
+      ## zero base backups. A one-shot Backup is taken immediately after this
+      ## lands, and `lastSuccessfulBackup` is the only acceptable evidence.
+      ##
+      ## ⭐ TLS restored. !369 landed this store on plain http, which handed
+      ## back exactly the property the Garage terminator was built for on
+      ## 2026-09-05: pods on qui/quo/qua reach an RGW pod on another node across
+      ## the physical LAN, over an UNENCRYPTED VXLAN overlay, and barman does not
+      ## encrypt. "It stays in the cluster" was the wrong reassurance -- the
+      ## cluster is three separate machines. RGW now carries its own house-PKI
+      ## leaf (rook-ceph-objectstore-users/rgw-tls-cert.yml) and this dials it.
+      endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+      ## The CA here is the house chain (MDAPI Root + MDAPI Issuing CA 01), which
+      ## is what a Horizon-issued RGW leaf chains to. The secret's NAME still says
+      ## garage-transit because that is where this chain was first needed; the
+      ## contents are correct and unchanged. Renaming it across six namespaces is
+      ## a separate change from fixing the transport.
+      endpointCA:
+        name: garage-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-bussola-pg
+          key: AWS_ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-bussola-pg
+          key: AWS_SECRET_ACCESS_KEY
+        region:
+          name: cnpg-rgw-region
+          key: REGION
+      ## ⛔ `data:` and `wal:` were both absent, so CNPG's defaults applied: ONE
+      ## upload worker and NO compression anywhere. Same gap as ha-recorder-pg,
+      ## which crawled at 0.3-1.0 MiB/s and reached 1.68 TiB for a 17 GB database
+      ## while the storage, TLS terminator and Garage all sat idle.
+      ## ⚠️ This one carries `retentionPolicy: "30d"`, the longest on the estate,
+      ## so uncompressed base backups accumulate for twice as long as everywhere
+      ## else — the compression matters more here, not less.
+      ## bootstrap/gitlab-pg has carried jobs + gzip all along; jobs: 2 matches it
+      ## and fits this pod's 1-CPU limit.
+      ## ⚠️ Compression is recorded PER BACKUP — existing backups stay
+      ## restorable, and nothing shrinks retroactively.
+      data:
+        compression: gzip
+        jobs: 2
+      wal:
+        compression: gzip
+    retentionPolicy: "30d"
+    target: prefer-standby
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: bussola
+      owner: bussola
+      ## UTF8 esplicito: l'interfaccia è in italiano e un cluster creato
+      ## SQL_ASCII rompe ogni accento. L'applicazione forza comunque
+      ## client_encoding, ma il posto giusto per deciderlo è qui.
+      encoding: UTF8
+      ## Nessun `secret:` — CNPG genera bussola-pg-app con dentro la chiave
+      ## `uri` già pronta, che il Deployment consuma come BUSSOLA_DATABASE_URL.
+      ## La password serve solo dentro il cluster: farla passare da Akeyless
+      ## aggiungerebbe un accoppiamento di rotazione per niente.
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quotato: CNPG memorizza la quantità come stringa, e un intero non
+      # quotato lascia il bundle Fleet perennemente "Modified" (1 contro "1").
+      cpu: "1"
+      memory: 1Gi
+---
+## Credenziali S3 per i backup barman. Chiave scoped in sola scrittura sul
+## bucket bussola-pg-backup del Garage esterno; il job garage_offsite_backup
+## la porta poi su B2 e SFTP.
+## ⚠️ 2026-09-19: NO LONGER REFERENCED by the cluster above -- the barman store
+## moved to the in-cluster Ceph RGW and now uses the OBC-written secret instead.
+## This is kept ONLY so the abandoned Garage store on salt stays readable while
+## that host is still up: it holds the sole pre-cutover PITR history, and the
+## credentials to reach it exist nowhere else in git. Delete it together with
+## the Garage buckets when salt is powered off -- an ExternalSecret nothing
+## consumes is exactly the kind of config that rots into a false sense of cover.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: bussola-pg-backup-s3
+  namespace: bussola
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: bussola-pg-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ACCESS_KEY_ID: "{{ .access_key }}"
+        ACCESS_SECRET_KEY: "{{ .secret_key }}"
+        ## Garage verifica lo scope SigV4 della regione; barman userebbe us-east-1.
+        REGION: "garage"
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/bussola/pg-backup-s3/access_key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/bussola/pg-backup-s3/secret_key
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: bussola-pg-daily
+  namespace: bussola
+spec:
+  schedule: "0 15 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: bussola-pg

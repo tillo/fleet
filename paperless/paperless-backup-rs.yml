@@ -1,0 +1,53 @@
+## VolSync backup of paperless-data-ceph (Ceph RBD — document originals,
+## thumbnails, archive PDFs; ~0.7 GiB today and growing). copyMethod Snapshot
+## -> crash-consistent CSI snapshot via the ceph-block VolumeSnapshotClass,
+## then restic to the external Garage ceph-backup bucket (off-site replicated
+## to B2/SFTP by garage_offsite_backup at 04:00). Daily 03:15 UTC — staggered
+## after owncloud's 02:30, done before the off-site sweep. Retain 7 daily /
+## 4 weekly / 3 monthly; prune weekly. The paperless DB is CNPG (barman ->
+## s3://paperless-pg-backup) so only the file data lives here.
+## Added 2026-08-14 — PVC audit gap G2 (beads infra-jjb).
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: paperless-data-ceph
+spec:
+  sourcePVC: paperless-data-ceph
+  trigger:
+    schedule: "15 3 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    volumeSnapshotClassName: ceph-block
+    # Mover runs as uid/gid 1000 — the owner of /usr/src/paperless/{data,media}.
+    # Same lesson as the owncloud RS: VolSync's restic container drops ALL
+    # capabilities (no CAP_DAC_OVERRIDE), so root still fails on any mode-600
+    # file owned by 1000; reading as the owning uid sidesteps it. No fsGroup —
+    # avoids a recursive chown of the snapshot clone.
+    moverSecurityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+    cacheCapacity: 2Gi
+    # restic cache on fast Longhorn, not the Ceph tier being backed up.
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    # 2026-08-27: a mover from the root-era config died on 2026-08-24T03:18:29Z
+    # still holding an exclusive lock (PID 24, UID 0). Every retry since then
+    # backed up fine and then aborted in `forget`, so lastSyncTime froze for 4
+    # days while the repo grew snapshots retention could never prune. VolSync
+    # runs `restic unlock` once per NEW value of this field and records it in
+    # status.restic.lastUnlocked, so leaving it here is idempotent, not a
+    # recurring unlock. Bump the date only if a stale lock happens again.
+    #
+    # 2026-09-02: this field is now EXCLUDED from the Fleet diff (see the
+    # comparePatches entry in paperless/fleet.yaml). f/heal/volsync_restic_stale_lock
+    # overwrites it live whenever it clears a lock, so git and cluster can never
+    # agree on it — which held this bundle Modified for 21h+ and kept
+    # FleetBundlesNotReady lit. The value below is the seed, not the live truth:
+    # read status.restic.lastUnlocked (or the heal's metrics) for what actually ran.
+    unlock: "2026-08-27-stale-root-lock"
+    retain:
+      daily: 7
+      weekly: 4
+      monthly: 3

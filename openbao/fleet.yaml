@@ -1,0 +1,106 @@
+# OpenBao — self-hosted secrets STANDBY (Akeyless failover, Option B).
+# Design/ADR: Joplin note "OpenBao secrets failover & backup — design / ADR".
+# P1 PoC: deploy alongside the live Akeyless path, zero impact. Akeyless stays
+# PRIMARY; this is a warm, continuously-mirrored standby (mirror job = P2).
+#
+# Auto-unseal = Option α: the `unsealer` sidecar reads Shamir keys from the
+# (optional) Secret `openbao-unseal-keys` and unseals on boot. That Secret is
+# created out-of-band at init time from `bao operator init` output (NEVER in git).
+#
+# TODO before this is a real failover target (post-P1):
+#   - scale ha.replicas 1 -> 3 if HA wanted
+# defaultNamespace (not `namespace:`) — the chart ships a cluster-scoped
+# ClusterRoleBinding (openbao-server-binding, for k8s TokenReview / ESO auth),
+# which Fleet's targetNamespace mode forbids.
+defaultNamespace: openbao
+helm:
+  maxHistory: 25
+  releaseName: openbao
+  repo: https://openbao.github.io/openbao-helm
+  chart: openbao
+  version: 0.29.4            # appVersion v2.5.5
+  values:
+    global:
+      tlsDisable: false       # P1.5: CA01 TLS (cert openbao-tls via horizon-private ClusterIssuer)
+      imagePullSecrets:
+        - name: zot-pull      # ES in fleet/zot-pull-secrets (htpasswd user zot)
+    injector:
+      enabled: false
+    csi:
+      enabled: false
+    ui:
+      enabled: true
+    server:
+      image:
+        registry: zot.mdapi.ch          # Lane B: mirrored from quay.io/openbao/openbao
+        repository: mdapi/openbao
+        tag: "2.5.5"
+        pullPolicy: IfNotPresent
+      dataStorage:
+        enabled: true
+        size: 5Gi
+        storageClass: ceph-block
+        accessMode: ReadWriteOnce
+      # The exec probe (`bao status`) blocks on storage IO; at the chart-default
+      # 3s it flapped 51x/48h under Ceph OSD-recreate backfill (2026-08-10),
+      # dropping the Service endpoint and deadline-killing the hourly mirror job.
+      readinessProbe:
+        enabled: true
+        timeoutSeconds: 10
+      ha:
+        enabled: true
+        replicas: 1
+        raft:
+          enabled: true
+          setNodeId: true
+          config: |
+            ui = true
+            listener "tcp" {
+              address = "[::]:8200"
+              cluster_address = "[::]:8201"
+              tls_cert_file = "/openbao/tls/tls.crt"
+              tls_key_file  = "/openbao/tls/tls.key"
+            }
+            storage "raft" {
+              path = "/openbao/data"
+            }
+      # Auto-unseal Option α: sidecar unseals from the optional Secret openbao-unseal-keys.
+      volumes:
+        - name: unseal-keys
+          secret:
+            secretName: openbao-unseal-keys
+            optional: true
+        - name: tls
+          secret:
+            secretName: openbao-tls    # CA01 leaf+chain, issued by horizon-private (P1.5)
+      volumeMounts:
+        - name: tls
+          mountPath: /openbao/tls
+          readOnly: true
+      extraContainers:
+        - name: unsealer
+          image: zot.mdapi.ch/mdapi/openbao:2.5.5
+          env:
+            - name: BAO_ADDR
+              value: https://127.0.0.1:8200
+            # Loopback only — the CA01 cert carries svc-DNS SANs, no 127.0.0.1
+            # IP SAN (deliberate; real consumers verify via mdapi-trust-bundle).
+            - name: BAO_SKIP_VERIFY
+              value: "true"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Drive off `bao status` EXIT CODE (2 = sealed) — robust vs JSON parsing.
+              while true; do
+                bao status >/dev/null 2>&1; rc=$?
+                if [ "$rc" = "2" ] && [ -f /unseal/key1 ]; then
+                  for f in /unseal/key1 /unseal/key2 /unseal/key3; do
+                    [ -f "$f" ] && bao operator unseal "$(cat $f)" >/dev/null 2>&1
+                  done
+                fi
+                sleep 10
+              done
+          volumeMounts:
+            - name: unseal-keys
+              mountPath: /unseal
+              readOnly: true

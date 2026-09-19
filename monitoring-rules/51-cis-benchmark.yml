@@ -1,0 +1,119 @@
+## CIS Kubernetes Benchmark posture, published by the weekly `kube-bench`
+## CronJob (ns `kube-bench`, bundle ../kube-bench/).
+##
+## ⚠️ These are NOT Windmill-pushed metrics, so the generic `BatchJobStale` in
+## `12-batch-jobs.yml` does NOT cover them and a scoped staleness rule below is
+## not the duplicate it looks like. That rule joins `job` against
+## `windmill_schedule_interval_seconds{script!=""}`, which the Windmill probe
+## `f/probe/schedule_cadence_map` publishes per *Windmill script*. A Kubernetes
+## CronJob publishes no cadence entry, so the join has no right-hand side and
+## the alert can never fire for `job="kube_bench"` — silently, which is the
+## failure mode that rule's own comment history is about.
+##
+## The job POSTs rather than PUTs: busybox wget in the kube-bench image has no
+## PUT. Safe here because the group is per-node and exclusively owned, and the
+## label set is a fixed enumeration (section 1–5), so no stale series can
+## accumulate the way a dynamic label set would.
+##
+## `component: Security` is INTERNAL on purpose. A benchmark regression is a
+## posture finding, not a service outage — routing it to a public statuspage
+## component would degrade mdapi.statuspage.io in front of strangers for
+## something no user can observe.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cis-benchmark
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cis-benchmark.posture
+    rules:
+    ## Baseline measured 2026-09-11 (rke2-cis-1.24, kube-bench v0.13.0):
+    ## 8 FAIL per node, of which 0 are genuine exposures —
+    ##   * 1.1.3 / 1.1.5 / 1.1.7: manifest mode 0644 against a literal 0600/0644
+    ##     check, inside a parent directory that is 0700 root:root, so the files
+    ##     are unreachable by any non-root principal and carry no credentials.
+    ##     Accepted deviation; the fix would be RKE2's `profile: cis`, which
+    ##     Harvester owns and we must not hand-edit.
+    ##   * 4.1.9 / 4.1.10 / 4.2.1 / 4.2.2 / 4.2.3: the profile looks for the
+    ##     retired `--config` kubelet path. This cluster uses `--config-dir`
+    ##     (0600 root:root) and the effective config sets anonymous.enabled
+    ##     false, authorization.mode Webhook and an x509 clientCAFile. Verified
+    ##     by reading the drop-in, not by trusting the check.
+    ## The alert therefore fires on REGRESSION from the accepted baseline, not
+    ## on the existence of failures. Lower the threshold as items are genuinely
+    ## remediated — a threshold parked above the real count is an alert that can
+    ## never fire, which is worse than no alert because it looks like coverage.
+    - alert: CisBenchmarkRegression
+      expr: max by (node) (kube_bench_checks_fail) > 8
+      for: 30m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark regressed on node {{ $labels.node }}: {{ $value }} failing checks (accepted baseline 8)"
+        description: |
+          kube-bench reports more failed checks than the accepted baseline, so
+          node or control-plane configuration has changed.
+          Read the run: kubectl -n kube-bench logs job/<newest job> --all-containers
+          Per-section attribution: kube_bench_section_fail{node="..."}
+          Triage and the accepted-deviation rationale: docs.mdapi.ch → CIS Benchmark.
+
+    ## See the header: the generic BatchJobStale cannot reach a k8s CronJob.
+    ## Weekly schedule, so two missed cycles is where silence stops being
+    ## plausible — the same 2x grace the generic rule applies.
+    - alert: CisBenchmarkStale
+      expr: (time() - max by (node) (kube_bench_last_run_timestamp_seconds)) > 1209600
+      for: 1h
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark has not run on node {{ $labels.node }} for over 14 days"
+        description: |
+          The weekly kube-bench CronJob has published no run for this node in
+          two cycles. Check it is not suspended (kubectl -n kube-bench get cronjob),
+          that the anti-affinity can still place one pod per node, and that the
+          namespace NetworkPolicy still permits egress to Pushgateway.
+
+    ## Separates "the audit ran and found problems" from "the audit broke".
+    ## Without it, a job that dies before parsing looks identical to a clean run
+    ## that simply has not happened yet.
+    - alert: CisBenchmarkRunFailed
+      expr: max by (node) (kube_bench_last_run_success) == 0
+      for: 15m
+      labels:
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark run failed on node {{ $labels.node }}"
+        description: |
+          kube-bench produced no parseable report. Most likely the pinned
+          BENCHMARK env no longer matches the running RKE2 version after an
+          upgrade, or a hostPath mount moved. The pod logs carry kube-bench's
+          own stderr.
+
+    ## Backstop for "the bundle deployed but nothing ever ran" — a state the
+    ## staleness rule cannot see, because an absent series yields no sample to
+    ## compare against. `for: 10d` and not 48h: the schedule is weekly, so a
+    ## freshly merged bundle legitimately has no data for up to 7 days, and an
+    ## alert that fires on every deployment is an alert people learn to ignore.
+    - alert: CisBenchmarkNeverRan
+      expr: absent(kube_bench_last_run_timestamp_seconds)
+      for: 10d
+      labels:
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark has never published a result"
+        description: |
+          No kube_bench_* series exists at all: either the bundle is not
+          deployed on this cluster, or the first run has never succeeded.
+          Trigger one by hand to find out:
+          kubectl -n kube-bench create job kb-once --from=cronjob/kube-bench

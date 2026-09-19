@@ -1,0 +1,44 @@
+# Production MetalLB pool. Open allocation: any Service with
+# spec.loadBalancerClass=metallb in any namespace can pull from it.
+# The --lb-class=metallb on the controller is what gates participation;
+# no per-pool selectors needed.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: prod-pool
+  namespace: metallb-system
+spec:
+  ## ⛔ THE GAP AT .62 IS LOAD-BEARING — DO NOT "TIDY" THIS BACK INTO ONE RANGE.
+  ##
+  ## 192.168.1.62 is the jump bastion VIP, and it is owned by **kube-vip**
+  ## (svc jump/jump carries `kube-vip.io/vipHost`), not by MetalLB. MetalLB has
+  ## no visibility of kube-vip's allocations, so while .62 sat inside this pool
+  ## it was simply a free address — and with .40-.61 and .63 all taken, it was
+  ## the LOWEST free one, i.e. the next to be handed out.
+  ##
+  ## That is not hypothetical: on 2026-09-08 a new LoadBalancer with no pinned
+  ## address was assigned .62 within seconds, colliding with the estate's
+  ## access path of last resort. It was deleted immediately and jump was
+  ## unharmed, but the next one would have done the same.
+  ##
+  ## The other kube-vip address, .191 (kube-system/ingress-expose), is outside
+  ## this pool and needs no exclusion. If a third kube-vip VIP is ever created
+  ## inside .40-.99, carve it out here too.
+  addresses:
+    - 192.168.1.40-192.168.1.61
+    - 192.168.1.63-192.168.1.99
+  autoAssign: true
+  avoidBuggyIPs: false
+---
+# L2Advertisement scoped to mgmt-br only — speakers won't ARP from any
+# other host interface. Matches our LAN topology.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: prod-pool-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - prod-pool
+  interfaces:
+    - mgmt-br

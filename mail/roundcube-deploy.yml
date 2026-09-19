@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: roundcube
+  namespace: mail
+  annotations:
+    reloader.stakater.com/auto: "true"
+    keel.sh/policy: force
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    keel.sh/match-tag: "true"
+spec:
+  selector:
+    matchLabels:
+      app: roundcube
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: roundcube
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+      - name: roundcube
+        image: roundcube/roundcubemail:latest
+        resources: {}
+        ports:
+        - containerPort: 80
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: ROUNDCUBEMAIL_DEFAULT_HOST
+          value: ssl://mail.mdapi.ch
+        - name: ROUNDCUBEMAIL_DEFAULT_PORT
+          value: "993"
+        - name: ROUNDCUBEMAIL_SMTP_SERVER
+          value: tls://mail.mdapi.ch
+        - name: ROUNDCUBEMAIL_SMTP_PORT
+          value: "587"
+        - name: ROUNDCUBEMAIL_COMPOSER_PLUGINS
+          value: johndoh/contextmenu,jfcherng-roundcube/show-folder-size,takerukoushirou/roundcube-dovecot_client_ip
+        - name: ROUNDCUBEMAIL_PLUGINS
+          value: archive,zipdownload,managesieve,emoticons,markasjunk,new_user_dialog,show_additional_headers,vcard_attachments,password,newmail_notifier,contextmenu,show_folder_size,roundcube_dovecot_client_ip
+        - name: ROUNDCUBEMAIL_INSTALL_PLUGINS
+          value: "1"
+        - name: ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE
+          value: "200M"
+        - name: ROUNDCUBEMAIL_ASPELL_DICTS
+          value: en,it,fr,de,pl
+        - name: ROUNDCUBEMAIL_DB_TYPE
+          value: mysql
+        - name: ROUNDCUBEMAIL_DB_HOST
+          value: roundcube-mariadb.mail.svc.cluster.local
+        - name: ROUNDCUBEMAIL_DB_USER
+          value: roundcube
+        - name: ROUNDCUBEMAIL_DB_NAME
+          value: roundcube
+        envFrom:
+        - secretRef:
+            name: roundcube-env-secret
+        volumeMounts:
+        - name: roundcube-config
+          mountPath: /var/roundcube/config/configuration.php
+          subPath: configuration.php
+        - name: roundcube-config
+          mountPath: /usr/local/etc/php/conf.d/zz-overrides.ini
+          subPath: zz-overrides.ini
+        - name: roundcube-secrets
+          mountPath: /var/roundcube/config/secrets.php
+          subPath: secrets.php
+      volumes:
+      - name: roundcube-config
+        configMap:
+          name: roundcube-config
+      - name: roundcube-secrets
+        secret:
+          secretName: roundcube-secrets

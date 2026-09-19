@@ -1,0 +1,70 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: backlog-dolt
+  namespace: backlog
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: backlog-dolt
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        DOLT_ROOT_PASSWORD: "{{ .root_password }}"
+        BEADS_DOLT_PASSWORD: "{{ .root_password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/backlog/dolt-root-password
+      secretKey: root_password
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: backlog-serve-token
+  namespace: backlog
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: backlog-serve-token
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        # bd serve --auth-token-file format: one bearer token per line
+        tokens: |
+          {{ .serve_token }}
+  data:
+    - remoteRef:
+        key: /mdapi/backlog/serve-token
+      secretKey: serve_token
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: backlog-basicauth
+  namespace: backlog
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: backlog-basicauth
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        # htpasswd line (user tillo); plaintext lives at
+        # /mdapi/backlog/basicauth-password for the human side.
+        auth: "{{ .htpasswd }}"
+  data:
+    - remoteRef:
+        key: /mdapi/backlog/basicauth-htpasswd
+      secretKey: htpasswd

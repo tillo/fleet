@@ -1,0 +1,624 @@
+## paperless-ngx main app + Tika + Gotenberg sidecars.
+##
+## Single Deployment, single replica, Recreate strategy:
+##   - paperless-ngx serves both web + Celery worker in-process when
+##     PAPERLESS_TASK_WORKERS>0 is set (no separate worker Deployment).
+##   - Tika and Gotenberg run as sidecars so paperless reaches them
+##     via 127.0.0.1 (no extra Services).
+##   - Data lives on /usr/src/paperless/data + /media + /export + /consume
+##     all backed by the single 100Gi Longhorn PVC.
+##
+## Auth = Keycloak OIDC via django-allauth (the paperless-ngx 2.18 image
+## does not bundle python-ldap, so direct LDAP bind isn't an option).
+## Keycloak realm `tilloch` at idp.mdapi.ch is itself LDAP-federated,
+## so users sign in with their existing LDAP credentials via the "MDAPI"
+## button on the login page. Local `tillo` admin login stays enabled.
+## First successful login auto-creates the Django user (SOCIAL_AUTO_SIGNUP).
+## Joint document visibility is set up post-login via paperless's group
+## `DMS` + default View+Change permissions on both users.
+##
+## Mail = IMAP poll of documents@mdapi.ch (LDAP-managed mailbox,
+## also created 2026-05-19). Rule routing handled via the UI after
+## first login.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperless
+  namespace: paperless
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: paperless
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: paperless
+    spec:
+      ## Kubernetes injects env vars for every Service in the namespace by
+      ## default (PAPERLESS_PORT=tcp://10.53.x.y:8000, etc.). paperless-ngx
+      ## uses PAPERLESS_PORT as its OWN listening-port config, so the
+      ## injected value gets parsed as "is not a valid integer" and the
+      ## granian web server refuses to start. Disable Service-env injection
+      ## for this pod — it doesn't need them.
+      enableServiceLinks: false
+      containers:
+        ## Image tag: two writers, and they must not disagree.
+        ##
+        ## Renovate raises the MAJOR (MR-only, a human merges it). The
+        ## fleet-image-sync Windmill job then keeps us on the newest release
+        ## INSIDE whatever major git already pins, and can never write a tag
+        ## lower than the one on the line below. Git stays the single source
+        ## of truth and a Fleet re-apply can never downgrade below the DB
+        ## migration level. (A 2.18 downgrade on 2026-05-20 broke tag
+        ## creation: code behind the treenode schema.)
+        ##
+        ## ⛔ 2026-09-16/17: fleet-image-sync had major=2 HARDCODED, so it
+        ## reverted the merged 3.1.3 bump back to 2.20.15 twice — and 3.1.3
+        ## had already applied its squashed migrations, which 2.20.15 refuses
+        ## to start against (InconsistentMigrationHistory, django_celery_results
+        ## is gone in v3). Net effect: ~24h of downtime and a Renovate MR that
+        ## looked like it "failed to stick". The job now DERIVES the major from
+        ## this line, so a merged major bump moves the line for good.
+        ##
+        ## ⚠️ A paperless-ngx major is a ONE-WAY DOOR — the DB cannot go back.
+        ## Read docs/migration-v3.md (upstream) before merging the next one:
+        ## v3 can only be entered from exactly 2.20.15.
+        ##
+        ## Keel is intentionally not used for the tag here (the annotations on
+        ## this Deployment only track digest changes of the pinned tag).
+        - name: paperless
+          image: ghcr.io/paperless-ngx/paperless-ngx:3.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # ---- Core ----
+            - name: PAPERLESS_URL
+              value: "https://documents.mdapi.ch"
+            - name: PAPERLESS_TIME_ZONE
+              value: "Europe/Zurich"
+            - name: PAPERLESS_OCR_LANGUAGES
+              value: "fra ita deu eng"
+            - name: PAPERLESS_OCR_LANGUAGE
+              value: "fra+ita+deu+eng"
+            ## Auto-detect and correct page rotation during OCR. Some PDFs
+            ## embed a 270° page-rotation hint while the raw image is stored
+            ## sideways - tesseract reads the un-rotated image and produces
+            ## garbage. OCRmyPDF's --rotate-pages probes each page with
+            ## tesseract's OSD and rotates as needed before the OCR pass.
+            ## Threshold 12 (default) is the confidence above which the
+            ## rotation is applied; below that the page is left alone.
+            - name: PAPERLESS_OCR_ROTATE_PAGES
+              value: "true"
+            - name: PAPERLESS_OCR_ROTATE_PAGES_THRESHOLD
+              value: "12"
+            ## v3 split "run OCR" from "produce an archive file" and changed
+            ## the effective default: v2 always wrote an archive PDF, v3's
+            ## ARCHIVE_FILE_GENERATION=auto skips it for born-digital PDFs
+            ## that already carry a text layer. The library-pusher sidecar
+            ## rclone-syncs media/documents/archive/ to the family's
+            ## Nextcloud share, so "no archive file" means the document never
+            ## appears in /Paperless-Library at all. Pin `always` to keep the
+            ## v2 behaviour this mirror was built on.
+            - name: PAPERLESS_ARCHIVE_FILE_GENERATION
+              value: "always"
+            - name: PAPERLESS_TASK_WORKERS
+              value: "2"
+            - name: PAPERLESS_WEBSERVER_WORKERS
+              value: "2"
+            - name: PAPERLESS_THREADS_PER_WORKER
+              value: "1"
+            # ---- Mail polling cadence ----
+            ## Poll the documents@mdapi.ch IMAP inbox every 5 min (default is
+            ## 10) — matches the consume-puller's Nextcloud poll interval. The
+            ## mail account + rule themselves are DB config, managed in the UI.
+            - name: PAPERLESS_EMAIL_TASK_CRON
+              value: "*/5 * * * *"
+            # ---- Database (CNPG) ----
+            ## v3 REQUIRES an explicit engine: up to 2.20 PostgreSQL was
+            ## inferred from PAPERLESS_DBHOST alone, and DBENGINE only picked
+            ## MariaDB over PostgreSQL. Spell it out so a future release that
+            ## drops the inference cannot silently fall back to SQLite and
+            ## start a brand-new empty database on the data volume.
+            - name: PAPERLESS_DBENGINE
+              value: "postgresql"
+            - name: PAPERLESS_DBHOST
+              value: "paperless-pg-rw"
+            - name: PAPERLESS_DBPORT
+              value: "5432"
+            - name: PAPERLESS_DBNAME
+              value: "paperless"
+            - name: PAPERLESS_DBUSER
+              value: "paperless"
+            # ---- Redis (Valkey) ----
+            - name: PAPERLESS_REDIS
+              value: "redis://paperless-valkey:6379"
+            # ---- Tika + Gotenberg sidecars ----
+            - name: PAPERLESS_TIKA_ENABLED
+              value: "1"
+            - name: PAPERLESS_TIKA_ENDPOINT
+              value: "http://127.0.0.1:9998"
+            - name: PAPERLESS_TIKA_GOTENBERG_ENDPOINT
+              value: "http://127.0.0.1:3000"
+            # ---- OIDC (django-allauth + Keycloak realm tilloch) ----
+            ## PAPERLESS_SOCIALACCOUNT_PROVIDERS comes from the rendered
+            ## paperless-oidc-secret (full JSON with the Akeyless secret
+            ## substituted in at sync time). See paperless-es.yml.
+            - name: PAPERLESS_APPS
+              value: "allauth.socialaccount.providers.openid_connect"
+            - name: PAPERLESS_SOCIAL_AUTO_SIGNUP
+              value: "True"
+            # ---- Consume / filename layout ----
+            ## Recursive walk of /consume + each subdirectory becomes a tag
+            ## on the ingested documents. Used for the first-wave bootstrap
+            ## from OwnCloud (cloud.mdapi.ch /Paperless-Consume) where each
+            ## Tier-1 topic folder maps 1:1 to a paperless tag.
+            - name: PAPERLESS_CONSUMER_RECURSIVE
+              value: "true"
+            - name: PAPERLESS_CONSUMER_SUBDIRS_AS_TAGS
+              value: "true"
+            - name: PAPERLESS_CONSUMER_ENABLE_BARCODES
+              value: "true"
+            - name: PAPERLESS_CONSUMER_ENABLE_ASN_BARCODE
+              value: "true"
+            - name: PAPERLESS_FILENAME_FORMAT
+              value: "{{ created_year }}/{{ correspondent }}/{{ title }}"
+            # ---- AI suggestions (v3) — LOCAL MODELS ONLY ----
+            ## Document text is sent to the model, so this points at the
+            ## in-cluster litellm Service and nowhere else. The api_base MUST
+            ## carry /v1: paperless builds a llama-index OpenAILike client.
+            ##
+            ## ⭐ What actually keeps this local is the scoped virtual key in
+            ## paperless-env-secret, NOT the model name below. The key allows
+            ## only the six fail-closed groups, so opus / ds-flash /
+            ## claude-haiku-4-5 — and the deceptive `infra` and `approfondito`,
+            ## which are the same local 30B but fall back to Anthropic — all
+            ## answer HTTP 403. See paperless-es.yml.
+            ##
+            ## ⭐ `local-only` is the FAIL-CLOSED 30B (gemma-4-26b-a4b): wired ->
+            ## local-wifi -> local-wg-closed, no cloud tail anywhere. NOT
+            ## `approfondito` or `infra`, which are the SAME WEIGHTS with an
+            ## `opus` tail — the key 403s those, and this line must never name one.
+            ##
+            ## This said `veloce` (the 4B companion) from 2026-09-17 to 09-18, on
+            ## the theory that background classification would queue ahead of an
+            ## interactive turn because the 30B ran numParallelSessions=1.
+            ## ⛔ Both halves of that were wrong. The premise is STALE — `lms ps`
+            ## shows gemma at PARALLEL 4. And the comparison behind it was
+            ## invalid: mbp-mda was serving only ONE LLM at the time, and this
+            ## LM Studio silently answers any model name with the single loaded
+            ## model, so `veloce` WAS the 30B and the two groups were measuring
+            ## the same weights. (Memory:
+            ## lmstudio-serves-one-llm-and-ignores-the-model-field-2026-09-17.)
+            ##
+            ## With the 4B genuinely restored on 09-18 the difference is real and
+            ## points the other way for a DMS: 9.6s vs 62s per RAG suggestion,
+            ## but the 4B answered document 717 with tags lifted from the
+            ## retrieved RAG NEIGHBOURS ('Echallens2023', 'PPE', 'Crèches',
+            ## correspondent 'KidsCare') rather than from the document, where the
+            ## 30B gave 'Gymnastique / Adhésion / Inscription'. Suggestions are
+            ## user-triggered and low-volume, so accuracy beats saving 50s.
+            ## Switching back needs only this one value; the key allows both.
+            ##
+            ## ⏱️ Measured END TO END through the app's own classifier on a real
+            ## document (717, a French letter), not through a bare gateway call —
+            ## and on THIS model, since `veloce` was the 30B when it was taken:
+            ## 31s with no output language, 43s with one, ~62s once RAG was on.
+            ## A bare tool-call probe returns in ~5s — do not quote that as the
+            ## user-facing latency; the real prompt carries up to 4000 chars of
+            ## document text plus the retrieved taxonomy context.
+            ##
+            ## 🗣️ Output language is NOT a property of the model: paperless
+            ## makes a SECOND LLM call to localize (build_localization_prompt),
+            ## driven by PAPERLESS_AI_LLM_OUTPUT_LANGUAGE or the requesting
+            ## user's UI language. With neither, this model answered a French
+            ## document in English ("Information for the 2026-2027 Gymnastics
+            ## Season"); asked for `fr` it returned "Informations pour la saison
+            ## 2026-2027" with French tags. That second call is where the extra
+            ## ~12s goes.
+            - name: PAPERLESS_AI_ENABLED
+              value: "true"
+            - name: PAPERLESS_AI_LLM_BACKEND
+              value: "openai-like"
+            - name: PAPERLESS_AI_LLM_ENDPOINT
+              value: "http://litellm.litellm.svc.cluster.local:4000/v1"
+            - name: PAPERLESS_AI_LLM_MODEL
+              value: "local-only"
+            ## Defaults to true already; stated because aiming at a ClusterIP
+            ## is deliberate here and paperless pins the resolved host.
+            - name: PAPERLESS_AI_LLM_ALLOW_INTERNAL_ENDPOINTS
+              value: "true"
+            ## paperless defaults to 120. Warm calls measured ~5s, but a cold
+            ## LM Studio JIT-load is ~40s and a cold prefill runs into minutes;
+            ## litellm allows 900 on these fail-closed groups.
+            - name: PAPERLESS_AI_LLM_REQUEST_TIMEOUT
+              value: "300"
+            ## ---- RAG embeddings (enabled 2026-09-17) ----
+            ## The gateway had NO embedding model until 2026-09-17, which is why
+            ## this was unset and RAG impossible (the same wall Frigate 0.18
+            ## hit). It now serves `local-embed` — nomic-embed-text v1.5, 768
+            ## dims, on the same LM Studio as the LLM, routed by model TYPE so an
+            ## embedding request can never be answered by the chat model.
+            ##
+            ## WHAT THIS ACTUALLY BUYS — measured on the live instance after the
+            ## 559-document index build, not inferred from the code path:
+            ##
+            ## ✅ v3's document CHAT works at all. This is the solid win:
+            ## ChatStreamingView is gated on ai_enabled alone but chat.py needs
+            ## load_or_build_index + VectorIndexRetriever, so without embeddings
+            ## the chat UI could only error. Measured 87s for a corpus-wide
+            ## question, answered in French WITH document references.
+            ##
+            ## ⚠️ Reuse of EXISTING taxonomy ids works, but INCONSISTENTLY with
+            ## this model. Retrieval itself is fine — get_taxonomy_context
+            ## returned 10 tag / 5 correspondent / 4 type candidates and 5142
+            ## chars of context. But model_to_classification_suggestions only
+            ## accepts a mapping when the model emits a name/id PAIR, and that is
+            ## a property of the MODEL, not of the code: across three documents
+            ## only one produced an existing id (doc 716 -> tag 114), and no
+            ## correspondent ever paired. Do not promise reuse-by-id; on doc 717
+            ## the RAG answer was actually LESS matchable than without RAG
+            ## ("Société de Gymnastique d'Echallens" where the existing
+            ## correspondent is "FSG Echallens").
+            ##
+            ## ⏱️ Cost: suggestions went from ~31-43s to ~45-79s, from retrieval
+            ## plus a larger prompt. Chat is the reason to keep this on.
+            ##
+            ## ⚠️ CHUNK_SIZE is load-bearing, not cosmetic: the embedding model
+            ## is served at ctx 2048, so a chunk must stay well under that or the
+            ## backend silently truncates and retrieval quality quietly drops.
+            ## 1024 is upstream's default and leaves headroom; do not raise it
+            ## without re-checking the served context on mbp-mda.
+            ##
+            ## ⚠️ Changing the embedding model changes the VECTOR SPACE — the
+            ## whole index must then be rebuilt, so this is not a quiet swap.
+            ##
+            ## ⚠️ Enabling this activates PAPERLESS_LLM_INDEX_TASK_CRON
+            ## (upstream default 10 2 * * *). Left at the default deliberately:
+            ## indexing is ALSO incremental via llm_index_add_or_update_document
+            ## on each consumed document, so the nightly pass is a catch-up and a
+            ## run that fails because the laptop is asleep at 02:10 is harmless —
+            ## the next one picks the backlog up. It does mean a failed task row
+            ## appears in Paperless on those nights.
+            - name: PAPERLESS_AI_LLM_EMBEDDING_BACKEND
+              value: "openai-like"
+            - name: PAPERLESS_AI_LLM_EMBEDDING_MODEL
+              value: "local-embed"
+            ## Would default to PAPERLESS_AI_LLM_ENDPOINT; stated explicitly so a
+            ## future change to the chat endpoint cannot silently move embeddings
+            ## somewhere else.
+            - name: PAPERLESS_AI_LLM_EMBEDDING_ENDPOINT
+              value: "http://litellm.litellm.svc.cluster.local:4000/v1"
+            - name: PAPERLESS_AI_LLM_EMBEDDING_CHUNK_SIZE
+              value: "1024"
+            ##
+            ## OUTPUT_LANGUAGE deliberately unset: it then follows each user's
+            ## own UI language instead of pinning the household to one — at the
+            ## cost of the second localization call described above. Set it only
+            ## if every user should get the same language regardless of their UI.
+            # ---- Secrets ----
+          envFrom:
+            - secretRef:
+                name: paperless-env-secret
+            - secretRef:
+                name: paperless-oidc-secret
+          volumeMounts:
+            - name: data
+              mountPath: /usr/src/paperless/data
+              subPath: data
+            - name: data
+              mountPath: /usr/src/paperless/media
+              subPath: media
+            - name: data
+              mountPath: /usr/src/paperless/export
+              subPath: export
+            - name: data
+              mountPath: /usr/src/paperless/consume
+              subPath: consume
+          resources:
+            requests:
+              cpu: 200m
+              memory: 2Gi
+            limits:
+              cpu: 4
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+
+        - name: tika
+          image: apache/tika:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9998
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits:   {cpu: 2,   memory: 1Gi}
+
+        - name: gotenberg
+          image: gotenberg/gotenberg:8
+          imagePullPolicy: IfNotPresent
+          ## Gotenberg disables --chromium-disable-javascript by default;
+          ## paperless needs PDF render only, no JS execution required.
+          command: ["gotenberg"]
+          args:
+            - "--chromium-disable-javascript=true"
+            - "--chromium-allow-list=file:///tmp/.*"
+          ports:
+            - containerPort: 3000
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits:   {cpu: 2,   memory: 1Gi}
+
+        ## consume-puller: every 5 min, rclone-move files from the Nextcloud
+        ## share /Paperless-Consume (owned by the `documents` LDAP service
+        ## account, R+W-shared with mdellambrogio) into paperless's local
+        ## /consume directory. Files vanish from Nextcloud once moved, so the
+        ## source folder is a true drop-zone (no double-consume on next poll).
+        ## Subdir structure is preserved so paperless's SUBDIRS_AS_TAGS
+        ## auto-tags each ingested doc with its parent folder name.
+        ##
+        ## Nextcloud (cloud.mdapi.ch since the 2026-08-17 cutover) maps the
+        ## LDAP account to the plain `documents` user id in the WebDAV path —
+        ## unlike the old ownCloud, which fell back to the LDAP entryUUID
+        ## (d1a8901f-...). The rclone remote is still *named* "owncloud"
+        ## (env-var prefix + the paperless-env-secret key) so the Akeyless /
+        ## secret wiring stays untouched.
+        ##
+        ## rclone's WebDAV password env var must be in obscured form. We
+        ## store the pre-obscured value in Akeyless at
+        ## /mdapi/paperless/imap-password-rclone-obscured and pull it
+        ## straight into RCLONE_CONFIG_OWNCLOUD_PASS via secretKeyRef —
+        ## doing the obscure at container startup proved fragile (export
+        ## in a sh -c "..." script did not reach the rclone subprocess
+        ## reliably). See paperless-es.yml for the password-rotation note.
+        - name: consume-puller
+          image: rclone/rclone:latest
+          imagePullPolicy: Always
+          ## Run as paperless's uid/gid (1000) — NOT root. rclone creates the
+          ## /consume subdirectories as it mirrors the Nextcloud folder tree;
+          ## if it runs as root those dirs are root:root 0755 and paperless's
+          ## uid-1000 celery worker cannot delete the source file after
+          ## consuming it ([Errno 13] → infinite re-OCR loop). uid 1000 owns
+          ## the /consume volume root, so rclone writes fine and every dir it
+          ## creates stays deletable by the worker.
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "[$(date -Iseconds)] consume-puller started"
+              while true; do
+                rclone move \
+                  --no-traverse --transfers 4 --checkers 8 \
+                  --retries 3 --low-level-retries 5 \
+                  --delete-empty-src-dirs \
+                  --stats 0 \
+                  owncloud:Paperless-Consume/ /consume/ \
+                  2>&1 | grep -vE '^$|^0 B / 0 B' || true
+                sleep 300
+              done
+          env:
+            - name: RCLONE_CONFIG_OWNCLOUD_TYPE
+              value: "webdav"
+            - name: RCLONE_CONFIG_OWNCLOUD_URL
+              value: "https://cloud.mdapi.ch/remote.php/dav/files/documents/"
+            - name: RCLONE_CONFIG_OWNCLOUD_VENDOR
+              value: "nextcloud"
+            - name: RCLONE_CONFIG_OWNCLOUD_USER
+              value: "documents"
+            - name: RCLONE_CONFIG_OWNCLOUD_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: paperless-env-secret
+                  key: RCLONE_CONFIG_OWNCLOUD_PASS
+          volumeMounts:
+            - name: data
+              mountPath: /consume
+              subPath: consume
+          ## rclone-move bursts hard during the 5-min poll window; the 1c
+          ## lid was throttling 17% of CFS periods. 2c gives the transfer
+          ## loop enough headroom to finish before the next poll wakes.
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits:   {cpu: 2,   memory: 256Mi}
+
+        ## archive-extractor: watches /consume for archives the consume-puller
+        ## drops in and extracts them in place so paperless can ingest the
+        ## contents (paperless-ngx has no native archive support). Handles
+        ## .zip and .tar(.gz/.bz2/.xz) via the Python stdlib, and .7z via
+        ## py7zr (pip-installed at startup; python:3.12-slim is glibc so the
+        ## C-extension wheels install with no build toolchain). RAR is NOT
+        ## supported — it needs a proprietary non-stdlib binary.
+        ## Charset-aware for zip: entries without the UTF-8 flag are recovered
+        ## from cp437 and re-decoded (utf-8 → cp850 → cp1252) so DOS/Windows
+        ## codepage filenames don't ingest as mojibake. Runs as uid 1000 so
+        ## everything it creates stays deletable by the worker (same reason
+        ## as consume-puller above). Each archive is extracted into a folder
+        ## named after it, then deleted; nested archives extract next pass.
+        - name: archive-extractor
+          ## library/ prefix = keel's canonical rewrite on force updates
+          ## (2026-08-04) - git must match or the bundle latches Modified
+          image: library/python:3-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          env:
+            - name: HOME
+              value: /tmp
+          command: ["sh", "-c"]
+          args:
+            - |
+              pip install --user --quiet --disable-pip-version-check py7zr 2>&1 \
+                || echo "[archive-extractor] py7zr install failed - .7z disabled this run"
+              cat > /tmp/extract.py <<'PYEOF'
+              import zipfile, tarfile, os, time, shutil
+              try:
+                  import py7zr
+                  HAVE_7Z = True
+              except Exception:
+                  HAVE_7Z = False
+              CONSUME, SETTLE, POLL = "/consume", 30, 60
+              def zname(zi):
+                  if zi.flag_bits & 0x800:
+                      return zi.filename
+                  raw = zi.filename.encode("cp437")
+                  for enc in ("utf-8", "cp850", "cp1252"):
+                      try: return raw.decode(enc)
+                      except UnicodeDecodeError: continue
+                  return zi.filename
+              def safe(base, name):
+                  t = os.path.normpath(os.path.join(base, name.lstrip("/")))
+                  if t != base and not t.startswith(base + os.sep):
+                      raise ValueError("unsafe path %r" % name)
+                  return t
+              def do_zip(path, dest):
+                  with zipfile.ZipFile(path) as zf:
+                      if zf.testzip() is not None:
+                          raise zipfile.BadZipFile("CRC failed")
+                      for zi in zf.infolist():
+                          if zi.is_dir(): continue
+                          t = safe(dest, zname(zi))
+                          os.makedirs(os.path.dirname(t), exist_ok=True)
+                          with zf.open(zi) as s, open(t, "wb") as o:
+                              shutil.copyfileobj(s, o)
+              def do_tar(path, dest):
+                  with tarfile.open(path) as tf:
+                      for m in tf.getmembers():
+                          if not m.isfile(): continue
+                          t = safe(dest, m.name)
+                          os.makedirs(os.path.dirname(t), exist_ok=True)
+                          with tf.extractfile(m) as s, open(t, "wb") as o:
+                              shutil.copyfileobj(s, o)
+              def do_7z(path, dest):
+                  os.makedirs(dest, exist_ok=True)
+                  with py7zr.SevenZipFile(path, "r") as z:
+                      z.extractall(path=dest)
+              def normalize(dest):
+                  ## py7zr's extractall can reproduce a 000 file mode from the
+                  ## archive — paperless (uid 1000) must be able to READ the
+                  ## file to consume it. Force sane modes on everything.
+                  for r, ds, fs in os.walk(dest):
+                      for x in ds:
+                          try: os.chmod(os.path.join(r, x), 0o755)
+                          except OSError: pass
+                      for x in fs:
+                          try: os.chmod(os.path.join(r, x), 0o644)
+                          except OSError: pass
+              print("[archive-extractor] started (7z %s)" % ("on" if HAVE_7Z else "off"), flush=True)
+              while True:
+                  try:
+                      for root, _, files in os.walk(CONSUME):
+                          for f in files:
+                              lo = f.lower()
+                              if lo.endswith(".zip"): fn = do_zip
+                              elif lo.endswith((".tar",".tar.gz",".tgz",".tar.bz2",".tar.xz")): fn = do_tar
+                              elif lo.endswith(".7z") and HAVE_7Z: fn = do_7z
+                              else: continue
+                              p = os.path.join(root, f)
+                              try:
+                                  if time.time() - os.path.getmtime(p) < SETTLE: continue
+                              except OSError: continue
+                              try:
+                                  dest = os.path.splitext(p)[0]
+                                  fn(p, dest)
+                                  normalize(dest)
+                                  os.remove(p)
+                                  print("[archive-extractor] extracted: " + p, flush=True)
+                              except Exception as e:
+                                  print("[archive-extractor] FAILED %s: %r" % (p, e), flush=True)
+                  except Exception as e:
+                      print("[archive-extractor] loop error: %r" % e, flush=True)
+                  time.sleep(POLL)
+              PYEOF
+              exec python3 -u /tmp/extract.py
+          volumeMounts:
+            - name: data
+              mountPath: /consume
+              subPath: consume
+          resources:
+            requests: {cpu: 10m,  memory: 64Mi}
+            limits:   {cpu: 500m, memory: 256Mi}
+
+        ## library-pusher: every 5 min, rclone-sync the paperless archive tree
+        ## (OCR'd searchable PDFs) into the Nextcloud `documents` user folder
+        ## /Paperless-Library. Read-only shares (migrated from ownCloud on the
+        ## 2026-08-17 cutover) expose that folder to the two household reader
+        ## accounts (mdellambrogio, elisadellambrogio), so they can browse the
+        ## {year}/{correspondent}/{title} document tree from Nextcloud without
+        ## granting any Paperless access.
+        ##
+        ## Direction is one-way: Paperless is source of truth, the Nextcloud
+        ## copy mirrors deletions too. The read-only share keeps consumers from
+        ## modifying files only to have them reverted on the next sync.
+        ##
+        ## Mount is `media/documents` (subPath) at /library read-only so the
+        ## sidecar can't accidentally write back into the archive. Same rclone
+        ## env block as consume-puller (same WebDAV creds via secretKeyRef).
+        - name: library-pusher
+          image: rclone/rclone:latest
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "[$(date -Iseconds)] library-pusher started"
+              while true; do
+                rclone sync \
+                  --transfers 4 --checkers 8 \
+                  --retries 3 --low-level-retries 5 \
+                  --stats 0 \
+                  /library/archive/ owncloud:Paperless-Library/ \
+                  2>&1 | grep -vE '^$|^0 B / 0 B' || true
+                sleep 300
+              done
+          env:
+            - name: RCLONE_CONFIG_OWNCLOUD_TYPE
+              value: "webdav"
+            - name: RCLONE_CONFIG_OWNCLOUD_URL
+              value: "https://cloud.mdapi.ch/remote.php/dav/files/documents/"
+            - name: RCLONE_CONFIG_OWNCLOUD_VENDOR
+              value: "nextcloud"
+            - name: RCLONE_CONFIG_OWNCLOUD_USER
+              value: "documents"
+            - name: RCLONE_CONFIG_OWNCLOUD_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: paperless-env-secret
+                  key: RCLONE_CONFIG_OWNCLOUD_PASS
+          volumeMounts:
+            - name: data
+              mountPath: /library
+              subPath: media/documents
+              readOnly: true
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits:   {cpu: 1,   memory: 256Mi}
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: paperless-data-ceph

@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: litellm
+  namespace: litellm
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # This gateway carries code/logs/commands as request bodies — CRS would
+    # false-positive constantly. Protection here is the LiteLLM master_key plus
+    # the source-range restriction below.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    # Anthropic-style streaming (SSE): don't buffer, allow long-lived responses.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # Unlike the other bundles this fronts a paid cloud key — keep it off the
+    # public internet. Restricted to the LAN.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: llm.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: litellm
+                port:
+                  number: 4000
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - llm.mdapi.ch
+      secretName: litellm-cert

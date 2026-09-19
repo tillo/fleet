@@ -1,0 +1,212 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trapeye-nodeport
+  namespace: honeypot
+spec:
+  selector:
+    matchLabels:
+      app: trapeye-nodeport
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: trapeye-nodeport
+    spec:
+      priorityClassName: mdapi-low
+      ## registry.mdapi.ch is private — without this the pull is anonymous and
+      ## GitLab answers 403, leaving the pod in ImagePullBackOff while the old
+      ## ReplicaSet keeps serving (so the decoy looks healthy and the certificate
+      ## silently stays unpatched). See honeypot/mdapi-registry-es.yml.
+      imagePullSecrets:
+      - name: mdapi-registry
+      containers:
+      - name: trapeye
+        image: registry.mdapi.ch/mdapi/trapeye-image:1.6.3-mdapi.3
+        imagePullPolicy: IfNotPresent
+        resources: {}
+        ports:
+        - name: ftp
+          containerPort: 21
+        - name: ssh
+          containerPort: 22
+        - name: smtp
+          containerPort: 25
+        - name: smtps
+          containerPort: 465
+        - name: http
+          containerPort: 80
+        - name: https
+          containerPort: 443
+        - name: ldap
+          containerPort: 389
+        - name: ldaps
+          containerPort: 636
+        - name: rdp
+          containerPort: 3389
+        - name: postgresql
+          containerPort: 5432
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            secretKeyRef:
+              name: trapeye-uuid-secret
+              key: TRAPEYE_UUID_NODEPORT
+        envFrom:
+        - secretRef:
+            name: trapeye-env-secret
+        volumeMounts:
+        - name: trapeye-tls
+          mountPath: /etc/trapeye-tls
+          readOnly: true
+      volumes:
+      - name: trapeye-tls
+        secret:
+          secretName: trapeye-tls
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trapeye-clusterip
+  namespace: honeypot
+spec:
+  selector:
+    matchLabels:
+      app: trapeye-clusterip
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: trapeye-clusterip
+    spec:
+      priorityClassName: mdapi-low
+      ## registry.mdapi.ch is private — without this the pull is anonymous and
+      ## GitLab answers 403, leaving the pod in ImagePullBackOff while the old
+      ## ReplicaSet keeps serving (so the decoy looks healthy and the certificate
+      ## silently stays unpatched). See honeypot/mdapi-registry-es.yml.
+      imagePullSecrets:
+      - name: mdapi-registry
+      containers:
+      - name: trapeye
+        ## Canary for serving a real CA01 certificate. The agent generates a
+        ## self-signed certificate for every TLS service, which is a fingerprint —
+        ## anyone who inspects it can tell the service is not real, which is the one
+        ## thing a decoy must not reveal. It has no setting for this (no certificate
+        ## path, no TLS env var, and the vendor's config protocol carries no
+        ## certificate field), so mdapi/trapeye-image redirects the two rcgen PEM
+        ## functions to read honeypot/trapeye-tls-cert.yml's secret instead. The
+        ## other three decoys stay on the previous image until this one is confirmed
+        ## serving the CA01 chain and still reporting to the vendor.
+        image: registry.mdapi.ch/mdapi/trapeye-image:1.6.3-mdapi.3
+        imagePullPolicy: IfNotPresent
+        resources: {}
+        ports:
+        - name: ftp
+          containerPort: 21
+        - name: ssh
+          containerPort: 22
+        - name: smtp
+          containerPort: 25
+        - name: smtps
+          containerPort: 465
+        - name: http
+          containerPort: 80
+        - name: https
+          containerPort: 443
+        - name: ldap
+          containerPort: 389
+        - name: ldaps
+          containerPort: 636
+        - name: rdp
+          containerPort: 3389
+        - name: postgresql
+          containerPort: 5432
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            secretKeyRef:
+              name: trapeye-uuid-secret
+              key: TRAPEYE_UUID_CLUSTERIP
+        envFrom:
+        - secretRef:
+            name: trapeye-env-secret
+        volumeMounts:
+        - name: trapeye-tls
+          mountPath: /etc/trapeye-tls
+          readOnly: true
+      volumes:
+      - name: trapeye-tls
+        secret:
+          secretName: trapeye-tls
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trapeye-loadbalancer
+  namespace: honeypot
+spec:
+  selector:
+    matchLabels:
+      app: trapeye-loadbalancer
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: trapeye-loadbalancer
+    spec:
+      priorityClassName: mdapi-low
+      ## registry.mdapi.ch is private — without this the pull is anonymous and
+      ## GitLab answers 403, leaving the pod in ImagePullBackOff while the old
+      ## ReplicaSet keeps serving (so the decoy looks healthy and the certificate
+      ## silently stays unpatched). See honeypot/mdapi-registry-es.yml.
+      imagePullSecrets:
+      - name: mdapi-registry
+      containers:
+      - name: trapeye
+        image: registry.mdapi.ch/mdapi/trapeye-image:1.6.3-mdapi.3
+        imagePullPolicy: IfNotPresent
+        resources: {}
+        ports:
+        - name: ftp
+          containerPort: 21
+        - name: ssh
+          containerPort: 22
+        - name: smtp
+          containerPort: 25
+        - name: smtps
+          containerPort: 465
+        - name: http
+          containerPort: 80
+        - name: https
+          containerPort: 443
+        - name: ldap
+          containerPort: 389
+        - name: ldaps
+          containerPort: 636
+        - name: rdp
+          containerPort: 3389
+        - name: postgresql
+          containerPort: 5432
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: TRAPEYE_UUID
+          valueFrom:
+            secretKeyRef:
+              name: trapeye-uuid-secret
+              key: TRAPEYE_UUID_LOADBALANCER
+        envFrom:
+        - secretRef:
+            name: trapeye-env-secret
+        volumeMounts:
+        - name: trapeye-tls
+          mountPath: /etc/trapeye-tls
+          readOnly: true
+      volumes:
+      - name: trapeye-tls
+        secret:
+          secretName: trapeye-tls

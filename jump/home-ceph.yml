@@ -1,0 +1,23 @@
+## jump-home-ceph — the durable home for the jump seat, replacing the 8Gi Longhorn
+## jump-home as part of the mbptillo permanent retirement (2026-09-02).
+##
+## Why ceph-block and not "just expand jump-home":
+##   * storage tiering rule — Longhorn is for fio-backed volumes, bulk goes to Ceph
+##   * VolSync copyMethod: Snapshot needs volumeSnapshotClassName: ceph-block; on
+##     Longhorn the mover would fall back to a slower Direct/Clone method
+## Sized 50Gi: incoming curated set from mbptillo is 2.31 GB / 11 519 files and the
+## existing jump-home content is 4.7 G, so ~8 G steady state. ceph-blockpool has
+## 4.2 TiB MAX AVAIL — the headroom is free.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jump-home-ceph
+  namespace: jump
+  labels:
+    app: jump-bastion
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 50Gi

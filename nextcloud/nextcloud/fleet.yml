@@ -1,0 +1,67 @@
+defaultNamespace: nextcloud
+namespace: nextcloud
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  releaseName: nextcloud-aio
+  repo: https://nextcloud.github.io/all-in-one/
+  chart: nextcloud-aio-helm-chart
+  version: 13.6.0  # Renovate-managed (renovate.json)
+  valuesFiles:
+    - values.yaml
+kustomize:
+  dir: kustomize
+ 
+
+# VPA (mode=Auto) writes resources.requests/limits onto running pods.
+# Strip the resources block from both sides before diff so Fleet stops
+# flagging the bundle as Modified.
+#
+# jsonPointers (not operations:[op:remove]) because the AIO chart
+# ships every container with resources unset; an op:remove against a
+# missing path fails atomically and leaves the whole patch unapplied,
+# which is what kept this bundle Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-apache
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-database
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-imaginary
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-nextcloud
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-notify-push
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-onlyoffice
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-redis
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nextcloud-aio-talk
+    namespace: nextcloud
+    jsonPointers: ["/spec/template/spec/containers/0/resources"]

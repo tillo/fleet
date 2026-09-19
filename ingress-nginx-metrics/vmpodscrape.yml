@@ -1,0 +1,28 @@
+# Scrape the rke2-ingress-nginx controller metrics (:10254, port "metrics") into
+# VictoriaMetrics. Metrics were enabled 2026-07-28 via the HelmChartConfig manifest on
+# the server nodes (controller.metrics.enabled) as part of the storage-stall T2 work:
+# the reload timestamps + worker-process RSS are the observables for the
+# "ModSec reload allocation burst -> reclaim stall -> D-state avalanche" hypothesis
+# (see ~/storage-stall-isolation-design.md v2 and memory
+# quo_iscsi_kernel_deadlock_umount_dead_lun_2026_07_18).
+#
+# keep-list only: the per-request histograms (path/host labels) are cardinality bombs
+# and are deliberately dropped. Kept: config_* (reload timestamps/hash), success
+# (reload counter), nginx_process_* (worker count + RSS = the burst observable),
+# build_info.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: ingress-nginx-controller
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rke2-ingress-nginx
+      app.kubernetes.io/component: controller
+  podMetricsEndpoints:
+    - port: metrics
+      metricRelabelConfigs:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: "nginx_ingress_controller_(config_.*|success|nginx_process_.*|build_info)"

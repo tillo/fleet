@@ -1,0 +1,158 @@
+## rke2-ingress-nginx chart overrides.
+##
+## ─── Why this file exists in git ──────────────────────────────────────────────
+## Until 2026-09-15 this HelmChartConfig was a node-local manifest at
+## /var/lib/rancher/rke2/server/manifests/rke2-ingress-nginx-config.yaml, owned by
+## RKE2's addon controller (k3s.cattle.io/v1 Kind=Addon). That meant it had to be
+## written identically to all three server nodes by hand, and a node rebuild would
+## silently drop it — including the memory bound below, whose whole purpose is to
+## stop this workload taking a node down. rke2-coredns-config/ was already the
+## precedent for owning an RKE2 packaged-component override from git; this follows it.
+##
+## Migration (2026-09-15): the live object was pre-stamped with Helm ownership
+## metadata so Fleet could adopt it in place rather than delete-and-recreate — a
+## delete would have reverted the chart to defaults (losing default-ssl-certificate
+## and tcp-services-configmap) for the length of a rollout. The node-local manifests
+## were removed only after Fleet ownership was confirmed.
+
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-ingress-nginx
+  namespace: kube-system
+spec:
+  ## Carried over explicitly from the node-local manifest. It was present on the
+  ## live object and is easy to lose silently in a migration like this.
+  failurePolicy: reinstall
+  valuesContent: |-
+    controller:
+      metrics:
+        enabled: true
+      ## ─── Memory bound ───────────────────────────────────────────────────────
+      ## Added 2026-09-15 after the qui node-wedge of 2026-09-14 09:21Z.
+      ##
+      ## The chart default is `requests: {cpu: 100m, memory: 90Mi}` with NO limit,
+      ## which is a fiction here: the generated nginx.conf carries 80 separate
+      ## `modsecurity_rules` blocks, each `Include`-ing the full OWASP CRS, so the
+      ## nginx MASTER process alone measures 4.69 GiB RSS (~58 MB x 80
+      ## instantiations of a 2.2 MB rule tree). Steady working set per controller
+      ## is 2.5-5.3 GiB, and the VIP-holding replica sits nearer 4 GiB because
+      ## `ingress-expose` is externalTrafficPolicy: Local.
+      ##
+      ## Worse, it ratchets: flat for hours, then STEPS UP ~2 GiB on a config
+      ## reload and never gives it back. Measured 09-14: qua held 2.74 GiB for 4 h
+      ## then stepped to 4.82 GiB and stayed; quo went 3.00 -> 4.78 GiB on the same
+      ## cluster-wide reload. qui, with only 12.5 GiB MemAvailable against qua's
+      ## 59 GiB, went 4.86 -> 11.29 GiB in 30 min instead: MemAvailable collapsed
+      ## 13.1 -> 5.2 GiB, PSI memory-full hit 8%, file cache was squeezed 9.2 ->
+      ## 3.4 GiB, whatever pets /dev/watchdog missed its 30 s deadline, and iLO's
+      ## ASR reset the box. The same mechanism took the control plane down on
+      ## 2026-08-23 (`leaderelection lost` on qui AND qua) with the controller at
+      ## 16.1 GiB — twice the limit set here, so expect OOM kills.
+      ##
+      ## `limits.memory` is a BACKSTOP, not the fix: the container is OOM-killed
+      ## and restarts clean instead of taking the node down, and the kill also
+      ## resets the reload ratchet. The durable fix is to stop instantiating the
+      ## CRS 80 times — see ~/hang-evidence-2026-09-15.md §8.1.
+      ##
+      ## ─── History of this number, because it moved twice in one day ──────────
+      ## 8Gi (first attempt) OOMKilled a freshly-rolled controller on qua at
+      ## 2026-09-15 10:31Z: with the CRS still instantiated 80 times, a reload
+      ## transiently held the old AND new rule sets, ~4.7 GiB each, on top of a
+      ## ~4 GiB working set. Reloads are cluster-wide, so all three controllers
+      ## would have OOMed together — a worse outage than the node wedge the limit
+      ## exists to prevent. Raised to 12Gi as a stopgap.
+      ##
+      ## Then the CRS consolidation landed and the picture changed completely.
+      ## Measured after the cut-over: nginx master RSS 73 MB (was 4.69 GiB) and a
+      ## per-controller working set of ~200-240 MiB (was 2.5-5.3 GiB). A reload
+      ## now duplicates ~60 MB, not ~4.7 GiB.
+      ##
+      ## So 2Gi is roughly 8x the measured steady state and leaves ample room for
+      ## a reload, while actually bounding a runaway — which 12Gi against a 230 MB
+      ## workload did not.
+      ##
+      ## The request comes down with it, to 512Mi. 3Gi was honest against a
+      ## multi-GiB working set; against ~230 MiB it is dishonest in the other
+      ## direction, and over-reserving 2.5 GiB on each of three nodes is 7.5 GiB
+      ## of allocatable withheld from everything else — which matters directly,
+      ## because the cluster cannot currently lose a node and reschedule.
+      ## 512Mi is ~2x the measured steady state, so it is still honest headroom
+      ## rather than the 90Mi fiction this started as.
+      ##
+      ## (requests must be <= limits; 3Gi against a 2Gi limit is rejected outright.)
+      ##
+      ## Deliberately NO cpu limit: CPU throttling on the ingress data path is its
+      ## own outage mode (cf. monitoring-rules/18-cpu-throttling.yml).
+      resources:
+        requests:
+          cpu: 100m
+          memory: 512Mi
+        limits:
+          memory: 2Gi
+      config:
+        allow-snippet-annotations: "true"
+        annotations-risk-level: "Critical"
+        use-forwarded-headers: "true"
+        proxy-real-ip-cidr: "10.0.0.0/8,192.168.1.0/24,100.64.0.0/10"
+        worker-processes: "2"
+        worker-shutdown-timeout: "60s"
+        ## ─── ModSecurity, loaded ONCE ────────────────────────────────────────
+        ## These three keys put `modsecurity on;`, our rule set, and the OWASP CRS
+        ## into the http{} block (nginx.tmpl lines 94-106), so the CRS is parsed a
+        ## single time instead of once per ingress.
+        ##
+        ## The snippet is deliberately one Include line: nginx caps a quoted config
+        ## parameter at its 4 KiB read buffer, and the 17 KiB rule set fails with
+        ## "too long parameter, probably missing terminating ' character".
+        ## The rules therefore live in the ingress-modsec-global ConfigMap.
+        ##
+        ## Order matters. The template emits this snippet BEFORE the CRS include,
+        ## so our id:900200 is parsed first and wins — ModSecurity is first-wins on
+        ## duplicate rule IDs — which is what makes the global REST method list
+        ## effective. Reverse the order and 911100 silently re-narrows the methods.
+        ##
+        ## ⛔ This CANNOT be enabled while any ingress still carries its own
+        ## `modsecurity-snippet` with a CRS Include. Both rule sets merge and nginx
+        ## refuses the config with "Rule id: 901001 is duplicated", which is why the
+        ## 88 per-ingress annotations are removed in this same commit rather than
+        ## in a preceding one. Verified with `nginx -t` on the controller image.
+        enable-modsecurity: "true"
+        enable-owasp-modsecurity-crs: "true"
+        modsecurity-snippet: |
+          Include /etc/nginx/modsec-global/modsec-global.conf
+      extraArgs:
+        tcp-services-configmap: "kube-system/rke2-ingress-nginx-tcp-services"
+        dynamic-configuration-retries: "30"
+        default-ssl-certificate: "cattle-system/tls-ingress"
+      livenessProbe:
+        initialDelaySeconds: 120
+        periodSeconds: 10
+        failureThreshold: 5
+        timeoutSeconds: 1
+        successThreshold: 1
+      readinessProbe:
+        initialDelaySeconds: 120
+        periodSeconds: 10
+        failureThreshold: 5
+        timeoutSeconds: 1
+        successThreshold: 1
+      extraVolumes:
+        - name: modsec-plugins
+          configMap:
+            name: nextcloud-rule-exclusions-plugin
+        ## The global ModSecurity rule set (modsec-global-cm.yml, same bundle).
+        ## Mounted here AHEAD of being referenced, deliberately: adding a volume
+        ## changes the DaemonSet and rolls all three controllers, whereas turning
+        ## the WAF on later is a ConfigMap change that only reloads nginx. Doing
+        ## the roll first keeps the actual cut-over to a reload.
+        - name: modsec-global
+          configMap:
+            name: ingress-modsec-global
+      extraVolumeMounts:
+        - name: modsec-plugins
+          mountPath: /etc/nginx/modsec-plugins
+          readOnly: true
+        - name: modsec-global
+          mountPath: /etc/nginx/modsec-global
+          readOnly: true
