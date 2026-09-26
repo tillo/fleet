@@ -1,0 +1,247 @@
+## Falco — runtime security detection for mdapi-prod.
+##
+## PHASE 1: OBSERVE ONLY. No alerting, no dedicated OpenObserve output, no
+## custom rule exceptions. The point of this phase is to find out what actually
+## fires on this estate before deciding what deserves to page, and before
+## writing exceptions for noise that may not materialise.
+##
+## Falco writes JSON to stdout, which rancher-logging-root-fluentbit already
+## collects on all three nodes, so events reach OpenObserve through the existing
+## pipeline. That is deliberate: it avoids putting an OpenObserve credential on
+## three privileged pods just to learn what the default ruleset does here.
+##
+## Every value below was chosen against a measurement taken 2026-09-22, not
+## against the chart defaults. See ~/studies/falco-integration-design-20260922.md.
+
+## ⛔ image.registry is deliberately NOT set to zot.mdapi.ch.
+##
+## zot is a pull-through cache with an EXPLICIT per-upstream prefix allow-list
+## (zot/zot-s3-config-es.yml), and `falcosecurity` is not in it — verified
+## 2026-09-22, 0 occurrences against a control that returns 1, and there is no
+## catch-all wildcard. Pointing at the mirror without adding the prefixes would
+## give ImagePullBackOff on all three nodes.
+##
+## Phase-2 follow-up: add `falcosecurity/falco`, `falcosecurity/falcoctl` and
+## `falcosecurity/falcosidekick` to zot's docker.io allow-list, then set
+## image.registry here AND falcoctl.image.registry AND the sidekick's own —
+## the top-level key covers only the falco image. Note the container plugin
+## (ghcr.io/falcosecurity/plugins/plugin/container) is pulled by falcoctl as an
+## OCI artifact at pod start, which bypasses the kubelet and the mirror
+## entirely: it needs direct ghcr.io egress regardless.
+
+driver:
+  enabled: true
+  ## modern_ebpf (CO-RE), NOT kmod, and not `auto`.
+  ##
+  ## Measured on qui/quo/qua: kernel 6.12.0-160000.28-default,
+  ## /sys/kernel/btf/vmlinux present (5,307,251 bytes), CONFIG_DEBUG_INFO_BTF=y,
+  ## CONFIG_BPF_SYSCALL=y, CONFIG_BPF_JIT=y, CONFIG_BPF_LSM=y.
+  ##
+  ## This is the single reason Falco fits this estate: there is no out-of-tree
+  ## module to compile against each new kernel. Compare cephfs-kmod, which has
+  ## to build ceph.ko from kernel-source on every node after every kernel bump.
+  ## `auto` would probably resolve the same way, but a driver choice on a
+  ## privileged agent should be stated, not inferred at runtime.
+  kind: modern_ebpf
+  modernEbpf:
+    ## Drops `privileged: true` in favour of CAP_BPF, CAP_PERFMON,
+    ## CAP_SYS_RESOURCE and CAP_SYS_PTRACE. Requires kernel >= 5.8; we are on
+    ## 6.12. A new always-on agent on every node should hold the smallest
+    ## privilege that actually works.
+    leastPrivileged: true
+
+collectors:
+  enabled: true
+  containerEngine:
+    enabled: true
+    engines:
+      ## Only the CRI engine is real here.
+      ##
+      ## Verified 2026-09-22 on the nodes: /run/containerd/containerd.sock does
+      ## NOT exist. The kubelet talks to /run/k3s/containerd/containerd.sock
+      ## (containerd 2.1.5-k3s1 under RKE2). Chart 9.2.0 does list the k3s path
+      ## among the CRI defaults, so this would likely work unpinned — but it
+      ## would work by probe order, and if it ever failed the symptom is silent:
+      ## Falco keeps running and every event simply loses its pod, namespace and
+      ## image. Pin the socket that was measured to exist.
+      cri:
+        enabled: true
+        sockets:
+          - /run/k3s/containerd/containerd.sock
+      ## Everything below is absent on this estate. Left explicitly off so a
+      ## future reader can see they were considered, not forgotten.
+      docker:
+        enabled: false
+      podman:
+        enabled: false
+      containerd:
+        enabled: false  # probes /run/host-containerd/... — not present here
+      lxc:
+        enabled: false
+      libvirt_lxc:
+        enabled: false
+      bpm:
+        enabled: false
+  ## k8s-metacollector deliberately off in phase 1. Without it Falco falls back
+  ## to container annotations, which still yield pod ID, name, namespace and
+  ## labels — enough to attribute an event to a workload. Enabling it adds a
+  ## cluster-wide component and another ghcr.io plugin pull; revisit only if an
+  ## alert genuinely needs owner-workload fields.
+  kubernetes:
+    enabled: false
+
+controller:
+  kind: daemonset
+
+## Tolerations are left at the chart defaults (master + control-plane
+## NoSchedule). Verified 2026-09-22 that qui, quo and qua carry NO taints at
+## all, so nothing is needed to reach all three today — but the defaults cost
+## nothing and keep coverage if a control-plane taint is ever introduced. Note
+## they are the only thing here still naming the legacy `master` label; that is
+## the chart's, not ours, and it is additive rather than a selector, so it
+## cannot shrink coverage the way a nodeSelector can.
+
+## Priority class is left unset on purpose: mdapi-default is the cluster's
+## GLOBAL-DEFAULT, so Falco inherits it. What matters is that Falco must NOT be
+## moved into the shed-first mdapi-low bucket — a detector evicted under memory
+## pressure is absent exactly when the cluster is behaving strangely.
+
+resources:
+  ## ~512Mi x 3 nodes. Booked deliberately: the cluster sits at 70/76/80% memory
+  ## with swap 0 and a standing ~10 GiB N-1 shortfall, so this is roughly 15-20%
+  ## of the gap that programme is trying to close. Not free, not disqualifying.
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+falco:
+  ## JSON so the existing fluentbit -> fluentd -> OpenObserve path parses it
+  ## into fields rather than shipping an opaque line.
+  json_output: true
+  buffered_outputs: true
+  ## Chart default is `debug`. On three nodes running KubeVirt that is a
+  ## firehose, and OpenObserve already uses ~19.1 GB/day of a 50 GB/day ceiling.
+  ## `notice` is the phase-1 floor; revisit once the real event rate is known.
+  priority: notice
+  ## Dropped syscalls are BLIND WINDOWS, not a performance curiosity. Make Falco
+  ## announce them rather than silently miss events it was deployed to catch.
+  syscall_event_drops:
+    threshold: 0.1
+    actions:
+      - log
+      - alert
+    rate: 0.03333
+    max_burst: 10
+
+falcoctl:
+  artifact:
+    ## Install the pinned ruleset once, at pod start.
+    install:
+      enabled: true
+    ## ⛔ Chart default is TRUE, and it is wrong for this estate.
+    ##
+    ## `follow` runs a sidecar that re-pulls falco-rules:5 from ghcr.io every
+    ## 168h and swaps the ruleset underneath a running Falco. That is a floating
+    ## dependency inside an otherwise pinned, git-reviewed bundle: detection
+    ## behaviour would change with no MR, no diff and no way to say afterwards
+    ## which rules were live when an event fired — or failed to.
+    ##
+    ## Rules change when git says they change. Pinning the exact rules version
+    ## (rather than the :5 major) is the logical next step once phase 1 has
+    ## shown what the current set actually does here.
+    follow:
+      enabled: false
+
+falcosidekick:
+  enabled: true
+  replicaCount: 2
+  ## No outputs configured in phase 1 — see the header. Sidekick is deployed for
+  ## its Prometheus metrics, which are exactly what is needed to baseline the
+  ## per-rule event rate before writing a single alert threshold.
+  ##
+  ## Phase 3 adds the OpenObserve output (stream `falco`, which is also
+  ## falcosidekick's own default name for it) behind an ExternalSecret. That
+  ## secret must use a SCOPED OpenObserve ingest user, not the existing
+  ## openobserve-admin credential — and, because a Fleet Helm bundle silently
+  ## ignores loose manifests, the ExternalSecret has to live in a raw sibling
+  ## bundle, not in this directory.
+  webui:
+    enabled: false
+
+## Scrape Falco's own metrics.
+metrics:
+  enabled: true
+serviceMonitor:
+  create: true
+
+## ── PHASE 2: exceptions, written from MEASURED events ────────────────────────
+##
+## Measured 2026-09-22 over 90 minutes across all three nodes: 3,367 matches of
+## "Drop and execute new binary in container", which is priority 2 (CRITICAL).
+## That one rule is the only thing standing between this estate and a usable
+## severity alert, because everything else that fires is priority 4 or 5.
+##
+##   2,509 (74.5%)  gitlab-gitaly-0        /tmp/gitaly-<random>/gitaly-{git-prev,hooks}
+##     ~680         runner-*-project-N-*   CI build tooling, many images
+##     180          transmission-pia-*     /usr/bin/wg + /sbin/ip, 60 of each per hour
+##
+## ⭐ The rule ships its OWN extension points and this uses them rather than
+## appending exceptions or disabling anything: upstream defines
+## `known_drop_and_execute_containers` (an empty list) and
+## `known_drop_and_execute_activities` (a macro pinned to `never_true`) purely so
+## adopters can narrow it. The macro is the right hook — the list would whitelist
+## an entire IMAGE for every behaviour, whereas the macro can demand the image
+## AND the exact path.
+##
+## ⛔ Scope, not disable. `insmod` or a dropped binary ANYWHERE else — including
+## cephfs-kmod, jump-bastion, or a Gitaly container running something that is not
+## its own bundled git — still fires at CRITICAL.
+##
+## ✅ Validated before commit with `falco --validate` against the real base
+## ruleset inside a running pod: schema_valid true, 0 errors, 0 warnings.
+customRules:
+  mdapi-exceptions.yaml: |-
+    ## Gitaly unpacks its bundled Git into a per-start temp dir and execs it from
+    ## there, so every git operation trips is_exe_upper_layer. This is how Gitaly
+    ## is built, not a finding.
+    ## ⚠️ The numeric suffix is random per start, hence the glob. If a Gitaly
+    ## upgrade changes that layout the exception stops matching and the noise
+    ## returns — which is the FAIL-LOUD direction, and visible on the dashboard.
+    - macro: mdapi_gitaly_bundled_git
+      condition: >
+        (container.image.repository endswith "/cng/gitaly"
+         and proc.exepath glob "/tmp/gitaly-*/gitaly-*")
+
+    ## The PIA VPN sidecar re-execs WireGuard and iproute2 once a minute, from
+    ## binaries its entrypoint installed into the writable layer. Exactly 60 of
+    ## each per hour, forever.
+    - macro: mdapi_transmission_pia_vpn
+      condition: >
+        (k8s.ns.name = "tv"
+         and k8s.pod.name startswith "transmission-pia-"
+         and proc.exepath in ("/usr/bin/wg", "/sbin/ip"))
+
+    ## GitLab CI runner pods. Downloading and running tooling IS what a build
+    ## does, and the tool set changes every pipeline, so an exepath allow-list
+    ## would need editing weekly.
+    ## ⛔ This is the one exception here that trades away real coverage: Falco
+    ## will no longer report a dropped binary inside a CI build. That is accepted
+    ## deliberately — CI supply-chain risk is handled by PINNING the tools (see
+    ## mdapi/ci-templates/scan.yml, which pins a release and verifies its
+    ## sha256), not by a runtime detector watching an ephemeral pod.
+    ## Scoped to the runner pods only; the rest of ns bootstrap still fires.
+    - macro: mdapi_ci_runner_tooling
+      condition: >
+        (k8s.ns.name = "bootstrap"
+         and k8s.pod.name startswith "runner-")
+
+    ## Replace the upstream placeholder (`never_true`) with the three above.
+    - macro: known_drop_and_execute_activities
+      condition: >
+        (mdapi_gitaly_bundled_git
+         or mdapi_transmission_pia_vpn
+         or mdapi_ci_runner_tooling)
+      override:
+        condition: replace

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: frigate-config
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 1Gi -> 4Gi (2026-09-21). This holds frigate.db, which had grown to 878 MiB
+      # of a 973 MiB filesystem. Frigate runs a SQLite VACUUM on every start, and a
+      # VACUUM rebuilds the database into a second copy before swapping it in, so it
+      # needs roughly the DB's own size free. With 95 MiB left it failed with
+      # "database or disk is full" and frigate exited 1 -> CrashLoopBackOff.
+      #
+      # ⛔ This was invisible while the pod stayed up: the running process never
+      # vacuums, so the volume could fill to 90% for weeks with every probe green.
+      # It only surfaced when an unrelated change rolled the Deployment. A restart
+      # is not a no-op on a volume that is nearly full -- it is when the expensive,
+      # space-hungry startup paths run for the first time in months.
+      storage: 4Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: frigate-media-ceph
+  labels:
+    app.mdapi.ch/phase2: migrated
+spec:
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 10Gi -> 30Gi (2026-08-16). At 10Gi the recording sawtooth peaked around
+      # 7.8Gi, close enough to capacity that the rising edge kept tripping
+      # PVCWillFillIn24h even though retention was pruning normally. Tripling
+      # gives real headroom rather than muting the alert.
+      storage: 30Gi

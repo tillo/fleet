@@ -1,0 +1,235 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-identity
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-identity.workload
+    rules:
+    - alert: IdentityKeycloakUnavailable
+      ## TWO INSTANCES, TWO WORKLOAD KINDS. The tilloch realm's Keycloak is a
+      ## Deployment in `keycloak`; envuassu's is a StatefulSet. Until 2026-08-29 this
+      ## rule read `namespace=~"keycloak|envuassu", deployment="keycloak"`, which LOOKS
+      ## like two-instance coverage but cannot be: a StatefulSet emits no
+      ## kube_deployment_* series, so the envuassu half never produced a sample and that
+      ## instance had no availability alert at all.
+      ## It hid well because IdentityKeycloakCrashLooping below selects on
+      ## `pod=~"keycloak-.*"`, which DOES match keycloak-0/1 — so envuassu was not
+      ## wholly invisible, just invisible in the way that mattered.
+      ## Verified after the fix: the deployment clause matches 1 series, the statefulset
+      ## clause 1. Re-check both return series before touching this again.
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace=~"keycloak|envuassu", deployment="keycloak"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace=~"keycloak|envuassu", deployment="keycloak"
+            }
+          ) > 0
+        )
+        or
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace=~"keycloak|envuassu", statefulset="keycloak"
+            }
+            - kube_statefulset_status_replicas_ready{
+              namespace=~"keycloak|envuassu", statefulset="keycloak"
+            }
+          ) > 0
+        )
+      for: 3m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "keycloak" }}'
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/keycloak: {{ $value }} replicas unavailable"
+        description: |
+          Keycloak (SSO) is down or degraded. ALL apps gated by oauth2-proxy/OIDC
+          will start failing logins. Check: kubectl -n {{ $labels.namespace }} logs deployment/keycloak
+
+    - alert: IdentityKeycloakCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace=~"keycloak|envuassu", pod=~"keycloak-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "keycloak" }}'
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} keycloak restarting frequently"
+
+    - alert: IdentityOpenLDAPUnavailable
+      ## Keycloak federates against openldap for primary user storage; if
+      ## openldap is down, Keycloak token-issue still works for cached
+      ## users but new logins and group lookups break.
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="openldap", deployment=~"openldap|lam"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="openldap", deployment=~"openldap|lam"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "openldap" }}'
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.deployment }} unavailable"
+        description: |
+          {{ $labels.deployment }} in openldap ns is down. Keycloak's user
+          federation lookups will fail; new SSO logins won't be able to
+          resolve users. `lam` is the web UI for openldap admin only —
+          openldap itself is the load-bearing one.
+
+    - alert: IdentityOpenLDAPCrashLooping
+      expr: |
+        max by (namespace, pod) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="openldap", pod=~"openldap-.*|lam-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "openldap" }}'
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} restarting frequently"
+
+    - alert: IdentityOpenLDAPSocketLeak
+      ## 2026-07-02: Joplin's LDAP SSO leaked one slapd socket per auth attempt
+      ## until slapd hit its fd ceiling (then 1024, ULIMIT_N now 8192) — postfix
+      ## LDAP lookups timed out and inbound mail 451-tempfailed for ~15h.
+      ## Healthy baseline is ~10–30 sockets; the incident peaked at 1017.
+      expr: |
+        max by (pod) (
+          container_sockets{namespace="openldap", container="openldap"}
+        ) > 500
+      for: 30m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "openldap" }}'
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} holding {{ $value }} sockets — client connection leak"
+        description: |
+          Some LDAP client is leaking connections (2026-07-02 culprit: Joplin
+          LDAP SSO — sessions from the owner-share-sync cron + MCP). At the
+          ULIMIT_N=8192 ceiling slapd stops answering and mail tempfails.
+          Find the leaker: decode /proc/net/tcp in the openldap pod, group
+          remote IPs, map to pods. Fix: rollout restart the leaking client
+          (e.g. kubectl -n joplin rollout restart deploy/joplin).
+
+    - alert: IdentityOpenLDAPSocketExhaustionNear
+      expr: |
+        max by (pod) (
+          container_sockets{namespace="openldap", container="openldap"}
+        ) > 6000
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "openldap" }}'
+        severity: critical
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "openldap/{{ $labels.pod }} at {{ $value }} sockets — nearing the 8192 fd ceiling"
+        description: |
+          slapd is close to its ULIMIT_N=8192 file-descriptor ceiling; binds
+          will start timing out (Keycloak logins + postfix recipient lookups
+          -> mail 451). Restart the leaking client pod NOW (see
+          IdentityOpenLDAPSocketLeak) or restart openldap as a stopgap.
+
+    ## ⭐ THE STANDING CHECK beads infra-cst7 ASKED FOR, and the reason it could
+    ## not exist until 2026-09-22.
+    ##
+    ## The idp.mdapi.ch `view-users` 403 storm was declared FIXED on 2026-05-30,
+    ## came back, was found again by the 2026-09-05 waf-audit run (1631 hits over
+    ## ~29 h on GET /admin/realms/tilloch/users/<uuid>, matched_rules null, so
+    ## app-level and not a WAF block) — and then went quiet. That row says it
+    ## plainly: "The storm going quiet is NOT evidence of repair — the 05-30 fix
+    ## had the same shape and it came back. Establish a standing check rather than
+    ## declaring it fixed on a quiet window."
+    ##
+    ## ⛔⛔ Why there was no check: the obvious one is a 403 count for that host,
+    ## and `nginx_ingress_controller_requests` was NOT COLLECTED. It is exposed by
+    ## the controller but was dropped by a keep-list in the VMPodScrape, so the
+    ## query returned EMPTY — which reads exactly like "the storm has stopped".
+    ## An absent metric does not fail loudly; it fails as a reassuring zero.
+    ## Collection was enabled 2026-09-22 (fleet !425) specifically to close that.
+    ##
+    ## ⚠️ The ingress `path` label is the INGRESS RULE path, not the request URI —
+    ## idp.mdapi.ch is a single `/` rule — so this cannot isolate the
+    ## /admin/realms/.../users URI the storm rode on. It counts ALL 403s for the
+    ## host. That is the right trade: the storm is loud enough to dominate, and a
+    ## rule that needs the URI would need per-path metrics this estate has
+    ## deliberately not enabled (cardinality; see ingress-nginx-metrics/).
+    ##
+    ## THRESHOLD, measured rather than guessed (2026-09-22) — and measured as a
+    ## RATE, because a counter's lifetime total is not an hourly figure. The first
+    ## attempt at this comparison used totals and was wrong by days of uptime.
+    ##   the storm            1631 hits / 29 h   ~= 56 per hour, sustained
+    ##   idp now, increase[1h]                    = 4 per hour (rate[15m] = 0)
+    ##   for scale, same query: spider3.ch 247/h, gitlab.mdapi.ch 22/h
+    ## 30/h sits between: ~7x idp's quiet rate, comfortably under the storm, and
+    ## below hosts that legitimately serve hundreds of 403s an hour.
+    ## ⚠️ That baseline is THIN — the metric had ~45 minutes of history when it was
+    ## taken. Re-check after a week and move the number if normal 403 traffic on
+    ## this host is higher than it looked; do not assume 4/h is the steady state.
+    ##
+    ## Poison-tested 2026-09-22, five cases: as-written does not fire (idp quiet);
+    ## the same selector without a threshold returns 4, proving the series exists
+    ## and the emptiness is not a typo; threshold inverted to >-1 fires; the same
+    ## rule shape against spider3.ch fires at 247; a nonexistent host stays empty.
+    ##
+    ## `for: 30m` because the storm ran for 29 HOURS. A short burst of 403s after
+    ## a client restart or a token expiry is ordinary and must not page.
+    - alert: IdentityIdpForbiddenStorm
+      expr: |
+        sum(
+          increase(nginx_ingress_controller_requests{host="idp.mdapi.ch", status="403"}[1h])
+        ) > 30
+      for: 30m
+      labels:
+        service: 'keycloak'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}keycloak{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Sign-in (SSO)
+        team: mdapi
+      annotations:
+        summary: "idp.mdapi.ch returning {{ $value | printf \"%.0f\" }} 403/h — view-users storm signature"
+        description: |
+          Sustained 403s from Keycloak on idp.mdapi.ch. This is the signature of
+          the Rancher<->Keycloak `view-users` storm that was declared fixed on
+          2026-05-30 and regressed by 2026-09-03 (beads infra-cst7).
+
+          ⛔ App-level, NOT a WAF block — expect matched_rules to be null. Do not
+          go looking for a ModSecurity carveout.
+
+          Triage, in order:
+          1. Re-check the Rancher service account's realm-management:view-users
+             role grant in realm tilloch, and force-refresh its cached token —
+             that was the 05-30 root cause and the fix did not hold.
+          2. Identify the callers. Last time: 192.168.1.31/.32 (rancher-mgmt-1/2,
+             expected) AND 192.168.1.254, the bpi-r4 router, which has no business
+             calling the Keycloak admin API and was never explained. If the router
+             appears again, that is the thread to pull.
+          3. The ingress path label cannot show the URI; read the Keycloak access
+             log or the modsec audit corpus for the exact /admin/realms/... path.

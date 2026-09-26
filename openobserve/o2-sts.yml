@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openobserve
+  namespace: openobserve
+  annotations:
+    reloader.stakater.com/auto: "true"
+    # Keel annotations removed with the digest pin (approved 2026-08-12,
+    # ext:o2-search-topk-blind): a 24h force-poll on latest-amd64 was a silent
+    # upgrade path — o2 version changes are now deliberate git edits here.
+spec:
+  serviceName: openobserve
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openobserve
+  template:
+    metadata:
+      labels:
+        app: openobserve
+    spec:
+      securityContext:
+        fsGroup: 10001
+      containers:
+      - name: openobserve
+        # ⚠️ ALWAYS the non-SIMD amd64 variant; the SIMD build SIGILLs on Xeon
+        # nodes without AVX2. None of qui/quo/qua have it. Upstream's tag
+        # convention is NOT consistent across releases - v1.0.1 publishes no
+        # amd64 build at all, v1.0.2 only a multi-arch index, v1.0.3 an explicit
+        # `-amd64`. So resolve the platform from the MANIFEST, never from the
+        # tag name, and boot-test on a prod node before merging.
+        #
+        # Pinned by digest (approved 2026-08-12, infra-health
+        # ext:o2-search-topk-blind): unpinned latest-amd64 + pullPolicy Always
+        # meant any pod recreation could silently change the o2 version.
+        # ⭐ The ref now carries the TAG as well as the digest. Digest-only is
+        # what made this image invisible to BOTH lanes for six weeks - see the
+        # Renovate note below.
+        #
+        # ENTERPRISE EDITION since 2026-09-01 (user decision). EE is free for
+        # self-hosted use up to 50 GB/day ingestion - no licence key, no
+        # registration, nothing to renew. Measured 2026-09-22: ~12-17 GB/day,
+        # `ingestion_quota_used` 19.1. That margin only exists because the
+        # pod_logs re-parse (infra-l8x9) took the estate from ~46.9 GB/day. The
+        # ceiling is per 24-hour UTC day, so hourly peaks do not breach it - but
+        # traces/RUM/LLM spans are ADDITIVE, so watch it as those land and
+        # filter in Cribl rather than let the licence lapse.
+        #
+        # ── 2026-09-22: v0.92.0 -> v1.0.3 ───────────────────────────────────
+        # First real version bump since the EE build-flag swap. Why v1.0.3:
+        #   * meets this repo's own Lane-B soak policy (minimumReleaseAge 3d);
+        #   * its ONLY delta over v1.0.2 is two backported fixes, one of them
+        #     "OTLP series identity" - load-bearing for the trace ingestion
+        #     being wired up now, so taking v1.0.2 to buy one more soak day
+        #     would mean knowingly shipping the OTLP bug;
+        #   * v1.0.1 publishes no amd64 build, so it was never a candidate.
+        # v1.0.0 brings SLOs, composite alerts, synthetics (now OSS), DBM,
+        # AI-Observability v1.0 and a hardened service graph; the storage layer
+        # split into separate ORM read/write clients, retiring the sqlite write
+        # lock - which is why the meta DB was snapshotted first.
+        #
+        # ⭐ BOOT-TESTED before merge, on prod node qua, with this exact digest:
+        # it ran tantivy, built the 247-tool MCP index, initialised the
+        # enterprise AI components and the ingesters. Exit was code 1 (a config
+        # complaint), NOT 132/SIGILL - which is the evidence that matters for
+        # the non-SIMD question.
+        #
+        # ⛔⛔ LANDMINE found by that boot test, deliberately NOT fixed here.
+        # v1.0.x validates ZO_ROOT_USER_PASSWORD strength (needs lower+upper+
+        # digit+SPECIAL) and PANICS if it fails. Our stored root password has no
+        # special character. It is harmless today because the check sits inside
+        # `if !db::user::root_user_exists()` (src/jobs/src/job/mod.rs) - it runs
+        # ONLY on first init, and our root user already exists in the meta DB.
+        # But if this PVC is ever lost or recreated, the pod will panic on first
+        # boot and the message will not mention the upgrade. Rotate the Akeyless
+        # secret /mdapi/openobserve/o2/root-password to add a special character
+        # before that can bite. Pre-upgrade snapshot: VolumeSnapshot
+        # openobserve/o2-pre-v1-upgrade-20260922.
+        #
+        # Rollback: restore the previous digest
+        #   @sha256:0e9abced022fb004103acc38ae2cb9b5fa041bcb3d96b5f9a054de04d6b2d3d5
+        # (EE v0.92.0, commit 30af70fdfc8c42fa672b28cbba78a1a8930745b6).
+        image: public.ecr.aws/zinclabs/openobserve-enterprise:v1.0.3-amd64@sha256:cd4e7a4a932995d40849f8d208b49e29433be6567a767be22939e2ba2e3e2ea5
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: openobserve-config
+        - secretRef:
+            name: openobserve-admin
+        ## RUM client token, kept out of git because the fleet repo is publicly
+        ## mirrored. Note this credential is public ONCE SERVED: with
+        ## ZO_RUM_ENABLED=true, logs.mdapi.ch/config hands it to any anonymous
+        ## caller by design. It is in Akeyless so the repo does not publish it,
+        ## not because the token is a secret in the usual sense. The thing that
+        ## actually bounds abuse is the rate limit in o2-rum-ing.yml.
+        - secretRef:
+            name: openobserve-rum
+        env:
+        - name: ZO_S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rgw-openobserve-s3-creds
+              key: access_key
+        - name: ZO_S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rgw-openobserve-s3-creds
+              key: secret_key
+        ports:
+        - { name: http, containerPort: 5080 }
+        - { name: grpc, containerPort: 5081 }
+        readinessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /data }
+        resources:
+          requests: { cpu: 200m, memory: 512Mi }
+          limits:   { cpu: "2",  memory: 4Gi }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 20Gi } }

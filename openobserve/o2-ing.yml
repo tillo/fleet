@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openobserve
+  namespace: openobserve
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    ## 600 (was 300, 2026-09-24): an incident RCA runs synchronously behind this
+    ## ingress and took up to 312 s. A 300 s cut returned 504, discarded the finished
+    ## analysis, and left the incident locked ("Analysis already in progress").
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: logs.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: openobserve
+                port:
+                  number: 5080
+  tls:
+    - hosts:
+        - logs.mdapi.ch
+      secretName: openobserve-cert

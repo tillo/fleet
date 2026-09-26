@@ -1,0 +1,176 @@
+# Bundle directories that gitrepo/mdapi-prod renders, one per line.
+#
+# WHY THIS FILE EXISTS
+# The GitRepo is NOT in git -- it lives only on the mgmt cluster
+# (-n fleet-default gitrepo/mdapi-prod) and enumerates spec.paths explicitly,
+# because a null paths renders an extra catch-all bundle that duplicates every
+# file in the repo and sits against etcd's 1.5 MiB per-object limit.
+#
+# The cost of that is permanent and easy to forget: Fleet discovers NOTHING.
+# On 2026-09-22 the falco/ bundle merged with a green pipeline and deployed
+# nothing at all -- no bundle was created, while the GitRepo reported
+# Ready=True, Stalled=False. lint.py now fails the MR instead.
+#
+# ADDING A BUNDLE
+#   1. add its directory here
+#   2. after merge, append it to the live GitRepo (APPEND, never regenerate):
+#      kubectl --context mdapi-rancher -n fleet-default \
+#        patch gitrepos.fleet.cattle.io mdapi-prod --type=json \
+#        -p '[{"op":"add","path":"/spec/paths/-","value":"<dir>"}]'
+#
+# RULES
+#   * Fleet RECURSES into every listed path, so never list a directory whose
+#     ancestor is also listed -- it renders that bundle twice in one job and
+#     the second write loses an optimistic-concurrency race, which stalls the
+#     GitRepo and freezes bundling for the WHOLE repo.
+#   * Both fleet.yaml and fleet.yml count.
+#
+# Generated from the live GitRepo on 2026-09-22.
+admission-policies
+akeyless-pg-bridge
+appdaemon
+aruba-snmp-exporter
+backlog
+bootstrap
+bussola
+cephfs-kmod
+cert-host
+cert-manager
+certspotter
+ciphertrust
+cloudnative-pg
+coiffuredreams
+cribl
+cribl-backup
+cribl-syslog
+ctf
+dellambrogio
+descheduler
+docs
+envuassu/cert-manager
+envuassu/external-secrets
+envuassu/keycloak
+envuassu/mail-reconciler
+envuassu/nextcloud
+envuassu/site
+esphome
+etcd-metrics
+etcd-priority
+evertrust-mcp
+external-dns
+external-dns-mdapi
+external-dns-secret
+external-secrets
+external-secrets-scrape
+falco
+findmy
+formbricks-kustodyan
+frigate
+gitlab-agent
+gitlab-runner-builder
+grafana-extra-dashboards
+grafana-harvester-sidecar-rbac
+harvester-backend-cert
+home-assistant
+honeypot
+horizon
+horizon-discovery
+horizon-issuer
+horizon-issuer-config
+infomaniak-webhook
+ingress
+ingress-nginx-metrics
+iomemory-storageclass
+ivodellambrogio
+joplin
+jump
+k8s-mcp
+keel
+keycloak
+kube-bench
+kustodyan-mcp
+letsencrypt-clusterissuer
+limit-ranges
+litellm
+longhorn
+macos-vm
+mail
+mdapiorg
+meshcentral
+metallb
+metallb-pools
+mirror
+monitoring-blackbox
+monitoring-cribl-am-relay
+monitoring-grafana
+monitoring-logging
+monitoring-logging-flows
+monitoring-pushgateway
+monitoring-rancher-am-config
+monitoring-rules
+monitoring-statuspage-adapter
+monitoring-vm
+monitoring-vm-operator
+monitoring-vmalertmanager-config
+mqtt
+nameserver
+nextcloud/external-secrets
+nextcloud/nextcloud
+ntppool
+ntppool-agent
+oauth2-proxy/admin
+oauth2-proxy/bussola
+oauth2-proxy/cert-manager
+oauth2-proxy/external-secrets
+oauth2-proxy/portal
+oauth2-proxy/tv
+openbao
+openbao-bootstrap
+openbao-eso
+openbao-mirror
+openldap
+opennic
+openfga
+plex-auth
+openobserve
+openwebui
+paperless
+paperless-kustodyan
+portal
+priority-classes
+rancher-monitoring-config
+reloader
+ripe-atlas
+rke2-coredns-config
+rke2-ingress-nginx-config
+rook-ceph
+rook-ceph-cluster
+rook-ceph-csi-drivers
+rook-ceph-objectstore-users
+rum-assets
+scrypted
+showcase
+snowflake-proxy
+spider3
+split-horizon
+squid
+stream
+tenant-1
+technitium
+tillo
+transit
+trust-manager
+trust-manager-bundle
+tv
+ups
+volsync
+vpa
+vpa-objects
+webtunnel-bridge
+windmill
+wyoming-openwakeword
+wyoming-piper
+wyoming-whisper
+znc
+zot
+zot-pull-secrets

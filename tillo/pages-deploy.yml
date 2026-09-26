@@ -1,0 +1,103 @@
+# Static pages under tillo.ch/<path>/ (everything else on tillo.ch still
+# redirects to LinkedIn via the `tillo` ingress). Content lives in
+# pages-cm.yml; each page is mounted as <path>/index.html.
+#
+# ⚠️ This namespace is watched by WebsiteUnavailable (06-websites.yml,
+# critical, keyed on the NAMESPACE): a pod that cannot become Ready for 5m
+# puts the public Websites component into major_outage.
+#
+# Live pages: ConfigMap tillo-pages-live is NOT in fleet — Windmill
+# f/desk/snds_status_page writes it every 30 min. It is mounted optional,
+# nginx serves it first and falls back to the static copy. The kubelet
+# refreshes the mounted file in place, so a status update needs no restart.
+# ⚠️ Reloader runs with --auto-reload-all cluster-wide, so the reload list
+# below does NOT keep tillo-pages-live out (every write rolled the pods until
+# 2026-09-25). The writer sets reloader.stakater.com/ignore: "true" on the
+# ConfigMap itself — verified: a write leaves the revision unchanged.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tillo-pages
+  namespace: tillo
+  annotations:
+    configmap.reloader.stakater.com/reload: "tillo-pages-html,tillo-pages-nginx"
+spec:
+  selector:
+    matchLabels:
+      app: tillo-pages
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: tillo-pages
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: tillo-pages
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.31-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          # Readiness on a real page, not /healthz: proves the content
+          # ConfigMap is mounted, so a broken mount never takes traffic.
+          readinessProbe:
+            httpGet:
+              path: /snds-outage/
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+            - name: site
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: live
+              mountPath: /usr/share/nginx/live
+              readOnly: true
+      volumes:
+        - name: html
+          configMap:
+            name: tillo-pages-html
+            items:
+              - key: snds-outage.html
+                path: snds-outage/index.html
+        - name: site
+          configMap:
+            name: tillo-pages-nginx
+        - name: live
+          configMap:
+            name: tillo-pages-live
+            optional: true
+            items:
+              - key: snds-outage.html
+                path: snds-outage.html

@@ -1,0 +1,32 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: keycloak-env-secret
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: keycloak-env-secret
+    creationPolicy: Owner
+
+  data:
+    - remoteRef:
+        key: /mdapi/keycloak/keycloak-env-secret/KC_DB_PASSWORD
+      secretKey: KC_DB_PASSWORD
+    - remoteRef:
+        key: /mdapi/keycloak/keycloak-env-secret/KC_BOOTSTRAP_ADMIN_PASSWORD
+      secretKey: KC_BOOTSTRAP_ADMIN_PASSWORD
+    # ⛔ The OTEL_EXPORTER_OTLP_HEADERS entry that lived here (added 2026-09-22,
+    # kept through the tracing revert) is REMOVED: Keycloak now exports to the
+    # in-cluster OTel collector, which is unauthenticated from inside the
+    # cluster and attaches the OpenObserve credential itself. Keycloak therefore
+    # needs no o2 credential at all, and an unused ingest credential sitting in
+    # this namespace is a hygiene cost with no benefit.
+    #
+    # If Keycloak is ever pointed DIRECTLY at OpenObserve again, put it back —
+    # o2's OTLP ingest 401s without one and the failure is silent (spans simply
+    # stop) rather than loud.

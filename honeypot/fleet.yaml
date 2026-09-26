@@ -1,0 +1,78 @@
+defaultNamespace: honeypot
+namespace: honeypot
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  # The two trapeye VMs and their PVCs were hand-built in Harvester long before
+  # this bundle existed and carry no Helm ownership metadata. Adding them to an
+  # already-installed release fails on ownership without this.
+  takeOwnership: true
+# VPA (mode=Auto) writes resources.requests/limits onto running pods.
+# Strip the resources block from both sides before diff so Fleet stops
+# flagging the bundle as Modified. Covers all trapeye workloads.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: DaemonSet
+    name: trapeye-daemonset
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-nodeport
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-clusterip
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: trapeye-loadbalancer
+    namespace: honeypot
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+
+  # The two VMs, adopted 2026-09-02. Everything KubeVirt or Harvester would
+  # otherwise generate is pinned in their manifests (firmware uuid/serial, MAC,
+  # maxSockets, architecture, machine type, node affinity), so this is the
+  # measured remainder — `kubectl diff` against both live objects is empty.
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    name: trapeye-vm-dmz
+    namespace: honeypot
+    jsonPointers:
+    # Derived from limits by Harvester's overcommit webhook (125m / 2730Mi)
+    # using cluster-wide ratios that would rot if hard-coded here.
+    - /spec/template/spec/domain/resources/requests
+    # Serialised as an explicit null on the pod template.
+    - /spec/template/metadata/creationTimestamp
+    # Rewritten by Harvester on every edit of the VM.
+    - /metadata/annotations/harvesterhci.io~1timestamp
+    # Harvester's own record of the run strategy; controller bookkeeping.
+    - /metadata/annotations/harvesterhci.io~1vmRunStrategy
+    - /metadata/annotations/kubevirt.io~1latest-observed-api-version
+    - /metadata/annotations/kubevirt.io~1storage-observed-api-version
+    # Defensive: absent today (a stale one was cleared from trapeye-vm-lan-v2
+    # during adoption, because `kubectl apply` prunes from it and would have
+    # stripped the webhook-written requests off a running VM), but it returns
+    # the moment anyone kubectl-applies either VM again.
+    - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    name: trapeye-vm-lan-v2
+    namespace: honeypot
+    jsonPointers:
+    - /spec/template/spec/domain/resources/requests
+    - /spec/template/metadata/creationTimestamp
+    - /metadata/annotations/harvesterhci.io~1timestamp
+    - /metadata/annotations/harvesterhci.io~1vmRunStrategy
+    - /metadata/annotations/kubevirt.io~1latest-observed-api-version
+    - /metadata/annotations/kubevirt.io~1storage-observed-api-version
+    - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration

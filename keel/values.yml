@@ -1,0 +1,36 @@
+polling:
+  defaultSchedule: "@every 4h"
+## Helm provider OFF (2026-09-24). With it on, keel's poll manager decodes EVERY deployed Helm release on
+## each scan (179 releases, 54 MiB of release JSON) looking for `keel:` blocks in their values, and none has one.
+## That produced a memory sawtooth of +1-1.4 GiB every 2-7 min (peaks 3.3 GiB) and ~7 OOM kills/week.
+## Image tracking is by workload annotations (62 workloads, policy force), which the Kubernetes provider handles.
+## Re-enable only if a Helm release gets a `keel:` values block.
+helmProvider:
+  enabled: false
+mail:
+  enabled: false
+secret:
+  name: keel-mail
+notificationLevel: info
+# Lane B (Renovate-managed): the chart pins keelhq/keel to its appVersion. We no
+# longer override to :latest (Keel can't self-update) — the keel CHART version is
+# pinned in fleet.yml and bumped by Renovate, which carries the new image with it.
+# IfNotPresent: the pinned image is boot-safe.
+#
+# TEMPORARY image override (infra-health restart:keel/keel, user-approved 2026-07-15):
+# 0.20.0 (chart v1.0.5 appVersion) dies with a silent exit-2 ~40s after every
+# 4-hourly digest-poll wave. Upstream fixed builds (0.21.x) exist only on GHCR —
+# Docker Hub stops at 0.20.x — and no chart release carries them yet. This pin is
+# invisible to Renovate (values file, not fleet.yml); REMOVE it when a chart
+# > v1.0.5 ships with appVersion >= 0.21.1 (Renovate will surface that bump).
+image:
+  repository: ghcr.io/keel-hq/keel
+  tag: "0.21.1"
+  pullPolicy: IfNotPresent
+resources:
+  limits:
+    cpu: 2000m
+    memory: 1Gi
+  requests:
+    cpu: 600m
+    memory: 1Gi

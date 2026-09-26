@@ -1,0 +1,37 @@
+## jump-cache — a deliberately UNBACKED-UP volume for regenerable caches.
+##
+## Why this exists: VolSync has no exclude support, so whatever sits on
+## jump-home-ceph is in every hourly restic snapshot forever. After the mbptillo
+## import the hourly run was 84 818 files / 6.47 GiB, of which ~2.6 GB was pure
+## cache — the grype DB alone is 2.0 GB and is re-downloaded on a schedule
+## anyway. The curated rsync filter that governed the mbptillo side excludes
+## exactly these paths; it never applied to jump's own pre-existing home.
+##
+## ⚠️ It is NOT enough to exclude them from a filter — they have to leave the
+## PVC. Splitting them onto their own claim is the only way, because the backup
+## scope IS the volume.
+##
+## ⚠️ What must NOT move here, despite looking cache-shaped (verified 2026-09-02):
+##   ~/.local/opt/node22    499M  dsh execs it directly (~/.local/bin/dsh)
+##   ~/.local/opt/wmill-cli  48M  the Windmill deploy path
+##   ~/.local/share/claude  746M  Claude Code's own data
+## Hence per-directory subPath mounts below rather than mounting ~/.local/share
+## or ~/.local/opt wholesale.
+##
+## NO ReplicationSource on purpose. Losing this volume costs one grype DB
+## download and some npm/pnpm refetching, nothing else. If it is ever lost,
+## delete the PVC and let it re-provision empty.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jump-cache
+  namespace: jump
+  labels:
+    app: jump-bastion
+    backup: "none"          # documents the intent; nothing consumes this label
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 20Gi

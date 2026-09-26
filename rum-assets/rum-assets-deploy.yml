@@ -1,0 +1,105 @@
+## Tiny read-only nginx serving exactly two bytes-worth of thing: the vendored
+## RUM SDK with its init appended, as a single rum.js.
+##
+## The initContainer concatenates them and substitutes the client token, so the
+## token is never written into git and the browser still gets ONE request
+## instead of two.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rum-assets
+  namespace: rum-assets
+  annotations:
+    ## rum.js is rendered by the initContainer at pod START, so a rum-init.js
+    ## change was invisible until the next unrelated restart. Reloader rolls it.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: rum-assets }
+  template:
+    metadata:
+      labels: { app: rum-assets }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        fsGroup: 101
+      initContainers:
+        - name: render
+          # Same image as the serving container on purpose: alpine already has
+          # sh/sed/grep, so this adds no second image to mirror or patch.
+          image: nginxinc/nginx-unprivileged:1.31-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              cat /src/openobserve-rum.js > /out/rum.js
+              sed "s|__RUM_CLIENT_TOKEN__|${RUM_CLIENT_TOKEN}|" /src/rum-init.js >> /out/rum.js
+              # fail loudly rather than serve a script that silently does nothing
+              grep -q '__RUM_CLIENT_TOKEN__' /out/rum.js && exit 1
+              wc -c /out/rum.js
+          env:
+            - name: RUM_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef: { name: rum-client-token, key: RUM_CLIENT_TOKEN }
+          volumeMounts:
+            - { name: src, mountPath: /src, readOnly: true }
+            - { name: out, mountPath: /out }
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.31-alpine
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /rum.js, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+          volumeMounts:
+            - { name: out, mountPath: /usr/share/nginx/html, readOnly: true }
+            - { name: conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+        - name: src
+          configMap: { name: rum-assets }
+        - name: out
+          emptyDir: {}
+        - name: conf
+          configMap: { name: rum-assets-nginx }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rum-assets-nginx
+  namespace: rum-assets
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+      root /usr/share/nginx/html;
+      gzip on;
+      gzip_types application/javascript;
+      # The file changes only when the SDK is re-vendored, and a stale copy for
+      # an hour is harmless, so let browsers keep it.
+      location = /rum.js {
+        add_header Cache-Control "public, max-age=3600";
+        add_header Access-Control-Allow-Origin "*";
+        default_type application/javascript;
+      }
+      location = /healthz { return 200 "ok\n"; }
+      location / { return 404; }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rum-assets
+  namespace: rum-assets
+spec:
+  selector: { app: rum-assets }
+  ports:
+    - port: 80
+      targetPort: 8080

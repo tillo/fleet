@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    reloader.stakater.com/auto: "true"
+    keel.sh/match-tag: 'true'
+    keel.sh/policy: force
+    keel.sh/pollSchedule: "@every 4h"
+    keel.sh/trigger: poll
+  name: coiffuredreams
+  namespace: coiffuredreams
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coiffuredreams
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: coiffuredreams
+    spec:
+      ## The uploads PVC arrives owned by uid 10025:82 while Apache serves
+      ## as www-data (33), so WordPress could never write to it — media
+      ## uploads failed silently for years, and it only surfaced when the
+      ## sucuri-scanner plugin could not recreate its datastore and PHP 8
+      ## turned that into a fatal on every login POST.
+      ## A one-off chown fixed the live volume; fsGroup makes it structural,
+      ## so a restored or re-provisioned volume cannot bring the bug back.
+      securityContext:
+        fsGroup: 33
+      containers:
+      - env:
+        ## Self-hosted ALTCHA proof-of-work on wp-login, replacing sucuri-scanner
+        ## (whose failed-login log grew to 651 MB and took the login down for five
+        ## months). altcha-challenge.php and the altcha-login mu-plugin BOTH fail
+        ## closed when this is empty, so a missing secret locks the admin out
+        ## rather than quietly accepting every solution.
+        - name: ALTCHA_HMAC_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: altcha-secret
+              key: ALTCHA_HMAC_SECRET
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: DB_PASSWORD
+              name: db-secret
+        envFrom:
+        - configMapRef:
+            name: db-config
+        - secretRef:
+            name: wp-salts
+        image: registry.mdapi.ch/mdapi/coiffuredreams:latest
+        imagePullPolicy: Always
+        name: coiffuredreams
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            memory: 768Mi
+          requests:
+            cpu: 50m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /wp-login.php
+            port: 80
+            httpHeaders:
+            # wp-config honors X-Forwarded-Proto; without it WP canonical-
+            # redirects to https://www.coiffuredreams.ch and the kubelet logs
+            # a ProbeWarning on every probe (2342 events by 2026-08-17).
+            - name: X-Forwarded-Proto
+              value: https
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - mountPath: /var/www/html/wp-content/uploads
+          name: uploads
+        - mountPath: /etc/msmtprc
+          name: msmtp-config
+          readOnly: true
+          subPath: msmtprc
+      imagePullSecrets:
+      - name: mdapi-registry
+      volumes:
+      - name: uploads
+        persistentVolumeClaim:
+          claimName: uploads
+      - configMap:
+          name: msmtp-config
+        name: msmtp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coiffuredreams
+  namespace: coiffuredreams
+spec:
+  ports:
+  - port: 80
+    targetPort: 80
+  selector:
+    app: coiffuredreams

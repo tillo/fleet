@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tdarr
+  namespace: tv
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: tdarr
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: tdarr
+        # Transcoder: pegs its CPU lid whenever a job runs, by design. Exempt
+        # from ContainerCpuThrottling (monitoring-rules/18-cpu-throttling.yml)
+        # via the KSM pod-label allowlist. Per-workload, NOT namespace-wide —
+        # seerr/sonarr in tv/ stay in scope (the rule was built to catch them).
+        monitoring.mdapi.ch/cpu-throttle-exempt: "true"
+    spec:
+      priorityClassName: mdapi-low
+      containers:
+      - name: tdarr
+        image: ghcr.io/haveagitgat/tdarr:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8265
+        # Tdarr is a transcoder: scales to all available CPU when a job
+        # runs. VPA was saturated at the old 8c lid (40% throttle observed
+        # 2026-06-05 mid-HEVC). Bumped to 12c + VPA maxAllowed raised to
+        # match. Memory grows with concurrent transcode threads.
+        resources:
+          requests:
+            cpu: 4
+            memory: 8Gi
+          limits:
+            cpu: 12
+            memory: 16Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        - name: serverIP
+          value: '0.0.0.0'
+        - name: serverPort
+          value: '8266'
+        - name: webUIPort
+          value: '8265'
+        - name: internalNode
+          value: 'true'
+        - name: nodeName
+          value: mdapi
+        volumeMounts:
+        - name: tdarr-server
+          mountPath: /app/server
+        - name: tdarr-configs
+          mountPath: /app/configs
+        - name: tdarr-temp
+          mountPath: /temp
+        - name: tv
+          mountPath: /media
+      volumes:
+      - name: tdarr-server
+        persistentVolumeClaim:
+          claimName: tdarr-server
+      - name: tdarr-configs
+        persistentVolumeClaim:
+          claimName: tdarr-configs
+      - name: tdarr-temp
+        persistentVolumeClaim:
+          claimName: tdarr-temp-ceph
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph

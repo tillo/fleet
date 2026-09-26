@@ -1,0 +1,29 @@
+# Windmill token for the dellambrogio.ch request form.
+#
+# SCOPED to exactly one runnable: run:flow/f/marketplace/request_membership.
+# The site is a public, unauthenticated front door, so this token is reachable by
+# anything that can compromise the container — scoping it is what keeps that from
+# being interesting. It cannot read variables, cannot list jobs, cannot run
+# anything else.
+#
+# It stays SERVER-SIDE: send.php reads it from the environment and posts the flow
+# itself. It must never be emitted into the HTML, which is why the form posts to
+# send.php rather than to Windmill directly. (envuassu solves the same problem by
+# having nginx envsubst it into a proxied /enrol path; this site is Apache + PHP,
+# so the environment is the natural place.)
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: dellambrogio-windmill-token
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: dellambrogio-windmill-token
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/dellambrogio/windmill-token/token
+      secretKey: WINDMILL_TOKEN

@@ -1,0 +1,29 @@
+## Open WebUI's whole state: SQLite (users, chats, prompts, model presets),
+## uploaded documents and the Chroma vector store, all under DATA_DIR.
+## Without this the app is amnesiac — every rollout drops all accounts and
+## history, which is how the first draft of this bundle was written.
+##
+## Backup class is DECLARED here, at definition time (2026-09-23): `weekly`,
+## because chat.mdapi.ch accounts/history exist nowhere else (the enforcer's
+## WEEKLY_NS reasoning). The recurring-job labels are exactly the set
+## f/heal/backup_label_enforcer derives for that class, so the enforcer finds
+## nothing to patch and stays a pure detector instead of racing Fleet.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwebui-data
+  namespace: openwebui
+  labels:
+    mdapi.ch/backup-class: weekly
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/default: enabled
+    recurring-job-group.longhorn.io/weekly: enabled
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # SQLite + config is tens of MB; the headroom is for RAG uploads and the
+      # embedding cache, which is what actually grows.
+      storage: 20Gi

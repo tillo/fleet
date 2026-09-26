@@ -1,0 +1,101 @@
+# OpenObserve admin credentials. Pushed to Akeyless before first deploy.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-admin
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-admin
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/o2/root-email }
+    secretKey: ZO_ROOT_USER_EMAIL
+  - remoteRef: { key: /mdapi/openobserve/o2/root-password }
+    secretKey: ZO_ROOT_USER_PASSWORD
+---
+# litellm virtual key for the OpenObserve AI assistant (o2-sre-agent), 2026-09-01.
+# Scoped at the litellm side to ds-pro / ds-flash / local-only — not a master key,
+# so it cannot reach the claude-* routes (Max subscription, ToS) or spend outside
+# those three. Created via litellm /key/generate with alias "openobserve-ai".
+# Consumed ONLY by the o2-sre-agent Deployment; the OpenObserve StatefulSet does
+# not get it (verified: O2_AI_ENABLED + O2_AGENT_URL alone are sufficient there).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-ai
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-ai
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/ai/litellm-key }
+    secretKey: O2_AI_API_KEY
+---
+# Credential the OTel Collector attaches on behalf of emitters that cannot carry
+# one themselves (ingress-nginx has no Authorization option at all).
+#
+# ⚠️ TWO SHAPES OF THE SAME CREDENTIAL, deliberately, because the two consumers
+# want different strings and neither will accept the other's:
+#
+#   /mdapi/openobserve/otel/ingest-header         "Authorization=Basic <b64>"
+#       -> OTEL_EXPORTER_OTLP_HEADERS, the OTel SDK env var (litellm). The SDK
+#          parses "key=value" pairs, so the header NAME is part of the value.
+#   /mdapi/openobserve/otel/ingest-authorization  "Basic <b64>"
+#       -> the collector's exporters.headers.Authorization, where the name is
+#          already the YAML key and only the VALUE belongs here.
+#
+# Both encode the SAME OpenObserve service account, otel-ingest@mdapi.ch (role
+# service_account) — NOT the root credential. Rotating the account means
+# rewriting both, and a mismatch fails CLOSED and silently: spans simply stop.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: otel-collector-auth
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: otel-collector-auth
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/otel/ingest-authorization }
+    secretKey: O2_OTLP_AUTHORIZATION
+---
+# RUM client token for OpenObserve's own web UI (ZO_RUM_ENABLED), 2026-09-23.
+# Minted with GET /api/default/rumtoken — a dedicated write-only ingest
+# credential, NOT the root passcode and NOT the org passcode.
+#
+# ⛔ This token is PUBLIC the moment RUM is enabled: logs.mdapi.ch/config answers
+# 200 without authentication and serves the whole rum block, client_token
+# included. That is inherent to RUM — a browser SDK cannot hold a secret. It
+# lives in Akeyless so the publicly-mirrored fleet repo does not carry it, and
+# the abuse bound is the rate limit in o2-rum-ing.yml, not the token's secrecy.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-rum
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-rum
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/rum/client-token }
+    secretKey: ZO_RUM_CLIENT_TOKEN

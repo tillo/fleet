@@ -1,0 +1,233 @@
+## Plex webhook receiver -> OpenObserve `plex_events` (2026-09-24).
+## Plex (lifetime Pass) posts multipart/form-data from PMS itself; Windmill can't take multipart
+## without a workspace S3 bucket, so this stdlib receiver parses it. ClusterIP only, NO Ingress:
+## the webhook URL registered on the owner's plex.tv account is the in-cluster Service.
+## Privacy: no client IP / geo kept (Player.publicAddress dropped; only lan|wan).
+## O2 credential: ingest-only ingestion token `plex-webhook` (Akeyless
+## /mdapi/openobserve/plex-webhook/ingestion-token) via the ExternalSecret below.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: plex-webhook-receiver
+  namespace: tv
+data:
+  receiver.py: |
+    """Plex webhook receiver -> OpenObserve stream plex_events.
+
+    Plex (lifetime Pass, account-level webhook on the owner's plex.tv account) POSTs
+    multipart/form-data: a JSON 'payload' part (+ an optional 'thumb' image, ignored).
+    Windmill cannot take multipart without a workspace S3 bucket, hence this receiver.
+    In-cluster only (ClusterIP, no Ingress): PMS runs in the same namespace.
+
+    PRIVACY: no client IP and no geo are kept. Player.publicAddress is dropped; only
+    Player.local (lan/wan) survives. The username and title are kept (the purpose).
+    O2: ingests with the ingestion token `plex-webhook` (ingest-only). _timestamp =
+    receive time (recent, so O2 never silently drops it); a failed row -> HTTP 502 + log.
+    """
+    import base64
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+    from email.parser import BytesParser
+    from email.policy import default as email_policy
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    O2 = os.environ.get("O2_URL", "http://openobserve.openobserve.svc.cluster.local:5080/api/default")
+    STREAM = os.environ.get("O2_STREAM", "plex_events")
+    AUTH = "Basic " + base64.b64encode(f"{os.environ['O2_USER']}:{os.environ['O2_TOKEN']}".encode()).decode()
+    MAX_BODY = 2 * 1024 * 1024  # thumbnails are small; refuse anything absurd
+
+
+    def log(**kw):
+        print(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **kw}), flush=True)
+
+
+    def parse_payload(content_type, body):
+        """Return the decoded 'payload' JSON from a multipart body, or a bare JSON body."""
+        if content_type.startswith("application/json"):
+            return json.loads(body)
+        msg = BytesParser(policy=email_policy).parsebytes(
+            b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body)
+        for part in msg.iter_parts():
+            if part.get_param("name", header="content-disposition") == "payload":
+                return json.loads(part.get_content() if isinstance(part.get_content(), str)
+                                  else part.get_payload(decode=True).decode())
+        raise ValueError("no 'payload' part")
+
+
+    def to_row(p, now_us):
+        acc, srv, pl, md = (p.get("Account") or {}), (p.get("Server") or {}), (p.get("Player") or {}), (p.get("Metadata") or {})
+        dur, off = md.get("duration"), md.get("viewOffset")
+        return {
+            "_timestamp": now_us, "event_at": now_us,
+            "service_name": "pms-docker", "k8s_namespace": "tv",
+            "event": p.get("event"), "plex_user": acc.get("title"), "account_id": acc.get("id"),
+            "is_owner": p.get("owner"), "is_user": p.get("user"), "server": srv.get("title"),
+            "player": pl.get("title"), "player_uuid": pl.get("uuid"),
+            "location": ("lan" if pl.get("local") else "wan") if "local" in pl else None,
+            "media_type": md.get("type"), "title": md.get("title"), "show": md.get("grandparentTitle") or "",  # always present: dashboard SQL references it
+            "season": md.get("parentIndex") if md.get("type") == "episode" else None,
+            "episode": md.get("index") if md.get("type") == "episode" else None,
+            "season_title": md.get("parentTitle"), "year": md.get("year"),
+            "library": md.get("librarySectionTitle"), "library_type": md.get("librarySectionType"),
+            "rating_key": md.get("ratingKey"), "view_offset_ms": off, "duration_ms": dur,
+            "progress_pct": round(100 * off / dur, 1) if dur and off is not None else None,
+            "rating": p.get("rating"),
+        }
+
+
+    def ingest(row):
+        req = urllib.request.Request(f"{O2}/{STREAM}/_json", method="POST", data=json.dumps([row]).encode(),
+                                     headers={"Authorization": AUTH, "content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            st = json.loads(r.read() or b"{}")
+        failed = sum(x.get("failed", 0) for x in (st.get("status") or []))
+        if failed:
+            raise RuntimeError(f"O2 rejected the row: {st}")
+
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # quiet default access log; we log structured lines
+            pass
+
+        def _reply(self, code, text):
+            self.send_response(code)
+            self.send_header("content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(text.encode())
+
+        def do_GET(self):
+            self._reply(200, "ok") if self.path == "/healthz" else self._reply(404, "nf")
+
+        def do_POST(self):
+            n = int(self.headers.get("content-length") or 0)
+            if self.path != "/plex" or n <= 0 or n > MAX_BODY:
+                return self._reply(400, "bad request")
+            body = self.rfile.read(n)
+            try:
+                p = parse_payload(self.headers.get("content-type", ""), body)
+                row = to_row(p, int(time.time() * 1_000_000))
+                ingest(row)
+                log(level="info", msg="event", event=row["event"], plex_user=row["plex_user"], media_type=row["media_type"])
+                self._reply(200, "ok")
+            except Exception as e:  # never echo payload contents
+                log(level="error", msg="webhook failed", error=str(e)[:300])
+                self._reply(502, "error")
+
+
+    if __name__ == "__main__":
+        port = int(os.environ.get("PORT", "8080"))
+        log(level="info", msg="listening", port=port, stream=STREAM)
+        ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: plex-webhook-o2
+  namespace: tv
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: plex-webhook-o2
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        O2_USER: plex-webhook
+        O2_TOKEN: '{{ .token }}'
+  data:
+  - remoteRef:
+      key: /mdapi/openobserve/plex-webhook/ingestion-token
+    secretKey: token
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plex-webhook-receiver
+  namespace: tv
+  annotations:
+    reloader.stakater.com/auto: 'true'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: plex-webhook-receiver
+  template:
+    metadata:
+      labels:
+        app: plex-webhook-receiver
+    spec:
+      imagePullSecrets:
+      - name: zot-pull
+      priorityClassName: mdapi-low
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: receiver
+        image: zot.mdapi.ch/library/python:3.12-alpine
+        imagePullPolicy: IfNotPresent
+        command:
+        - python3
+        - -u
+        - /app/receiver.py
+        ports:
+        - containerPort: 8080
+          name: http
+        envFrom:
+        - secretRef:
+            name: plex-webhook-o2
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            memory: 96Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 30
+        volumeMounts:
+        - name: code
+          mountPath: /app
+          readOnly: true
+      volumes:
+      - name: code
+        configMap:
+          name: plex-webhook-receiver
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: plex-webhook-receiver
+  namespace: tv
+spec:
+  type: ClusterIP
+  selector:
+    app: plex-webhook-receiver
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http

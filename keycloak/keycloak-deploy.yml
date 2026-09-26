@@ -1,0 +1,167 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      priorityClassName: mdapi-critical
+      serviceAccountName: keycloak
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: keycloak
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: keycloak
+          image: zot.mdapi.ch/mdapi/keycloak:latest
+          imagePullPolicy: Always
+          args: ["start", "--optimized"]
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: KC_HOSTNAME
+              value: https://idp.mdapi.ch
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://postgres.keycloak.svc.cluster.local/keycloak
+            - name: KC_DB_USERNAME
+              value: keycloak
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            # ─── OTel tracing: the RUNTIME half (2026-09-22) ─────────────────
+            # These four are RUNTIME options and are safe here. The two that are
+            # not — tracing-enabled and tracing-sampler-type — are baked into the
+            # image instead (mdapi/keycloak Dockerfile), which is the actual fix
+            # for the outage described below.
+            #
+            # ⭐ VERIFIED BEFORE MERGING, not assumed: a throwaway pod running the
+            # CURRENT (tracing-disabled) image with exactly these four variables
+            # started cleanly and failed only on the deliberately-missing HTTPS
+            # key material — no "disabled option", no build-time complaint. So
+            # this can land AHEAD of the rebuilt image without breaking the one
+            # that is running, which matters because keycloak is Lane-A (Keel,
+            # policy force, poll @every 4h) and rolls the new image on its own
+            # schedule rather than on ours.
+            #
+            # ⚠️ Points at the in-cluster COLLECTOR, not at OpenObserve directly.
+            # o2's OTLP ingest is authenticated and Keycloak would need a
+            # credential for it; the collector accepts unauthenticated OTLP from
+            # inside the cluster and attaches the credential itself. grpc because
+            # that is both the collector's native receiver and Keycloak's own
+            # default — no reason to force http here.
+            - name: KC_TRACING_ENDPOINT
+              value: "http://otel-collector.openobserve.svc.cluster.local:4317"
+            - name: KC_TRACING_PROTOCOL
+              value: "grpc"
+            - name: KC_TRACING_SERVICE_NAME
+              value: "keycloak"
+            # 10%. Keycloak's default is 1.0 — EVERY request, including every
+            # silent token refresh from every logged-in session. The sampler TYPE
+            # is build-time and lives in the Dockerfile; only the ratio is
+            # tunable here.
+            - name: KC_TRACING_SAMPLER_RATIO
+              value: "0.1"
+            # ⛔⛔ DO NOT SET KC_TRACING_ENABLED OR KC_TRACING_SAMPLER_TYPE HERE.
+            # Setting KC_TRACING_ENABLED here TOOK SSO DOWN on 2026-09-22 —
+            # both replicas CrashLoopBackOff within a minute.
+            #
+            # `kc.tracing-enabled` and `kc.tracing-sampler-type` are Keycloak
+            # BUILD-TIME options, not runtime ones. This image is built with
+            # `kc.sh build` (optimized mode), and in optimized mode a build-time
+            # option whose value differs from what was baked in does not warn
+            # and carry on — the process prints exactly one line and EXITS:
+            #
+            #   The following build time options have values that differ from
+            #   what is persisted - the new values will NOT be used until
+            #   another build is run: kc.tracing-enabled, kc.tracing-sampler-type
+            #
+            # That single line is the ENTIRE log. There is no stack trace and no
+            # mention of tracing being at fault, so this reads like a generic
+            # startup failure. If you see it, look at what build-time option
+            # someone just added.
+            #
+            # ⭐ THE REAL FIX, when tracing on Keycloak is wanted: add the
+            # options to the IMAGE BUILD (the `kc.sh build` step in the
+            # zot.mdapi.ch/mdapi/keycloak Dockerfile) — `--tracing-enabled=true`
+            # and `--tracing-sampler-type=traceidratio` — and only then set the
+            # pure-runtime ones here (KC_TRACING_ENDPOINT, KC_TRACING_PROTOCOL,
+            # KC_TRACING_SAMPLER_RATIO, KC_TRACING_SERVICE_NAME), which are
+            # runtime and would have been fine on their own.
+            #
+            # The Akeyless-backed OTEL_EXPORTER_OTLP_HEADERS entry in
+            # keycloak-es.yml is LEFT IN PLACE deliberately: an unused key in a
+            # Secret is harmless, it is the credential this will need, and
+            # removing it would only have to be redone.
+          envFrom:
+            - secretRef:
+                name: keycloak-env-secret
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1024Mi
+            limits:
+              memory: 1536Mi
+          # Custom login theme "mdapi" — adds the "request an account" link to the
+          # login page without enabling Keycloak self-registration. A theme is a
+          # plain resource directory, NOT a provider jar, so it needs no `kc.sh
+          # build` and is compatible with `start --optimized` above. Keycloak
+          # caches themes: editing the ConfigMap needs a pod restart to show up.
+          volumeMounts:
+            - name: theme-mdapi
+              mountPath: /opt/keycloak/themes/mdapi
+              readOnly: true
+      volumes:
+        # Each item path carries the subdirectory, which is what gives the theme
+        # its required <theme>/<type>/ layout from one flat ConfigMap.
+        - name: theme-mdapi
+          configMap:
+            name: keycloak-theme-mdapi
+            items:
+              - key: theme.properties
+                path: login/theme.properties
+              - key: footer.ftl
+                path: login/footer.ftl
+              - key: messages_en.properties
+                path: login/messages/messages_en.properties
+              - key: messages_it.properties
+                path: login/messages/messages_it.properties
+              - key: messages_de.properties
+                path: login/messages/messages_de.properties
+              - key: messages_fr.properties
+                path: login/messages/messages_fr.properties
+              - key: messages_pl.properties
+                path: login/messages/messages_pl.properties

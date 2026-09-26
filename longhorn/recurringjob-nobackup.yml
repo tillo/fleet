@@ -1,0 +1,33 @@
+# RecurringJob "nobackup" — the ONLY way to keep a volume out of Garage.
+#
+# Longhorn auto-assigns any volume that has NO recurring-job label to the
+# `default` group (upstream docs: "Longhorn will automatically add a volume to
+# the `default` group when the volume has no recurring job"), and the
+# longhorn-webhook-mutator materialises that as a real label on the Volume.
+#
+# Measured 2026-09-16: deleting `recurring-job-group.longhorn.io/default` from a
+# Volume is undone within seconds, and a Volume-level label patch is discarded
+# outright — the Volume's recurring-job labels are DERIVED from the PVC. So the
+# old enforcer behaviour of *stripping* the backup labels could never work: an
+# unlabelled PVC is precisely the input that produces `default`. Seven PVCs on
+# the no-backup list were backed up on 2026-09-01 regardless (111.7 GiB).
+#
+# Exclusion therefore has to be expressed as MEMBERSHIP of a group that has no
+# backup task. filesystem-trim is used because it is harmless and genuinely
+# useful (these volumes already got trim via the `default` group), and because a
+# RecurringJob must declare some task.
+#
+# Offset from the `default` group's own trim job (27 15 * * *) so the two do not
+# contend for the same window.
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: nobackup
+  namespace: longhorn-system
+spec:
+  cron: "47 15 * * *"
+  task: filesystem-trim
+  groups:
+    - nobackup
+  retain: 0
+  concurrency: 1

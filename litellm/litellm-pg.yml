@@ -1,0 +1,150 @@
+## Dedicated CNPG Postgres for the LiteLLM proxy's own state (2026-08-26).
+##
+## WHY IT EXISTS: the admin UI at llm.mdapi.ch/ui answered every action with
+## "Authentication Error, Not connected to DB!". That string comes from
+## litellm/proxy/management_endpoints/*.py, guarded by `if prisma_client is
+## None`, and prisma_client is built only when DATABASE_URL is set
+## (proxy_server.py:999-1001). No config flag or CLI switch substitutes for a
+## database -- LiteLLM keeps virtual keys, teams, budgets and SpendLogs in
+## Postgres, so the UI is inert without one.
+##
+## It also unlocks the thing the chat frontend needs: a VIRTUAL KEY. Open WebUI
+## must not hold LITELLM_MASTER_KEY (that key is proxy-admin: it can mint keys
+## and read every other consumer's spend). With a DB we issue it a scoped,
+## revocable sk-... instead.
+##
+## Sizing: keys + spend rows only, tens of MB. No barman here -- unlike
+## grafana-pg/guac-pg (G6, 2026-08-15) this DB holds nothing that cannot be
+## reconstructed by re-minting keys, and the model routing lives in
+## litellm-cm.yml under git. Durability = Longhorn 2-replica + the recurring
+## backup groups the label enforcer applies automatically.
+## FOLLOW-UP if that judgement changes: add a barmanObjectStore +
+## ScheduledBackup exactly as grafana-pg does (needs a Garage bucket and an
+## Akeyless-backed s3 ExternalSecret first).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: litellm-pg
+  namespace: litellm
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+  ## switchover, NOT the default in-place restart: a restart-requiring change (e.g. a
+  ## shared_preload_libraries edit) otherwise restarts the PRIMARY in place, a full DB
+  ## outage (grafana-pg, 2026-09-24: ~3 min of connection refused). Switchover promotes
+  ## the replica first, so only the switchover gap remains.
+  primaryUpdateMethod: switchover
+
+  ## Same lesson as ha-recorder-pg (2026-06-15) and grafana-pg: soft
+  ## anti-affinity lets both instances co-locate. `required` is always
+  ## satisfiable at 2 instances on 3 nodes and is what actually survives a
+  ## node loss -- and litellm is on the critical path for every LLM door.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    ## O2 Database Monitoring (2026-09-24): server-side top queries read pg_stat_statements,
+    ## which must be PRELOADED. Changing this list restarts Postgres; with
+    ## primaryUpdateMethod: switchover the replica is promoted first.
+    shared_preload_libraries:
+      - pg_stat_statements
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    ## Lossless failover, preferred keeps availability when the standby is down
+    ## (same shape as grafana-pg / ha-recorder-pg).
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## Read-only monitoring login for the O2 DBM collector (openobserve/o2-dbm-collector.yml).
+  ## pg_monitor = read pg_stat_* / pg_stat_statements; it cannot read table data.
+  ## Password: Akeyless /mdapi/litellm/litellm-pg-o2dbm/password.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: litellm-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: litellm
+      owner: litellm
+      ## No `secret:` -- CNPG generates the litellm-pg-app secret itself, which
+      ## carries a ready-made `uri` key. litellm-deploy.yml consumes that
+      ## directly as DATABASE_URL. This is the jump/guacamole.yml pattern: the
+      ## password is only ever needed in-cluster, so routing it through Akeyless
+      ## would add a rotation coupling for nothing.
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int renders
+      # as a perpetual Fleet "Modified" diff (1 vs "1").
+      cpu: "1"
+      memory: 1Gi
+---
+## Password for the o2_dbm login (O2 Database Monitoring). CNPG requires a basic-auth
+## secret whose username matches the role name.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: litellm-pg-o2dbm
+  namespace: litellm
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: litellm-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/litellm/litellm-pg-o2dbm/password
+      secretKey: password
+---
+## Declares pg_stat_statements in `litellm` (the O2 DBM receiver reads the view there).
+## Adopting the existing database is safe: owner litellm is the CURRENT owner (checked in
+## pg_database), and databaseReclaimPolicy defaults to retain, so deleting this object
+## never drops the database.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: litellm-pg-litellm
+  namespace: litellm
+spec:
+  name: litellm
+  owner: litellm
+  cluster:
+    name: litellm-pg
+  extensions:
+    - name: pg_stat_statements
+      ensure: present

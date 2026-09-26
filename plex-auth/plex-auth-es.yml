@@ -1,0 +1,30 @@
+## Secrets for the bridge, from Akeyless (never in git: this repo is publicly mirrored).
+##
+## PLEX_SERVER_TOKEN is the Plex OWNER token. Plex has no scoped tokens, so this is
+## full control of the owner's Plex account: it is used only to read the server's
+## shared-user list (the friend filter) and is never logged by the bridge.
+## The OIDC client id/secret are shared with the door (dellambrogio/plex-oidc-es.yml),
+## which is the bridge's one and only client.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: plex-oidc-bridge
+  namespace: plex-auth
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: plex-oidc-bridge
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/plex-auth/plex-server-token
+      secretKey: PLEX_SERVER_TOKEN
+    - remoteRef:
+        key: /mdapi/plex-auth/oidc-client-id
+      secretKey: OIDC_CLIENT_ID
+    - remoteRef:
+        key: /mdapi/plex-auth/oidc-client-secret
+      secretKey: OIDC_CLIENT_SECRET

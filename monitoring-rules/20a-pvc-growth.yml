@@ -1,0 +1,117 @@
+## Rate-based PVC fill alert. Catches "this volume will be full within
+## 24h at the current rate" BEFORE the static FilesPVCNearlyFull
+## threshold (85%) hits. Useful when a transient runaway (log spew,
+## misbehaving service) starts filling a 100 GiB PVC at 5 GiB/hr —
+## the static threshold doesn't fire until 12+ hours later, the
+## predictive one fires within 30 min.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-pvc-growth
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-pvc-growth.predictive
+    rules:
+    - alert: PVCWillFillIn24h
+      ## predict_linear extrapolates the used_bytes slope into the
+      ## future. We alert when the predicted value 24h from now
+      ## exceeds capacity AND the volume is already past 50% full
+      ## (filters out tiny-PVC noise where the slope is huge but the
+      ## absolute number is small).
+      ## Lookback widened 6h -> 24h (2026-08-18, user-approved): the 6h
+      ## slope fired on routine bursts on retention-managed/churny
+      ## volumes (frigate daily recording fill ×2, autobrr, VM-stack
+      ## restart discontinuity) that a full-day slope averages away.
+      ## Genuine monotonic fills (vmsingle day-1) still trend positive
+      ## over 24h; "already full but flat" is the static backstop's job.
+      ##
+      ## 2026-09-23 (user-approved, ledger alert:PVCWillFillIn24h): the fill
+      ## prediction must now HOLD, sustained, for 2h (min_over_time over a
+      ## bool subquery) — and "predicted full" means BOTH the 24h slope and
+      ## the last-2h slope reach capacity within 24h. The 24h lookback alone
+      ## could not tell a finished burst from an ongoing fill: macos-vm/
+      ## macos-disk went 35% -> 58% in one step at 09-09T01-02Z, was FLAT
+      ## afterwards, and the 24h slope kept predicting "full" until 17:00Z
+      ## (13h of warning). The short slope goes flat as soon as writing
+      ## stops; the long slope ignores a short burst; 2h of agreement is what
+      ## a real fill looks like. Replayed 07-25..09-23 (10m step): every one of
+      ## the 12 historical episodes except the 08-03 data-gap artefact is
+      ## silent, incl. macos-disk 09-09. Poison-tested with a 30d horizon: the
+      ## same form DOES fire on the steadily-growing frigate-media-ceph,
+      ## openobserve and webtunnel-bridge volumes. A step-fill that jumps
+      ## straight to full (openobserve 08-06, 47% -> 99.5% in ~1h) is PVCNearFull's
+      ## job below, which caught it. max by() folds the per-node duplicate
+      ## series a volume leaves behind when its pod moves node.
+      expr: |
+        (
+          min_over_time((
+            (
+              max by (namespace, persistentvolumeclaim) (predict_linear(kubelet_volume_stats_used_bytes[24h], 24*3600))
+              > bool max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes)
+            )
+            *
+            (
+              max by (namespace, persistentvolumeclaim) (predict_linear(kubelet_volume_stats_used_bytes[2h], 24*3600))
+              > bool max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes)
+            )
+          )[2h:10m]) == 1
+        )
+        and on (namespace, persistentvolumeclaim) (
+          max by (namespace, persistentvolumeclaim) (
+            kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes
+          ) > 0.5
+        )
+      for: 15m
+      labels:
+        service: '{{ or $labels.persistentvolumeclaim "pvc" }}'
+        severity: warning
+        component: Backups
+        team: mdapi
+        ## Internal capacity tune-signal (2026-07-30, user-approved): a PVC
+        ## trending full is ops work, not a user-visible Backups outage —
+        ## it was degrading the public statuspage Backups component.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} will fill in <24h at current rate"
+        description: |
+          For 2h straight, linear extrapolation of BOTH the last 24h and the
+          last 2h of used_bytes growth has predicted the volume exceeds
+          capacity within 24 hours — it is still being written, not a
+          finished burst. Static FilesPVCNearlyFull (85%) catches this
+          eventually but reacts too late if growth is rapid.
+
+          Investigate which process is writing: kubectl -n {{ $labels.namespace }}
+          exec into the pod, du -sh on the mount, identify the noisy
+          consumer. Common causes: app log rotation broken, transcoder
+          temp dir not being cleaned, runaway sync loop.
+
+    - alert: PVCNearFull
+      ## Static backstop for the predictive rule above. PVCWillFillIn24h
+      ## is provably blind to "already full": once writes start failing,
+      ## growth stops, the 6h slope flattens, and the prediction resolves
+      ## — exactly what happened when openobserve's data PVC sat at 99.8%
+      ## for 6h on 2026-08-06 while every log write ENOSPC'd. A volume
+      ## SITTING at >90% is a problem regardless of slope.
+      ## Namespaces with the 85% FilesPVCNearlyFull static rule (04-files)
+      ## are excluded to avoid double-firing.
+      expr: |
+        kubelet_volume_stats_used_bytes{namespace!~"spider3|tv|paperless|mirror"}
+          / kubelet_volume_stats_capacity_bytes{namespace!~"spider3|tv|paperless|mirror"}
+          > 0.90
+      for: 15m
+      labels:
+        service: '{{ or $labels.persistentvolumeclaim "pvc" }}'
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is {{ $value | humanizePercentage }} full"
+        description: |
+          Static >90% threshold, independent of growth rate. Expand the
+          PVC or clean up. If this is firing with PVCWillFillIn24h quiet,
+          the volume is likely already full and writes may be failing
+          silently (check the app's logs for ENOSPC).

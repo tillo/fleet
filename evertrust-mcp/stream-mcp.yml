@@ -1,0 +1,122 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: stream-mcp-secrets
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: stream-mcp-secrets
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/evertrust-mcp/stream-mcp-token
+      secretKey: AUTH_TOKEN
+    - remoteRef:
+        key: /mdapi/stream/admin/password
+      secretKey: STREAM_API_KEY
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-mcp
+  # Floating :latest tracked by Keel (poll every 4h); reloader restarts on secret rotation.
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stream-mcp
+  template:
+    metadata:
+      labels:
+        app: stream-mcp
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        # Self-contained image: supergateway + @evertrust/stream-mcp baked in, behind an
+        # nginx bearer-token gate (accepts Authorization: Bearer OR ?token=). stream-mcp
+        # runs stateless (no --stateful); MCP_BIN and ports are baked into the image ENV.
+        - name: stream-mcp
+          image: zot.mdapi.ch/mdapi/stream-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: stream-mcp-secrets
+                  key: AUTH_TOKEN
+            - name: STREAM_URL
+              value: http://stream.stream.svc.cluster.local:9000
+            - name: STREAM_API_ID
+              value: administrator
+            - name: STREAM_API_IDPROV
+              value: local
+            - name: STREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stream-mcp-secrets
+                  key: STREAM_API_KEY
+          startupProbe:
+            tcpSocket: { port: 8080 }
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            # 1Gi OOMKilled (2026-06-21), 1536Mi OOMKilled (2026-07-02);
+            # stateless but spikes on large search result sets.
+            limits: { memory: 2Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-mcp
+spec:
+  selector:
+    app: stream-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: stream-mcp
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    # streamable-HTTP/SSE needs no buffering + long timeouts (per k8s-mcp).
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [stream-mcp.mdapi.ch]
+      secretName: stream-mcp-tls
+  rules:
+    - host: stream-mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: stream-mcp
+                port:
+                  number: 8080

@@ -1,0 +1,378 @@
+## Dedicated CNPG single-node Postgres for the Home Assistant recorder.
+##
+## Replaces the on-PVC SQLite home-assistant_v2.db, which hit the SQLite
+## ~32766 SQL-variable ceiling on recorder.purge once states_meta grew
+## past 500k rows. Postgres has no IN-list cap, autovacuums incrementally,
+## and supports concurrent reads while the recorder writes.
+##
+## Mirrors fleet/paperless/paperless-cnpg.yml. HA points at this via
+## recorder.db_url in configuration.yaml (on the HA PVC).
+##
+## Barman WAL + base backups go to the salt/pepper Garage bucket
+## s3://homeassistant-pg-backup; the rgw_offsite_backup Windmill job
+## then replicates that bucket to B2 + o2switch.
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: ha-recorder-pg
+  namespace: home-assistant
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+  ## switchover, NOT the default in-place restart: a restart-requiring change (e.g. a
+  ## shared_preload_libraries edit) otherwise restarts the PRIMARY in place, a full DB
+  ## outage (grafana-pg, 2026-09-24: ~3 min of connection refused). Switchover promotes
+  ## the replica first, so only the switchover gap remains.
+  primaryUpdateMethod: switchover
+
+  ## Keep the two instances on different nodes. CNPG defaults to a *soft*
+  ## (preferred) anti-affinity, which let both copies land on `qui` during a
+  ## 2026-06-15 rolling restart -- primary + replica + the HA app all
+  ## co-located, so the replica bought zero node-failure protection. `required`
+  ## is always satisfiable here (2 instances, 3 nodes) and guarantees the
+  ## replica schedules onto a different node than the primary.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  ## Recorder write-freshness metric (cnpg_ha_recorder_last_write_age_seconds)
+  ## feeding the HomeAssistantRecorderStalled alert. enablePodMonitor is
+  ## auto-scraped by vmagent (empty scrape selectors). Non-disruptive: enabling
+  ## monitoring does not roll the pods; the instance-manager exporter reloads
+  ## the custom query in place.
+  monitoring:
+    enablePodMonitor: true
+    customQueriesConfigMap:
+      - name: ha-recorder-pg-metrics
+        key: queries.yaml
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    ## 30Gi filled on 2026-07-30: the nightly purge (~02:12Z) plus the 03:00Z
+    ## base backup generated ~8GB of WAL faster than archiving drained it,
+    ## pg_wal ate the remaining headroom and the primary crashlooped with
+    ## "Not enough disk space" (recorder + grafana down ~3h). 50Gi restores
+    ## ~2.4x the observed worst-case burst above the ~21Gi steady state.
+    size: 50Gi
+
+  ## Dedicated WAL volume (follow-up to the 2026-07-30 incident above): a
+  ## purge-night archiving stall now fills the 20Gi WAL PVC instead of
+  ## starving the data volume, so the failure mode becomes "WAL volume
+  ## full, writes pause" rather than a crashlooping primary. 20Gi = ~2.5x
+  ## the observed 8GB burst. Adding this rolls both instances (operator
+  ## restarts the replica, switches over, then restarts the old primary).
+  walStorage:
+    storageClass: harvester-longhorn-2replicas
+    size: 20Gi
+
+  postgresql:
+    ## O2 Database Monitoring (2026-09-24): server-side top queries read pg_stat_statements,
+    ## which must be PRELOADED. Changing this list restarts Postgres; with
+    ## primaryUpdateMethod: switchover the replica is promoted first.
+    shared_preload_libraries:
+      - pg_stat_statements
+    parameters:
+      max_connections: "100"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+      ## recorder is write-heavy with frequent purges; give autovacuum
+      ## room and keep WAL modest.
+      maintenance_work_mem: 128MB
+      ## The ~8GB purge-night WAL burst is mostly full-page images: the
+      ## 02:12Z recorder purge mass-deletes a day of states/events rows,
+      ## and every heap+index page first touched after a checkpoint is
+      ## written whole into WAL. lz4-compressing FPIs shrinks the burst
+      ## at negligible CPU cost. Reloadable — applies without a restart.
+      wal_compression: lz4
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the one standby to confirm each commit before it
+    ## returns. The default (async, maxSyncReplicas=0) drops the last
+    ## unreplicated writes on promotion; HA's in-memory recorder session then
+    ## references rows the new primary never received -> a sqlalchemy
+    ## StaleDataError loop ("expected to update N rows; M matched") that
+    ## freezes the recorder until HA is restarted. Root cause of the
+    ## 2026-06-22 22:04 UTC ~8h silent recorder freeze, and recurrent across
+    ## node-maintenance failovers. dataDurability: preferred falls back to
+    ## async when the standby is unavailable, so HA writes never stall on a
+    ## missing replica (availability favoured over strict RPO for a 2-node
+    ## cluster). Requires CNPG >= 1.25 (operator is 1.29.1).
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## Read-only monitoring login for the O2 DBM collector (openobserve/o2-dbm-collector.yml).
+  ## pg_monitor = read pg_stat_* / pg_stat_statements; it cannot read table data.
+  ## Password: Akeyless /mdapi/home-assistant/ha-recorder-pg-o2dbm/password.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: ha-recorder-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: homeassistant
+      owner: homeassistant
+      secret:
+        name: ha-recorder-pg-app
+
+  backup:
+    ## ⛔ There was NO retention policy here until 2026-09-17, and barman prunes
+    ## nothing without one. The result: 123 daily base backups going back to
+    ## 2026-05-20, plus every WAL segment between them, for a 50 GiB database —
+    ## 1.7 TiB in homeassistant-pg-backup, the single largest object in the whole
+    ## estate's backup footprint and bigger than the entire Longhorn backup
+    ## target (1.0 TiB). It was also the only CNPG cluster here with a barman
+    ## store and no policy except paperless-pg, which has the same latent bug but
+    ## is still small (1.2 GiB) — fix that one too before it grows.
+    ##
+    ## 14d matches gitlab-pg, guac-pg and grafana-pg. Recorder data is continuous
+    ## telemetry, so a fortnight of PITR is ample; keeping four months of it was
+    ## an accident, not a decision. Expect barman to prune ~109 of the 123 base
+    ## backups and their WAL on the next backup — that is irreversible and is the
+    ## point (user decision 2026-09-17, ahead of moving backups to metered
+    ## offsite storage, beads infra-wd77).
+    retentionPolicy: "14d"
+    barmanObjectStore:
+      destinationPath: s3://cnpg-ha-recorder-pg
+      ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the IN-CLUSTER Ceph
+      ## RGW, as part of retiring both those hosts. This is the "local" half of
+      ## the backup architecture: short-window PITR and granular restore live
+      ## here; the offsite copy is a separate, client-side-encrypted channel.
+      ##
+      ## ⛔ NEW bucket name on purpose. The Garage bucket was `homeassistant-pg-backup`;
+      ## reusing it would mean a half-applied change (new store, stale
+      ## endpointURL) kept writing to Garage and SUCCEEDED, silently. With a
+      ## distinct name that mistake fails closed with NoSuchBucket.
+      ##
+      ## ⛔⛔ Changing destinationPath starts an EMPTY archive. WAL archiving
+      ## alone is not a backup -- paperless-pg proved that with 33k objects and
+      ## zero base backups. A one-shot Backup is taken immediately after this
+      ## lands, and `lastSuccessfulBackup` is the only acceptable evidence.
+      ##
+      ## ⭐ TLS restored. !369 landed this store on plain http, which handed
+      ## back exactly the property the Garage terminator was built for on
+      ## 2026-09-05: pods on qui/quo/qua reach an RGW pod on another node across
+      ## the physical LAN, over an UNENCRYPTED VXLAN overlay, and barman does not
+      ## encrypt. "It stays in the cluster" was the wrong reassurance -- the
+      ## cluster is three separate machines. RGW now carries its own house-PKI
+      ## leaf (rook-ceph-objectstore-users/rgw-tls-cert.yml) and this dials it.
+      endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+      ## The CA here is the house chain (MDAPI Root + MDAPI Issuing CA 01), which
+      ## is what a Horizon-issued RGW leaf chains to.
+      ## ⭐ Renamed garage-transit-ca -> rgw-transit-ca on 2026-09-21, across all
+      ## six namespaces at once. Contents byte-identical; the old name was the
+      ## last thing on the estate still calling Garage a live dependency.
+      ## ⭐ Changing this name costs NOTHING here: measured on CNPG 1.30, the
+      ## instance pods do not reference the secret at all (the operator resolves
+      ## endpointCA through the API at backup time), so there is no pod-spec
+      ## change and no switchover.
+      endpointCA:
+        name: rgw-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-ha-recorder-pg
+          key: AWS_ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-ha-recorder-pg
+          key: AWS_SECRET_ACCESS_KEY
+        region:
+          name: cnpg-rgw-region
+          key: REGION
+      wal:
+        compression: gzip
+      ## ⛔⛔ `data:` was ABSENT entirely until 2026-09-18, which meant CNPG's
+      ## defaults applied: ONE upload worker and NO compression on the base
+      ## backup. Only WAL was ever gzipped. Two consequences, both measured:
+      ##
+      ##  - throughput: a base backup crawled at 0.3-1.0 MiB/s, so a 17 GB
+      ##    database needed 5-16 h. It was NOT the storage — during that
+      ##    transfer salt's pool was idle (~174 KB/s), the nginx TLS terminator
+      ##    sat at 0.04% CPU and Garage at 0.30%, while a Longhorn backup to the
+      ##    SAME disk ran at 24 MB/s. A single un-compressed stream over TLS was
+      ##    the whole bottleneck.
+      ##  - size: every base backup was stored raw. This bucket reached 1.68 TiB
+      ##    for a 17 GB database — the largest object in the estate.
+      ##
+      ## `bootstrap/gitlab-pg` has had `jobs: 2` + `compression: gzip` all along
+      ## and does not have either problem; this brings ha-recorder to that proven
+      ## shape.
+      ##
+      ## ⛔⛔ jobs MUST STAY AT 2 ON GARAGE. It was briefly set to 4 on 2026-09-18
+      ## ("largest producer, 2 CPUs to spend") and the very next backup died with
+      ##   InvalidPart on CompleteMultipartUpload:
+      ##   Parts given to CompleteMultipartUpload do not match uploaded parts
+      ## — the transfer itself ran fine at 11.4 MiB/s, then failed at the end.
+      ## This is the documented Garage defect in memory
+      ## `garage_multipart_invalidpart_large_upload_2026_09_11`: too many parts
+      ## pushed by too much concurrency races part registration against the
+      ## completion call. The fix there was FEWER parts and BOUNDED concurrency,
+      ## and gitlab-pg has quietly proved 2 is safe for months.
+      ## ⇒ Do not raise this to chase throughput. The ceiling here is Garage's
+      ## multipart handling, not the worker count.
+      ##
+      ## ⚠️ A failed CompleteMultipartUpload STRANDS its parts permanently —
+      ## Garage expires nothing and `garage bucket info` does not show them, so
+      ## the leak is invisible from the CLI. Sweep with list_multipart_uploads +
+      ## abort_multipart_upload after any failure.
+      ##
+      ## ⚠️ Compression is recorded PER BACKUP, so existing uncompressed backups
+      ## stay restorable; this only affects new ones. It does NOT retroactively
+      ## shrink the 1.68 TiB — that needs the retention prune.
+      data:
+        compression: gzip
+        jobs: 2
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int
+      # renders as a perpetual Fleet "Modified" diff (2 vs "2").
+      cpu: "2"
+      memory: 2Gi
+---
+## App-role credentials for the recorder database. CNPG initdb reads this
+## Secret to set the `homeassistant` role password; HA's recorder.db_url
+## uses the same value.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ha-recorder-pg-app
+  namespace: home-assistant
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ha-recorder-pg-app
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      data:
+        username: homeassistant
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/home-assistant/recorder-db-password
+      secretKey: password
+---
+## Garage credentials for CNPG WAL/base backups. Dedicated key
+## 'ha-recorder-pg-backup', scoped read-write to s3://homeassistant-pg-backup
+## on the salt/pepper Garage cluster.
+## ⚠️ 2026-09-19: NO LONGER REFERENCED by the cluster above -- the barman store
+## moved to the in-cluster Ceph RGW and now uses the OBC-written secret instead.
+## This is kept ONLY so the abandoned Garage store on salt stays readable while
+## that host is still up: it holds the sole pre-cutover PITR history, and the
+## credentials to reach it exist nowhere else in git. Delete it together with
+## the Garage buckets when salt is powered off -- an ExternalSecret nothing
+## consumes is exactly the kind of config that rots into a false sense of cover.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ha-recorder-pg-backup-s3
+  namespace: home-assistant
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ha-recorder-pg-backup-s3
+    creationPolicy: Owner
+  data:
+    - remoteRef: { key: /mdapi/home-assistant/garage-backup-access-key }
+      secretKey: ACCESS_KEY_ID
+    - remoteRef: { key: /mdapi/home-assistant/garage-backup-secret-key }
+      secretKey: ACCESS_SECRET_KEY
+    - remoteRef: { key: /mdapi/home-assistant/garage-region }
+      secretKey: REGION
+---
+## Nightly base backup at 03:00 (WAL is streamed continuously). CNPG
+## ScheduledBackup; retention managed by Garage bucket lifecycle / the
+## offsite job, not barman here.
+##
+## Schedule history — this slot is squeezed between three other writers
+## on the same salt/pepper Garage (single large HDD per node):
+##   * Longhorn `weekly` group: Fri 01:00 UTC, ~140Gi until ~02:05
+##   * gitlab-toolbox-backup:   daily 02:00 UTC, done by ~02:20
+##   * rgw_offsite_backup:   daily 04:00 UTC (Windmill)
+## Moved 03:30 -> 01:30 on 2026-06-16 (then-~30Gi/90min backup overran into
+## the 04:00 offsite job -> 504s on CompleteMultipartUpload). That landed it
+## inside the Friday Longhorn wave instead: Friday runs degraded 16 -> 41 ->
+## 62 min and failed on 2026-07-10 (UploadPart 503 backpressure, exit 1).
+## Moved 01:30 -> 03:00 on 2026-07-10: backup is now ~14Gi/7-10min, so it
+## clears both the Friday wave/GitLab tail and finishes well before 04:00.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: ha-recorder-pg-daily
+  namespace: home-assistant
+spec:
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: ha-recorder-pg
+---
+## Password for the o2_dbm login (O2 Database Monitoring). CNPG requires a basic-auth
+## secret whose username matches the role name.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ha-recorder-pg-o2dbm
+  namespace: home-assistant
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ha-recorder-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          ## CNPG only re-reads a password secret it WATCHES: without this label a role that was
+          ## reconciled before ESO created the secret stays "pending-reconciliation" forever
+          ## (gitlab-pg / ha-recorder-pg, 2026-09-24), and a rotated password is never applied.
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/home-assistant/ha-recorder-pg-o2dbm/password
+      secretKey: password
+---
+## Declares pg_stat_statements in `homeassistant` (the O2 DBM receiver reads the view there).
+## Adopting the existing database is safe: owner homeassistant is the CURRENT owner (checked in
+## pg_database), and databaseReclaimPolicy defaults to retain, so deleting this object
+## never drops the database.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: ha-recorder-pg-homeassistant
+  namespace: home-assistant
+spec:
+  name: homeassistant
+  owner: homeassistant
+  cluster:
+    name: ha-recorder-pg
+  extensions:
+    - name: pg_stat_statements
+      ensure: present

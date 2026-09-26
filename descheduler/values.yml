@@ -1,0 +1,82 @@
+# Descheduler — closes the gap that the default kube-scheduler leaves: it
+# schedules on REQUESTS only and never rebalances after the fact. This runs as
+# a CronJob and rebalances on ACTUAL usage (metrics-server) plus enforces
+# topology-spread. Added 2026-06-18 after the "qui under load" investigation.
+#
+# Deliberately conservative for the #144 recovery window:
+#   - targetThresholds 65% => with all nodes currently ~30-44% real CPU it is
+#     effectively DORMANT (evicts nothing until a node is genuinely hot), so it
+#     is safe to leave armed.
+#   - maxNoOfPodsToEvict 1/node and 1/namespace per run => tiny blast radius.
+#   - hourly (not the chart's 2-minute default).
+#   - PodsWithPVC protection ON => it will NEVER evict a Longhorn/Ceph-backed
+#     pod (no storage churn — that was the Incident-1 trigger). DaemonSets,
+#     mirror pods and system-cluster/node-critical pods are protected by the
+#     evictor automatically (etcd, apiserver, canal, node-exporter, IM, OSDs).
+#   - storage / control-plane / VM namespaces excluded outright as belt-and-suspenders.
+#
+# NOTE: actual-CPU/mem balancing does NOT see network/data-plane churn (the
+# real qui driver). That is what monitoring-rules/25-node-dataplane-balance.yml
+# surfaces; once those series have baked, LowNodeUtilization can be switched to
+# a Prometheus metricsProvider query (node:net_bytes:rate5m etc.) to balance on
+# data-plane load directly. Left on KubernetesMetrics for the safe first pass.
+
+kind: CronJob
+schedule: "17 * * * *"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+cmdOptions:
+  v: 3
+
+deschedulerPolicyAPIVersion: "descheduler/v1alpha2"
+deschedulerPolicy:
+  maxNoOfPodsToEvictPerNode: 1
+  maxNoOfPodsToEvictPerNamespace: 1
+  metricsProviders:
+    - source: KubernetesMetrics
+  profiles:
+    - name: balance-on-actual-usage
+      pluginConfig:
+        - name: DefaultEvictor
+          args:
+            nodeFit: true
+            podProtections:
+              extraEnabled:
+                - "PodsWithPVC"
+        - name: RemovePodsViolatingTopologySpreadConstraint
+          args:
+            constraints:
+              - DoNotSchedule
+        - name: LowNodeUtilization
+          args:
+            metricsUtilization:
+              source: KubernetesMetrics
+            thresholds:
+              cpu: 30
+              memory: 30
+            targetThresholds:
+              cpu: 65
+              memory: 65
+            evictableNamespaces:
+              exclude:
+                - kube-system
+                - longhorn-system
+                - rook-ceph
+                - harvester-system
+                - cattle-fleet-system
+                - cattle-provisioning-capi-system
+                - cattle-system
+                - ciphertrust
+                - kubevirt
+      plugins:
+        balance:
+          enabled:
+            - RemovePodsViolatingTopologySpreadConstraint
+            - LowNodeUtilization

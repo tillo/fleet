@@ -1,0 +1,26 @@
+defaultNamespace: ups
+namespace: ups
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  # Allow the first install to adopt pre-existing K8s objects (created
+  # manually via `kubectl apply` before this bundle was added). Helm
+  # otherwise refuses to import them ("invalid ownership metadata") and
+  # the install loops. Set once on bundle creation; safe to keep on.
+  takeOwnership: true
+# Two sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running pods.
+#   2. Keel (`keel.sh/policy: force`) rewrites the image field on its poll
+#      cadence as new digests publish for the rolling tag.
+# Strip both from the diff so Fleet stops flagging Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: nut-server
+    namespace: ups
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/image"}

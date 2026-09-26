@@ -1,0 +1,79 @@
+## Rate limit on /wp-login.php only.
+##
+## ─── Why a SECOND Ingress instead of annotations on the first ─────────────────
+## `limit-rpm` applies to the location an Ingress generates, and the main
+## coiffuredreams Ingress matches `/` — annotating it would throttle the whole
+## public site. A separate Ingress with an Exact path gives nginx a more specific
+## location, so the limit binds to the login endpoint alone. This is the same
+## shape `start-request` already uses for dellambrogio's /request form.
+##
+## ─── Why it is needed (2026-09-23) ───────────────────────────────────────────
+## This site was returning HTTP 500 on 2,588 of 2,680 POST /wp-login.php — 97 % —
+## and had been since 2026-04-19, i.e. the owner could not reach wp-admin for five
+## months. The cause was not WordPress itself:
+##
+##   * the Apache SAPI sets memory_limit = 128M (/etc/php/7.4/apache2/php.ini —
+##     note the CLI ini says -1, which is a trap: `php -i` from a shell reports
+##     the CLI value and looks like there is no limit at all);
+##   * the sucuri-scanner plugin reads wp-content/uploads/sucuri/
+##     sucuri-oldfailedlogins.php on the failed-login path, and brute-force
+##     traffic had grown it to 651 MB / 3,050,388 entries dating back to
+##     2017-05-05 (plus an 82 MB audit queue);
+##   * 651 MB against a 128 MB limit is a fatal, WordPress 5.2's fatal handler
+##     renders its 3,201-byte "critical error" page, and nginx logs a 500.
+##
+## The two oversized files were renamed aside on 2026-09-23 and login recovered
+## immediately (verified: 200 in 0.098 s). But that only reset the clock — at the
+## ~2,600 login attempts/day this host currently receives, a fresh log re-crosses
+## 128 MB inside a year and the site breaks again the same way. Throttling the
+## attempts is what stops it coming back.
+##
+## ⭐ 10 r/m is deliberately generous for a human (a real sign-in is 1-2 POSTs,
+## and the default burst multiplier of 5 allows 50) while making credential
+## stuffing pointless. Exceeding it returns 503, because that is what
+## `limit_req_status` is set to globally.
+##
+## ⛔ Deliberately NOT extending this to /xmlrpc.php, the other classic WordPress
+## brute-force vector: "Jetpack by WordPress.com" appears in this site's own
+## request logs, and Jetpack drives xmlrpc. Throttling it could break a live
+## integration. Revisit only with evidence about what actually calls it.
+##
+## ⚠️ This treats the symptom. The site runs WordPress 5.2.24 on PHP 7.4.33 —
+## both years past end of life, internet-facing, and under continuous automated
+## attack. That is a separate and larger piece of work.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coiffuredreams-wp-login
+  namespace: coiffuredreams
+  annotations:
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/limit-rpm: "10"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: coiffuredreams.ch
+      http:
+        paths:
+          - path: /wp-login.php
+            pathType: Exact
+            backend:
+              service:
+                name: coiffuredreams
+                port:
+                  number: 80
+    - host: www.coiffuredreams.ch
+      http:
+        paths:
+          - path: /wp-login.php
+            pathType: Exact
+            backend:
+              service:
+                name: coiffuredreams
+                port:
+                  number: 80
+  tls:
+    - hosts:
+        - coiffuredreams.ch
+        - www.coiffuredreams.ch
+      secretName: coiffuredreams-cert

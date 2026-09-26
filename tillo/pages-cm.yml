@@ -1,0 +1,199 @@
+# Page content for tillo-pages (pages-deploy.yml). One key per page,
+# mounted as <path>/index.html. snds-outage.html carries <!--LIVE:BEGIN/END-->
+# markers: Windmill f/desk/snds_status_page replaces what is between them.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tillo-pages-html
+  namespace: tillo
+data:
+  snds-outage.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Microsoft SNDS outage since 23 Sep 2026</title>
+    <meta name="description" content="Microsoft SNDS portal and API have been failing since 23 Sep 2026: HTTP 500/503 after 30-120 s, with or without a valid token. Timings, request-ids and how to reproduce.">
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="Microsoft SNDS outage since 23 Sep 2026">
+    <meta property="og:description" content="The SNDS portal and API mostly return HTTP 500/503 after 30-120 s, with or without a valid token. Every failing request lands on back end PROD-S01-005-EUR-WESTEUROPE. Timings, request-ids and a one-line reproduction.">
+    <meta property="og:url" content="https://tillo.ch/snds-outage/">
+    <meta name="twitter:card" content="summary">
+    <style>
+      :root {
+        --bg: #fbfbf9; --fg: #1d1d1b; --muted: #5d5d58; --line: #deded8;
+        --code-bg: #f0f0ec; --accent: #9b2c1f; --link: #1f5fa8; --head-bg: #f3f3ef;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #151514; --fg: #e8e8e3; --muted: #a3a39c; --line: #34342f;
+          --code-bg: #20201e; --accent: #f08a78; --link: #8cb8ee; --head-bg: #1c1c1a;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: var(--bg); color: var(--fg);
+        font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      }
+      main { max-width: 48rem; margin: 0 auto; padding: 2.5rem 1rem 4rem; }
+      h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 .4rem; }
+      h2 { font-size: 1.3rem; margin: 2.4rem 0 .6rem; padding-top: .4rem; border-top: 1px solid var(--line); }
+      p { margin: .7rem 0; }
+      a { color: var(--link); }
+      .byline { color: var(--muted); font-size: .95rem; margin-bottom: 1.4rem; }
+      .status {
+        border-left: 4px solid var(--accent); background: var(--head-bg);
+        padding: .8rem 1rem; margin: 1.2rem 0; font-weight: 600;
+      }
+      .table-wrap { overflow-x: auto; margin: 1rem 0; border: 1px solid var(--line); border-radius: 6px; }
+      table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+      th, td { text-align: left; padding: .5rem .65rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+      th { background: var(--head-bg); font-weight: 600; white-space: nowrap; }
+      tr:last-child td { border-bottom: 0; }
+      td.num { white-space: nowrap; }
+      code, pre, .id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      code { background: var(--code-bg); padding: .1rem .3rem; border-radius: 4px; font-size: .85em; overflow-wrap: anywhere; }
+      .id { font-size: .8rem; white-space: nowrap; }
+      pre { background: var(--code-bg); padding: .9rem 1rem; border-radius: 6px; overflow-x: auto; font-size: .82rem; line-height: 1.5; }
+      pre code { background: none; padding: 0; font-size: inherit; overflow-wrap: normal; }
+      ul { padding-left: 1.3rem; }
+      li { margin: .4rem 0; }
+      footer { color: var(--muted); font-size: .85rem; margin-top: 3rem; }
+    </style>
+    </head>
+    <body>
+    <main>
+
+    <h1>Microsoft SNDS outage since 23 Sep 2026</h1>
+    <p class="byline">Martino Dell'Ambrogio &middot; first published 25 Sep 2026</p>
+
+    <p>Microsoft SNDS (Smart Network Data Services) has been broken since 23 Sep 2026, starting between 08:35 and 14:35 UTC. The portal mostly returns HTTP 500 or hangs, and the REST API hangs or returns 500, with or without a valid token. Microsoft sign-in and the substrate.office.com front door work, so the fault is inside the SNDS application. It is regional: an independent check from 15 locations timed out from Frankfurt, London, Paris and Mexico, while every US and Asia-Pacific location got the portal in under a second.</p>
+
+    <!--LIVE:BEGIN-->
+    <p class="status">Still failing when last checked, 07:55 UTC on 25 Sep: portal 500 on 3 of 3 tries (40&ndash;84 s), both report APIs gave no answer within 120 s.</p>
+    <!--LIVE:END-->
+
+    <h2>What fails and what works</h2>
+
+    <p>SNDS requests fail at one Microsoft back end, after 30&ndash;120 s: mostly HTTP 500/503 or no answer at all. The portal occasionally loads (2 of 5 tries at 07:43&ndash;07:47 UTC); no API call with a valid token has returned a normal answer since 23 Sep. The substrate front door and Microsoft sign-in answer in under half a second. The table was measured 25 Sep 2026, 07:38&ndash;07:42 UTC, from Switzerland. &ldquo;Token&rdquo; means a valid Microsoft-account OAuth token.</p>
+
+    <div class="table-wrap">
+    <table>
+    <thead><tr><th>URL (on substrate.office.com unless noted)</th><th>Token</th><th>HTTP</th><th>Answer after</th><th>request-id</th></tr></thead>
+    <tbody>
+    <tr><td>/ip-domain-management-snds/snds (portal)</td><td>no</td><td>500</td><td class="num">41 s</td><td class="id">1187d4a1-7f84-a03e-980d-4678e50ed098</td></tr>
+    <tr><td>/ip-domain-management-snds/SNDS/FAQ</td><td>no</td><td>503</td><td class="num">81 s</td><td class="id">2d81adef-13d8-1ec1-a3e0-d745c0cf2705</td></tr>
+    <tr><td>/ip-domain-management-snds/api/report/status/ip</td><td>yes</td><td>500</td><td class="num">85 s</td><td class="id">d81ae356-86b3-fb48-8b61-37ea96bc4526</td></tr>
+    <tr><td>/ip-domain-management-snds/api/report/data</td><td>yes</td><td>500</td><td class="num">43 s</td><td class="id">646b515c-f7c2-4cfa-4194-c49b307addc7</td></tr>
+    <tr><td>/ip-domain-management-snds/api/report/status/ip</td><td>no</td><td>500</td><td class="num">41 s</td><td class="id">4a93320d-fbff-e158-dca6-4bc6e04cb4d1</td></tr>
+    <tr><td>/ip-domain-management-snds/api/report/data</td><td>no</td><td>401</td><td class="num">79 s</td><td class="id">e5da4aa7-6431-e9df-53a0-6318d77d10ce</td></tr>
+    <tr><td>/ (front door)</td><td>no</td><td>301</td><td class="num">0.09 s</td><td class="id">11cebd22-2247-a3ea-6bf5-7b5b90947cc9</td></tr>
+    <tr><td>login.microsoftonline.com /consumers/v2.0/.well-known/openid-configuration</td><td>no</td><td>200</td><td class="num">0.35 s</td><td class="id">5fe748dc-8951-4e8c-a114-e9a3fd830701</td></tr>
+    </tbody>
+    </table>
+    </div>
+
+    <p>Every SNDS response carries <code>X-CalculatedBETarget: PROD-S01-005-EUR-WESTEUROPE.SUBSTRATE.COSMIC.OFFICE.NET</code>. The 500s also carry <code>X-BackEndHttpStatus: 500,500</code>. They came through six different front-end servers (ZR0P278CA0002, 0007, 0018; ZR2P278CA0011, 0043, 0085), so the fault follows that back end, not one front end.</p>
+
+    <p>The OAuth token refresh at login.microsoftonline.com (consumers tenant) returned 200 on every attempt, so sign-in is not the problem.</p>
+
+    <p>An independent check of the portal from 15 locations (<a href="https://onlineornot.com/website-down-checker?requestId=a1sPN9VJiB0SDmO-5ICaY&amp;url=https://substrate.office.com/ip-domain-management-snds/snds">OnlineOrNot report</a>, 25 Sep 2026, 13:16 UTC, 10 s limit per location) shows the failure is regional:</p>
+
+    <div class="table-wrap">
+    <table>
+    <thead><tr><th>Result</th><th>Locations</th></tr></thead>
+    <tbody>
+    <tr><td>Timed out (no answer in 10 s)</td><td>Frankfurt, London, Paris, Mexico</td></tr>
+    <tr><td class="num">HTTP 200 in 78&ndash;851 ms</td><td>US: N. Virginia, Ohio, N. California, Oregon. Asia-Pacific: Tokyo, Seoul, Mumbai, Singapore, Sydney, Melbourne, ap-southeast-6</td></tr>
+    </tbody>
+    </table>
+    </div>
+
+    <p>The same requests sent from a US network (Ashburn, VA; 25 Sep, 14:36&ndash;14:42 UTC) work normally, with a token too. The portal answered HTTP 200 in 1.2 s from back end PROD-S01-179-NAM-WESTUS. Both report APIs, called with a valid token, answered in 1&ndash;3 s from PROD-S01-020-NAM-EASTUS (HTTP 404, the documented reply when there is no data). So the back end is chosen by the client's location, and only the West Europe one is broken.</p>
+
+    <h2>Timeline</h2>
+
+    <p>SNDS last answered normally at 08:35 UTC on 23 Sep and has failed on every check since. An automated check hits the two report APIs every 6 hours with a valid token.</p>
+
+    <div class="table-wrap">
+    <table>
+    <thead><tr><th>When (UTC)</th><th>What happened</th></tr></thead>
+    <tbody>
+    <tr><td class="num">25 Sep 14:36&ndash;14:42</td><td>From a US network (Ashburn, VA): portal HTTP 200 in 1.2 s (PROD-S01-179-NAM-WESTUS); both report APIs with a valid token answered in 1&ndash;3 s (HTTP 404 = no data, the healthy reply) from PROD-S01-020-NAM-EASTUS.</td></tr>
+    <tr><td class="num">25 Sep 13:16</td><td>Independent check from 15 locations (OnlineOrNot): portal timed out from Frankfurt, London, Paris and Mexico; HTTP 200 in 78&ndash;851 ms from all 11 US and Asia-Pacific locations.</td></tr>
+    <tr><td class="num">25 Sep 07:55</td><td>5 more tries: portal 500 on 3 of 3 (40&ndash;84 s); both report APIs gave no answer within 120 s.</td></tr>
+    <tr><td class="num">25 Sep 07:43&ndash;07:47</td><td>10 more tries. Portal: 200 on 2 of 5 (after 31 s and 51 s), otherwise 500 or no answer within 120 s. Anonymous API: 500, 503 or no answer within 120 s on all 5.</td></tr>
+    <tr><td class="num">25 Sep 07:38&ndash;07:42</td><td>Full re-test (table above): portal 500/503, API 500 with and without a token, 40&ndash;85 s per answer.</td></tr>
+    <tr><td class="num">25 Sep, just before 07:00</td><td>With a token: status/ip gave no answer within 180 s; data returned 500 with an empty body after 45 s. Anonymous status/ip still returned 401 within 7 s.</td></tr>
+    <tr><td class="num">23 Sep 14:35 to 25 Sep 02:35</td><td>All 7 automated checks failed the same way: token refresh OK, then both API calls timed out on 3 tries each.</td></tr>
+    <tr><td class="num">23 Sep 14:35</td><td>First failure.</td></tr>
+    <tr><td class="num">23 Sep 08:35</td><td>Last good answer: both APIs replied 404 (&ldquo;no data&rdquo;, the documented healthy reply) within 3 s.</td></tr>
+    <tr><td class="num">18&ndash;23 Sep</td><td>Every automated check answered normally.</td></tr>
+    </tbody>
+    </table>
+    </div>
+
+    <h2>Reproduce it</h2>
+
+    <p>Anyone can check from their own network without an SNDS account. Please reply with your result, your rough location and the <code>x-calculatedbetarget</code> value: that shows whether back ends other than West Europe fail too.</p>
+
+    <pre><code># Portal: prints the status code and how long it took
+    curl -s -o /dev/null -m 120 -w '%{http_code} after %{time_total}s\n' \
+      https://substrate.office.com/ip-domain-management-snds/snds
+
+    # API without a token: a working service rejects this with 401;
+    # right now it returns 500/503 or nothing within 120 s
+    curl -s -o /dev/null -m 120 -D - \
+      https://substrate.office.com/ip-domain-management-snds/api/report/status/ip \
+      | grep -iE '^(HTTP|request-id|x-calculatedbetarget|x-backendhttpstatus)'</code></pre>
+
+    <h2>What we need from Microsoft</h2>
+
+    <p>Someone on the SNDS team to check back end PROD-S01-005-EUR-WESTEUROPE using the request-ids above, and a public note once it is fixed.</p>
+
+    <ul>
+    <li><strong>A support case is open:</strong> Microsoft case 2609251410000460, opened 25 Sep 2026. If you are affected too, citing this number in your own case may help Microsoft group the reports.</li>
+    <li><strong>The contact route is broken too.</strong> The route suggested for SNDS problems is the feedback section of the SNDS FAQ page (<a href="https://learn.microsoft.com/en-us/answers/questions/5928061/snds-automated-data-access-not-working-all-forms">Microsoft Q&amp;A</a>). That page is on the failing portal: it returned 503 after 81 s at 07:39 UTC.</li>
+    <li><strong>Senders are blind to Outlook.com reputation.</strong> Since 23 Sep nobody using SNDS can see IP block status, filter results, complaint rates or spam-trap hits. A real Outlook delivery problem would go unnoticed.</li>
+    </ul>
+
+    <h2>Sources</h2>
+
+    <ul>
+    <li><a href="https://substrate.office.com/ip-domain-management-snds/snds">SNDS portal</a> and <a href="https://substrate.office.com/ip-domain-management-snds/SNDS/FAQ">SNDS FAQ</a>: the pages tested above.</li>
+    <li><a href="https://learn.microsoft.com/en-us/answers/questions/5928061/snds-automated-data-access-not-working-all-forms">Microsoft Q&amp;A: SNDS Automated Data Access not working (all forms)</a>: a separate June 2026 problem; the reply there points to the FAQ feedback section.</li>
+    </ul>
+
+    <footer>Static snapshot. All times UTC.</footer>
+
+    </main>
+    </body>
+    </html>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tillo-pages-nginx
+  namespace: tillo
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+        root /usr/share/nginx/html;
+        server_tokens off;
+        # Relative redirects: /snds-outage -> /snds-outage/ must not leak the
+        # container's http://host:8080 into the Location header.
+        absolute_redirect off;
+        location = /healthz { access_log off; default_type text/plain; return 200 "ok\n"; }
+        # Live copy written by Windmill f/desk/snds_status_page (ConfigMap
+        # tillo-pages-live, mounted optional at /usr/share/nginx/live); the static
+        # copy from tillo-pages-html is the fallback.
+        location = /snds-outage/ {
+            root /usr/share/nginx;
+            try_files /live/snds-outage.html /html/snds-outage/index.html =404;
+            add_header Cache-Control "public, max-age=300";
+        }
+        location / { try_files $uri $uri/ =404; }
+    }

@@ -1,0 +1,212 @@
+# SpiceDB — the authorization engine Formbricks v6 requires.
+#
+# ⛔ WHY THIS EXISTS: Renovate bumped the app to ghcr.io/formbricks/formbricks:6.0.0
+# (b13ff69, "Update ghcr.io/formbricks/formbricks Docker tag to v6"). v6 refuses to
+# start without AuthZed and has NO legacy authorization fallback, so the container
+# exited 1 on every start for ~2h with:
+#
+#   - AUTHZED_ENABLED: Formbricks v6 requires AUTHZED_ENABLED=true
+#   - AUTHZED_ENDPOINT / AUTHZED_TOKEN / AUTHZED_SYSTEM_KEY are required
+#   - AUTHZED_CONSISTENCY: Formbricks v6 requires AUTHZED_CONSISTENCY=fully_consistent
+#
+# A major-version bump carried a new hard dependency. The lesson is for Renovate
+# policy, not for this file: a major bump is a migration, not an update.
+#
+# ⭐ Verified against the running image rather than assumed (2026-09-21):
+#   * SpiceDB reads its flags from SPICEDB_* env vars — tested by starting it with
+#     ONLY env vars set and watching it serve; the prefix is honoured.
+#   * gRPC TLS is OPTIONAL: without --grpc-tls-cert-path/--grpc-tls-key-path it
+#     serves plaintext. There is no separate "no-tls" flag to set.
+#   * :50051 gRPC, :9090 metrics (serves /healthz).
+#
+# ⚠️ PLAINTEXT gRPC, deliberately, and worth revisiting. Authorization traffic
+# crosses the physical LAN on the VXLAN overlay between qui/quo/qua, so
+# "in-cluster" is NOT the same as encrypted here — see
+# [[incluster_is_not_encrypted_rgw_tls_2026_09_19]]. It matches this stack's
+# existing posture (formbricks -> postgres and -> valkey are both plaintext), so
+# this change does not make anything worse; it also does not make it right. TLS for
+# the whole formbricks-kustodyan stack is its own piece of work.
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: spicedb-env
+  namespace: formbricks-kustodyan
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: spicedb-env
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## The preshared key is the ONLY thing standing between a pod in this
+        ## namespace and every authorization decision, since gRPC is plaintext.
+        SPICEDB_GRPC_PRESHARED_KEY: "{{ .token }}"
+        ## Dedicated `spicedb` role + database, created 2026-09-21 inside the
+        ## existing formbricks-postgres. The docs require it to be separate from
+        ## the Formbricks database; it is a separate DB on the same server, which
+        ## is the sensible reading for a single-tenant sandbox.
+        ## ⚠️ sslmode=disable because this Postgres serves no TLS at all — same
+        ## caveat as the note at the top of this file.
+        SPICEDB_DATASTORE_CONN_URI: "postgres://spicedb:{{ .dbpass }}@formbricks-postgres:5432/spicedb?sslmode=disable"
+  data:
+    - remoteRef:
+        key: /mdapi/formbricks-kustodyan/authzed-token
+      secretKey: token
+    - remoteRef:
+        key: /mdapi/formbricks-kustodyan/spicedb-db-password
+      secretKey: dbpass
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb
+  namespace: formbricks-kustodyan
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: spicedb
+  template:
+    metadata:
+      labels:
+        app: spicedb
+    spec:
+      automountServiceAccountToken: false
+      ## ⭐ The datastore migration runs as an initContainer rather than a Job.
+      ## `datastore migrate head` is idempotent, so re-running it on every start is
+      ## free, and using the SAME image as the serving container makes the docs'
+      ## hard rule -- "never run migration and serving from different image
+      ## versions" -- structurally impossible to break. A Job would also be
+      ## immutable once created, which fights Fleet on the next version bump.
+      initContainers:
+        - name: migrate
+          image: authzed/spicedb:v1.56.2
+          imagePullPolicy: IfNotPresent
+          command: [spicedb, datastore, migrate, head]
+          env:
+            - name: SPICEDB_DATASTORE_ENGINE
+              value: postgres
+            - name: SPICEDB_SKIP_RELEASE_CHECK
+              value: "true"
+          envFrom:
+            - secretRef:
+                name: spicedb-env
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { memory: 256Mi }
+      containers:
+        - name: spicedb
+          image: authzed/spicedb:v1.56.2
+          imagePullPolicy: IfNotPresent
+          command: [spicedb, serve]
+          env:
+            - name: SPICEDB_DATASTORE_ENGINE
+              value: postgres
+            - name: SPICEDB_GRPC_ADDR
+              value: ":50051"
+            - name: SPICEDB_METRICS_ADDR
+              value: ":9090"
+            ## Outbound release checks are pointless here and add a startup
+            ## dependency on the internet for a pod that must come up locally.
+            - name: SPICEDB_SKIP_RELEASE_CHECK
+              value: "true"
+            ## ⛔ SKIP_RELEASE_CHECK is NOT the same thing as telemetry, and only
+            ## the first was set. `--telemetry-endpoint` defaults to
+            ## https://telemetry.authzed.com and reports on its own interval
+            ## (default 1h) regardless of the release check — so this pod has
+            ## been phoning home hourly since it was deployed. Empty string is
+            ## the documented way to disable it.
+            ##
+            ## This is a posture decision, not a security finding: the payload is
+            ## usage counts, not data. But on this estate cloud egress is a
+            ## CHOICE that gets made explicitly, and nobody made this one.
+            - name: SPICEDB_TELEMETRY_ENDPOINT
+              value: ""
+            ## ─── OTel tracing (2026-09-22) ──────────────────────────────────
+            ## ⛔⛔ `spicedb serve --help` DOES NOT LIST THESE, and that is not
+            ## evidence they are unsupported. The help output is complete — 184
+            ## lines, twelve "… Flags:" sections, ending properly at "Global
+            ## Flags:" — and contains no OpenTelemetry section at all. I
+            ## concluded from that (wrongly) that tracing needed a version bump.
+            ##
+            ## ⭐ The decisive test was to feed the option a BOGUS value and see
+            ## whether the binary validates it. It does:
+            ##   SPICEDB_OTEL_PROVIDER=definitely-not-a-provider
+            ##   -> "initializing OTel provider: unknown otel-provider ...:
+            ##       must be one of: none, otlpgrpc, otlphttp"
+            ## An undocumented flag that REJECTS a bad value is a wired flag.
+            ## (pkg/cmd/server/otel.go in v1.56.2 registers all six.)
+            ##
+            ## ⚠️ There is also nothing to "bump to": v1.56.2 IS the latest
+            ## SpiceDB release (2026-09-11).
+            ##
+            ## Plaintext to the in-cluster collector, which is why `insecure` is
+            ## true — the collector terminates no TLS and attaches the
+            ## OpenObserve credential itself, so SpiceDB needs none.
+            - name: SPICEDB_OTEL_PROVIDER
+              value: "otlpgrpc"
+            - name: SPICEDB_OTEL_ENDPOINT
+              value: "otel-collector.openobserve.svc.cluster.local:4317"
+            - name: SPICEDB_OTEL_INSECURE
+              value: "true"
+            - name: SPICEDB_OTEL_SERVICE_NAME
+              value: "spicedb"
+            ## SpiceDB's own default is 0.01 (1%). 0.1 matches what ingress-nginx
+            ## and Keycloak use on this estate, and this is a low-volume authz
+            ## engine for one sandbox tenant, so the extra coverage is free.
+            - name: SPICEDB_OTEL_SAMPLE_RATIO
+              value: "0.1"
+          envFrom:
+            - secretRef:
+                name: spicedb-env
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: metrics
+              containerPort: 9090
+          ## ⛔ SpiceDB serves NO /healthz. Measured against the running pod
+          ## 2026-09-21: :9090/metrics -> 200, :9090/healthz -> 404. Health is the
+          ## standard gRPC health service on the main port instead, and it answers
+          ## WITHOUT the preshared key (grpc_health_probe -> "status: SERVING"),
+          ## so kubelet's native grpc probe works with no credential plumbing.
+          ##
+          ## ⚠️ An HTTP probe on /metrics would also have gone green, and would
+          ## have been a worse check: it proves the metrics listener is up, not
+          ## that SpiceDB can answer an authorization call.
+          startupProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 10
+          livenessProbe:
+            grpc: { port: 50051 }
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb
+  namespace: formbricks-kustodyan
+spec:
+  selector:
+    app: spicedb
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+    - name: metrics
+      port: 9090
+      targetPort: 9090

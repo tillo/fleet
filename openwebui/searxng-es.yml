@@ -1,0 +1,24 @@
+## SearXNG's server.secret_key, injected as SEARXNG_SECRET (which upstream
+## documents as the override for `server.secret_key`, see searx/settings.yml).
+## Kept out of searxng-cm.yml so no secret material sits in a ConfigMap.
+##
+## Minted 2026-08-26: openssl rand -hex 32.
+## Rotating it invalidates in-flight form tokens only; SearXNG is stateless, so
+## a rotation costs nothing beyond the reloader-triggered restart.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: searxng-secret
+  namespace: openwebui
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: searxng-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/openwebui/searxng-secret/SEARXNG_SECRET
+      secretKey: SEARXNG_SECRET

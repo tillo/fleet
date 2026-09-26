@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: znc
+  namespace: znc
+  annotations:
+    keel.sh/policy: force
+    keel.sh/match-tag: "true"
+    keel.sh/trigger: poll
+    keel.sh/pollSchedule: "@every 4h"
+spec:
+  selector:
+    matchLabels:
+      app: znc
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: znc
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      initContainers:
+        - name: cert-init
+          image: alpine:3
+          command:
+            - /bin/sh
+            - -c
+            - |
+              cat /tls/tls.key /tls/tls.crt > /znc-data/znc.pem
+              chmod 600 /znc-data/znc.pem
+              if [ -f /znc-data/configs/znc.conf ]; then
+                sed -i \
+                  -e 's/Port = [0-9]*/Port = 443/' \
+                  -e '/^\tBindHost/d' \
+                  -e 's|SSLCertFile = .*|SSLCertFile = /znc-data/znc.pem|' \
+                  -e 's|SSLKeyFile = .*|SSLKeyFile = /znc-data/znc.pem|' \
+                  -e 's|SSLDHParamFile = .*|SSLDHParamFile = /znc-data/znc.pem|' \
+                  -e 's/ProtectWebSessions = true/ProtectWebSessions = false/' \
+                  /znc-data/configs/znc.conf
+              fi
+          volumeMounts:
+            - name: znc-data
+              mountPath: /znc-data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      containers:
+        - name: znc
+          image: registry.mdapi.ch/mdapi/znc:latest
+          resources: {}
+          ports:
+            - containerPort: 443
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            - name: znc-data
+              mountPath: /znc-data
+        - name: oidentd
+          image: registry.mdapi.ch/mdapi/znc:latest
+          command: ["oidentd", "-i", "-C", "/etc/oidentd.conf"]
+          ports:
+            - containerPort: 113
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+        ## cert-init above snapshots the secret into znc.pem only at pod
+        ## start, so a cert-manager renewal never reached a long-lived pod:
+        ## znc.mdapi.ch served a 24-day-stale cert on 2026-07-11 (renewed
+        ## 07-06, pod up since 06-17) and would have expired 07-17. This
+        ## sidecar re-concats znc.pem whenever the projected secret rotates;
+        ## znc picks the file up on new TLS connections without a restart.
+        ## Backstop if that assumption fails: Horizon ManagedCertExpiring
+        ## fires at 7 days on the live-served cert.
+        - name: cert-sync
+          image: alpine:3
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                if [ /tls/tls.crt -nt /znc-data/znc.pem ] || [ ! -f /znc-data/znc.pem ]; then
+                  cat /tls/tls.key /tls/tls.crt > /znc-data/znc.pem.new
+                  chmod 600 /znc-data/znc.pem.new
+                  mv /znc-data/znc.pem.new /znc-data/znc.pem
+                  echo "znc.pem refreshed: $(ls -l /znc-data/znc.pem)"
+                fi
+                sleep 300
+              done
+          volumeMounts:
+            - name: znc-data
+              mountPath: /znc-data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: znc-data
+          persistentVolumeClaim:
+            claimName: znc-data
+        - name: tls
+          secret:
+            secretName: znc-cert

@@ -1,0 +1,103 @@
+## plex-oidc-bridge (github.com/tikibozo/plex-oidc-bridge, Go, MIT), pinned by index
+## digest; Renovate Lane-B, MR-only.
+##
+## ONE replica, Recreate: PIN sessions and auth codes live in the process memory, so
+## a second replica would lose half the sign-ins. The RSA signing key is generated
+## into an emptyDir at start. A restart rotates it, which is harmless here: the only
+## client (the door) fetches the JWKS on every callback and nothing long-lived is
+## signed; an in-flight sign-in at restart time just has to be retried.
+##
+## PUBLIC_URL is the issuer (`iss`) the door verifies. The door calls /token and
+## /.well-known/jwks.json in-cluster (the Service), the browser uses the public host.
+##
+## Friend filter: PLEX_SERVER_ID + the owner token -> shared_servers of THIS server,
+## cached 5 min, fail-closed (503) when the list cannot be fetched. Unsharing
+## someone in Plex stops new sign-ins within the cache TTL.
+##
+## ALLOWED_REDIRECT_URIS is the redirect allow-list: exactly the door's callback.
+## Anything else gets 401 "Unregistered redirect_uri".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plex-oidc-bridge
+  namespace: plex-auth
+  labels:
+    app: plex-oidc-bridge
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: plex-oidc-bridge
+  template:
+    metadata:
+      labels:
+        app: plex-oidc-bridge
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          image: ghcr.io/tikibozo/plex-oidc-bridge:0.6.13@sha256:60ceff7f249b9bc8e6a0f7162a20fc9a38f764f82e40f4d221aebf1af2d18050
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PUBLIC_URL
+              value: https://plex-auth.mdapi.ch
+            - name: ALLOWED_REDIRECT_URIS
+              value: https://start.mdapi.ch/request/plex-callback.php
+            - name: PLEX_SERVER_ID
+              value: e7ca8af27e15c79cb5df7fa1c593ba0d6396cb82
+            - name: PLEX_PRODUCT_NAME
+              value: mdapi.ch
+            ## Behind ingress-nginx, which sets X-Forwarded-For/X-Real-IP; the
+            ## bridge's own per-IP limiter needs the real client address.
+            - name: TRUST_PROXY_HEADERS
+              value: "true"
+          envFrom:
+            - secretRef:
+                name: plex-oidc-bridge
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /.well-known/openid-configuration, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /.well-known/openid-configuration, port: http }
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: config, mountPath: /app/config }
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { memory: 128Mi }
+      volumes:
+        - name: config
+          emptyDir:
+            sizeLimit: 1Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: plex-oidc-bridge
+  namespace: plex-auth
+  labels:
+    app: plex-oidc-bridge
+spec:
+  selector:
+    app: plex-oidc-bridge
+  ports:
+    - { name: http, port: 8080, targetPort: http }

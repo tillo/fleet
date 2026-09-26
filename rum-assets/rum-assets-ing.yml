@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rum-assets
+  namespace: rum-assets
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    ## Found by internet scanners within minutes of the certificate being
+    ## issued — Certificate Transparency publishes every new hostname — and
+    ## probed for /.git/config, /.DS_Store, /telescope/requests. It serves
+    ## exactly one file and 404s everything else, so the exposure is small,
+    ## but it was the only public host on this estate without a limit.
+    ## 120 r/m is far above real use: rum.js is cached for an hour, so a
+    ## visitor fetches it once per browser session, not once per page.
+    nginx.ingress.kubernetes.io/limit-rpm: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: rum.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rum-assets
+                port:
+                  number: 80
+  tls:
+    - hosts: [rum.mdapi.ch]
+      secretName: rum-assets-cert

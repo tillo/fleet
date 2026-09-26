@@ -1,0 +1,289 @@
+## OpenTelemetry Collector — the estate's span hub (added 2026-09-22).
+##
+## ─── WHY THIS EXISTS AT ALL ───────────────────────────────────────────────────
+## Not for batching, and not because "you should have a collector". It exists
+## because ingress-nginx CANNOT talk to OpenObserve directly:
+##
+##   * OpenObserve's OTLP ingest is AUTHENTICATED. An unauthenticated POST to
+##     /api/<org>/v1/traces answers 401 (measured 2026-09-22), so an emitter with
+##     no credential fails CLOSED and silently drops every span.
+##   * ingress-nginx's OTel options are exactly: enable-opentelemetry,
+##     opentelemetry-operation-name, opentelemetry-trust-incoming-span,
+##     otlp-collector-host, otlp-collector-port, otel-service-name,
+##     otel-max-queuesize, otel-schedule-delay-millis, otel-max-export-batch-size,
+##     otel-sampler, otel-sampler-ratio, otel-sampler-parent-based.
+##     There is NO option for an Authorization header, and the exporter speaks
+##     otlp-GRPC only.
+##
+## So nginx can only ever reach an unauthenticated in-cluster endpoint. This
+## collector is that endpoint: it accepts OTLP with no auth from inside the
+## cluster and is the single place the Akeyless-backed credential is attached.
+##
+## litellm does NOT go through here — it sets OTEL_EXPORTER_OTLP_HEADERS itself
+## and talks to OpenObserve directly. Route an emitter through the collector only
+## when it cannot carry its own credential.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: openobserve
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          ## ingress-nginx speaks otlp-grpc and nothing else.
+          grpc:
+            endpoint: 0.0.0.0:4317
+          ## Kept for emitters that can only do HTTP but cannot set headers.
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      ## Ordered deliberately: memory_limiter FIRST so it can shed load before
+      ## anything is buffered, batch LAST so it is the thing handed to the exporter.
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 75
+        spike_limit_percentage: 25
+      ## ─── k8sattributes (2026-09-23) ────────────────────────────────────
+      ## WHY: without it every span reaches OpenObserve with only service.name,
+      ## so O2's service discovery files keycloak/spicedb/ingress-nginx under
+      ## identity set `default` (no namespace) while their pod_logs sit under set
+      ## `kubernetes` with k8s-namespace=<ns> — and the two NEVER correlate.
+      ## o2 flattens resource attrs to `service_<attr>`, so k8s.namespace.name
+      ## lands as `service_k8s_namespace_name`, which the stock `k8s-namespace`
+      ## semantic group already lists.
+      ##
+      ## Association is by CONNECTION source IP. That is sound here because every
+      ## emitter (ingress-nginx, keycloak, spicedb) runs on the pod network — no
+      ## hostNetwork — and ClusterIP DNAT rewrites only the destination.
+      ## ⛔ If an emitter ever moves to hostNetwork, its IP is the NODE's and this
+      ## silently attributes nothing (k8sattributes skips hostNetwork pods).
+      ##
+      ## ⛔ Must run BEFORE batch: batch drops the per-request client context, and
+      ## after it every span "comes from" nowhere.
+      ##
+      ## Deliberately NO k8s.deployment.name: the O2 `kubernetes` identity set
+      ## distinguishes by cluster+namespace+deployment, and pod_logs carries no
+      ## deployment field. A span with a deployment would get a DIFFERENT
+      ## disambiguation from its own pod logs and still not correlate.
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        pod_association:
+        - sources:
+          - from: connection
+        extract:
+          metadata:
+          - k8s.namespace.name
+          - k8s.pod.name
+          - k8s.node.name
+      ## Grafana 13 (traced since 2026-09-24) emits ~95% background SQL spans
+      ## (sql.pollingNotifier.poller, sql.backend.listLatestRVs, sql.db.*): ~40k spans per
+      ## 15 min at 0.5 sampling, ~3 GB/day of nothing. Drop ONLY grafana's sql.* spans;
+      ## request/handler spans (the useful part) and every other emitter are untouched.
+      filter/grafana-sql:
+        error_mode: ignore
+        traces:
+          span:
+          - 'resource.attributes["service.name"] == "grafana" and IsMatch(name, "^sql\\.")'
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+
+    exporters:
+      otlphttp/openobserve:
+        ## ⚠️ BASE path, NO /v1/traces. The otlphttp exporter appends the signal
+        ## path itself; writing it here yields /v1/traces/v1/traces and every
+        ## span 404s. Same trap as the litellm and Keycloak endpoints.
+        endpoint: http://openobserve.openobserve.svc.cluster.local:5080/api/default
+        headers:
+          ## Bare "Basic <b64>" — NOT the "Authorization=Basic <b64>" form the
+          ## OTel SDK env var wants. Both shapes of the same service-account
+          ## credential live in Akeyless on purpose; see o2-es.yml.
+          Authorization: ${env:O2_OTLP_AUTHORIZATION}
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          queue_size: 1000
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+
+    service:
+      extensions: [health_check]
+      telemetry:
+        metrics:
+          level: basic
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, filter/grafana-sql, batch]
+          exporters: [otlphttp/openobserve]
+    ## ⭐ NOT configured yet, but this is where it goes when it is wanted:
+    ## a `filter` processor to drop spans for polling endpoints. 24h of ingress
+    ## traffic is 168,795 requests, and a visible share of that is monitoring
+    ## noise (pushgateway 4,500; rook-ceph-dashboard 11,840; home-assistant
+    ## 22,833 — largely polling/websocket). Tracing those buys nothing.
+    ## The cheaper first move is the per-ingress opt-out annotation
+    ## `nginx.ingress.kubernetes.io/enable-opentelemetry: "false"`, which costs
+    ## no collector CPU at all because the span is never created.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: openobserve
+  labels:
+    app: otel-collector
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: otel-collector
+              topologyKey: kubernetes.io/hostname
+      ## ⛔ Required, and easy to miss: this namespace had NO zot credential.
+      ## Everything else in ns openobserve comes from public.ecr.aws, which needs
+      ## none, so the collector is the first workload here to pull from zot. The
+      ## failure reads "pull access denied, repository does not exist or may
+      ## require authorization: authorization failed: no basic auth credentials"
+      ## — which names "repository does not exist" first and sends you hunting a
+      ## missing image that is actually present.
+      ## k8sattributes needs to watch pods cluster-wide; see the RBAC at the end.
+      serviceAccountName: otel-collector
+      imagePullSecrets:
+      - name: zot-pull
+      containers:
+      - name: collector
+        ## contrib rather than core: core has no `filter` / `probabilistic_sampler`
+        ## / `tail_sampling`, and the first thing this will want is to drop polling
+        ## noise. Choosing contrib now avoids an image swap later.
+        ##
+        ## Pinned as TAG+DIGEST, never digest-only — a digest-only ref is owned by
+        ## NEITHER lane (Keel is not on it, and Renovate's Default OFF means it is
+        ## never evaluated) and is invisible even to
+        ## tests/test_every_pinned_image_is_renovate_reachable.py. That is exactly
+        ## what froze OpenObserve at v0.92.0 for six weeks.
+        ##
+        ## v0.161.0 released 2026-09-16, i.e. 5 days of soak at adoption, clearing
+        ## this repo's own Lane-B minimumReleaseAge of 3 days.
+        ##
+        ## ⛔⛔ THE DIGEST MUST BE RESOLVED FROM ZOT, NOT FROM THE UPSTREAM.
+        ## This first shipped with ghcr's digest and every pull failed. zot does
+        ## not proxy the upstream manifest byte-for-byte — it RE-WRAPS it:
+        ##   ghcr serves application/vnd.docker.distribution.manifest.list.v2+json
+        ##        -> sha256:b5cf9836...
+        ##   zot  serves application/vnd.oci.image.index.v1+json
+        ##        -> sha256:43649a46...   (and different child digests again)
+        ## A different media type is a different manifest is a different digest,
+        ## so an upstream digest is simply not a valid reference here. Resolve it
+        ## with a Docker-Content-Digest HEAD/GET against zot itself.
+        ##
+        ## ⚠️ And zot is ON-DEMAND: the tag has to be fetched once before any
+        ## digest exists to resolve. containerd requests a tag+digest ref BY
+        ## DIGEST (the failing event dropped the tag), so on a cold repo the pull
+        ## fails even though the tag would have worked. Warm it with a
+        ## `skopeo inspect docker://zot.mdapi.ch/<repo>:<tag>` first.
+        image: zot.mdapi.ch/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.161.0@sha256:43649a46ed32d3b2bfd9bd89e29884782d3c350492761b918ba227dd73ef3719
+        imagePullPolicy: IfNotPresent
+        args: ["--config=/conf/config.yaml"]
+        ports:
+        - { name: otlp-grpc, containerPort: 4317 }
+        - { name: otlp-http, containerPort: 4318 }
+        - { name: health,    containerPort: 13133 }
+        env:
+        - name: O2_OTLP_AUTHORIZATION
+          valueFrom:
+            secretKeyRef:
+              name: otel-collector-auth
+              key: O2_OTLP_AUTHORIZATION
+        volumeMounts:
+        - name: config
+          mountPath: /conf
+          readOnly: true
+        ## Small on purpose. This is a stateless forwarder, not a store: at the
+        ## measured ingress rate (1.95 req/s average, 12.14 req/s peak over 24h)
+        ## it handles single-digit spans/second.
+        resources:
+          requests: { cpu: 50m,  memory: 128Mi }
+          limits:   { cpu: "1",  memory: 512Mi }
+        readinessProbe:
+          httpGet: { path: /, port: health }
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /, port: health }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: openobserve
+  labels:
+    app: otel-collector
+spec:
+  type: ClusterIP
+  selector:
+    app: otel-collector
+  ports:
+  - { name: otlp-grpc, port: 4317, targetPort: otlp-grpc }
+  - { name: otlp-http, port: 4318, targetPort: otlp-http }
+---
+## RBAC for the k8sattributes processor: read-only pod/namespace watch, nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-collector
+  namespace: openobserve
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector-k8sattributes
+rules:
+- apiGroups: [""]
+  resources: ["pods", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector-k8sattributes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector-k8sattributes
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: openobserve

@@ -1,0 +1,66 @@
+# Exceptions for tools/ci/validate-manifests.py.
+#
+# Everything here is a HOLE IN THE GATE. Each entry must name what would close it.
+# A missing schema is not "fine" -- it means nothing checks that resource at all.
+#
+# ⛔ Do not add an entry to make a red pipeline green. Add it only when the gap is in
+# the upstream schema catalog rather than in our manifest.
+
+# Kinds with no published JSON schema in the datreeio CRDs-catalog. kubeconform skips
+# them, so these resources are UNVALIDATED.
+#
+# ⚠️ Match on group+version+kind, never on kind alone: `ClusterIssuer` exists in BOTH
+# cert-manager.io/v1 (schema present, validated) and horizon.evertrust.io/v1beta1 (no
+# schema). Same for NetworkPolicy in networking.k8s.io vs crd.projectcalico.org. A
+# kind-only exception would silently switch off validation for the one that IS covered.
+allowedMissingSchemas:
+  - apiVersion: horizon.evertrust.io/v1beta1
+    kind: ClusterIssuer
+    reason: >-
+      Evertrust Horizon ships no CRD schema to the datreeio catalog. Closes when
+      Horizon publishes one, or when we generate schemas from the installed CRDs.
+  - apiVersion: harvesterhci.io/v1beta1
+    kind: Addon
+    reason: >-
+      Harvester CRDs are not in the datreeio catalog. Closes by generating schemas from
+      the CRDs installed on mdapi-rancher.
+  - apiVersion: harvesterhci.io/v1beta1
+    kind: VirtualMachineImage
+    reason: same as harvesterhci.io Addon.
+  - apiVersion: crd.projectcalico.org/v1
+    kind: NetworkPolicy
+    reason: >-
+      Calico's namespaced NetworkPolicy is not in the datreeio catalog. Worth closing
+      properly -- this is the kind the isolation programme writes, so it is exactly the
+      one we most want schema-checked. Closes by generating a schema from the installed
+      networkpolicies.crd.projectcalico.org CRD.
+
+# Resources that FAIL validation for a reason we have accepted for now. Matched on
+# file + kind + name + a substring of the message, so an unrelated new failure in the
+# same resource still fails the job.
+#
+# The entry this file shipped with -- the CephCluster duplicate cephVersion key -- was
+# FIXED in rook-ceph-cluster/values.yml rather than tolerated: the pin moved to the
+# top-level `cephImage:` block the chart now reads, and cephVersion was removed from
+# cephClusterSpec. The rendered CephCluster is byte-identical to what the duplicate
+# collapsed to, so nothing changed in the cluster.
+#
+# ⭐ Fixing it exposed a second finding underneath: while the resource was unparseable,
+# kubeconform could not schema-check ANY of it. A duplicate key does not hide one
+# problem, it hides the whole object.
+allowedFindings:
+  - file: rook-ceph-cluster.yaml
+    kind: CephCluster
+    name: rook-ceph
+    messageContains: "additional properties 'keyType' not allowed"
+    reason: >-
+      FALSE POSITIVE -- the datreeio catalog's cephcluster_v1.json lags rook v1.20.7.
+      `spec.security.cephx.csi.keyType` is a CHART DEFAULT (value `aes`, not set by our
+      values.yml), and the CRD actually installed on mdapi-prod declares it: the live
+      cephclusters.ceph.rook.io v1 schema lists csi properties
+      [keepPriorKeyCountMax, keyGeneration, keyRotationPolicy, keyType] (verified
+      2026-09-12). So the cluster accepts this field and the external catalog is simply
+      out of date. Closes by generating schemas from the CRDs the charts render instead
+      of trusting a third-party catalog -- see the known-gaps section of
+      tools/ci/README.md. Re-check this entry whenever the catalog or rook is bumped;
+      if the catalog catches up, delete it.

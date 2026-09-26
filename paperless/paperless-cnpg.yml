@@ -1,0 +1,279 @@
+## Dedicated CNPG Postgres (HA, 2 instances) for paperless-ngx.
+##
+## Mirrors fleet/bootstrap/cnpg-cluster.yml. paperless's metadata sits
+## here; documents themselves live on the Longhorn PVC mounted into the
+## paperless pod (paperless-ngx has no native S3 backend; the nightly
+## `document_exporter` to Garage is the off-cluster backup path).
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: paperless-pg
+  namespace: paperless
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+  ## switchover, NOT the default in-place restart: a restart-requiring change (e.g. a
+  ## shared_preload_libraries edit) otherwise restarts the PRIMARY in place, a full DB
+  ## outage (grafana-pg, 2026-09-24: ~3 min of connection refused). Switchover promotes
+  ## the replica first, so only the switchover gap remains.
+  primaryUpdateMethod: switchover
+
+  ## ⭐ 2026-09-19: without this the CNPG collector is never scraped, so
+  ## cnpg_collector_last_available_backup_timestamp does not exist for this
+  ## cluster and NO backup-freshness alert can fire on it. That is part of why
+  ## this cluster archived WAL happily while completing ZERO base backups for
+  ## months (beads infra-g80u): nothing was watching the catalog.
+  ## See monitoring-rules/52-cnpg-backups.yml.
+  monitoring:
+    enablePodMonitor: true
+
+  ## Keep primary + replica on different nodes. CNPG defaults to *soft*
+  ## (preferred) anti-affinity, which can let both copies co-locate on one
+  ## node during a rolling restart -- then a node loss takes out both and the
+  ## replica buys zero protection (the trap ha-recorder-pg hit 2026-06-15).
+  ## required is always satisfiable here (2 instances, 3 nodes).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    ## O2 Database Monitoring (2026-09-24): server-side top queries read pg_stat_statements,
+    ## which must be PRELOADED. Changing this list restarts Postgres; with
+    ## primaryUpdateMethod: switchover the replica is promoted first.
+    shared_preload_libraries:
+      - pg_stat_statements
+    parameters:
+      max_connections: "200"
+      shared_buffers: 128MB
+      effective_cache_size: 384MB
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the standby to confirm each commit. Default async
+    ## drops the last unreplicated writes on promotion. dataDurability:
+    ## preferred falls back to async if the standby is down so writes never
+    ## stall on a missing replica. (Mirrors ha-recorder-pg; CNPG >=1.25.)
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## Read-only monitoring login for the O2 DBM collector (openobserve/o2-dbm-collector.yml).
+  ## pg_monitor = read pg_stat_* / pg_stat_statements; it cannot read table data.
+  ## Password: Akeyless /mdapi/paperless/paperless-pg-o2dbm/password.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: paperless-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: paperless
+      owner: paperless
+      secret:
+        name: paperless-pg-app-credentials
+
+  backup:
+    ## ⛔ There was NO retention policy here until 2026-09-17, and barman prunes
+    ## nothing without one, so this store grew unbounded. It was caught while
+    ## fixing the same omission on ha-recorder-pg, which had reached 1.7 TiB for
+    ## a 50 GiB database (123 daily base backups since May, plus all their WAL).
+    ## paperless-pg had not hurt yet at 1.2 GiB — it was the same bug, just
+    ## earlier. Fixing it now is far cheaper than after it grows.
+    ##
+    ## 30d rather than the 14d used for ha-recorder-pg, deliberately: this is a
+    ## document-management database, so restore points are worth more than
+    ## home-automation telemetry, and at ~1 GiB the extra fortnight is close to
+    ## free. Matches bussola-pg. (beads infra-wd77)
+    retentionPolicy: "30d"
+    barmanObjectStore:
+      ## Postgres backups go to the same Garage bucket pattern as the
+      ## other CNPG clusters. Path is per-cluster.
+      destinationPath: s3://cnpg-paperless-pg
+      ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the IN-CLUSTER Ceph
+      ## RGW, as part of retiring both those hosts. This is the "local" half of
+      ## the backup architecture: short-window PITR and granular restore live
+      ## here; the offsite copy is a separate, client-side-encrypted channel.
+      ##
+      ## ⛔ NEW bucket name on purpose. The Garage bucket was `paperless-pg-backup`;
+      ## reusing it would mean a half-applied change (new store, stale
+      ## endpointURL) kept writing to Garage and SUCCEEDED, silently. With a
+      ## distinct name that mistake fails closed with NoSuchBucket.
+      ##
+      ## ⛔⛔ Changing destinationPath starts an EMPTY archive. WAL archiving
+      ## alone is not a backup -- paperless-pg proved that with 33k objects and
+      ## zero base backups. A one-shot Backup is taken immediately after this
+      ## lands, and `lastSuccessfulBackup` is the only acceptable evidence.
+      ##
+      ## ⭐ TLS restored. !369 landed this store on plain http, which handed
+      ## back exactly the property the Garage terminator was built for on
+      ## 2026-09-05: pods on qui/quo/qua reach an RGW pod on another node across
+      ## the physical LAN, over an UNENCRYPTED VXLAN overlay, and barman does not
+      ## encrypt. "It stays in the cluster" was the wrong reassurance -- the
+      ## cluster is three separate machines. RGW now carries its own house-PKI
+      ## leaf (rook-ceph-objectstore-users/rgw-tls-cert.yml) and this dials it.
+      endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+      ## The CA here is the house chain (MDAPI Root + MDAPI Issuing CA 01), which
+      ## is what a Horizon-issued RGW leaf chains to.
+      ## ⭐ Renamed garage-transit-ca -> rgw-transit-ca on 2026-09-21, across all
+      ## six namespaces at once. Contents byte-identical; the old name was the
+      ## last thing on the estate still calling Garage a live dependency.
+      ## ⭐ Changing this name costs NOTHING here: measured on CNPG 1.30, the
+      ## instance pods do not reference the secret at all (the operator resolves
+      ## endpointCA through the API at backup time), so there is no pod-spec
+      ## change and no switchover.
+      endpointCA:
+        name: rgw-transit-ca
+        key: ca.crt
+      s3Credentials:
+        accessKeyId:
+          name: cnpg-paperless-pg
+          key: AWS_ACCESS_KEY_ID
+        secretAccessKey:
+          name: cnpg-paperless-pg
+          key: AWS_SECRET_ACCESS_KEY
+        region:
+          name: cnpg-rgw-region
+          key: REGION
+      wal:
+        compression: gzip
+      ## ⛔ `data:` was absent, so CNPG's default of ONE upload worker and NO
+      ## compression on the base backup applied — WAL was gzipped, the base
+      ## backup was not. Same gap as ha-recorder-pg, which crawled at
+      ## 0.3-1.0 MiB/s and grew to 1.68 TiB for a 17 GB database while the
+      ## storage, TLS terminator and Garage all sat idle.
+      ## This bucket is only 1.3 GiB today, so the win here is preventative:
+      ## paperless-pg is the cluster that had NO retentionPolicy at all until
+      ## 2026-09-17, i.e. it was on exactly the trajectory ha-recorder took.
+      ## jobs: 2 matches bootstrap/gitlab-pg and fits the 2-CPU limit.
+      ## ⚠️ Compression is recorded PER BACKUP — existing backups stay
+      ## restorable, and nothing shrinks retroactively.
+      data:
+        compression: gzip
+        jobs: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int
+      # renders as a perpetual Fleet "Modified" diff (2 vs "2").
+      cpu: "2"
+      memory: 1Gi
+---
+## Garage credentials for CNPG WAL/base backups. Dedicated key
+## 'paperless-pg-backup', scoped read-write to the s3://paperless-pg-backup
+## bucket on the salt/pepper Garage cluster.
+## ⚠️ 2026-09-19: NO LONGER REFERENCED by the cluster above -- the barman store
+## moved to the in-cluster Ceph RGW and now uses the OBC-written secret instead.
+## This is kept ONLY so the abandoned Garage store on salt stays readable while
+## that host is still up: it holds the sole pre-cutover PITR history, and the
+## credentials to reach it exist nowhere else in git. Delete it together with
+## the Garage buckets when salt is powered off -- an ExternalSecret nothing
+## consumes is exactly the kind of config that rots into a false sense of cover.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-pg-backup-s3
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-pg-backup-s3
+    creationPolicy: Owner
+  data:
+    - remoteRef: { key: /mdapi/paperless/garage-backup-access-key }
+      secretKey: ACCESS_KEY_ID
+    - remoteRef: { key: /mdapi/paperless/garage-backup-secret-key }
+      secretKey: ACCESS_SECRET_KEY
+    - remoteRef: { key: /mdapi/paperless/garage-region }
+      secretKey: REGION
+---
+## ⛔⛔ There was NO ScheduledBackup and NO Backup object for this cluster until
+## 2026-09-17 — not one base backup had EVER been taken. WAL archiving had been
+## running the whole time, so paperless-pg-backup held 33,450 objects and looked
+## healthy, but WAL is unreplayable without a base backup to replay it onto: the
+## cluster was NOT RESTORABLE while appearing fully backed up.
+##
+## It was the only one of the six barman-backed CNPG clusters in this state
+## (gitlab 35 base backups, ha-recorder 108, guac 31, grafana 28, bussola 20).
+## Found while adding the retention policy, because status.lastSuccessfulBackup
+## was empty while the bucket kept growing.
+##
+## ⚠️ f/probe/pvc_backup_coverage did NOT catch this: it asserts that a CNPG
+## cluster HAS a barmanObjectStore, i.e. that the mechanism exists — not that a
+## base backup ever completed. A mechanism is not evidence.
+##
+## 02:50 is a free slot: bussola 02:15, grafana 02:30, guac 02:40, gitlab and
+## ha-recorder both 03:00.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: paperless-pg-daily
+  namespace: paperless
+spec:
+  schedule: "0 50 2 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: paperless-pg
+---
+## Password for the o2_dbm login (O2 Database Monitoring). CNPG requires a basic-auth
+## secret whose username matches the role name.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-pg-o2dbm
+  namespace: paperless
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/paperless/paperless-pg-o2dbm/password
+      secretKey: password
+---
+## Declares pg_stat_statements in `paperless` (the O2 DBM receiver reads the view there).
+## Adopting the existing database is safe: owner paperless is the CURRENT owner (checked in
+## pg_database), and databaseReclaimPolicy defaults to retain, so deleting this object
+## never drops the database.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: paperless-pg-paperless
+  namespace: paperless
+spec:
+  name: paperless
+  owner: paperless
+  cluster:
+    name: paperless-pg
+  extensions:
+    - name: pg_stat_statements
+      ensure: present

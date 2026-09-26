@@ -1,0 +1,369 @@
+{
+  "uid": "supply-chain",
+  "title": "Supply chain — what is running, and what is known about it",
+  "tags": [
+    "security",
+    "supply-chain",
+    "cve",
+    "mdapi"
+  ],
+  "editable": true,
+  "links": [],
+  "refresh": "5m",
+  "schemaVersion": 36,
+  "timezone": "browser",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Two layers, and neither is sufficient alone.** Build-time scanning covers what you make; runtime scanning covers what you *pull* — third-party images never went through your pipeline. These figures are the runtime layer: every image actually running, rescanned four times a day in rotating batches.\n\n⭐ **Read the *fixable* count, not the total.** A critical CVE with no upstream fix is a risk to accept and document; a critical CVE with a fix available is a rebuild you have not done. Only the second is actionable, and only the second belongs on a dashboard.\n\n⚠️ Measured 2026-09-22: Grype and Trivy agree on only **81%** of findings for the same Debian image, and on an Alpine image one reported 7 vulnerabilities where the other reported *Clean*. A single scanner is not coverage.\n\n*Scope: only **critical** and **high** are tracked. Medium and low on 146 running images is a number nobody acts on, and a dashboard nobody acts on trains people to ignore the ones that matter. Source: `f/probe/pod_image_cve_scan`.*"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Images scanned",
+      "description": "Distinct images actually running and rescanned on rotation.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "pod_image_cve_scan_images_total",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Critical, fix available",
+      "description": "The actionable number: a fix exists upstream and has not been pulled in.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"critical\",fix_state=\"fixed\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "High, fix available",
+      "description": "Same reading as critical, one severity down.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"high\",fix_state=\"fixed\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Components with an upgrade waiting",
+      "description": "Platform components behind their latest release. Distinct from CVEs: this is cadence, not exposure.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(component_upgrade_available)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Fixable vulnerabilities over time — rebuild cadence made visible",
+      "description": "A sawtooth on the fixable lines is healthy: it means rebuilds land. A rising flat line means the daily patch layer has stopped reaching the registry. The third line is a different conversation entirely — nothing to rebuild, so it belongs in the risk register, not in a backlog.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"critical\",fix_state=\"fixed\"})",
+          "refId": "A",
+          "legendFormat": "critical, fixable"
+        },
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"high\",fix_state=\"fixed\"})",
+          "refId": "B",
+          "legendFormat": "high, fixable"
+        },
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"critical\",fix_state=\"unfixed\"})",
+          "refId": "C",
+          "legendFormat": "critical, NO fix available"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Images carrying fixable critical or high findings",
+      "description": "Ranked by what can actually be fixed today. Rebuild from the top; an image with only unfixable findings belongs in the risk register, not here.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "topk(20, sum by (image) (pod_image_cve_count{severity=~\"critical|high\",fix_state=\"fixed\"}))",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "prometheus": true,
+              "service": true,
+              "instance": true,
+              "namespace": true,
+              "endpoint": true,
+              "container": true,
+              "pod": true
+            },
+            "renameByName": {
+              "image": "Image",
+              "Value": "Fixable critical + high"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Fixable critical + high",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}

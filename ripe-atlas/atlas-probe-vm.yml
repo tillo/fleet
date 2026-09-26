@@ -1,0 +1,112 @@
+## RIPE Atlas software probe — a measurement source for the RIPE Atlas network.
+## It dials out to RIPE's controllers and needs no inbound reachability, so it
+## runs on the trusted LAN with no published address.
+##
+## Registration is manual and one-time: the package generates the probe's own
+## keypair at install, and RIPE identifies the probe by it, so it cannot be
+## seeded from git. Take /etc/ripe-atlas/probe_key.pub to
+## https://atlas.ripe.net/register/swprobe once the VM is up.
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: atlas-probe
+  namespace: atlas
+  labels:
+    harvesterhci.io/creator: harvester
+    harvesterhci.io/os: linux
+  annotations:
+    ## Harvester requires the boot PVC to use the StorageClass generated for the
+    ## backing image, named lh-<image UID> — which only exists once the image is
+    ## imported. It is therefore a pin, like a container tag: re-importing
+    ## debian13-image.yml mints a new UID and this must be bumped with it.
+    harvesterhci.io/volumeClaimTemplates: |
+      [{"metadata": {"name": "atlas-probe-disk-0",
+        "annotations": {"harvesterhci.io/imageId": "atlas/debian13"}},
+        "spec": {"accessModes": ["ReadWriteMany"],
+        "resources": {"requests": {"storage": "10Gi"}},
+        "volumeMode": "Block",
+        "storageClassName": "lh-ee6bf6ed-810d-4967-8012-ed7ce363a36d"}}]
+    ## Pinned rather than left to Harvester's allocator so a recreate keeps the
+    ## same L2 identity. Locally-administered unicast address.
+    harvesterhci.io/mac-address: '{"lan":"26:ac:71:5a:10:01"}'
+    network.harvesterhci.io/ips: '[]'
+spec:
+  runStrategy: Always
+  template:
+    metadata:
+      labels:
+        harvesterhci.io/vmName: atlas-probe
+      annotations:
+        harvesterhci.io/sshNames: '[]'
+    spec:
+      architecture: amd64
+      hostname: atlas-probe
+      evictionStrategy: LiveMigrateIfPossible
+      terminationGracePeriodSeconds: 120
+
+      ## Injected by the Harvester network controller for VMs on a mgmt-network
+      ## NAD. Declared so the manifest is what actually lands.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: network.harvesterhci.io/mgmt
+                    operator: In
+                    values:
+                      - "true"
+
+      domain:
+        cpu:
+          cores: 1
+          sockets: 1
+          threads: 1
+          ## KubeVirt defaults this to `sockets` and writes it back; declared so
+          ## git matches the live object.
+          maxSockets: 1
+        memory:
+          guest: 1Gi
+        ## Limits only — Harvester's overcommit webhook derives the requests.
+        resources:
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        ## Pinned so the guest keeps a stable DMI identity across a recreate;
+        ## KubeVirt generates random values when these are absent.
+        firmware:
+          uuid: 4131f2a0-5156-47b0-bf0e-a4b3602fb61f
+          serial: 15881864-eca7-4e9a-80e7-c01f9f76abba
+        features:
+          acpi:
+            enabled: true
+        machine:
+          type: q35
+        devices:
+          disks:
+            - name: disk-0
+              bootOrder: 1
+              disk:
+                bus: virtio
+            - name: cloudinitdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: lan
+              model: virtio
+              macAddress: "26:ac:71:5a:10:01"
+              bridge: {}
+
+      networks:
+        - name: lan
+          multus:
+            networkName: default/lan
+
+      volumes:
+        - name: disk-0
+          persistentVolumeClaim:
+            claimName: atlas-probe-disk-0
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            secretRef:
+              name: atlas-probe-cloudinit

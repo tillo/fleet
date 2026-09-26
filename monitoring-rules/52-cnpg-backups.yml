@@ -1,0 +1,152 @@
+## Generic CNPG backup-freshness alerting — every cluster, not one namespace.
+##
+## WHY (beads infra-bjzc)
+## Until now the ONLY in-cluster backup-freshness rule was
+## HomeAssistantRecorderBackupStale in 23-ha-recorder.yml, hard-scoped to
+## namespace home-assistant. The other six CNPG clusters had no equivalent.
+##
+## ⚠️ HONEST SCOPE — this is NOT the only backup check, and the bead overstated
+## the gap. f/probe/pvc_backup_coverage already DERIVES the cluster list from
+## the API and flags clusters with no working backup (no barman store, no
+## ScheduledBackup, never completed a base backup, or stale past its own
+## cadence); `PvcBackupUncovered` in 12-batch-jobs.yml alerts on its
+## pvc_backup_cnpg_nobarman_total. That probe remains the EXHAUSTIVE check and
+## is deliberately not duplicated here.
+##
+## What these rules add is RESOLUTION. The probe runs once a day, so its verdict
+## can be up to 24h behind the store — the same lag that made
+## restic_snapshot_freshness read 51h while B2 said 62h on 2026-09-19. These
+## rules evaluate continuously against the cluster's own barman catalog, so a
+## backup that stops being taken is caught in an hour rather than a day.
+##
+## ⛔ PREREQUISITE, and it was the actual bug: `spec.monitoring.enablePodMonitor`
+## must be true or a cluster publishes NO cnpg_collector_* metrics at all and
+## none of these rules can fire on it. On 2026-09-19 it was false on THREE of
+## the seven clusters — bootstrap/gitlab-pg, jump/guac-pg, paperless/paperless-pg
+## — which is part of why paperless-pg archived WAL happily while completing
+## zero base backups for months (beads infra-g80u). Enabled for all three in the
+## same MR as this file. A new CNPG cluster MUST set it, or it is invisible here.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cnpg-backups
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: cnpg-backups.freshness
+      rules:
+        ## max() by namespace: only the PRIMARY reads the barman object-store
+        ## catalog; replicas publish this metric as 0. Without the aggregation a
+        ## replica's 0-series satisfies any staleness threshold and false-fires.
+        ## (Same reasoning as HomeAssistantRecorderBackupStale, which this
+        ## generalises — see 23-ha-recorder.yml.)
+        ##
+        ## `> 0` inside the max() drops the replica zeros. That makes this rule
+        ## fail OPEN for a cluster whose series are ALL zero — deliberately, so
+        ## that case gets its own, much louder rule below. The two are a pair:
+        ## this one means "backups ran and then stopped", the next means
+        ## "backups never ran at all". Never delete one without the other.
+        ##
+        ## 93600s = 26h: daily cadence + runtime + buffer, matching the existing
+        ## ha-recorder rule rather than inventing a second number.
+        ##
+        ## litellm is excluded by name: it is the one cluster with no
+        ## barmanObjectStore at all, an ACCEPTED exemption recorded in
+        ## ~/backup-readiness-report.py section 7 and beads infra-4882. It is
+        ## excluded here so the exemption is explicit and greppable, rather than
+        ## silently swallowed by the `> 0` filter.
+        - alert: CnpgBackupStale
+          expr: |
+            time() - max by (namespace) (
+              cnpg_collector_last_available_backup_timestamp{namespace!="litellm"} > 0
+            ) > 93600
+          for: 1h
+          labels:
+            service: '{{ or $labels.cluster "cnpg" }}'
+            severity: warning
+            component: Backups
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}: base backup {{ $value | humanizeDuration }} old"
+            description: |
+              No successful base backup has landed in this cluster's barman
+              object store for >26h. Continuous WAL archiving may still protect
+              PITR, but the base-backup anchor is aging and every restore means
+              a longer WAL replay.
+              Check: `kubectl -n {{ $labels.namespace }} get backups.postgresql.cnpg.io`
+              and the cluster's LastBackupSucceeded condition. Common causes:
+              instance-manager restart mid-backup; the object store rejecting
+              writes; a ScheduledBackup that was removed.
+              Store since 2026-09-19 is the in-cluster Ceph RGW over house-PKI
+              TLS (s3://cnpg-<cluster>), not the retired salt/pepper Garage.
+
+        ## ⭐ THE ONE THAT WOULD HAVE CAUGHT infra-g80u ON DAY ONE.
+        ## paperless-pg had barmanObjectStore CONFIGURED and WAL archiving
+        ## SUCCEEDING while never once completing a base backup. Everything
+        ## looked healthy; WAL without a base backup is NOT restorable. The
+        ## catalog reports 0 in that state, which the staleness rule above
+        ## cannot see because it filters zeros.
+        ##
+        ## No `for:` shorter than an hour: a freshly created cluster legitimately
+        ## reads 0 until its first base backup completes.
+        - alert: CnpgClusterNeverBackedUp
+          expr: |
+            max by (namespace) (
+              cnpg_collector_last_available_backup_timestamp{namespace!="litellm"}
+            ) == 0
+          for: 1h
+          labels:
+            service: '{{ or $labels.cluster "cnpg" }}'
+            severity: critical
+            component: Backups
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}: NO base backup has EVER completed"
+            description: |
+              The barman catalog reports no available backup at all. If WAL
+              archiving is succeeding this looks healthy from every other angle
+              and is NOT restorable — WAL replay needs a base backup to replay
+              onto. This is exactly the paperless-pg failure (beads infra-g80u),
+              which went unnoticed for months.
+              Check: `kubectl -n {{ $labels.namespace }} get cluster.postgresql.cnpg.io -o yaml`
+              for a `backup.barmanObjectStore` stanza and a ScheduledBackup, then
+              force one: `kubectl -n {{ $labels.namespace }} create -f -` with a
+              Backup CR, and watch it reach phase `completed`.
+              ⚠️ A brand-new cluster reads 0 until its first base backup lands;
+              that is what the 1h `for:` absorbs. Anything longer is real.
+
+    - name: cnpg-backups.instrumentation
+      rules:
+        ## Fail-closed companion: the cluster IS scraped (the collector is up)
+        ## but publishes no backup-catalog series, so neither rule above can
+        ## evaluate for it. Means the barman cloud catalog read is broken, or
+        ## the cluster has no backup stanza at all.
+        ##
+        ## Derived by set difference, so it needs no hand-maintained namespace
+        ## list — a list is what goes stale and produces false negatives exactly
+        ## where they hurt most. It cannot, however, see a cluster that is not
+        ## scraped AT ALL: that is what enablePodMonitor guarantees, and what
+        ## f/probe/pvc_backup_coverage catches independently from the API.
+        - alert: CnpgBackupCatalogMissing
+          expr: |
+            (count by (namespace) (cnpg_collector_up) > 0)
+              unless (count by (namespace) (cnpg_collector_last_available_backup_timestamp))
+          for: 1h
+          labels:
+            service: '{{ or $labels.cluster "cnpg" }}'
+            severity: warning
+            component: Backups
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}: scraped, but no backup-catalog metric"
+            description: |
+              cnpg_collector_up exists for this namespace but
+              cnpg_collector_last_available_backup_timestamp does not, so both
+              backup-freshness rules are silently unable to evaluate here.
+              Either the CNPG collector's barman catalog read is failing, or the
+              cluster has no barmanObjectStore configured.
+              Check the instance metrics endpoint and the operator logs:
+              `kubectl -n cnpg-system logs deploy/cnpg-controller-manager --tail=100`.

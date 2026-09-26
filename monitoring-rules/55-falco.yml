@@ -1,0 +1,278 @@
+## Falco — runtime security detection. Does the detector still work, and is it
+## telling us something NEW?  (bundle: fleet/falco/, deployed 2026-09-22)
+##
+## These rules deliberately do NOT alert on event volume. Falco's own
+## `falcosecurity_falco_rules_matches_total` carries `rule_name` and `priority`
+## but NOT the offending workload — its only k8s labels are Falco's own pod. So
+## a volume alert can say "1300 criticals an hour" and nothing about who did it;
+## attribution lives in the events (OpenObserve, stream `pod_logs`, filter
+## `k8s_namespace = 'falco'`, body in `_raw`).
+##
+## ⛔⛔ AND THE VOLUME WOULD BE A LIE ANYWAY, TODAY. Measured 2026-09-22 across
+## all three nodes: 4,824 events/h, of which "Drop and execute new binary in
+## container" is 1,300/h at priority 2 (Critical) — and ~811/h of that is Gitaly
+## exec'ing its own bundled git out of /tmp/gitaly-<random>/, which is simply how
+## Gitaly works. Alerting on priority<=3 before the phase-2 exception ruleset
+## lands would page continuously on a false positive, and the detector would be
+## muted within a week. A muted detector is worse than no detector.
+##   ⇒ The severity alert belongs in the SAME change as the exceptions. Not here.
+##
+## What IS here: "is Falco alive, complete, and unmuzzled", plus the novelty
+## signal that actually deserves a human — a rule firing that never fired before.
+##
+## ⚠️ priority is SYSLOG-NUMERIC, not a word: 2=Critical, 4=Warning, 5=Notice.
+## Verified 2026-09-22 against the live series; `priority="Critical"` matches
+## nothing and fails silently.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: falco
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-security.falco
+    rules:
+
+    ## ⭐ A Falco rule of CRITICAL severity or worse matched.
+    ##
+    ## ⚠️ This alert was deliberately WITHHELD from the first version of this
+    ## file and is armed now, in the same change as the phase-2 exceptions,
+    ## because until those landed it would have paged continuously: "Drop and
+    ## execute new binary in container" is priority 2 and ran at ~1,300/h, of
+    ## which 74.5% was Gitaly exec'ing its own bundled git. An alert that pages
+    ## on a known false positive gets muted, and a muted detector is worse than
+    ## no detector — so arming it and scoping the noise had to be one commit.
+    ##
+    ## ⚠️ `priority` is syslog-numeric and the label is a STRING, so the match is
+    ## a regex over digits: 0=Emergency … 3=Error. `priority<=3` would compare
+    ## nothing.
+    ##
+    ## `for: 10m` because this fires on a rate, not a single event, and
+    ## Alertmanager groups by alertname+rule_name — so even a genuine burst is
+    ## one notification per rule, not one per event.
+    - alert: FalcoCriticalRuleFiring
+      expr: |
+        sum by (rule_name) (increase(falcosecurity_falco_rules_matches_total{priority=~"[0-3]"}[15m])) > 0
+      for: 10m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Falco CRITICAL rule matched: {{ $labels.rule_name }}"
+        description: |
+          A rule at syslog priority 0-3 (Emergency/Alert/Critical/Error) has
+          been matching for 10 minutes.
+          The metric cannot say WHICH workload — attribute it in OpenObserve:
+            SELECT _raw FROM "pod_logs"
+             WHERE k8s_namespace = 'falco'
+               AND _raw LIKE '%{{ $labels.rule_name }}%'
+             ORDER BY _timestamp DESC LIMIT 20
+          (no full-text index on that stream, so LIKE rather than match_all)
+          If this turns out to be another structural false positive, scope it in
+          falco/values.yml customRules — extend the rule's own macro, never
+          disable the rule.
+
+    ## Falco is not on every node — i.e. part of the cluster is unwatched.
+    ##
+    ## ⭐ The expected count is DERIVED from kube_node_info (3 today), never
+    ## hardcoded. That is the whole lesson of the kube-audit gap fixed the same
+    ## day: a DaemonSet whose selector matched 2 of 3 nodes read 2/2 READY and
+    ## nothing noticed a third of the estate was uncollected. Readiness cannot
+    ## see a fleet that silently shrank; only a comparison against the topology
+    ## can.
+    ##
+    ## `or vector(0)` on both sides: count() over an absent selector returns
+    ## EMPTY, not 0, and an empty result makes the comparison vanish rather than
+    ## fire — so the alert would go quiet at exactly the moment Falco disappeared
+    ## entirely.
+    - alert: FalcoNodeCoverageIncomplete
+      expr: |
+        (count(up{job="falco-metrics"} == 1) or vector(0))
+          < (count(kube_node_info) or vector(0))
+      for: 15m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Falco is running on fewer nodes than the cluster has"
+        description: |
+          Some node is running workloads with no syscall visibility at all.
+          15m tolerates a rolling update; beyond that it is a real gap.
+          Check: kubectl -n falco get ds falco -o wide
+          Then: kubectl -n falco get pods -o wide, and compare against
+          kubectl get nodes. A node missing from the DaemonSet usually means a
+          taint it does not tolerate, or a node that joined without the labels
+          the scheduler expects.
+
+    ## Falco is up but has matched NOTHING for six hours.
+    ##
+    ## This is the mandatory partner to any `> 0` alert: a threshold on "too many
+    ## events" fails OPEN — it is satisfied by a detector that died. On this
+    ## cluster the floor is ~4,800 events/h, so six hours of exactly zero means
+    ## the probe detached, not that the estate went quiet.
+    ##
+    ## ⚠️ The `and on()` guard suppresses this during the first six hours after a
+    ## fresh install, when increase() legitimately has no window to measure.
+    - alert: FalcoSilent
+      expr: |
+        (sum(increase(falcosecurity_falco_rules_matches_total[6h])) or vector(0)) == 0
+          and on() (count(falcosecurity_falco_version_info offset 6h) > 0)
+      for: 30m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Falco has matched no rule at all for 6h — the probe is likely detached"
+        description: |
+          Falco reports healthy but sees nothing. Expected floor is ~4,800
+          events/h across three nodes, so zero is not quiet, it is blind.
+          Check the driver actually attached:
+            kubectl -n falco logs ds/falco -c falco | grep -i "modern BPF probe"
+          A pod that is Running with no probe looks identical to a working one
+          from the outside. `lsmod | grep falco` must stay EMPTY (we run
+          modern_ebpf, no kernel module) — that is not the fault here.
+
+    ## ⭐ THE SIGNAL WORTH READING: a rule fired that has never fired before.
+    ##
+    ## Volume tells you about the estate's habits; novelty tells you something
+    ## changed. Only 7 distinct rules have ever matched here (6 on 2026-09-22
+    ## plus "Run shell untrusted" hours later), so an eighth is genuinely worth a
+    ## look — including, and especially, after an exception is added, because a
+    ## too-broad exception shows up as a rule that STOPS appearing rather than
+    ## one that starts.
+    ##
+    ## ⚠️ `and on() count(... offset 7d) > 0` is not decoration: without it every
+    ## existing rule reads as "new" for the first seven days after install and
+    ## this fires seven times on day one. The guard says "only judge novelty once
+    ## Falco was actually running a week ago".
+    - alert: FalcoNewRuleFired
+      expr: |
+        (
+          count by (rule_name, priority) (falcosecurity_falco_rules_matches_total)
+            unless
+          count by (rule_name, priority) (falcosecurity_falco_rules_matches_total offset 7d)
+        )
+          and on() (count(falcosecurity_falco_version_info offset 7d) > 0)
+      for: 5m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: info
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "New Falco rule firing: {{ $labels.rule_name }} (priority {{ $labels.priority }})"
+        description: |
+          This rule has not matched in the previous 7 days. Priority is syslog
+          numeric: 2=Critical, 4=Warning, 5=Notice.
+          Attribute it — the metric cannot, only the events can:
+            OpenObserve -> stream pod_logs
+            SELECT _raw FROM "pod_logs"
+             WHERE k8s_namespace = 'falco'
+               AND _raw LIKE '%{{ $labels.rule_name }}%'
+             ORDER BY _timestamp DESC LIMIT 20
+          (pod_logs has NO full-text index, so match_all() returns nothing and
+          LIKE on _raw is the way in.)
+          Then decide: real finding, or a phase-2 exception candidate.
+
+    ## Syscalls were DROPPED — Falco was blind for that window.
+    ##
+    ## ⭐ Calibrated, not guessed: the counter already stands at ~141k, all of it
+    ## accumulated during the first seconds after each pod started (buffer
+    ## warm-up), while the 30m rate has been a flat 0 since. So a threshold on
+    ## the TOTAL would fire forever on startup noise and mean nothing; the rate
+    ## is the honest signal and its normal value is exactly zero.
+    - alert: FalcoSyscallDrops
+      expr: sum(rate(falcosecurity_scap_n_drops_total[15m])) > 0
+      for: 15m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Falco is dropping syscalls — events are being missed"
+        description: |
+          A dropped syscall is a blind window, not a performance statistic:
+          whatever happened in it was never evaluated against any rule.
+          Sustained drops usually mean the ring buffer is too small for the
+          event rate on a busy node, or the node is CPU-starved.
+          Per-node: sum by (pod) (rate(falcosecurity_scap_n_drops_total[15m]))
+          Lever: falco.syscall_event_drops / buffer dimension in
+          fleet/falco/values.yml (currently the 8 MB default).
+
+    ## ⭐ EXCLUSION INTEGRITY: the loaded ruleset changed.
+    ##
+    ## falcoctl's `follow` sidecar is deliberately DISABLED in our values, so the
+    ## ruleset must only ever change when a deploy lands. If this fires and
+    ## nobody deployed, something is rewriting detection rules underneath a
+    ## running Falco — which would also silently retire every exception we rely
+    ## on, with no diff and nothing in git to show for it.
+    ##
+    ## This is the answer to "how do I know my exclusions are still the ones I
+    ## wrote": the hash is the exclusions' fingerprint.
+    ##
+    ## ⚠️ It fires ONCE on a legitimate deploy too. That is intended — it is the
+    ## confirmation the new ruleset actually reached all three nodes.
+    - alert: FalcoRulesetChanged
+      expr: |
+        (
+          count by (sha256) (falcosecurity_falco_sha256_rules_files_info{file_name="falco_rules.yaml"})
+            unless
+          count by (sha256) (falcosecurity_falco_sha256_rules_files_info{file_name="falco_rules.yaml"} offset 1d)
+        )
+          and on() (count(falcosecurity_falco_version_info offset 1d) > 0)
+      for: 10m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: info
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Falco's loaded ruleset hash changed ({{ $labels.sha256 }})"
+        description: |
+          Expected right after a fleet/falco deploy — in that case this is the
+          proof it landed. If nothing was deployed, investigate: falcoctl
+          'follow' is disabled on purpose precisely so this cannot happen on its
+          own, and a changed ruleset means every exception we depend on may no
+          longer be in force.
+          Compare across nodes:
+            count by (sha256) (falcosecurity_falco_sha256_rules_files_info)
+
+    ## The three nodes disagree about which ruleset they are running.
+    ##
+    ## Normal only during a rollout. Sustained divergence means one pod never
+    ## restarted and is still enforcing the previous rules — so an exception you
+    ## believe is live is live on two nodes out of three, which is the kind of
+    ## partial truth that makes an incident unreadable afterwards.
+    - alert: FalcoRulesetDiverged
+      expr: |
+        count(count by (sha256) (falcosecurity_falco_sha256_rules_files_info{file_name="falco_rules.yaml"})) > 1
+      for: 20m
+      labels:
+        service: 'falco'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}falco{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Falco nodes are running different rulesets"
+        description: |
+          More than one distinct falco_rules.yaml hash is live at once, for over
+          20 minutes — longer than any rollout here takes.
+          Find the odd one out:
+            count by (pod, sha256) (falcosecurity_falco_sha256_rules_files_info)
+          Then restart it: kubectl -n falco delete pod <pod>

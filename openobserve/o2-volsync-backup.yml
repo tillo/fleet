@@ -1,0 +1,124 @@
+## File-level backup for data-openobserve-0 (added 2026-09-22).
+##
+## ⛔ This PVC had NO ReplicationSource at all. It was found while taking a
+## one-off VolumeSnapshot before the v0.92.0 -> v1.0.3 upgrade: that snapshot was
+## the only copy of this volume that had ever existed.
+##
+## ─── What is actually AT RISK here, and what is not ──────────────────────────
+## The bulk of OpenObserve's data — the parquet — lives in Ceph RGW (bucket
+## `openobserve`), NOT on this PVC, and is protected separately. What is on this
+## PVC is the part with no other copy:
+##   * the SQLite METADATA db — stream definitions and per-stream retention,
+##     users and service accounts, dashboards, alerts, and the CIPHER KEY
+##     definitions (the Akeyless DFC wrapping). Losing it does not lose the logs;
+##     it loses every piece of configuration that makes them findable.
+##   * the WAL (not yet flushed to object storage)
+##   * the local query cache — transient and re-derivable, backed up only because
+##     VolSync has no exclude support. restic dedupes it, so the cost is small.
+##
+## ⚠️ There is a second, sharper reason this matters now. v1.0.x validates
+## ZO_ROOT_USER_PASSWORD strength and PANICS on a weak one, but only inside
+## `if !db::user::root_user_exists()`. Our stored root password has no special
+## character, so it is harmless while the meta DB exists — and a FIRST BOOT
+## against an empty PVC would crash-loop. A restore of this volume is therefore
+## also what keeps that landmine disarmed.
+##
+## ⚠️ Crash-consistency, stated rather than assumed: this snapshots a LIVE SQLite
+## database. The copy can land mid-transaction; SQLite is designed to recover
+## from exactly that via its journal/WAL, so the restore is expected to be
+## consistent-but-rolled-back-to-the-last-commit, not corrupt. It is not a
+## quiesced dump and should not be described as one.
+##
+## Shared /mdapi/volsync/ceph-backup creds, per-PVC subpath in the B2 bucket —
+## same convention as jump/esphome/paperless.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: openobserve
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## B2 direct, region us-west-001 (read from b2_authorize_account's
+        ## s3ApiUrl — do not guess the region, 002/003/004 all fail in a way that
+        ## reads as "B2 is not S3 compatible"). restic encrypts client-side, so
+        ## this bucket is in the offsite job's NO_ENCRYPT set by design.
+        RESTIC_REPOSITORY: "s3:https://s3.us-west-001.backblazeb2.com/saltminio/ceph-backup/data-openobserve-0"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .b2_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .b2_app_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: b2_key_id
+      remoteRef:
+        key: /mdapi/volsync/b2/account-id
+    - secretKey: b2_app_key
+      remoteRef:
+        key: /mdapi/volsync/b2/account-key
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: data-openobserve-0
+  namespace: openobserve
+spec:
+  sourcePVC: data-openobserve-0
+  trigger:
+    ## Every 6h rather than daily. The RPO that matters is CONFIGURATION, not
+    ## log data (that is in RGW): losing a day of dashboard, alert and cipher-key
+    ## changes is a real loss, and restic dedupe makes the extra runs nearly free
+    ## at this file count.
+    schedule: "23 */6 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    ## Longhorn PVC (harvester-longhorn-2replicas), so the Longhorn snapshot
+    ## class — NOT ceph-block, which the jump/esphome sources use because those
+    ## PVCs are Ceph. `longhorn-snapshot` is type "snap" (in-cluster), which is
+    ## what a mover wants; the plain `longhorn` class means a backupstore backup.
+    volumeSnapshotClassName: longhorn-snapshot
+    ## OpenObserve runs with fsGroup 10001 (see o2-sts.yml), so the volume is
+    ## group-owned by 10001 and group-readable. The mover must match the data
+    ## owner or it simply cannot read the files.
+    ## fsGroup is NOT optional: VolSync provisions the cache PVC root-owned, and
+    ## a mover pinned to a uid without it gets
+    ##   "unable to open cache: open /cache/CACHEDIR.TAG: permission denied"
+    ## and then runs CACHELESS — still reporting Successful while re-reading
+    ## everything every run. Learned on jump, 2026-09-02.
+    moverSecurityContext:
+      runAsUser: 10001
+      runAsGroup: 10001
+      runAsNonRoot: true
+      fsGroup: 10001
+      ## Skip kubelet's recursive chown of every file on every mover run
+      ## (2026-09-23, infra-health VolSyncBackupMissedIntervals). This WORKS
+      ## here because the app pod also runs fsGroup 10001 (default policy
+      ## Always), which leaves the volume root gid 10001 + g+rwx + setgid —
+      ## exactly what kubelet's requiresPermissionChange() tests, so the mover
+      ## (on a snapshot clone of it) skips the walk. It does NOT work on a
+      ## source whose root is e.g. 0755 without setgid (jump-home-ceph):
+      ## there the walk still runs, so it was not added there.
+      fsGroupChangePolicy: OnRootMismatch
+    ## Sized from measurement, not habit: 36,199 inodes and 9.07 GiB used
+    ## (kubelet_volume_stats, 2026-09-22). restic's cache scales with FILE COUNT
+    ## and snapshot churn rather than with data size — jump needed 16Gi at 245k
+    ## files and wedged at 4Gi. 36k files is ~1/7 of that, so 4Gi is roughly the
+    ## same ratio of headroom. Re-measure before shrinking it.
+    cacheCapacity: 4Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      hourly: 8
+      daily: 7
+      weekly: 4
+      monthly: 6

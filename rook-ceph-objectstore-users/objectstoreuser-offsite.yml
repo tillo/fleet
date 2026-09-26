@@ -1,0 +1,52 @@
+## The identity the offsite sweep uses to ENUMERATE buckets in this object store.
+##
+## WHY IT EXISTS
+## `f/config_backup/rgw_offsite_backup` derives which buckets to replicate to
+## B2 from the `offsite-backup` key's grants in Garage. As the salt/pepper Garage
+## is decommissioned its tenants moved here, and nothing could see them: RGW has
+## no equivalent cross-user grant that an S3 key can list.
+##
+## ⛔⛔ ADMIN CAPS AND S3 DATA ACCESS ARE TWO DIFFERENT PERMISSION SYSTEMS.
+## Verified 2026-09-19: with the capabilities below this user enumerates all 23
+## buckets through `GET /admin/bucket`, and is denied **403** on a plain
+## `list-type=2` of every single one of them, including buckets it can see. Do
+## not assume one implies the other.
+##
+## ⭐ SO THE DATA GRANT IS A PER-BUCKET POLICY, NOT A SYSTEM USER.
+## The obvious fix is `radosgw-admin user modify --system`, which makes one
+## credential able to read the entire object store. A bucket policy is strictly
+## better and is what is deployed (`~/rgw-offsite-grant.py`):
+##   * read-only, and only on buckets that are actually backups;
+##   * ⭐ THE GRANT IS THE CONTROL, exactly as `garage bucket allow/deny` was.
+##     The sweep set is DERIVED from what this user can read — never a
+##     hand-maintained list, which is what let bussola-pg-backup go unswept for
+##     two days (2026-08-31);
+##   * revoking is one call and takes effect immediately.
+##
+## Granted 2026-09-19 on 9 buckets: cnpg-{bussola,gitlab,grafana,guac,
+## ha-recorder,paperless}-pg, config-backups, home-assistant-backups,
+## longhorn-backup. Deliberately NOT gitlab-* (live object storage, not a
+## backup), frigate-recordings (bulky, regenerable), openobserve, or zot-images
+## (a rebuildable registry cache).
+##
+## ⚠️ A bucket that loses its policy leaves the sweep SILENTLY. That is only
+## acceptable because the coverage probe flags RGW buckets that are not swept —
+## do not rely on this mechanism without that alert.
+##
+## ⚠️ Rook cannot express `--system`, and deliberately so here; it CAN express
+## the capabilities below. Keys are mirrored to Akeyless
+## /mdapi/offsite/rgw/{access-key,secret-key} for the Windmill job.
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: offsite
+  namespace: rook-ceph
+spec:
+  store: ceph-objectstore
+  displayName: Offsite sweep (bucket enumeration)
+  capabilities:
+    ## Enumeration only. `buckets: read` is what makes GET /admin/bucket work;
+    ## `metadata: read` lets the sweep read bucket stats without owning them.
+    ## Neither grants a single byte of object data — see above.
+    buckets: read
+    metadata: read

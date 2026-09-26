@@ -1,0 +1,34 @@
+## https://plex-auth.mdapi.ch -- the bridge's public face. The browser needs it for
+## /authorize (-> app.plex.tv) and /callback (back from Plex); nothing else here is
+## meant for people.
+##
+## Rate limit: one sign-in is ~2 requests from the browser (/authorize, /callback),
+## so 20 rpm per address is ample; the bridge also runs its own per-IP limiter
+## (TRUST_PROXY_HEADERS). ModSecurity/CRS stays on (the controller default).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: plex-oidc-bridge
+  namespace: plex-auth
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/limit-rpm: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: plex-auth.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: plex-oidc-bridge
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - plex-auth.mdapi.ch
+      secretName: plex-auth-tls
