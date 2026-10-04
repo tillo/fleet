@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-mcp
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-mcp
+  template:
+    metadata:
+      labels:
+        app: k8s-mcp
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - name: kube-mcp-server
+        image: registry.mdapi.ch/mdapi/kubernetes-mcp-server:latest@sha256:043bcaef0c0bdeb87722d015bfb851d9c4252a12dbfc82fd896325b8d07fb98c
+        imagePullPolicy: Always
+        args:
+          - --port
+          - "9090"
+          - --kubeconfig
+          - /etc/kubeconfig/kubeconfig
+          - --stateless
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        volumeMounts:
+        - name: secrets
+          mountPath: /etc/kubeconfig
+          readOnly: true
+
+      # Kept fully-qualified (library/caddy) because that is what LIVE holds:
+      # Keel wrote the canonical form back on its last force-poll and the value
+      # outlived the daemon (retired 2026-10-02). Declaring the short form
+      # caddy:2-alpine would drift against live -> Fleet Modified.
+      #
+      # PINNED BY TAG + DIGEST since 2026-09-03 — do not go back to :2-alpine.
+      # `2-alpine` is a major-line tag: it rolls across 2.x MINORS on its own
+      # (it is how we got to 2.11.4). For a reverse proxy whose whole job is a
+      # Caddyfile in the k8s-mcp-caddy ConfigMap that is a config contract — a
+      # renamed/retired directive in a 2.x minor takes the MCP endpoint down
+      # unattended, with nobody reading the release notes. Renovate owns this
+      # now (renovate.json) and opens an MR with changelog for 2.12+.
+      #
+      # Mixed-lane pod: kubernetes-mcp-server above is Lane A (`:latest` + digest),
+      # this container is Lane B (pinned tag + digest). The Keel annotations that
+      # used to be what kept the Lane-A container updated are gone with the
+      # 2026-10-02 retirement — Renovate reads BOTH refs out of this file now, so
+      # the split is a comment-level distinction, not an annotation one.
+      # Leave imagePullPolicy unset: a non-latest tag defaults to IfNotPresent,
+      # which keeps this Lane B. Do NOT set Always (lint: pinned+Always re-pulls
+      # every start and cannot boot when the registry is down).
+      - name: caddy
+        image: library/caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+        ## Explicit since 2026-09-28: live read `Always` while git declared nothing
+        ## (ledger alert:ImagePolicyWarn).
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: k8s-mcp-secrets
+              key: AUTH_TOKEN
+        volumeMounts:
+        - name: caddy-config
+          mountPath: /etc/caddy
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+          limits:
+            memory: 64Mi
+
+      imagePullSecrets:
+      - name: mdapi-registry
+
+      volumes:
+      - name: secrets
+        secret:
+          secretName: k8s-mcp-secrets
+          items:
+          - key: kubeconfig
+            path: kubeconfig
+            mode: 0600
+      - name: caddy-config
+        configMap:
+          name: k8s-mcp-caddy

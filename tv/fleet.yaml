@@ -1,0 +1,140 @@
+defaultNamespace: tv
+namespace: tv
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+# Sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running
+#      pods after start.
+#   2. A stale keel.sh/update-time, written live by Keel before it was
+#      retired for these workloads (2026-10-02). Fleet does not own that
+#      field, so an apply cannot remove it; the pointer stays until the
+#      pod templates recycle.
+#   3. Manual `kubectl rollout restart` writes kubectl.kubernetes.io/
+#      restartedAt onto the pod template.
+#
+# Workloads moved to VPA Auto on 2026-06-04 (after radarr OOM-looped
+# under VPA Off): radarr, sonarr, bazarr, prowlarr, pms-docker, tdarr,
+# autobrr, threadfin, transmission-pia. sftpgo was already on Auto.
+# All entries below strip /containers[*]/resources, which VPA rewrites.
+# The image is deliberately NOT stripped: git carries the resolved digest
+# (Renovate Lane A), so an image difference is a real change that must roll.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: sftpgo
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: radarr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: sonarr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: bazarr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: prowlarr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: pms-docker
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: tdarr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: autobrr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: threadfin
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: seerr
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"
+
+  ## transmission-pia has 3 containers (transmission + pia + port-manager).
+  ## VPA Auto only writes resources on container[0] (transmission); pia +
+  ## port-manager have NO `resources` in this manifest, so a `remove` op on
+  ## /containers/{1,2}/resources is a BOGUS PATH that fails the ENTIRE
+  ## comparePatch (Fleet discards all ops) -> drift never stripped, bundle
+  ## stuck Modified. Only strip resources where they exist (c0).
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: transmission-pia
+    namespace: tv
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+    jsonPointers:
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"

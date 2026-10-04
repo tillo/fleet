@@ -1,0 +1,95 @@
+## Open-Terminal — shell access tool for chat.mdapi.ch.
+##
+## A remote shell + file API that Open WebUI's terminal tool calls in-cluster
+## (same shape as searxng: no ingress, one consumer, ClusterIP only). The API
+## key comes from Akeyless via open-terminal-es.yml; the image reads it as
+## OPEN_TERMINAL_API_KEY — NOT API_KEY, which it ignores and then falls back to
+## an auto-generated key (verified: /app/entrypoint.sh file_env).
+##
+## IMAGE LANE — pinned + Renovate (Lane-B), NOT Keel: the repo publishes semver
+## tags (0.14.0, …), so Renovate owns the bump via the
+## ghcr.io/open-webui/open-terminal rule in renovate.json (MR-only, ghcr opt-out).
+##
+## /home/user is the agent's working directory and lives on the open-terminal-home
+## PVC, so Recreate is deliberate: an RWO volume must never be held by two pods
+## at once (the same reason openwebui itself uses Recreate). uid/gid 1000 is the
+## image's `user` account.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-terminal
+  namespace: openwebui
+  annotations:
+    # Restart when the Akeyless-backed Secret rotates.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-terminal
+  template:
+    metadata:
+      labels:
+        app: open-terminal
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: open-terminal
+        image: ghcr.io/open-webui/open-terminal:0.14.0@sha256:81a5394b3cd4ae32adb600f2135f09ee124de37f26b0a780e2f5692472c0fc5c
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        env:
+        - name: OPEN_TERMINAL_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: open-terminal-secret
+              key: OPEN_TERMINAL_API_KEY
+        volumeMounts:
+        - name: home
+          mountPath: /home/user
+        resources:
+          # The `latest`-line image bundles LibreOffice (and sudo) for office
+          # conversions; 512Mi was OOM territory for a big PPTX/DOCX render and
+          # for agent scratch work. 2Gi is the same headroom call as openwebui
+          # (which also loads lazy models), not a measured peak — raise again if
+          # a conversion still gets OOMKilled.
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+        readinessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet: { path: /health, port: 8000 }
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: home
+        persistentVolumeClaim:
+          claimName: open-terminal-home
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-terminal
+  namespace: openwebui
+spec:
+  selector:
+    app: open-terminal
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP

@@ -1,0 +1,26 @@
+# Single-address pool for the split-horizon resolver's well-known DNS VIP.
+# autoAssign:false so it is never handed to any other Service — only the
+# split-horizon/unbound Service, which explicitly pins loadBalancerIP
+# 192.168.1.1, can take it.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: split-horizon
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.1.1/32
+  autoAssign: false
+  avoidBuggyIPs: false
+---
+# L2Advertisement scoped to mgmt-br only, matching prod-pool-l2.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: split-horizon-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - split-horizon
+  interfaces:
+    - mgmt-br

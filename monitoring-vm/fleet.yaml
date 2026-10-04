@@ -1,0 +1,37 @@
+defaultNamespace: monitoring
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  - name: mdapi-prod-monitoring-vm-operator
+helm:
+  maxHistory: 25
+  takeOwnership: true
+# VMSingle/VMAgent get reconciled by the operator at runtime — pod resources
+# may end up rewritten, image tags follow the operator's release.
+diff:
+  comparePatches:
+  - apiVersion: operator.victoriametrics.com/v1beta1
+    kind: VMSingle
+    name: mdapi
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/resources"}
+  - apiVersion: operator.victoriametrics.com/v1beta1
+    kind: VMAgent
+    name: mdapi
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/resources"}
+  - apiVersion: operator.victoriametrics.com/v1beta1
+    kind: VMAlert
+    name: mdapi
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/resources"}
+  - apiVersion: operator.victoriametrics.com/v1beta1
+    kind: VMAlertmanager
+    name: mdapi
+    namespace: monitoring
+    operations:
+    - {"op": "remove", "path": "/spec/resources"}

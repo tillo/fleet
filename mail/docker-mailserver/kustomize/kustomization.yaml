@@ -1,0 +1,21 @@
+# Post-renders the docker-mailserver chart (see ../fleet.yml). Fleet feeds the
+# helm-rendered manifests in as the kustomize base, then applies this patch
+# (same pattern as metallb/ and cribl/). Patch-only, no `resources:` — same
+# shape as metallb/kustomize, which carries no resources key either.
+#
+# ⛔ This overlay exists for exactly ONE reason. The chart hardcodes
+# `image: {{ .Values.image.name }}:{{ .Values.image.tag }}` in its Deployment
+# template and exposes no `repository`/`tag` pair, so Renovate's helm-values
+# manager — whose heuristic needs a key ending in `image` holding BOTH
+# `repository` and `tag|version` — can never match the ref in ../values.yml.
+# No values-file rule could ever have reached it. Declared here as a
+# Deployment-shaped patch, the ref falls to the kubernetes manager instead,
+# which already owns the Lane-A pinDigests + digest-automerge rules: no new
+# renovate.json rule was needed, and nothing had to be carved back out.
+# ⚠️ The patch carries NO namespace: this chart renders the Deployment without
+# one (metallb's does render it, and that patch sets it for that reason), and
+# kustomize matches on namespace — a namespaced patch against a namespace-less
+# base fails the whole build with "no matches for Id". Verified with
+# `kubectl kustomize` on both shapes before committing.
+patchesStrategicMerge:
+- deployment-image-pin.yaml

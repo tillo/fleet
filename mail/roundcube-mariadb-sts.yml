@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: roundcube-mariadb
+  namespace: mail
+spec:
+  serviceName: roundcube-mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: roundcube-mariadb
+  template:
+    metadata:
+      labels:
+        app: roundcube-mariadb
+    spec:
+      priorityClassName: mdapi-critical
+      securityContext:
+        fsGroup: 999
+      containers:
+      - name: mariadb
+        ## library/ prefix = what Keel canonicalized the live ref to on its
+        ## 2026-08-04 force-pull. Keel is retired (2026-10-02) and this ref is
+        ## Renovate-owned, but git must still match the live object or the
+        ## bundle latches Modified.
+        image: library/mariadb:12@sha256:2bdff1534a7e569fecaf4b10b66ad0d410806e382d9db29ba305448addda97c4
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: mysql
+          containerPort: 3306
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: MARIADB_AUTO_UPGRADE
+          value: "1"
+        - name: MARIADB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: roundcube-mariadb-credentials
+              key: mariadb-root-password
+        - name: MARIADB_DATABASE
+          value: roundcube
+        - name: MARIADB_USER
+          value: roundcube
+        - name: MARIADB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: roundcube-mariadb-credentials
+              key: mariadb-password
+        readinessProbe:
+          exec:
+            command: ["sh", "-c", "mariadb-admin ping -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["sh", "-c", "mariadb-admin ping -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        recurring-job.longhorn.io/source: enabled
+        recurring-job-group.longhorn.io/default: enabled
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: harvester-longhorn-2replicas
+      resources:
+        requests:
+          storage: 10Gi

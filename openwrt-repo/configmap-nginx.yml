@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openwrt-repo-nginx
+  labels:
+    app: openwrt-repo
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+      root /srv;
+      autoindex off;          # never list a release tree
+      server_tokens off;
+
+      # The feed is the only thing that carries private content, so it is the
+      # only thing served. $remote_addr is the true TCP peer: the Service is
+      # externalTrafficPolicy: Local and nothing proxies in front of us, so
+      # there is no X-Forwarded-For to forge (see fleet.yaml).
+      location /feed/ {
+        allow 192.168.1.254;  # bpi-r4, and nothing else
+        deny all;
+        alias /srv/feed/latest/;
+      }
+
+      # Firmware images, on a deliberately WIDER allowlist than the feed.
+      #
+      # The router cannot take a URL: LuCI's flash page only does
+      # ui.uploadFile('/tmp/firmware.bin', ...) and the URL-based flow (ASU) is
+      # a package this image does not build. So the operator's BROWSER has to
+      # fetch the image and then upload it -- a router-only allowlist here would
+      # make the webui upgrade impossible, which is the point of hosting it.
+      #
+      # That is safe because nothing carries .64 from the WAN (no DNAT; the VIP
+      # is answered on br-lan), so this only separates LAN networks from each
+      # other; and the image holds no credential -- jumpfail ships deliberately
+      # without them (see its files/jumpfail.env). It does embed jumpfail's
+      # estate blueprint, which is exactly why /feed/ stays router-only.
+      #
+      # wg_iot is absent on purpose: sensors do not need a 38 MiB image.
+      location /firmware/ {
+        allow 192.168.1.0/24;   # lan   - the seat an operator browses from
+        allow 192.168.7.0/24;   # dmz
+        allow 192.168.77.0/24;  # adlan
+        allow 10.99.0.0/24;     # wg_csm - remote operator
+        deny all;
+        alias /srv/firmware/latest/;
+      }
+
+      # Everything else, including the release directories themselves.
+      location / {
+        deny all;
+      }
+
+      # Unauthenticated on purpose: the kubelet probes from the node address,
+      # which is not the router. Returns no data and reads no file.
+      location = /healthz {
+        allow all;
+        access_log off;
+        return 200 "ok\n";
+      }
+    }

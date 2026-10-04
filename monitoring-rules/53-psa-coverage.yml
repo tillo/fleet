@@ -1,0 +1,135 @@
+## Does the Pod Security promise still hold? — producer f/probe/psa_coverage
+##
+## The cluster default is `enforce: privileged`: there is NO admission floor, and
+## a namespace carrying no label runs unconstrained. On 2026-09-21, 87 namespaces
+## were labelled `warn`+`audit`=baseline — chosen because their workloads already
+## passed — and `bootstrap` was added once it came back clean. That is a promise:
+## nothing in those namespaces violates baseline, and somebody hears about it if
+## that changes.
+##
+## ⚠️ NOTHING IS ENFORCED. `warn` reaches only the API client that made the call —
+## a CI job's stdout, a Fleet controller log — and `audit` reaches a log that no
+## ClusterFlow routes. So a violating workload lands, one line is printed
+## somewhere nobody reads, and the cluster forgets. These rules are the only thing
+## that would say otherwise.
+##
+## Real-time violation COUNTS come free from the API server itself
+## (pod_security_evaluations_total, already scraped). What that metric cannot say
+## is WHICH namespace — its `namespace` label is the apiserver's own — so the
+## probe supplies attribution and these rules alert on the probe.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: psa-coverage
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-security.psa-coverage
+    rules:
+
+    ## A namespace that promised baseline and now violates it. The regression
+    ## signal, and the reason the labels exist at all.
+    ##
+    ## ⭐ `for: 2h` is not caution, it is a known oscillator. `bootstrap` hosts
+    ## GitLab CI runner pods that violate baseline (forbidden AppArmor profile)
+    ## for the length of a pipeline and then vanish. Those pods come from the
+    ## runner, not from a stored workload template, so the probe cannot judge them
+    ## ahead of time and a shorter window would page on every build. Two hours is
+    ## longer than any pipeline here and far shorter than a workload that landed
+    ## and stayed.
+    - alert: PsaBaselineRegression
+      expr: psa_labelled_violating > 0
+      for: 2h
+      labels:
+        service: 'pod-security'
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "{{ $value }} namespace(s) promised Pod Security baseline and now violate it"
+        description: |
+          A namespace labelled warn+audit=baseline is running something that
+          breaks baseline, and has been for over two hours — so it is a workload
+          that landed, not a CI pod passing through.
+          Name it: the probe logs one PSA-REGRESSION line per namespace.
+          Read the run: wmill job list --script-path f/probe/psa_coverage
+          Then decide: fix the workload, or drop the namespace's label and admit
+          it is an exemption. Leaving the label on a violating namespace is the
+          one outcome to avoid — it makes the promise a lie.
+
+    ## A namespace that conforms but carries no label: a free win going unclaimed,
+    ## and the fingerprint of Fleet recreating a namespace. Fleet stamps
+    ## namespaceLabels ONLY at namespace creation and never reconciles them, so a
+    ## recreated namespace returns bare while its bundle reports Ready.
+    ##
+    ## ⭐ `for: 6h` makes this a claim about PERSISTENT conformity. A namespace
+    ## with intermittent workloads drifts in and out of conforming all day; only
+    ## one that has been quiet for six hours is genuinely a missed opportunity.
+    ## `info` because nothing is worse than before — the namespace was never
+    ## labelled — so this is a to-do, not an incident.
+    - alert: PsaLabelDrift
+      expr: psa_unlabelled_conforming > 0
+      for: 6h
+      labels:
+        service: 'pod-security'
+        severity: info
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "{{ $value }} namespace(s) would pass Pod Security baseline but carry no label"
+        description: |
+          Free coverage available, or a namespace that lost its labels when Fleet
+          recreated it. The probe logs one PSA-DRIFT line per namespace.
+          Claim it:
+            kubectl -n <ns> label ns <ns> --overwrite \
+              pod-security.kubernetes.io/warn=baseline \
+              pod-security.kubernetes.io/warn-version=latest \
+              pod-security.kubernetes.io/audit=baseline \
+              pod-security.kubernetes.io/audit-version=latest
+
+    ## Half a promise: warn without audit tells the caller and nobody else, audit
+    ## without warn tells a log and not the caller.
+    ##
+    ## ⭐ Threshold is > 1, not > 0, and the 1 is `jump`: deliberately
+    ## `enforce: privileged` with `warn: baseline` so its own violations stay
+    ## visible to whoever works in it. That is a considered state, not drift, so
+    ## the baseline is 1 and this fires on the SECOND one. Re-derive the number if
+    ## jump's labels ever change, rather than assuming this comment is still true.
+    - alert: PsaPartialLabel
+      expr: psa_namespaces_partial_label > 1
+      for: 1h
+      labels:
+        service: 'pod-security'
+        severity: info
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "{{ $value }} namespace(s) carry only half the Pod Security labels (accepted baseline: 1)"
+        description: |
+          A namespace has warn without audit, or the reverse. The probe logs one
+          PSA-PARTIAL line naming each and its actual label pair.
+          Either complete the pair or remove it; a half-set pair is the state
+          nobody can reason about later.
+
+    ## The probe's own silence is an alert. An unreadable API renders as zero
+    ## findings, which looks exactly like a healthy cluster — so the probe fails
+    ## CLOSED, pushing only this gauge and letting every other series vanish.
+    ## Staleness itself is already covered by the generic BatchJobStale rule via
+    ## psa_coverage_last_run_timestamp_seconds; this covers the different case of
+    ## a run that happened and could not see.
+    - alert: PsaCoverageCheckBroken
+      expr: psa_coverage_check_ok == 0
+      for: 30m
+      labels:
+        service: 'pod-security'
+        severity: warning
+        team: mdapi
+        component: Security
+      annotations:
+        summary: "Pod Security coverage probe ran but could not read the cluster"
+        description: |
+          f/probe/psa_coverage completed with an API failure, so every psa_*
+          gauge is ABSENT rather than zero. Coverage is unknown, not fine.
+          Read the failure: wmill job list --script-path f/probe/psa_coverage

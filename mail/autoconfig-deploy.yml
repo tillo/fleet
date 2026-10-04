@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoconfig
+  namespace: mail
+spec:
+  selector:
+    matchLabels:
+      app: autoconfig
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: autoconfig
+    spec:
+      priorityClassName: mdapi-critical
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: autoconfig
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: autoconfig
+        image: registry.mdapi.ch/mdapi/autoconfig:latest@sha256:d2ba536ad9ebc20ef04849198d1719b5dcc6c83cfaa19ac945826f42bdaef52c
+        imagePullPolicy: Always
+        resources: {}
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: MAIL_HOSTNAME
+          value: mail.mdapi.ch
+        - name: DISPLAY_NAME
+          value: "Martino Dell'Ambrogio Personal Infrastructure"
+        - name: DISPLAY_SHORT_NAME
+          value: MDAPI
+      imagePullSecrets:
+      - name: mdapi-registry

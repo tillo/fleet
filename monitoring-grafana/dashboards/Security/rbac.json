@@ -1,0 +1,527 @@
+{
+  "uid": "rbac-hygiene",
+  "title": "RBAC hygiene — bindings that outlived what created them",
+  "tags": [
+    "security",
+    "rbac",
+    "mdapi"
+  ],
+  "editable": true,
+  "links": [],
+  "refresh": "5m",
+  "schemaVersion": 36,
+  "timezone": "browser",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "version": 2,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**A binding is inert only while its subject cannot exist.** Recreate the namespace with the same account name and the grant is live again, silently — which is how two `cluster-admin` bindings to a decommissioned Portainer survived until 2026-09-22, one of them since 2024. They were found by hand; nothing measured them.\n\nRead **left to right**: *privileged orphans* is the only number that justifies interrupting someone. *cluster-admin bindings* is a **drift** gauge — the level is inherited from Helm, Harvester and Rancher, the growth is the finding. Built-in Kubernetes RBAC (`kubernetes.io/bootstrapping`) is excluded: without that filter 10 of every 12 findings are noise. Source: `f/probe/rbac_hygiene`, daily 05:17, read-only."
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Privileged orphans",
+      "description": "Bindings to cluster-admin, or to a role granting *:*, whose ServiceAccount subject cannot exist. Baseline 0 since the 2026-09-22 sweep. Anything above 0 is the exact class that caused this probe to be written.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_orphaned_bindings_privileged",
+          "refId": "A",
+          "legendFormat": "privileged",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Orphans — namespace gone",
+      "description": "The subject's whole namespace no longer exists. Strong signal: nothing recreates that identity by accident. Baseline 0.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_orphaned_bindings_namespace_gone",
+          "refId": "A",
+          "legendFormat": "namespace gone",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "cluster-admin bindings",
+      "description": "Total bindings to cluster-admin, builtins included. Baseline 23 on 2026-09-22, down from 25 after the Portainer sweep. The level is inherited from upstream tooling; growth is what matters.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_cluster_admin_bindings",
+          "refId": "A",
+          "legendFormat": "cluster-admin",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 24
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Probe could read the cluster",
+      "description": "0 means the probe failed and pushed only this flag: every other rbac_* gauge is absent rather than stale. A missing number beats a reassuring one.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_hygiene_check_ok",
+          "refId": "A",
+          "legendFormat": "check",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "NOT MEASURED",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "OK",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Uncollectable owner references",
+      "description": "Cluster-scoped RBAC objects naming a NAMESPACED owner. Kubernetes refuses that ownership, so garbage collection can never fire and the cascade only looks wired — sandbox-sandbox survived two years that way. Baseline 1 (cattle-cleanup).",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_invalid_owner_refs",
+          "refId": "A",
+          "legendFormat": "uncollectable",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "cluster-admin bindings over time — the drift, not the level",
+      "description": "A step upward is someone acquiring cluster-admin. The flat line is inherited tooling and is not a finding.",
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 6,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_cluster_admin_bindings",
+          "refId": "A",
+          "legendFormat": "cluster-admin bindings"
+        },
+        {
+          "expr": "rbac_wildcard_clusterroles",
+          "refId": "B",
+          "legendFormat": "ClusterRoles granting *:*"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Orphaned bindings — the two classes are not equally damning",
+      "description": "Namespace gone is strong evidence of a leftover. ServiceAccount missing is weak: upstream charts name accounts they never create, which is why its baseline is 2 rather than 0.",
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 15,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_orphaned_bindings_namespace_gone",
+          "refId": "A",
+          "legendFormat": "namespace gone (strong)"
+        },
+        {
+          "expr": "rbac_orphaned_bindings_sa_missing",
+          "refId": "B",
+          "legendFormat": "serviceaccount missing (weak)"
+        },
+        {
+          "expr": "rbac_orphaned_bindings_privileged",
+          "refId": "C",
+          "legendFormat": "privileged"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Orphaned bindings — which one, what it grants, and where it lives",
+      "description": "One row per binding whose ServiceAccount subject cannot be resolved. Remove the BINDING, never the ClusterRole: upstream roles are shared. Back up the live manifest first.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "rbac_orphaned_binding_detail",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "prometheus": true,
+              "service": true,
+              "instance": true,
+              "Value": true
+            },
+            "renameByName": {
+              "binding": "Binding",
+              "subject": "Subject (namespace/serviceaccount)",
+              "scope": "Scope",
+              "role": "Role granted",
+              "privilege": "Privilege"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Privilege",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Privilege"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "privileged": {
+                        "text": "PRIVILEGED",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "standard": {
+                        "text": "standard",
+                        "color": "text",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}

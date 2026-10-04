@@ -1,0 +1,42 @@
+defaultNamespace: jump
+namespace: jump
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # bastion runs sshd as root + mosh setcap → namespace must allow it
+  pod-security.kubernetes.io/enforce: privileged
+  pod-security.kubernetes.io/warn: baseline
+dependsOn:
+  - name: mdapi-prod-cert-manager
+  - name: mdapi-prod-cloudnative-pg
+  - name: mdapi-prod-external-secrets
+  - name: mdapi-prod-metallb
+helm:
+  maxHistory: 25
+  # Everything in ns jump was kubectl-applied during the 2026-07-2x outage
+  # (built live from bpi-r4, Fleet down) and carries no Helm ownership
+  # metadata — first reconcile fails on the jump-home PVC without this.
+  takeOwnership: true
+
+# f/heal/volsync_restic_stale_lock (every 15 min) clears an orphaned restic repo
+# lock by writing spec.restic.unlock on the ReplicationSource live. git therefore
+# can never match the cluster on that one field, and the mismatch holds the whole
+# bundle Modified — which is what kept mdapi-prod-paperless red for 21h+ on
+# 2026-08-28, lighting FleetBundlesNotReady/Sustained and degrading the public
+# statuspage. Same coupling, same fix (cf. paperless/fleet.yaml): hand the field
+# to the heal so a successful autoheal stops red-flagging the bundle. The value
+# in jump/volsync-backup.yml stays as the documented seed/reset value.
+diff:
+  comparePatches:
+  - apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    name: jump-home-ceph
+    namespace: jump
+    operations:
+    - {"op": "remove", "path": "/spec/restic/unlock"}
+  - apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    name: openvpn-pki
+    namespace: jump
+    operations:
+    - {"op": "remove", "path": "/spec/restic/unlock"}

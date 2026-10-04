@@ -1,0 +1,51 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webtunnel-bridge
+  namespace: webtunnel-bridge
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+    ## ⛔ Do not let a client choose its own X-Forwarded-For.
+    ##
+    ## The controller sets use-forwarded-headers: true estate-wide, so a
+    ## client-supplied XFF is PREPENDED to the real peer and the whole chain is
+    ## forwarded. webtunnel-server reads the first value, so it believes
+    ## whatever the caller put there.
+    ##
+    ## Measured 2026-09-23 over 24h on this host:
+    ##   "127.0.0.1, 195.178.110.31"   1,378 requests
+    ##   "10.0.0.1, 195.178.110.31"      132 requests
+    ## — one remote caller spoofing a loopback/private client IP, which is what
+    ## produced 773 "unexpected internal address in X-Forwarded-For header"
+    ## warnings in six hours. For a Tor bridge the apparent client address is not
+    ## cosmetic, so this is worth closing on its own merits.
+    ##
+    ## $remote_addr is the address nginx actually observed: `ingress-expose` is
+    ## externalTrafficPolicy: Local so the client IP survives the LB, and the
+    ## real_ip module only rewrites $remote_addr when the PEER is inside
+    ## proxy-real-ip-cidr — a public client never is.
+    ##
+    ## ⚠️ This is NOT known to fix the webtunnel-server exit-2 crashes (Go exits
+    ## 2 on an unrecovered panic, and tor does not relay the child's stderr, so
+    ## the reason is still unseen). It removes the only hostile input found so
+    ## far. `webtunnel_bridge_502_burst` stays armed to show whether it helped.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header X-Forwarded-For $remote_addr;
+# Intentionally no `tls:` section — flame's Ingress (flame ns) owns TLS for
+# mdapi.ch, and nginx-ingress merges per-host path rules across Ingresses.
+# Requests on https://mdapi.ch/api/v1/proxy/* hit our sidecar; everything
+# else falls through to flame.
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: webtunnel-bridge
+                port:
+                  number: 8443
+            path: /api/v1/proxy
+            pathType: Prefix

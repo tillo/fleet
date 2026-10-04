@@ -1,0 +1,108 @@
+## Ship + rotate Nextcloud admin_audit (audit.log) -> OpenObserve (O2), direct.
+## logfile_audit points at /var/www/html/data/audit.log (the RWX webroot PVC, not
+## the RWO ceph ncdata volume) so this pod can mount it RWX and rotate it. The
+## mv->POST->rm is atomic against Nextcloud's per-write logger reopen, so no line
+## is lost across the rename; a failed POST leaves the .ship file for the next run
+## to drain. Blocks a repeat of the 2026-09-29 webroot-PVC fill (unrotated audit
+## noise from the whole-home SFTP mount's files:cleanup).
+##
+## We POST straight to O2's NDJSON ingest (/_multi), NOT via Cribl httpraw: Cribl's
+## "Cribl" breaker ruleset mis-breaks newline-delimited JSON and silently dropped
+## most of the audit lines (verified 2026-09-29: 847 lines -> Cribl "count":7 ->
+## 0 events in O2). O2 /_multi ingests every line (847/847). Auth is the Cribl O2
+## user (ingest-only, read=401) from Secret nextcloud-audit-o2, created out-of-band
+## (not in git; fleet mirrors publicly).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nextcloud-audit-log-ship
+  namespace: nextcloud
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # Co-locate with the nextcloud pod. The RWX webroot PVC has no Longhorn
+          # share-manager, so a pod on a different node forces a live-migration attach
+          # that fails with "invalid controller count 2". Same node => the already
+          # attached volume is bind-mounted, no migration.
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    io.kompose.service: nextcloud-aio-nextcloud
+          containers:
+          - name: ship
+            image: alpine/curl:8.22.0@sha256:741b2d162e65956e3c694985a9b4c7f6a0714c8d6551bc68d9341d8474bf1ccf
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: O2_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-audit-o2
+                  key: username
+            - name: O2_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-audit-o2
+                  key: password
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+              cd /var/www/html/data
+              url="http://openobserve.openobserve.svc.cluster.local:5080/api/default/nextcloud_audit/_multi"
+              # Return 0 only when O2 reported every record ingested ("failed":0).
+              # Fail-closed: a curl error or a partial failure leaves the .ship file.
+              ship() {
+                curl -fsS --max-time 120 -u "$O2_USER:$O2_PASSWORD" -XPOST "$url" \
+                  -H 'Content-Type: application/json' --data-binary "@$1" | grep -q '"failed":0'
+              }
+              fail=0
+              for f in audit.log.*.ship; do
+                [ -e "$f" ] || continue
+                if ship "$f"; then
+                  rm -f "$f"
+                else
+                  echo "O2 POST failed for $f; leaving for retry" >&2
+                  fail=1
+                fi
+              done
+              [ "$fail" = 0 ] || exit 1
+              if [ -s audit.log ]; then
+                s="audit.log.$(date -u +%Y%m%dT%H%M%SZ).ship"
+                mv audit.log "$s"
+                if ship "$s"; then
+                  rm -f "$s"
+                  echo "audit.log shipped to O2 and rotated"
+                else
+                  echo "O2 POST failed for $s; leaving for retry" >&2
+                  exit 1
+                fi
+              else
+                echo "audit.log empty; nothing to ship"
+              fi
+            volumeMounts:
+            - name: webroot
+              mountPath: /var/www/html/data
+              subPath: data
+            resources:
+              requests:
+                cpu: 10m
+                memory: 16Mi
+              limits:
+                memory: 64Mi
+          volumes:
+          - name: webroot
+            persistentVolumeClaim:
+              claimName: nextcloud-aio-nextcloud

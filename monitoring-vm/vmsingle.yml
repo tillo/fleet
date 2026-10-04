@@ -1,0 +1,53 @@
+## Single-node VictoriaMetrics instance. Long retention for multi-year energy
+## / solar analysis. PVC on Longhorn (2 replicas, fio-hot tier).
+##
+## SIZING: grew to 92% of 50Gi by 2026-08-07 (3.8 GiB free, ~1 GiB/day => ~4
+## days to full). A full disk stops ingestion, which blinds every probe/heal
+## job that queries VM. Raised to 100Gi (~50 days of headroom at that rate;
+## the fio tier had ~2 TiB free per node, so 2 replicas cost ~100 GiB).
+##
+## RESOLVED 2026-08-17 (infra-14y, user decision): retention 13 months on
+## 500Gi -- year-over-year energy/solar/pool comparisons, one month margin.
+## VictoriaMetrics does NOT trim to fit the disk (a full disk just stops
+## ingestion) and prunes whole MONTHLY partitions, so peak disk is
+## (retention + up to 1 month) x rate: (13mo + 1mo) x ~0.9 GiB/day ~= 385
+## GiB = 77% of 500Gi at the 2026-08 rate (0.8-0.9 GiB/day over 14/30d).
+## Re-decide if growth pushes the projection past ~80%.
+## Operator naming: pod and Service get the prefix `vmsingle-mdapi`.
+## The Service exposes :8429 (HTTP API + remoteWrite endpoint).
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMSingle
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  ## Pull via the in-cluster Zot cache (zot.mdapi.ch is htpasswd-protected
+  ## via the zot-pull dockerconfigjson Secret in this namespace, owned by
+  ## fleet bundle `zot-pull-secrets/`). Tag is left to the VM operator's
+  ## default so existing version-rollout behaviour is unchanged.
+  image:
+    repository: zot.mdapi.ch/victoriametrics/victoria-metrics
+  imagePullSecrets:
+    - name: zot-pull
+  ## Plain number = months (VictoriaMetrics -retentionPeriod semantics).
+  retentionPeriod: "13"
+  storage:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: longhorn
+    resources:
+      requests:
+        storage: 500Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  extraArgs:
+    ## Smooth out series-churn behaviour for the recorder's per-sensor cardinality
+    dedup.minScrapeInterval: "30s"
+    ## Default 16 is too low when vmalert evaluates ~50 rule groups every 30s
+    ## (kube-prometheus-stack rules + our custom rules). 64 keeps things headroom-y
+    ## without exploding memory.
+    search.maxConcurrentRequests: "64"

@@ -1,0 +1,31 @@
+# ServiceAccount + RBAC required for KC_CACHE_STACK=kubernetes
+# Keycloak needs to list pods in its namespace to discover cluster peers
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak
+  namespace: keycloak
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keycloak-discovery
+  namespace: keycloak
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keycloak-discovery
+  namespace: keycloak
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keycloak-discovery
+subjects:
+- kind: ServiceAccount
+  name: keycloak
+  namespace: keycloak

@@ -1,0 +1,112 @@
+## cloud-init user-data for the RIPE Atlas software probe VM.
+##
+## An ExternalSecret because authorized_keys are kept out of git; the rest of
+## the user-data is not sensitive but shares the object, since KubeVirt takes
+## cloud-init from a single Secret key (`userdata`).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: atlas-probe-cloudinit
+  namespace: atlas
+spec:
+  refreshInterval: 1h0m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: atlas-probe-cloudinit
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        userdata: |
+          #cloud-config
+          hostname: atlas-probe
+          timezone: Europe/Zurich
+
+          package_update: true
+          package_upgrade: true
+          packages:
+            - ca-certificates
+            ## Without it KubeVirt cannot enumerate the guest's addresses.
+            - qemu-guest-agent
+            - unattended-upgrades
+            - wget
+
+          users:
+            - name: tillo
+              groups: [sudo]
+              sudo: "ALL=(ALL) NOPASSWD:ALL"
+              shell: /bin/bash
+              lock_passwd: true
+              ssh_authorized_keys:
+                - {{ .authorized_keys | trim }}
+
+          write_files:
+            ## The probe package stopped auto-updating at release 5080 and RIPE
+            ## expects the host to run its own updater. APT config lists
+            ## accumulate across files, so a 51* file extends the default
+            ## Origins-Pattern rather than replacing it.
+            - path: /etc/apt/apt.conf.d/51ripe-atlas-unattended
+              permissions: '0644'
+              content: |
+                Unattended-Upgrade::Origins-Pattern { "origin=RIPE NCC,archive=stable"; };
+
+            - path: /etc/apt/apt.conf.d/20auto-upgrades
+              permissions: '0644'
+              content: |
+                APT::Periodic::Update-Package-Lists "1";
+                APT::Periodic::Unattended-Upgrade "1";
+
+            - path: /usr/local/sbin/install-ripe-atlas-probe.sh
+              permissions: '0755'
+              content: |
+                #!/bin/sh
+                ## Install the probe from the RIPE NCC apt repository.
+                ##
+                ## The repository package is fetched over HTTPS and is not
+                ## signed by anything already trusted, so its sha256 is checked
+                ## against RIPE's published CHECKSUMS before dpkg sees it. A
+                ## mismatch is fatal.
+                set -eu
+
+                ARCH="$(dpkg --print-architecture)"
+                CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+                REPO_PKG="ripe-atlas-repo_1.6-1_all.deb"
+                BASE="https://ftp.ripe.net/ripe/atlas/software-probe/debian/dists/${CODENAME}/main/binary-${ARCH}"
+
+                cd /tmp
+                wget -q -O "${REPO_PKG}" "${BASE}/${REPO_PKG}"
+                wget -q -O CHECKSUMS \
+                  https://github.com/RIPE-NCC/ripe-atlas-software-probe/releases/latest/download/CHECKSUMS
+
+                if ! grep -qF "$(sha256sum "${REPO_PKG}" | cut -d' ' -f1)" CHECKSUMS; then
+                    echo "ripe-atlas-repo checksum mismatch - refusing to install" >&2
+                    rm -f "${REPO_PKG}" CHECKSUMS
+                    exit 1
+                fi
+
+                dpkg -i "${REPO_PKG}"
+                rm -f "${REPO_PKG}" CHECKSUMS
+
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y ripe-atlas-probe
+
+                ## The package ships ripe-atlas.service disabled despite its
+                ## systemd preset, so installing it is not enough.
+                systemctl enable --now ripe-atlas.service
+
+                ## Leave the key to be registered somewhere obvious.
+                if [ -r /etc/ripe-atlas/probe_key.pub ]; then
+                    cp /etc/ripe-atlas/probe_key.pub /root/probe_key.pub
+                fi
+
+          runcmd:
+            - [ /usr/local/sbin/install-ripe-atlas-probe.sh ]
+
+  data:
+    - remoteRef:
+        key: /mdapi/atlas/authorized-keys/authorized_keys
+      secretKey: authorized_keys

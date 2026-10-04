@@ -1,0 +1,2363 @@
+## OpenObserve Database Monitoring collector: DEMO on ONE cluster (monitoring/grafana-pg),
+## 2026-09-24, QUICK-WINS #6. Decides whether DBM is worth rolling out to all 7 CNPG clusters.
+##
+## Recipe: O2 v1.0.3's own DBM setup card (served UI bundle), VERBATIM receivers/filter/exporter,
+## with placeholders filled. Deviations, each deliberate:
+##   - NO filelog/pg_deadlocks: it tails a log FILE on the DB host. CNPG writes csvlog that its
+##     instance manager re-emits as JSON on stdout, which Cribl already ships into pod_logs.
+##     The Deadlocks and Slowest-calls pages are therefore NOT part of this demo.
+##   - memory_limiter 300/75 MiB instead of 768/192: this pod is not a DB host (limit 384Mi).
+##   - ONE replica: the sqlquery/postgresql receivers are scrapers, so two replicas would double-count.
+## Identity: the DB login is o2_dbm (pg_monitor, read-only stats, cannot read table data);
+## the O2 credential is the ingest-only org ingestion token `dbm` (Basic dbm:<token>; RBAC Phase 0,
+## 2026-09-24; it replaced the admin-equivalent service account dbm-ingest@mdapi.ch). Both are in Akeyless, never in git.
+## Revert: delete this file and the grafana-pg additions (see the DEMO-6 write-up).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-dbm-grafana-pg
+  namespace: openobserve
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-dbm-grafana-pg
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        PGUSER: o2_dbm
+        PGPASS: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/monitoring/grafana-pg-o2dbm/password
+      secretKey: password
+---
+## "Basic <b64(email:token)>". The exporter wants the header VALUE only (as with
+## otel-collector-auth); ESO builds it, so the token never appears in plain text in a manifest.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-dbm-ingest
+  namespace: openobserve
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-dbm-ingest
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        O2_DBM_AUTHORIZATION: 'Basic {{ printf "%s:%s" "dbm" .token | b64enc }}'
+  data:
+    - remoteRef:
+        key: /mdapi/openobserve/dbm/ingestion-token
+      secretKey: token
+---
+## One password per DBM target (login o2_dbm everywhere, so PGUSER comes from the grafana-pg
+## secret). Each lives in Akeyless at /mdapi/<ns>/<db>-o2dbm/password; the fleet repo is public.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-dbm-targets
+  namespace: openobserve
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-dbm-targets
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        PGPASS_GITLAB: "{{ .gitlab }}"
+        PGPASS_HAREC: "{{ .harec }}"
+        PGPASS_KEYCLOAK: "{{ .keycloak }}"
+        PGPASS_JOPLIN: "{{ .joplin }}"
+        PGPASS_WINDMILL: "{{ .windmill }}"
+        PGPASS_NEXTCLOUD: "{{ .nextcloud }}"
+        PGPASS_BUSSOLA: "{{ .bussola }}"
+        PGPASS_LITELLM: "{{ .litellm }}"
+        PGPASS_PAPERLESS: "{{ .paperless }}"
+        PGPASS_GUAC: "{{ .guac }}"
+        PGPASS_ENVNC: "{{ .envnc }}"
+        PGPASS_ENVKC: "{{ .envkc }}"
+  data:
+    - remoteRef:
+        key: /mdapi/bootstrap/gitlab-pg-o2dbm/password
+      secretKey: gitlab
+    - remoteRef:
+        key: /mdapi/home-assistant/ha-recorder-pg-o2dbm/password
+      secretKey: harec
+    - remoteRef:
+        key: /mdapi/keycloak/postgres-o2dbm/password
+      secretKey: keycloak
+    - remoteRef:
+        key: /mdapi/joplin/postgres-o2dbm/password
+      secretKey: joplin
+    - remoteRef:
+        key: /mdapi/windmill/windmill-postgresql-o2dbm/password
+      secretKey: windmill
+    - remoteRef:
+        key: /mdapi/nextcloud/nextcloud-aio-database-o2dbm/password
+      secretKey: nextcloud
+    - remoteRef:
+        key: /mdapi/bussola/bussola-pg-o2dbm/password
+      secretKey: bussola
+    - remoteRef:
+        key: /mdapi/litellm/litellm-pg-o2dbm/password
+      secretKey: litellm
+    - remoteRef:
+        key: /mdapi/paperless/paperless-pg-o2dbm/password
+      secretKey: paperless
+    - remoteRef:
+        key: /mdapi/jump/guac-pg-o2dbm/password
+      secretKey: guac
+    - remoteRef:
+        key: /mdapi/envuassu/nextcloud-aio-database-o2dbm/password
+      secretKey: envnc
+    - remoteRef:
+        key: /mdapi/envuassu/postgres-o2dbm/password
+      secretKey: envkc
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: o2-dbm-collector
+  namespace: openobserve
+data:
+  config.yaml: |
+    receivers:
+      sqlquery/pg_blocking:
+        driver: postgres
+        datasource: "host=grafana-pg-rw.monitoring.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS} dbname=grafana sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'grafana-pg-rw.monitoring.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats:
+        driver: postgres
+        datasource: "host=grafana-pg-rw.monitoring.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS} dbname=grafana sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'grafana-pg-rw.monitoring.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats:
+        driver: postgres
+        datasource: "host=grafana-pg-rw.monitoring.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS} dbname=grafana sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'grafana-pg-rw.monitoring.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events:
+        endpoint: "grafana-pg-rw.monitoring.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS}
+        databases: [grafana]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_gitlab:
+        driver: postgres
+        datasource: "host=gitlab-pg-rw.bootstrap.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_GITLAB} dbname=gitlabhq_production sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'gitlab-pg-rw.bootstrap.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_gitlab:
+        driver: postgres
+        datasource: "host=gitlab-pg-rw.bootstrap.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_GITLAB} dbname=gitlabhq_production sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        # COST OVERRIDE for this target only (see OVERRIDES in dbm-gen.py)
+        collection_interval: 900s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'gitlab-pg-rw.bootstrap.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_gitlab:
+        driver: postgres
+        datasource: "host=gitlab-pg-rw.bootstrap.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_GITLAB} dbname=gitlabhq_production sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        # COST OVERRIDE for this target only (see OVERRIDES in dbm-gen.py)
+        collection_interval: 3600s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'gitlab-pg-rw.bootstrap.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_gitlab:
+        endpoint: "gitlab-pg-rw.bootstrap.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_GITLAB}
+        databases: [gitlabhq_production]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 60s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_harec:
+        driver: postgres
+        datasource: "host=ha-recorder-pg-rw.home-assistant.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_HAREC} dbname=homeassistant sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'ha-recorder-pg-rw.home-assistant.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_harec:
+        driver: postgres
+        datasource: "host=ha-recorder-pg-rw.home-assistant.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_HAREC} dbname=homeassistant sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'ha-recorder-pg-rw.home-assistant.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_harec:
+        driver: postgres
+        datasource: "host=ha-recorder-pg-rw.home-assistant.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_HAREC} dbname=homeassistant sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'ha-recorder-pg-rw.home-assistant.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_harec:
+        endpoint: "ha-recorder-pg-rw.home-assistant.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_HAREC}
+        databases: [homeassistant]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_keycloak:
+        driver: postgres
+        datasource: "host=postgres.keycloak.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_KEYCLOAK} dbname=keycloak sslmode=disable"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'postgres.keycloak.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_keycloak:
+        driver: postgres
+        datasource: "host=postgres.keycloak.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_KEYCLOAK} dbname=keycloak sslmode=disable"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'postgres.keycloak.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_keycloak:
+        driver: postgres
+        datasource: "host=postgres.keycloak.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_KEYCLOAK} dbname=keycloak sslmode=disable"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'postgres.keycloak.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_keycloak:
+        endpoint: "postgres.keycloak.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_KEYCLOAK}
+        databases: [keycloak]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: false }
+      sqlquery/pg_blocking_joplin:
+        driver: postgres
+        datasource: "host=postgres.joplin.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_JOPLIN} dbname=joplin sslmode=disable"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'postgres.joplin.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_joplin:
+        driver: postgres
+        datasource: "host=postgres.joplin.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_JOPLIN} dbname=joplin sslmode=disable"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'postgres.joplin.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_joplin:
+        driver: postgres
+        datasource: "host=postgres.joplin.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_JOPLIN} dbname=joplin sslmode=disable"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'postgres.joplin.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_joplin:
+        endpoint: "postgres.joplin.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_JOPLIN}
+        databases: [joplin]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: false }
+      sqlquery/pg_blocking_windmill:
+        driver: postgres
+        datasource: "host=windmill-postgresql.windmill.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_WINDMILL} dbname=windmill sslmode=disable"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'windmill-postgresql.windmill.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_windmill:
+        driver: postgres
+        datasource: "host=windmill-postgresql.windmill.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_WINDMILL} dbname=windmill sslmode=disable"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'windmill-postgresql.windmill.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_windmill:
+        driver: postgres
+        datasource: "host=windmill-postgresql.windmill.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_WINDMILL} dbname=windmill sslmode=disable"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'windmill-postgresql.windmill.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_windmill:
+        endpoint: "windmill-postgresql.windmill.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_WINDMILL}
+        databases: [windmill]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: false }
+      sqlquery/pg_blocking_nextcloud:
+        driver: postgres
+        datasource: "host=nextcloud-aio-database.nextcloud.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_NEXTCLOUD} dbname=nextcloud_database sslmode=disable"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'nextcloud-aio-database.nextcloud.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_nextcloud:
+        driver: postgres
+        datasource: "host=nextcloud-aio-database.nextcloud.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_NEXTCLOUD} dbname=nextcloud_database sslmode=disable"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'nextcloud-aio-database.nextcloud.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_nextcloud:
+        driver: postgres
+        datasource: "host=nextcloud-aio-database.nextcloud.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_NEXTCLOUD} dbname=nextcloud_database sslmode=disable"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'nextcloud-aio-database.nextcloud.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_nextcloud:
+        endpoint: "nextcloud-aio-database.nextcloud.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_NEXTCLOUD}
+        databases: [nextcloud_database]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: false }
+      sqlquery/pg_blocking_bussola:
+        driver: postgres
+        datasource: "host=bussola-pg-rw.bussola.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_BUSSOLA} dbname=bussola sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'bussola-pg-rw.bussola.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_bussola:
+        driver: postgres
+        datasource: "host=bussola-pg-rw.bussola.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_BUSSOLA} dbname=bussola sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'bussola-pg-rw.bussola.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_bussola:
+        driver: postgres
+        datasource: "host=bussola-pg-rw.bussola.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_BUSSOLA} dbname=bussola sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'bussola-pg-rw.bussola.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_bussola:
+        endpoint: "bussola-pg-rw.bussola.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_BUSSOLA}
+        databases: [bussola]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_litellm:
+        driver: postgres
+        datasource: "host=litellm-pg-rw.litellm.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_LITELLM} dbname=litellm sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'litellm-pg-rw.litellm.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_litellm:
+        driver: postgres
+        datasource: "host=litellm-pg-rw.litellm.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_LITELLM} dbname=litellm sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'litellm-pg-rw.litellm.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_litellm:
+        driver: postgres
+        datasource: "host=litellm-pg-rw.litellm.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_LITELLM} dbname=litellm sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'litellm-pg-rw.litellm.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_litellm:
+        endpoint: "litellm-pg-rw.litellm.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_LITELLM}
+        databases: [litellm]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_paperless:
+        driver: postgres
+        datasource: "host=paperless-pg-rw.paperless.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_PAPERLESS} dbname=paperless sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'paperless-pg-rw.paperless.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_paperless:
+        driver: postgres
+        datasource: "host=paperless-pg-rw.paperless.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_PAPERLESS} dbname=paperless sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'paperless-pg-rw.paperless.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_paperless:
+        driver: postgres
+        datasource: "host=paperless-pg-rw.paperless.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_PAPERLESS} dbname=paperless sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'paperless-pg-rw.paperless.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_paperless:
+        endpoint: "paperless-pg-rw.paperless.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_PAPERLESS}
+        databases: [paperless]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_guac:
+        driver: postgres
+        datasource: "host=guac-pg-rw.jump.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_GUAC} dbname=guacamole_db sslmode=require"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'guac-pg-rw.jump.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_guac:
+        driver: postgres
+        datasource: "host=guac-pg-rw.jump.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_GUAC} dbname=guacamole_db sslmode=require"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'guac-pg-rw.jump.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_guac:
+        driver: postgres
+        datasource: "host=guac-pg-rw.jump.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_GUAC} dbname=guacamole_db sslmode=require"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'guac-pg-rw.jump.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_guac:
+        endpoint: "guac-pg-rw.jump.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_GUAC}
+        databases: [guacamole_db]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: true }
+      sqlquery/pg_blocking_envnc:
+        driver: postgres
+        datasource: "host=nextcloud-aio-database.envuassu.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_ENVNC} dbname=nextcloud_database sslmode=disable"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'nextcloud-aio-database.envuassu.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_envnc:
+        driver: postgres
+        datasource: "host=nextcloud-aio-database.envuassu.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_ENVNC} dbname=nextcloud_database sslmode=disable"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'nextcloud-aio-database.envuassu.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_envnc:
+        driver: postgres
+        datasource: "host=nextcloud-aio-database.envuassu.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_ENVNC} dbname=nextcloud_database sslmode=disable"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'nextcloud-aio-database.envuassu.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_envnc:
+        endpoint: "nextcloud-aio-database.envuassu.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_ENVNC}
+        databases: [nextcloud_database]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: false }
+      sqlquery/pg_blocking_envkc:
+        driver: postgres
+        datasource: "host=postgres.envuassu.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_ENVKC} dbname=keycloak sslmode=disable"
+        collection_interval: 10s
+        # max_open_conn is SINGULAR. The plural max_open_conns is not a key
+        # sqlqueryreceiver knows, and an unknown key here is silently ignored
+        # rather than rejected -- the misspelling reads like a bound and enforces
+        # nothing. Unset means 0, which means UNLIMITED.
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT
+                blocked.pid::text                                          AS blocked_pid,
+                -- PER-SESSION datname, NOT current_database(). pg_stat_activity
+                -- spans every database on the cluster while the scrape connects to
+                -- one, so current_database() would stamp the scrape's database onto
+                -- a lock convoy that happened in a different one -- silently
+                -- misattributed rows, and a ?database= filter confidently wrong.
+                coalesce(blocked.datname,'')                               AS pg_db,
+                coalesce(blocked.usename,'')                               AS blocked_user,
+                coalesce(blocked.application_name,'')                      AS blocked_app,
+                coalesce(blocked.query,'')                                 AS blocked_query,
+                coalesce(blocked.wait_event_type,'')                       AS wait_event_type,
+                coalesce(blocked.wait_event,'')                            AS wait_event,
+                coalesce(round(EXTRACT(EPOCH FROM (now()-blocked.query_start))::numeric,3),0)::text AS blocked_wait_s,
+                blocking.pid::text                                         AS blocking_pid,
+                coalesce(blocking.state,'')                                AS blocking_state,
+                coalesce(blocking.application_name,'')                     AS blocking_app,
+                coalesce(blocking.query,'')                                AS blocking_query,
+                'postgres.envuassu.svc.cluster.local'                                                   AS server_address,
+                'pg_blocking_chain'                                        AS o2_recipe
+              FROM pg_stat_activity blocked
+              JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS b(pid) ON true
+              JOIN pg_stat_activity blocking ON blocking.pid = b.pid
+              -- Output-identical: only a Lock waiter can have blockers, so this
+              -- removes only rows the LATERAL join drops anyway, and stops
+              -- pg_blocking_pids() taking lock-manager state for every session.
+              WHERE blocked.wait_event_type = 'Lock'
+            logs:
+              - body_column: blocked_query
+                attribute_columns:
+                  [blocked_pid, pg_db, blocked_user, blocked_app, wait_event_type, wait_event,
+                   blocked_wait_s, blocking_pid, blocking_state, blocking_app,
+                   blocking_query, server_address, o2_recipe]
+      sqlquery/pg_table_stats_envkc:
+        driver: postgres
+        datasource: "host=postgres.envuassu.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_ENVKC} dbname=keycloak sslmode=disable"
+        # 300s, not 60s: pg_total_relation_size() walks the catalog and filesystem
+        # metadata for every fork of every relation once per table per tick, so
+        # cost is O(your schema).
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT n.nspname                                    AS schema_name,
+                     c.relname                                    AS table_name,
+                     pg_total_relation_size(c.oid)::text          AS total_bytes,
+                     pg_relation_size(c.oid)::text                AS heap_bytes,
+                     coalesce(s.seq_scan,0)::text                 AS seq_scan,
+                     coalesce(s.seq_tup_read,0)::text             AS seq_tup_read,
+                     coalesce(s.idx_scan,0)::text                 AS idx_scan,
+                     coalesce(s.n_live_tup,0)::text               AS n_live_tup,
+                     coalesce(s.n_dead_tup,0)::text               AS n_dead_tup,
+                     coalesce(s.n_mod_since_analyze,0)::text      AS n_mod_since_analyze,
+                     coalesce(s.last_vacuum::text,'')             AS last_vacuum,
+                     coalesce(s.last_autovacuum::text,'')         AS last_autovacuum,
+                     coalesce(s.last_analyze::text,'')            AS last_analyze,
+                     coalesce(s.autovacuum_count,0)::text         AS autovacuum_count,
+                     age(c.relfrozenxid)::text                    AS frozen_xid_age,
+                     CASE WHEN coalesce(s.n_live_tup,0) > 0
+                          THEN round(100.0*s.n_dead_tup/(s.n_live_tup+s.n_dead_tup),2)::text
+                          ELSE '0' END                            AS dead_tup_pct,
+                     'postgres.envuassu.svc.cluster.local'                                     AS server_address,
+                     'pg_table_stats'                             AS o2_recipe
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+              LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog','information_schema')
+                -- The bound. Deliberately NOT a LIMIT: a LIMIT with no stable
+                -- ORDER BY drops a different set of tables each tick and the tab
+                -- flickers; this drops the same ones.
+                --
+                -- n_live_tup ALONE IS NOT THE TEST. It is a statistics estimate
+                -- that stays 0 until autovacuum or a manual ANALYZE first runs, so
+                -- gating on it hid every table on a freshly loaded database —
+                -- measured: 5 populated tables, 0 rows returned, and Postgres
+                -- absent from Table health until ANALYZE was run by hand. That is
+                -- precisely when someone opens the tab to look at a new database.
+                -- Size comes from the catalog and needs no ANALYZE, so a relation
+                -- that occupies pages is real whatever the estimator has recorded.
+                AND (coalesce(s.n_live_tup, 0) > 0
+                     OR pg_total_relation_size(c.oid) > 0)
+            logs:
+              - body_column: table_name
+                attribute_columns:
+                  [schema_name, total_bytes, heap_bytes, seq_scan, seq_tup_read,
+                   idx_scan, n_live_tup, n_dead_tup, n_mod_since_analyze,
+                   last_vacuum, last_autovacuum, last_analyze, autovacuum_count,
+                   frozen_xid_age, dead_tup_pct, server_address, o2_recipe]
+      sqlquery/pg_index_stats_envkc:
+        driver: postgres
+        datasource: "host=postgres.envuassu.svc.cluster.local port=5432 user=${env:PGUSER} password=${env:PGPASS_ENVKC} dbname=keycloak sslmode=disable"
+        # 300s, matching pg_table_stats and for the same reason: one
+        # pg_relation_size() plus one pg_get_indexdef() per INDEX per tick.
+        collection_interval: 300s
+        max_open_conn: 2
+        queries:
+          - sql: |
+              SELECT s.schemaname                                  AS schema_name,
+                     s.relname                                     AS table_name,
+                     s.indexrelname                                AS index_name,
+                     coalesce(s.idx_scan,0)::text                  AS idx_scan,
+                     coalesce(s.idx_tup_read,0)::text              AS idx_tup_read,
+                     coalesce(s.idx_tup_fetch,0)::text             AS idx_tup_fetch,
+                     pg_relation_size(s.indexrelid)::text          AS index_bytes,
+                     (i.indisunique OR i.indisprimary)::text       AS is_unique,
+                     coalesce(pg_get_indexdef(s.indexrelid),'')    AS index_def,
+                     'postgres.envuassu.svc.cluster.local'                                      AS server_address,
+                     'pg_index_stats'                              AS o2_recipe
+              FROM pg_stat_user_indexes s
+              JOIN pg_index i ON i.indexrelid = s.indexrelid
+              WHERE s.schemaname NOT IN ('pg_catalog','information_schema')
+            logs:
+              - body_column: index_def
+                attribute_columns:
+                  [schema_name, table_name, index_name, idx_scan, idx_tup_read,
+                   idx_tup_fetch, index_bytes, is_unique, server_address, o2_recipe]
+      postgresql/dbm_events_envkc:
+        endpoint: "postgres.envuassu.svc.cluster.local:5432"
+        transport: tcp
+        username: ${env:PGUSER}
+        password: ${env:PGPASS_ENVKC}
+        databases: [keycloak]
+        tls:
+          insecure: true
+        collection_interval: 10s
+        query_sample_collection:
+          max_rows_per_query: 1000
+        top_query_collection:
+          top_n_query: 200
+          # 0 = NO EXPLAIN (receiver: `explained < maxExplainEachInterval`). EXPLAIN needs privileges on the
+          # tables, and o2_dbm is pg_monitor ONLY (statistics, never table data). Granting pg_read_all_data would
+          # let the monitor read every row. So there are no plans, and top queries still flow. Measured
+          # 2026-09-24: 'permission denied for table …' on every explain of gitlab and HA queries.
+          max_explain_each_interval: 0
+          query_plan_cache_size: 1000
+          # DELIBERATE DEVIATION FROM UPSTREAM, WHICH DEFAULTS TO 60s, so an
+          # "align with upstream" pass does not revert it silently. It multiplies
+          # every per-cycle cost, including the EXPLAIN pass
+          # max_explain_each_interval bounds: the ceiling is 200 x 240 = 48,000
+          # EXPLAINs/hour against a measured real rate of 1,775. So do NOT cut the
+          # budget, and do NOT shorten query_plan_cache_ttl to catch plan
+          # regressions sooner -- a shorter TTL pushes more queries back through
+          # the cycle and multiplies the one cost here that is real.
+          collection_interval: 15s
+        # ON. These two events fill the Activity tab and the server-side Top
+        # queries. Upstream has shipped them default-OFF since v0.148.0, so without
+        # this block the collector looks healthy and emits ZERO events. Set one to
+        # false to trim cost, but the block itself must STAY -- and events: must
+        # stay a TOP-LEVEL receiver key, never nested inside the blocks above.
+        events:
+          db.server.query_sample: { enabled: true }
+          db.server.top_query: { enabled: false }
+
+    processors:
+      ## Recipe filter, VERBATIM: keeps only rows a recipe tagged (o2_recipe / o2_*_event).
+      filter/dbm:
+        error_mode: ignore
+        logs:
+          log_record:
+            - 'attributes["o2_recipe"] == nil and (attributes["o2_pg_event"] == nil or attributes["o2_pg_event"] == "other") and (attributes["o2_my_event"] == nil or attributes["o2_my_event"] == "other") and (attributes["o2_maria_event"] == nil or attributes["o2_maria_event"] == "other")'
+      ## FIRST in every pipeline. Recipe says 768/192 for a collector on a DB host;
+      ## this pod's limit is 384Mi, so 300/75 keeps the guard below the cgroup limit.
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 600
+        spike_limit_mib: 150
+      batch:
+        timeout: 5s
+        send_batch_size: 512
+
+    exporters:
+      otlphttp/openobserve_dbm:
+        logs_endpoint: http://openobserve.openobserve.svc.cluster.local:5080/api/default/v1/logs
+        headers:
+          Authorization: ${env:O2_DBM_AUTHORIZATION}
+          stream-name: _o2_dbm_server
+        sending_queue:
+          enabled: true
+          queue_size: 500
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 300s
+
+    service:
+      telemetry:
+        metrics:
+          level: basic
+      pipelines:
+        logs:
+          receivers: [sqlquery/pg_blocking, sqlquery/pg_table_stats, sqlquery/pg_index_stats, sqlquery/pg_blocking_gitlab, sqlquery/pg_table_stats_gitlab, sqlquery/pg_index_stats_gitlab, sqlquery/pg_blocking_harec, sqlquery/pg_table_stats_harec, sqlquery/pg_index_stats_harec, sqlquery/pg_blocking_keycloak, sqlquery/pg_table_stats_keycloak, sqlquery/pg_index_stats_keycloak, sqlquery/pg_blocking_joplin, sqlquery/pg_table_stats_joplin, sqlquery/pg_index_stats_joplin, sqlquery/pg_blocking_windmill, sqlquery/pg_table_stats_windmill, sqlquery/pg_index_stats_windmill, sqlquery/pg_blocking_nextcloud, sqlquery/pg_table_stats_nextcloud, sqlquery/pg_index_stats_nextcloud, sqlquery/pg_blocking_bussola, sqlquery/pg_table_stats_bussola, sqlquery/pg_index_stats_bussola, sqlquery/pg_blocking_litellm, sqlquery/pg_table_stats_litellm, sqlquery/pg_index_stats_litellm, sqlquery/pg_blocking_paperless, sqlquery/pg_table_stats_paperless, sqlquery/pg_index_stats_paperless, sqlquery/pg_blocking_guac, sqlquery/pg_table_stats_guac, sqlquery/pg_index_stats_guac, sqlquery/pg_blocking_envnc, sqlquery/pg_table_stats_envnc, sqlquery/pg_index_stats_envnc, sqlquery/pg_blocking_envkc, sqlquery/pg_table_stats_envkc, sqlquery/pg_index_stats_envkc]
+          processors: [memory_limiter, filter/dbm, batch]
+          exporters: [otlphttp/openobserve_dbm]
+        logs/dbm_events:
+          receivers: [postgresql/dbm_events, postgresql/dbm_events_gitlab, postgresql/dbm_events_harec, postgresql/dbm_events_keycloak, postgresql/dbm_events_joplin, postgresql/dbm_events_windmill, postgresql/dbm_events_nextcloud, postgresql/dbm_events_bussola, postgresql/dbm_events_litellm, postgresql/dbm_events_paperless, postgresql/dbm_events_guac, postgresql/dbm_events_envnc, postgresql/dbm_events_envkc]
+          processors: [memory_limiter, batch]
+          exporters: [otlphttp/openobserve_dbm]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: o2-dbm-collector
+  namespace: openobserve
+  labels:
+    app.kubernetes.io/name: o2-dbm-collector
+  ## Roll when the auth/target secrets change (they are env, read once at start).
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: o2-dbm-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: o2-dbm-collector
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otelcol
+          image: zot.mdapi.ch/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.161.0@sha256:43649a46ed32d3b2bfd9bd89e29884782d3c350492761b918ba227dd73ef3719
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/config.yaml"]
+          envFrom:
+            - secretRef:
+                name: o2-dbm-grafana-pg
+            - secretRef:
+                name: o2-dbm-ingest
+            - secretRef:
+                name: o2-dbm-targets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+      volumes:
+        - name: conf
+          configMap:
+            name: o2-dbm-collector

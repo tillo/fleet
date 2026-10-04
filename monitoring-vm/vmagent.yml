@@ -1,0 +1,259 @@
+## VMAgent scrapes everything the bundled Rancher Prometheus scrapes today.
+## Phase 3 will narrow this to label `monitoring-stack: mdapi` so the
+## Rancher Prometheus reverts to vendor-default scope (no double scrape).
+## remoteWrite points at the vmsingle Service above.
+##
+## scrapeInterval 30s matches kube-prometheus-stack default.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAgent
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  ## Pull via the in-cluster Zot cache; see vmsingle.yml for the pattern.
+  image:
+    repository: zot.mdapi.ch/victoriametrics/vmagent
+  imagePullSecrets:
+    - name: zot-pull
+  scrapeInterval: 30s
+
+  ## Empty selectors = scrape everything cluster-wide. Phase 3 will tighten.
+  serviceScrapeNamespaceSelector: {}
+  serviceScrapeSelector: {}
+  podScrapeNamespaceSelector: {}
+  podScrapeSelector: {}
+  probeNamespaceSelector: {}
+  probeSelector: {}
+  staticScrapeNamespaceSelector: {}
+  staticScrapeSelector: {}
+
+  remoteWrite:
+    - url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8429/api/v1/write"
+
+    ## ── Per-workload metrics → OpenObserve (2026-09-24) ──────────────────────
+    ## Purpose: O2's log/trace → "Metrics" drill-down. It joins on service_name +
+    ## namespace, the same identity Cribl derives for pod_logs and the collector
+    ## adds to spans. This is NOT a second metrics store; VM/Grafana/vmalert stay
+    ## the source of truth.
+    ## Why only this: the full feed is 22k samples/s, 4,953 metric names (each
+    ## one an O2 stream) and 370-630 B of labels per sample, about 1 TB/day, which
+    ## is 5x the O2 licence. This subset is about 2k series, deduped to 60s
+    ## (~2.9M rows/day).
+    ## ⛔ Every scraped series carries `service` = the SCRAPING Service
+    ## (rancher-monitoring-kubelet …). O2's semantic group would read that as the
+    ## service, so it is dropped below, and service_name is derived from `pod`.
+    - url: "http://openobserve.openobserve.svc.cluster.local:5080/api/default/prometheus/api/v1/write"
+      basicAuth:
+        username: { name: o2-vmagent-ingest, key: username }
+        password: { name: o2-vmagent-ingest, key: password }
+      streamAggrConfig:
+        ## Keep one sample per series per 60s (drill-down charts don't need 30s).
+        dedupInterval: 60s
+      inlineUrlRelabelConfig:
+        - action: keep
+          source_labels: [__name__]
+          regex: container_cpu_usage_seconds_total|container_memory_working_set_bytes|container_cpu_cfs_throttled_periods_total|kube_pod_container_status_restarts_total|ceph_pg_down|ceph_pg_incomplete|ceph_pg_inconsistent|ceph_pg_backfill_toofull|ceph_pg_activating|ceph_osd_apply_latency_ms|ceph_osd_weight|etcd_server_id|etcd_mvcc_db_total_size_in_bytes|etcd_server_quota_backend_bytes|etcd_mvcc_db_total_size_in_use_in_bytes|etcd_disk_wal_fsync_duration_seconds_bucket|etcd_server_leader_changes_seen_total|etcd_server_proposals_failed_total|etcd_network_peer_sent_failures_total|node_filesystem_device_error|node_edac_uncorrectable_errors_total|node_edac_correctable_errors_total|node_hwmon_temp_crit_alarm_celsius|node_hwmon_temp_alarm|node_hwmon_temp_celsius|node_hwmon_temp_max_celsius|node_vmstat_oom_kill|kube_pod_status_reason|kube_pod_container_status_terminated_reason|kube_persistentvolumeclaim_status_phase|kube_cronjob_status_last_schedule_time|kube_cronjob_status_last_successful_time|kube_cronjob_status_active|kube_cronjob_next_schedule_time|kube_horizontalpodautoscaler_status_condition|apiserver_admission_webhook_request_total|coredns_forward_healthcheck_broken_total|coredns_panics_total|coredns_dns_responses_total|probe_success|probe_duration_seconds
+        ## cAdvisor also emits pod-level cgroups (container="") and the pause
+        ## container (POD); per-container only.
+        - action: drop
+          source_labels: [__name__, container]
+          regex: "container_.+;(|POD)"
+        ## ── O2 Alert Library feed (2026-09-24): ~1.4k series, ~0.5 GB/day ──
+        ## These metrics are large only because of label VALUES the alerts never
+        ## read (kube_pod_status_reason alone is 2.5k series across all reasons).
+        ## Mark the values an alert uses, then drop the unmarked series of those
+        ## metrics. RE2 has no negative lookahead, hence the temporary label.
+        - source_labels: [__name__, reason]
+          separator: ";"
+          regex: "kube_pod_status_reason;Evicted"
+          target_label: __tmp_keep
+          replacement: "1"
+        - source_labels: [__name__, phase]
+          separator: ";"
+          regex: "kube_persistentvolumeclaim_status_phase;(Lost|Pending)"
+          target_label: __tmp_keep
+          replacement: "1"
+        - source_labels: [__name__, condition]
+          separator: ";"
+          regex: "kube_horizontalpodautoscaler_status_condition;AbleToScale"
+          target_label: __tmp_keep
+          replacement: "1"
+        - source_labels: [__name__, rejected]
+          separator: ";"
+          regex: "apiserver_admission_webhook_request_total;true"
+          target_label: __tmp_keep
+          replacement: "1"
+        - action: drop
+          source_labels: [__name__, __tmp_keep]
+          separator: ";"
+          regex: "(kube_pod_status_reason|kube_persistentvolumeclaim_status_phase|kube_horizontalpodautoscaler_status_condition|apiserver_admission_webhook_request_total);"
+        - action: labeldrop
+          regex: __tmp_keep
+        ## kube_pod_container_status_terminated_reason is kept WHOLE (~29 series):
+        ## filtering it to OOMKilled left the stream empty, and O2 refuses to create
+        ## an alert on a stream that does not exist yet ("Stream … not found").
+        ## Pseudo-filesystems are excluded by the library alert anyway.
+        - action: drop
+          source_labels: [__name__, fstype]
+          separator: ";"
+          regex: "node_filesystem_device_error;(fuse.*|tmpfs|cifs|nfs.*)"
+        ## node-exporter and etcd series identify their host ONLY via instance
+        ## (IP:port), which is dropped below; keep it as `node` (O2 host group).
+        - source_labels: [__name__, instance]
+          separator: ";"
+          regex: "(node|etcd)_.+;192\\.168\\.1\\.190:[0-9]+"
+          target_label: node
+          replacement: qui
+        - source_labels: [__name__, instance]
+          separator: ";"
+          regex: "(node|etcd)_.+;192\\.168\\.1\\.192:[0-9]+"
+          target_label: node
+          replacement: quo
+        - source_labels: [__name__, instance]
+          separator: ";"
+          regex: "(node|etcd)_.+;192\\.168\\.1\\.193:[0-9]+"
+          target_label: node
+          replacement: qua
+        ## Scrape plumbing only. ⛔ NOT `name`/`instance`/`id`/`image` globally (bug fixed 2026-09-24):
+        ## on apiserver_admission_webhook_request_total `name` IS the webhook, and `instance` is
+        ## the apiserver. Dropping them merged independent counters from different webhooks and
+        ## apiservers into one series, rate() saw fake resets/jumps, and lib_admission_webhook_failures_high
+        ## fired on a phantom 0.5/s while the real rate was 0.01/s.
+        - action: labeldrop
+          regex: service|job|endpoint|metrics_path|prometheus|uid
+        ## cAdvisor container_*: `id`/`image`/`name` are cgroup/docker noise and `node` identifies
+        ## the host, so these are safe to blank there, and ONLY there.
+        - source_labels: [__name__]
+          regex: "container_.+"
+          target_label: id
+          replacement: ""
+        - source_labels: [__name__]
+          regex: "container_.+"
+          target_label: image
+          replacement: ""
+        - source_labels: [__name__]
+          regex: "container_.+"
+          target_label: name
+          replacement: ""
+        ## `instance` is redundant where another label already identifies the target: container_*
+        ## and node_/etcd_ carry `node` (mapped above); kube_* comes from ONE kube-state-metrics pod
+        ## whose IP would only churn series. apiserver_/coredns_/ceph_ keep `instance` (several targets).
+        - source_labels: [__name__]
+          regex: "(container|kube|node|etcd)_.+"
+          target_label: instance
+          replacement: ""
+        ## service_name = the owning workload, the SAME names Cribl gives pod_logs.
+        ## Tested 2026-09-24 on all 501 pods: 499 agree with the Cribl
+        ## derivation. The 2 exceptions: a helm-hook Job keeps its hash in Cribl,
+        ## and a pod name the apiserver truncated into its hash.
+        ## Each rule only fires while service_name is still empty ("^;"), so the
+        ## first match wins. The random-suffix alphabet [bcdfghjklmnpqrstvwxz2456789]
+        ## has no vowels and no 0/1/3, so words like "controller" never match.
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";runner-[a-z0-9]+-project-[0-9]+-concurrent-.*"
+          target_label: service_name
+          replacement: gitlab-ci-job
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";virt-launcher-(.+)-[bcdfghjklmnpqrstvwxz2456789]{5}"
+          target_label: service_name
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";instance-manager-[0-9a-f]{16,}"
+          target_label: service_name
+          replacement: longhorn-instance-manager
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";bim-[0-9a-f]{16,}"
+          target_label: service_name
+          replacement: longhorn-backing-image-manager
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";engine-image-ei-[0-9a-f]+-[bcdfghjklmnpqrstvwxz2456789]{5}"
+          target_label: service_name
+          replacement: longhorn-engine-image
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";(etcd|kube-apiserver|kube-controller-manager|kube-scheduler|kube-proxy|cloud-controller-manager)-[a-z0-9]+"
+          target_label: service_name
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";(.+)-[0-9]{8,}-[bcdfghjklmnpqrstvwxz2456789]{5}"
+          target_label: service_name
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";(.+)-[bcdfghjklmnpqrstvwxz2456789]{6,10}-[bcdfghjklmnpqrstvwxz2456789]{5}"
+          target_label: service_name
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";(.+)-[bcdfghjklmnpqrstvwxz2456789]{5}"
+          target_label: service_name
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";(.+)-[0-9]+"
+          target_label: service_name
+        - source_labels: [service_name, pod]
+          separator: ";"
+          regex: ";(.+)"
+          target_label: service_name
+        ## Same alias as Cribl, so the controller's metrics join its OTel spans.
+        - source_labels: [service_name]
+          regex: rke2-ingress-nginx-controller
+          target_label: service_name
+          replacement: ingress-nginx
+        ## ⛔ On exporter-sourced series `pod` (and for node-exporter/ceph/etcd/coredns
+        ## also `namespace`) names the EXPORTER, not the subject. The rules above
+        ## would file every host metric under rancher-monitoring-prometheus-node-exporter.
+        ## Clear them: host/cluster metrics carry no workload identity.
+        - source_labels: [__name__]
+          regex: "(node|probe|ceph|etcd|coredns|apiserver)_.+"
+          target_label: pod
+          replacement: ""
+        - source_labels: [__name__]
+          regex: "(node|probe|ceph|etcd|coredns|apiserver)_.+"
+          target_label: namespace
+          replacement: ""
+        - source_labels: [__name__]
+          regex: "(node|probe|ceph|etcd|coredns|apiserver|kube_persistentvolumeclaim|kube_cronjob|kube_horizontalpodautoscaler)_.+"
+          target_label: service_name
+          replacement: ""
+        ## kube-state-metrics object series: namespace IS the subject; pod is KSM.
+        - source_labels: [__name__]
+          regex: "(kube_persistentvolumeclaim|kube_cronjob|kube_horizontalpodautoscaler)_.+"
+          target_label: pod
+          replacement: ""
+        ## CronJob / HPA series join their workload by the object's own name.
+        - source_labels: [__name__, cronjob]
+          separator: ";"
+          regex: "kube_cronjob_.+;(.+)"
+          target_label: service_name
+        - source_labels: [__name__, horizontalpodautoscaler]
+          separator: ";"
+          regex: "kube_horizontalpodautoscaler_.+;(.+)"
+          target_label: service_name
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      ## 512Mi was OOMKilling vmagent ~once per hour (6 restarts in 4h).
+      ## 1Gi then OOMKilled again (2026-06-21) — scrape buffer + remote-write
+      ## queue spike past 1Gi when apiserver/cadvisor targets are fattest.
+      memory: 2Gi
+
+  extraArgs:
+    ## Survive vmsingle restarts without dropping data.
+    remoteWrite.tmpDataPath: "/tmp/vmagent-remotewrite-data"
+    remoteWrite.maxDiskUsagePerURL: "1GiB"
+    ## Default 16 MiB; multiple kubelet/cadvisor + apiserver scrapes
+    ## breach it on every scrape, silently dropping the response. 64 MiB
+    ## gives ~4x headroom for kubelet on the busier nodes.
+    promscrape.maxScrapeSize: "64MiB"
+    ## Per remoteWrite URL, in the order of spec.remoteWrite: keep metadata
+    ## (TYPE/HELP) for vmsingle, where Grafana uses it, and send NONE to OpenObserve.
+    ## Metadata bypasses inlineUrlRelabelConfig, and O2 creates one (empty) metric
+    ## stream per metadata entry. The first rollout created 4,025 of them.
+    ## ⚠️ This is positional: reordering spec.remoteWrite requires reordering this list.
+    remoteWrite.disableMetadata: "false,true"

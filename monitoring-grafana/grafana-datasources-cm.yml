@@ -1,0 +1,56 @@
+## Grafana datasource provisioning.
+## - HA-Postgres: read-only role grafana_ro on ha-recorder-pg; used for HA
+##   energy/battery long-term analysis from the recorder `statistics` table.
+## - VictoriaMetrics: the single metrics source (isDefault). The old
+##   "Prometheus" datasource (Rancher-bundled kube-prometheus in
+##   cattle-monitoring-system) was removed 2026-06-24 — that embedded server
+##   stack was retired in favour of VM (see rancher-monitoring-config), and VM
+##   already scrapes every job it had. Dashboards now target uid victoriametrics
+##   or the default datasource.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    ## Grafana provisioning UPSERTS the datasources list but never prunes one
+    ## merely removed from it — a deleted entry lingers in the DB. This block
+    ## explicitly removes the retired "Prometheus" (prometheus-rancher) source
+    ## on startup. Harmless no-op once gone.
+    deleteDatasources:
+      - name: Prometheus
+        orgId: 1
+    datasources:
+      - name: HA-Postgres
+        uid: ha-postgres
+        type: postgres
+        access: proxy
+        url: ha-recorder-pg-rw.home-assistant.svc.cluster.local:5432
+        user: grafana_ro
+        database: homeassistant
+        editable: false
+        secureJsonData:
+          password: "$HA_PG_RO_PASSWORD"
+        jsonData:
+          ## Grafana 12's Postgres plugin requires the default database in
+          ## jsonData.database (the top-level `database` field is deprecated
+          ## for postgres specifically — the frontend refuses queries without
+          ## this and prints "no default database configured").
+          database: homeassistant
+          sslmode: disable
+          postgresVersion: 1600
+          timescaledb: false
+      - name: VictoriaMetrics
+        uid: victoriametrics
+        type: prometheus
+        access: proxy
+        url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+        editable: false
+        isDefault: true
+        jsonData:
+          httpMethod: POST
+          timeInterval: 30s
+          ## PromQL-compatible; VM supports MetricsQL extensions too.
+          prometheusType: VictoriaMetrics

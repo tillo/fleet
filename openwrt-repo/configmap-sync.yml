@@ -1,0 +1,243 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openwrt-repo-sync
+  labels:
+    app: openwrt-repo
+data:
+  sync.py: |
+    #!/usr/bin/env python3
+    """Mirror the newest mdapi/openwrt build output into the served tree.
+
+    Why a sidecar pulling, and not CI pushing: pushing would mean an inbound
+    write surface into the cluster plus a cluster credential living in GitLab
+    CI. This way CI keeps uploading only to the GitLab package registry it
+    already publishes firmware to, and the one new credential is a read-only
+    project token that never leaves the cluster.
+
+    Two packages are mirrored, each under a stable unversioned path so the
+    router's repository list never has to change:
+
+      mdapi-feed                               -> /srv/feed/latest/
+      openwrt-mediatek-filogic-bananapi_bpi-r4 -> /srv/firmware/latest/
+
+    A release becomes visible only complete. Files land in <version>.partial,
+    a .complete marker is written, the directory is renamed into place, and the
+    `latest` symlink is then swapped with rename(2) -- so a reader can never
+    catch a half-copied tree, and an interrupted run leaves the previous release
+    serving rather than a truncated one.
+    """
+    import json
+    import os
+    import shutil
+    import sys
+    import tarfile
+    import time
+    import urllib.request
+
+    API = os.environ.get("GITLAB_URL", "https://gitlab.mdapi.ch").rstrip("/") + "/api/v4"
+    PROJECT = os.environ.get("GITLAB_PROJECT_ID", "33")
+    TOKEN = os.environ.get("GITLAB_TOKEN", "")
+    SRV = os.environ.get("SRV_DIR", "/srv")
+    INTERVAL = int(os.environ.get("SYNC_INTERVAL_SECONDS", "300"))
+    KEEP = int(os.environ.get("KEEP_RELEASES", "3"))
+
+    # The only branch whose builds may reach a router (see releases()).
+    PROD_REF = os.environ.get("PROD_REF", "openwrt-25.12-tillo")
+
+    # (registry package name, path served under). Both names are already fixed by
+    # .gitlab-ci.yml; the firmware one is the target's image-name prefix, so every
+    # artefact of the build is named after it.
+    FEED = ("mdapi-feed", "feed")
+    FIRMWARE = ("openwrt-mediatek-filogic-bananapi_bpi-r4", "firmware")
+
+    # Consecutive failures before giving up loudly. Serving a tree that quietly
+    # stopped updating is the failure this whole service exists to avoid -- an
+    # apk client accepts a stale index without a word -- so a broken credential
+    # or an unreachable forge must end up as a CrashLoopBackOff, not as a feed
+    # that looks fine and is a month old.
+    MAX_FAILURES = 5
+
+
+    def log(msg):
+        print(time.strftime("%H:%M:%S") + " " + str(msg), flush=True)
+
+
+    def api_get(path):
+        req = urllib.request.Request(API + path, headers={"PRIVATE-TOKEN": TOKEN})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+
+    def fetch(path, dest):
+        req = urllib.request.Request(API + path, headers={"PRIVATE-TOKEN": TOKEN})
+        with urllib.request.urlopen(req, timeout=900) as r, open(dest, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+
+
+    def releases(name):
+        """Newest first (GitLab's default order is ascending), production only.
+
+        The ref filter is not a formality. `publish` in .gitlab-ci.yml ends in a
+        bare `when: on_success` with no branch gate, so a MERGE REQUEST pipeline
+        publishes firmware from a branch nobody has merged -- observed on this
+        registry 2026-10-04, version 1458 carrying pipeline ref
+        `refs/merge-requests/15/head` one below the current release. This mirror
+        is flashed FROM, so "newest" has to mean newest REVIEWED build, not
+        newest upload: without this, the next merge request to build would
+        silently become what the router's web UI offers to flash.
+
+        Unattributed versions are dropped too, not kept: nothing uploads those,
+        so one appearing means something changed, and defaulting it to trusted
+        is the wrong way to be surprised.
+        """
+        items = api_get(
+            "/projects/%s/packages?package_type=generic&package_name=%s"
+            "&order_by=created_at&sort=desc&per_page=100" % (PROJECT, name)
+        )
+        eligible, skipped = [], []
+        for i in items:
+            ref = (i.get("pipeline") or {}).get("ref") or ""
+            (eligible if ref == PROD_REF else skipped).append((i, ref))
+        if skipped:
+            log("%s: skipping %d build(s) not from %s (saw: %s)"
+                % (name, len(skipped), PROD_REF,
+                   ", ".join(sorted({r or "no pipeline" for _, r in skipped}))))
+        return [i for i, _ in eligible]
+
+
+    def publish(slug, version, part):
+        final = os.path.join(SRV, slug, version)
+        open(os.path.join(part, ".complete"), "w").close()
+        if os.path.isdir(final):
+            shutil.rmtree(final)
+        os.rename(part, final)
+
+        link = os.path.join(SRV, slug, "latest")
+        tmp = link + ".tmp"
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        # Relative target, and renaming over the old symlink is atomic.
+        os.symlink(version, tmp)
+        os.replace(tmp, link)
+        log("%s: latest -> %s" % (slug, version))
+
+
+    def prune(slug):
+        d = os.path.join(SRV, slug)
+        for entry in os.listdir(d):
+            if entry.endswith(".partial"):
+                shutil.rmtree(os.path.join(d, entry), ignore_errors=True)
+                log("%s: dropped interrupted %s" % (slug, entry))
+        published = sorted(
+            (e for e in os.listdir(d) if e.isdigit() and os.path.isdir(os.path.join(d, e))),
+            key=int,
+            reverse=True,
+        )
+        for stale in published[KEEP:]:
+            shutil.rmtree(os.path.join(d, stale), ignore_errors=True)
+            log("%s: pruned %s" % (slug, stale))
+
+
+    def stage(name, slug, want=None):
+        """Download and publish one package. Returns the published version."""
+        items = releases(name)
+        if not items:
+            log("%s: nothing published yet" % name)
+            return None
+        chosen = items[0]
+        if want is not None and str(chosen["version"]) != str(want):
+            match = [i for i in items if str(i["version"]) == str(want)]
+            if match:
+                chosen = match[0]
+            else:
+                log("%s: no build for %s, falling back to %s"
+                    % (name, want, chosen["version"]))
+        version = str(chosen["version"])
+
+        if os.path.exists(os.path.join(SRV, slug, version, ".complete")):
+            return version
+
+        part = os.path.join(SRV, slug, version + ".partial")
+        shutil.rmtree(part, ignore_errors=True)
+        os.makedirs(part)
+
+        pkg = "/projects/%s/packages/%s" % (PROJECT, chosen["id"])
+        uploaded = api_get(pkg + "/package_files?per_page=100")
+        if not uploaded:
+            raise RuntimeError("%s %s has no files" % (name, version))
+        for f in uploaded:
+            fetch(pkg + "/package_files/%s/download" % f["id"],
+                  os.path.join(part, f["file_name"]))
+        log("%s %s: fetched %d file(s), %.1f MiB"
+            % (name, version, len(uploaded),
+               sum(os.path.getsize(os.path.join(part, f["file_name"])) for f in uploaded) / 1048576.0))
+
+        # The feed ships as one archive and is served as a tree.
+        entries = os.listdir(part)
+        if len(entries) == 1 and entries[0].endswith((".tar.gz", ".tgz", ".tar")):
+            with tarfile.open(os.path.join(part, entries[0])) as tar:
+                tar.extractall(part, filter="data")
+            os.remove(os.path.join(part, entries[0]))
+
+            # The kmods directory is named after the kernel vermagic, which
+            # changes on every kernel bump. Hand out one stable name for it so
+            # the router's repository list does not have to be edited (and
+            # cannot be silently forgotten) each time.
+            kmods = os.path.join(part, "targets/mediatek/filogic/kmods")
+            if os.path.isdir(kmods):
+                dirs = [e for e in os.listdir(kmods) if os.path.isdir(os.path.join(kmods, e))]
+                if len(dirs) == 1:
+                    os.symlink("targets/mediatek/filogic/kmods/" + dirs[0],
+                               os.path.join(part, "kmods-current"))
+                    log("%s %s: kmods-current -> %s" % (name, version, dirs[0]))
+                else:
+                    log("WARN %s %s: %d kmods directories, not linking kmods-current"
+                        % (name, version, len(dirs)))
+
+        with open(os.path.join(part, "build.json"), "w") as fh:
+            json.dump({
+                "package": name,
+                "version": version,
+                "created_at": chosen.get("created_at"),
+                "pipeline": chosen.get("pipeline"),
+                "files": sorted(os.listdir(part)),
+            }, fh, indent=2, sort_keys=True)
+
+        publish(slug, version, part)
+        return version
+
+
+    def tick():
+        feed_version = stage(*FEED)
+        # Same pipeline as the feed when there is one, so a router that takes
+        # both gets a matched pair rather than firmware from a different build.
+        stage(FIRMWARE[0], FIRMWARE[1], want=feed_version)
+        for slug in (FEED[1], FIRMWARE[1]):
+            prune(slug)
+
+
+    def main():
+        if not TOKEN:
+            log("FATAL: GITLAB_TOKEN is empty. Refusing to run: the feed would "
+                "stay empty and an apk client accepts an empty index silently.")
+            return 1
+        for slug in (FEED[1], FIRMWARE[1]):
+            os.makedirs(os.path.join(SRV, slug), exist_ok=True)
+        failures = 0
+        while True:
+            try:
+                tick()
+                failures = 0
+            except Exception as e:
+                failures += 1
+                log("ERROR (%d/%d): %s: %s"
+                    % (failures, MAX_FAILURES, type(e).__name__, e))
+                if failures >= MAX_FAILURES:
+                    log("FATAL: %d consecutive failures -- exiting so the pod "
+                        "restarts visibly instead of serving a frozen feed." % failures)
+                    return 1
+            time.sleep(INTERVAL)
+
+
+    sys.exit(main())

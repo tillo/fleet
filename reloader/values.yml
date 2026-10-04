@@ -1,0 +1,54 @@
+## stakater/Reloader — watches ConfigMaps/Secrets and rolls the workloads
+## that reference them when their content changes.
+##
+## ⭐ 2026-09-20: switched from opt-in to WATCH EVERYTHING (autoReloadAll), and
+## the repeated OOMKills were root-caused and fixed properly rather than by
+## raising the ceiling again.
+##
+## NB: when Reloader triggers a rollout it patches the live workload, so
+## Fleet will briefly show that bundle as "Modified". Fleet correctDrift is
+## off, so it only reports — it does not fight Reloader.
+
+reloader:
+  ## ⭐ Every workload that consumes a ConfigMap/Secret now reloads on change,
+  ## not only those carrying `reloader.stakater.com/auto: "true"`.
+  ## Measured 2026-09-20: of 159 secret-consuming Deployments/StatefulSets only
+  ## 38 had the annotation, so 121 would silently keep running with a stale
+  ## credential after a rotation — and `envFrom: secretRef` snapshots at pod
+  ## start, so that failure is invisible until the old credential is revoked.
+  ## Opt-in coverage that is 24% complete is worse than no policy, because it
+  ## reads as covered. See beads infra-ikig.
+  autoReloadAll: true
+
+  ## ⛔⛔ THE ACTUAL FIX for the OOMKills — exclude Helm's own release history.
+  ##
+  ## Measured 2026-09-20: Reloader cached 4,187 objects / 243.8 MiB cluster-wide
+  ## against a 256 MiB limit. It could not fit by construction: it sat at 246 MiB
+  ## steady (96% of the limit) with 5 restarts, last OOMKilled 09-19 19:51Z.
+  ## 3,082 of those objects are `owner=helm` release secrets = 210.6 MiB = **99%**
+  ## of the payload, and Reloader has no use for any of them — they are Helm's
+  ## revision store, never mounted by a workload.
+  ##
+  ## ⚠️ The 128→256 MiB bump on 2026-05-28 treated the same symptom without
+  ## finding this, which is why it came back. Raising the ceiling a third time
+  ## would have failed again the moment Helm history grew.
+  ##
+  ## `owner!=helm` also matches objects that have NO owner label — verified, all
+  ## 487 ConfigMaps are still selected — so nothing real is dropped:
+  ##     4,187 objects / 243.8 MiB  ->  1,103 objects / ~33 MiB
+  resourceLabelSelector: "owner!=helm"
+
+  deployment:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 96Mi
+      limits:
+        ## Unchanged at 256 MiB, and now genuinely ample rather than marginal:
+        ## with Helm history excluded the working set is ~33 MiB, so this is ~8×
+        ## headroom instead of 104% of the limit. autoReloadAll adds only the
+        ## workload list (275 Deployments/StatefulSets), which is negligible
+        ## beside the ConfigMap/Secret cache.
+        ## ⛔ If this OOMs again, do NOT just raise it — re-measure what is being
+        ## cached first (`kubectl get secrets,configmaps -A -o json | wc -c`).
+        memory: 256Mi

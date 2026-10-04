@@ -1,0 +1,24 @@
+# Lane A pin for the mail server image: the `latest` tag keeps tracking
+# upstream (our GitLab rebuild, `25 */4 * * *` UTC, project 71) and the @sha256
+# is what git freezes. Renovate owns this ref — the kubernetes manager reads
+# this file, sees a floating tag with no digest, and keeps it pinned: a new
+# upstream build arrives as a `digest` MR after the 1-day soak and automerges.
+# The soak is deliberately short-circuited for this one package (renovate.json
+# no-soak list) because mail is rebuilt every 4h with a daily CACHEBUST, so the
+# digest moves ~daily right at the 1-day boundary.
+# ⚠️ Strategic merge by container name, so the chart's own metrics-exporter
+# sidecar (digest-pinned in the chart's values) is preserved untouched, as are
+# this container's ports/probes. Only `image` and `imagePullPolicy` are set.
+# ⛔ IfNotPresent, not Always: with an explicit digest, Always re-resolves the
+# tag on every pod start and re-opens the drift this pin exists to close.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-mailserver
+spec:
+  template:
+    spec:
+      containers:
+        - name: docker-mailserver
+          image: registry.mdapi.ch/mdapi/docker-mailserver:latest@sha256:d316bc0c48a31b7c979cfbe891a2643f86a85574726d576ad7bde6ae6d089a78
+          imagePullPolicy: IfNotPresent
