@@ -1,0 +1,62 @@
+# Rook Ceph OPERATOR values — Lane B.
+# Image + CSI sidecars are pinned by the chart (rook/ceph:v1.20.0, cephcsi v3.17.0,
+# provisioner v6.2.0, snapshotter v8.5.0, attacher v4.12.0, resizer v2.1.0,
+# registrar v2.17.0, csiaddons v0.14.0). pullPolicy defaults to IfNotPresent.
+
+csi:
+  enableRbdDriver: true          # RWO block (StorageClass ceph-block)
+  enableCephfsDriver: true       # RWX file  (StorageClass ceph-filesystem)
+  enableNFSDriver: false         # not needed for k8s consumers; CephNFS export is separate
+  provisionerReplicas: 2         # 3-node cluster
+  # CSI plugin DaemonSet runs on every node; provisioners are HA at 2 replicas.
+
+# Operator-side ServiceMonitors (CSI metrics). Needs the Prometheus-operator CRDs
+# (ServiceMonitor) already present via the rancher/VM monitoring stack.
+monitoring:
+  enabled: true
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    # 512Mi OOMKilled (2026-06-21); operator reconcile spikes with OSD count
+    # (18 OSDs) during CRUSH/topology recompute. 1Gi ceiling.
+    memory: 1Gi
+
+# Keep the operator off any future non-storage/tainted nodes if the cluster grows.
+# (3 bare-metal nodes today all carry storage, so no nodeSelector needed yet.)
+
+# Rook's OBC `additionalConfig` allowlist. The chart default is "maxObjects,maxSize",
+# and that default REJECTS every OBC declaring additionalConfig.bucketPolicy.
+#
+# ⭐ Widened 2026-10-07 to admit `bucketPolicy`. Rook gates which additionalConfig keys
+# an OBC may set, and the check runs in Provision() AND Grant() alike (Rook v1.20.7,
+# pkg/operator/ceph/object/bucket/util.go additionalConfigSpecFromMap, gated on
+# opcontroller.ObcAdditionalConfigKeyIsAllowed):
+#     error provisioning bucket: failed to process additionalConfig:
+#     OBC config "bucketPolicy" is not allowed, requeuing
+#
+# ⛔ This was not a new-OBC problem. All seven cnpg-*-pg OBCs carry
+# additionalConfig.bucketPolicy (fleet MR !596, 2026-09-29 — the "durable fix" for the
+# RgwBucketUnswept incident) and had been failing identically ever since: 281 rejections
+# each in the operator log, continuous from the operator's first reconcile. They are
+# `Bound` — provisioned before the field was added — so nothing in status showed it. The
+# declared policy never took effect, and the offsite grants were in fact being maintained
+# by that window's manual re-grant and by f/heal/rgw_backup_bucket_grant, NOT by Rook.
+# Making the declared config true is the point of this line. (beads infra-prji)
+#
+# Rook's own values.yaml documents this exact widening as the supported way to do it:
+#   "maxObjects,maxSize,bucketMaxObjects,bucketMaxSize,bucketPolicy,bucketLifecycle,bucketOwner"
+# ⭐ Only bucketPolicy is added. bucketMaxObjects/bucketMaxSize/bucketLifecycle/bucketOwner
+# stay disallowed: nothing in the estate sets them, and the chart calls them risky.
+#
+# ⚠️ EXPOSURE, accepted deliberately: an OBC author can now attach a bucket policy to
+# their own bucket. The estate already depends on exactly that — with the policy declared,
+# Rook re-applies it instead of deleting whatever it finds, which is what made the
+# 2026-09-28 wipe possible. Leaving it undeclared is the worse half: an absent
+# additionalConfig.bucketPolicy makes Rook DELETE the live policy.
+# ⭐ Checked before flipping this: all 7 live policies contain exactly the single
+# OffsiteSweepRead statement the OBCs declare and nothing else, so Rook's PutBucketPolicy
+# diffs empty and is a no-op on them rather than a replacement that drops statements.
+obcAllowAdditionalConfigFields: "maxObjects,maxSize,bucketPolicy"

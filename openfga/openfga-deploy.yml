@@ -1,0 +1,170 @@
+## OpenFGA server for OpenObserve RBAC (Phase 1, 2026-09-24).
+##
+## O2 talks to it over HTTP (O2_OPENFGA_BASE_URL=http://openfga.openfga.svc:8080,
+## bare base URL tested). O2 creates its own store ("openobserve") and writes its
+## auth model on first start; nothing to provision here beyond the server.
+##
+## Failure mode, tested on a scratch O2: while OpenFGA is DOWN, root and every
+## ingestion token keep working; only non-root READ principals (Windmill probes,
+## future SSO users) get 403, fail-closed. Two replicas so a node drain or
+## reschedule doesn't cause that window.
+##
+## Image pinned by index digest. Pulled from docker.io directly: openfga/openfga is
+## not in zot's sync allow-list (zot/zot-s3-config-es.yml); add it there to cache it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openfga
+  namespace: openfga
+  labels:
+    app: openfga
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: openfga
+  template:
+    metadata:
+      labels:
+        app: openfga
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: openfga
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        ## Schema migration before the server starts. Idempotent: on an up-to-date
+        ## schema it is a no-op.
+        - name: migrate
+          image: docker.io/openfga/openfga:v1.21.0@sha256:2113c664a486b5da8d7a2cdab479e0d4e30639c80fd2c000540f645c1dbc1e55
+          imagePullPolicy: IfNotPresent
+          args: ["migrate"]
+          env:
+            - name: OPENFGA_DATASTORE_ENGINE
+              value: postgres
+            - name: OPENFGA_DATASTORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-pg-app
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+      containers:
+        - name: openfga
+          image: docker.io/openfga/openfga:v1.21.0@sha256:2113c664a486b5da8d7a2cdab479e0d4e30639c80fd2c000540f645c1dbc1e55
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          env:
+            - name: OPENFGA_DATASTORE_ENGINE
+              value: postgres
+            - name: OPENFGA_DATASTORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: openfga-pg-app
+                  key: uri
+            - name: OPENFGA_PLAYGROUND_ENABLED
+              value: "false"
+            - name: OPENFGA_LOG_FORMAT
+              value: json
+            - name: OPENFGA_METRICS_ENABLED
+              value: "true"
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: grpc, containerPort: 8081 }
+            - { name: metrics, containerPort: 2112 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openfga
+  namespace: openfga
+  labels:
+    app: openfga
+spec:
+  selector:
+    app: openfga
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: metrics, port: 2112, targetPort: metrics }
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: openfga
+  namespace: openfga
+spec:
+  selector:
+    matchLabels:
+      app: openfga
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 60s
+---
+## Only OpenObserve may call OpenFGA's API. Scoped to the OpenFGA pods ONLY: the
+## namespace is deliberately NOT onboarded to the baseline default-deny, which would
+## also cut CNPG's replication/operator traffic for openfga-pg.
+## Allowed: O2 (8080), kubelet probes from the node network, vmagent (metrics).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openfga-only-from-openobserve
+  namespace: openfga
+spec:
+  podSelector:
+    matchLabels:
+      app: openfga
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openobserve
+          podSelector:
+            matchLabels:
+              app: openobserve
+      ports:
+        - { protocol: TCP, port: 8080 }
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - { protocol: TCP, port: 8080 }
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - { protocol: TCP, port: 2112 }

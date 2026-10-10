@@ -1,0 +1,71 @@
+## Publish the refreshed Apple session back to the secret store.
+##
+## WHY: the collector keeps its session on the state volume and findmy rewrites
+## it as tokens refresh, so the stored seed only ages. Measured 2026-09-10: the
+## volume's copy had already diverged from the seed. If the volume were lost
+## after the seed went stale, recovery would need a person with a two-factor
+## code -- the single manual step this whole pipeline exists to remove.
+##
+## ⭐ PushSecret rather than an Akeyless credential in this namespace: the store
+## already holds the credential, so nothing cluster-wide is copied here.
+apiVersion: external-secrets.io/v1alpha1
+kind: PushSecret
+metadata:
+  name: findmy-session-current
+  namespace: findmy
+spec:
+  ## Only republish what the collector actually changed; it writes the source
+  ## secret at most once per session refresh.
+  refreshInterval: 15m
+  secretStoreRefs:
+    - name: cm-akeyless
+      kind: ClusterSecretStore
+  selector:
+    secret:
+      name: findmy-session-current
+  ## Deliberately NOT deleting the remote secret if this object goes away: the
+  ## pushed session is a recovery artefact and outliving the pusher is the point.
+  deletionPolicy: None
+  data:
+    - match:
+        secretKey: account.json
+        remoteRef:
+          remoteKey: /mdapi/findmy/icloud/SESSION_CURRENT
+---
+## The collector writes the refreshed session into a Secret; PushSecret carries
+## it to the store. It cannot write to the store directly without holding a
+## credential of its own, which is exactly what we are avoiding.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: findmy-collector
+  namespace: findmy
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: findmy-collector
+  namespace: findmy
+rules:
+  ## Namespace-scoped, and this namespace holds only findmy's own secrets. No
+  ## escalation: the pod already mounts the Apple session and the Mac password,
+  ## so read access here grants nothing it did not already have.
+  ## `create` cannot be restricted by resourceName, so the verb is namespace
+  ## wide while the collector only ever touches findmy-session-current.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: findmy-collector
+  namespace: findmy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: findmy-collector
+subjects:
+  - kind: ServiceAccount
+    name: findmy-collector
+    namespace: findmy

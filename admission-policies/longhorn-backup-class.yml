@@ -1,0 +1,59 @@
+## Backup-class declaration for Longhorn/Harvester PVCs (2026-09-16).
+##
+## Every PVC on a longhorn/harvester StorageClass should declare what it wants
+## from Garage: mdapi.ch/backup-class = none | default | weekly. The enforcer
+## (windmill f/heal/backup_label_enforcer) translates that into Longhorn's own
+## recurring-job group labels; this policy is what tells the person applying the
+## manifest, at apply time, that they forgot to say.
+##
+## WARN + AUDIT, never Deny, deliberately:
+##  - Longhorn auto-assigns an unlabelled volume to the `default` group, so an
+##    undeclared PVC already fails SAFE (it gets backed up). The cost of silence
+##    is wasted Garage space, not lost data — that does not justify blocking.
+##  - Many PVCs here are created by controllers, not by a person: StatefulSet
+##    volumeClaimTemplates, VolSync mover caches, CNPG, KubeVirt. A Deny would
+##    break those outright, and they cannot carry a hand-written label anyway —
+##    the enforcer classifies them by pattern instead. Their CREATE warning is
+##    itself useful signal: a new operator-created PVC shape has appeared and
+##    may need a pattern rule.
+##
+## This cluster runs no Kyverno/Gatekeeper, and RKE2 1.35.2 exposes only
+## ValidatingAdmissionPolicy — there is no MutatingAdmissionPolicy — so the
+## label cannot be stamped at admission. Warn is the strongest safe action.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: longhorn-backup-class
+spec:
+  ## Ignore: this policy must never be able to interfere with PVC creation, even
+  ## if an expression errors on an unexpected object shape.
+  failurePolicy: Ignore
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["persistentvolumeclaims"]
+        scope: Namespaced
+  validations:
+    - expression: >-
+        !has(object.spec.storageClassName) ||
+        !(object.spec.storageClassName.contains('longhorn') ||
+          object.spec.storageClassName.contains('harvester')) ||
+        (has(object.metadata.labels) &&
+         'mdapi.ch/backup-class' in object.metadata.labels &&
+         object.metadata.labels['mdapi.ch/backup-class'] in ['none', 'default', 'weekly'])
+      message: >-
+        This PVC is on a Longhorn/Harvester StorageClass but does not declare
+        mdapi.ch/backup-class (none|default|weekly). Until it does, Longhorn's
+        auto-default will back it up to Garage monthly. Note: 'none' is applied
+        by joining the `nobackup` recurring-job group — REMOVING the labels does
+        not work, it is what triggers the auto-default in the first place.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: longhorn-backup-class
+spec:
+  policyName: longhorn-backup-class
+  validationActions: ["Warn", "Audit"]

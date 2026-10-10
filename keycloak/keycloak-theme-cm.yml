@@ -1,0 +1,75 @@
+# Login theme "mdapi" for realm tilloch — adds a "no account yet? request one"
+# link pointing at https://start.mdapi.ch/request/ (beads infra-kgnp).
+#
+# ── WHY A THEME AT ALL ──────────────────────────────────────────────────────
+# Someone who reaches mdapi.ch with no account is sent here to log in, and the
+# stock login page offers them nothing: realm tilloch has registrationAllowed
+# = false ON PURPOSE (Keycloak cannot create the LDAP user anyway -- error 65,
+# it fails closed -- so every path must end in the LDAP-first
+# f/marketplace/request_membership flow). Enabling Keycloak's own registration
+# to get the link would turn on real self-registration, which is precisely what
+# we do not want. A theme adds the link without touching that setting.
+#
+# ── WHY footer.ftl AND NOT login.ftl ────────────────────────────────────────
+# The obvious move is to fork login.ftl and add the link next to the form. Do
+# NOT: that file is ~120 lines carrying the password form, passkey handling and
+# the credential-reset links, and a fork silently stops inheriting upstream
+# changes to any of them. Breaking the SSO front door to add a hyperlink is a
+# bad trade.
+# base/login/footer.ftl is an EMPTY macro whose own upstream comment reads:
+# "The footer at the bottom of the login-box. You can override this file in your
+# custom theme to declare a custom login footer element". It is the intended
+# extension point, it is three lines, the stock `keycloak` theme does not
+# override it, and the worst case for a bad override is a missing footer rather
+# than an unusable login form. Verified against tag 26.7.2, the running version.
+#
+# NOTE: footer.ftl renders on EVERY login-theme page, not only the login form --
+# so the link also appears on password reset and required-action pages. Wording
+# is kept neutral for that reason. Rendering it unconditionally is deliberate:
+# the alternatives all key off context variables that would make the link vanish
+# silently if they ever changed, and a link that fails OPEN is the safer default.
+#
+# Messages carry a distinct mdapi* prefix so they can never collide with a
+# Keycloak key, and cover every locale the realm actually advertises
+# (supportedLocales = de,en,fr,it,pl; internationalizationEnabled = true).
+# Non-ASCII is \u-escaped so the file is safe whatever encoding the properties
+# loader assumes.
+#
+# The theme is a plain resource directory, not a provider jar, so it needs NO
+# `kc.sh build` and works with the optimized image. Keycloak caches themes, so a
+# change here needs a pod restart to take effect.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-theme-mdapi
+  namespace: keycloak
+data:
+  theme.properties: |
+    parent=keycloak
+
+  footer.ftl: |
+    <#macro content>
+        <div id="mdapi-request-account" class="${properties.kcSignUpClass!}" style="margin-top:1rem;text-align:center">
+            <span>${msg("mdapiNoAccount")} <a href="https://start.mdapi.ch/request/">${msg("mdapiRequestAccount")}</a></span>
+        </div>
+    </#macro>
+
+  messages_en.properties: |
+    mdapiNoAccount=No account yet?
+    mdapiRequestAccount=Request one
+
+  messages_it.properties: |
+    mdapiNoAccount=Non hai ancora un account?
+    mdapiRequestAccount=Chiedine uno
+
+  messages_de.properties: |
+    mdapiNoAccount=Noch kein Konto?
+    mdapiRequestAccount=Konto anfragen
+
+  messages_fr.properties: |
+    mdapiNoAccount=Pas encore de compte ?
+    mdapiRequestAccount=En demander un
+
+  messages_pl.properties: |
+    mdapiNoAccount=Nie masz jeszcze konta?
+    mdapiRequestAccount=Popro\u015B o konto

@@ -1,0 +1,128 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: litellm-env-secret
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: litellm-env-secret
+    creationPolicy: Owner
+
+  data:
+    # Backend URLs live in Akeyless (not this public repo) so the laptop's
+    # internal hostnames are never committed. Values, e.g.:
+    #   LMSTUDIO_WIRED_URL = http://mbp-mda.home.tillo.ch:1234/v1
+    #   LMSTUDIO_WIFI_URL  = http://mbp-mda-wifi.home.tillo.ch:1234/v1
+    #   LMSTUDIO_WG_URL    = the laptop's WireGuard road-warrior address
+    #                        (bpi-r4 wg_iot peer, reachable when it's away)
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_WIRED_URL
+      secretKey: LMSTUDIO_WIRED_URL
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_WIFI_URL
+      secretKey: LMSTUDIO_WIFI_URL
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_WG_URL
+      secretKey: LMSTUDIO_WG_URL
+    # LM Studio API token ("Require Authentication" in its Developer server
+    # settings, 2026-08-19) — the laptop serves an unauthenticated OpenAI API
+    # on whatever LAN it sits on otherwise.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_API_KEY
+      secretKey: LMSTUDIO_API_KEY
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/ANTHROPIC_API_KEY
+      secretKey: ANTHROPIC_API_KEY
+    # DeepSeek platform key (2026-08-24) for the ds-flash / ds-pro aliases.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/DEEPSEEK_API_KEY
+      secretKey: DEEPSEEK_API_KEY
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LITELLM_MASTER_KEY
+      secretKey: LITELLM_MASTER_KEY
+    # Admin-UI login (2026-08-26). Without these the /ui login form only accepts
+    # the master key, which means pasting the proxy's most privileged credential
+    # into a browser on every visit. UI_USERNAME defaults to "admin" upstream
+    # (proxy/auth/login_utils.py:71) -- set both explicitly.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/UI_USERNAME
+      secretKey: UI_USERNAME
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/UI_PASSWORD
+      secretKey: UI_PASSWORD
+    # OTLP span export to OpenObserve (2026-09-22). This is the ONLY secret part
+    # of the tracing wiring -- endpoint, protocol and service name are plain env
+    # on the Deployment, because they are not credentials and hiding them in a
+    # Secret only makes them harder to read.
+    #
+    # Value shape is exactly what the OTel SDK wants for OTEL_EXPORTER_OTLP_HEADERS:
+    #     Authorization=Basic <base64(email:token)>
+    # It is NOT the root credential: it is a dedicated OpenObserve SERVICE ACCOUNT
+    # (otel-ingest@mdapi.ch, role service_account), created for this and scoped to
+    # ingestion. OTLP ingest is authenticated -- an unauthenticated POST to
+    # /api/default/v1/traces answers 401, verified 2026-09-22 -- so a span emitter
+    # with no credential fails CLOSED and silently drops everything. If traces stop
+    # arriving, check this secret before suspecting the exporter.
+    - remoteRef:
+        key: /mdapi/openobserve/otel/ingest-header
+      secretKey: OTEL_EXPORTER_OTLP_HEADERS
+    # Search-provider keys for the `tavily` / `serper` search_tools (litellm-cm.yml).
+    # These names are not free choices: the provider transforms read exactly
+    # TAVILY_API_KEY / SERPER_API_KEY via resolve_server_api_key, so an env var
+    # under any other name is silently ignored and the tool 401s.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/TAVILY_API_KEY
+      secretKey: TAVILY_API_KEY
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/SERPER_API_KEY
+      secretKey: SERPER_API_KEY
+    # Shared-state Redis (general_settings.coordination_redis in litellm-cm.yml).
+    # Reuses the cluster's existing bootstrap/valkey cluster, so this is the SAME
+    # credential bootstrap/valkey-es.yml syncs -- duplicated here only because a
+    # cross-namespace secretKeyRef is not allowed and the litellm Deployment
+    # receives secrets via envFrom on this one ExternalSecret. Verified
+    # 2026-10-02: the path resolves identically in ns litellm and the value
+    # AUTHs against valkey.bootstrap:6379. Keep it out of the CM -- a password is
+    # not config, and the ConfigMap is world-readable.
+    - remoteRef:
+        key: /mdapi/bootstrap/valkey/password
+      secretKey: VALKEY_PASSWORD
+    # At-rest encryption key (LITELLM_SALT_KEY). Read straight from the env by
+    # litellm/proxy/common_utils/encrypt_decrypt_utils.py::_get_salt_key, which
+    # otherwise falls back to the MASTER KEY -- so before this, every stored
+    # credential was encrypted under the master key and a master-key rotation
+    # would have made all of them undecryptable.
+    #
+    # ⛔ THE AKEYLESS ITEM MUST EXIST BEFORE THIS MERGES. External Secrets resolves
+    # every remoteRef in one pass: a missing key fails the whole sync, so this
+    # entry landing first would also stop VALKEY_PASSWORD above (and everything
+    # else here) from reaching the pod. Create it first:
+    #   akeyless create-secret --name /mdapi/litellm/litellm-env-secret/LITELLM_SALT_KEY \
+    #     --value "$(openssl rand -base64 48 | tr -d '\n')" --delete-protection true
+    #
+    # ⛔ PERMANENT. This key encrypts stored credentials; changing it strands every
+    # value written under the old one and there is no recovery path. Verified safe
+    # to introduce on 2026-10-02: litellm's own attestation scan
+    # (GET /credentials/migrate-encryption/check) reported residual_legacy=0 and
+    # total_undecryptable=0, so nothing was yet encrypted under the master-key
+    # fallback. What it does invalidate is transient: sealed UI session tokens and
+    # any outstanding `resp_*` ids (encrypt_bearer_token), i.e. a re-login.
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LITELLM_SALT_KEY
+      secretKey: LITELLM_SALT_KEY
+    # Customer-data guard (2026-10-05 -- 2026-10-05): CUSTOMER_DENYLIST and
+    # CUSTOMER_GUARD_MODE used to be synced here for the retired custom-callback
+    # guard. The native guardrail that replaced it (`customer-data-guard`, a
+    # DB-stored litellm guardrail) fetches the deny-list itself, directly from
+    # Akeyless, via a role scoped to read only that one secret
+    # (litellm-customer-denylist-ro) -- so it never needs a broad credential
+    # like this one's, and the terms no longer need to pass through this K8s
+    # Secret or the litellm pod's own environment at all. The underlying
+    # Akeyless secret at /mdapi/litellm/litellm-env-secret/CUSTOMER_DENYLIST
+    # still exists and is still the one the guard reads -- only this wider
+    # ExternalSecret's access to it was removed.

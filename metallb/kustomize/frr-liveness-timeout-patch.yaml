@@ -1,0 +1,23 @@
+# Approved infra-health hardening (restart:metallb-system/metallb-frr-k8s,
+# approved 2026-08-12): the frr container's livenessProbe (HTTPS :9141/livez)
+# ships timeoutSeconds=1 and the frr-k8s chart template hardcodes no timeout
+# field, so the values.yml raise (timeoutSeconds 1->5, 2026-08-03) reached only
+# the controller probes. Under Ceph OSD-recreate backfill IO/CPU load the 1s
+# probe misses 6x10s and kubelet SIGTERMs a healthy FRR (85 restarts by 08-12,
+# all exit 143, BGP/VIP flap each time). Strategic-merge sets only
+# timeoutSeconds; httpGet/period/failureThreshold are preserved. Namespace is
+# explicit because the frr-k8s chart renders it (unlike cribl's chart) and
+# kustomize matches on it. Verified locally with helm template | kubectl
+# kustomize before committing.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: metallb-frr-k8s
+  namespace: metallb-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: frr
+        livenessProbe:
+          timeoutSeconds: 5

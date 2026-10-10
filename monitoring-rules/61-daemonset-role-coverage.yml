@@ -1,0 +1,234 @@
+## DaemonSet COVERAGE — "how many nodes is this supposed to be running on?"
+##
+## THE INCIDENT THIS EXISTS FOR (found 2026-09-22 by hand, beads infra-yncu).
+## cattle-logging-system/rancher-logging-kube-audit-fluentbit shipped the fluentbit
+## that tails each control-plane node's API-server audit log. It selected
+## node-role.kubernetes.io/master — and `master` is a legacy label current RKE2 does
+## not set at all, which qua and qui only still carry as an artifact of their
+## two-year-old provisioning. Measured timeline, all from vmsingle:
+##
+##   09-14 00:40  quo goes NotReady; both control-plane-scoped DaemonSets drop to
+##                desired=2. Harmless: a node that is down emits no audit events.
+##   09-14 06:05  quo leaves the cluster (control-plane and etcd counts 3 -> 2).
+##   09-14 06:45  quo rejoins with control-plane and etcd, WITHOUT master.
+##                control-plane is back to 3; `master` is 2 from here on, forever.
+##   09-14 06:45  the DaemonSet is now desired=2 against 3 control-plane nodes —
+##       ->       quo's audit log is written to /var/lib/rancher/rke2/server/logs/
+##   09-22 16:00  audit.log and tailed by nobody for eight days (196 h). The node
+##                was healthy and emitting the whole time.
+##   09-22 16:00  fleet !440 repoints the selector at control-plane. Coverage 3/3.
+##
+## ⛔ WHY "DESIRED vs the nodes matching its nodeSelector" IS NOT A CHECK — it is
+## the tautology that let this run for eight days. kube_daemonset_status_desired_
+## number_scheduled IS, by definition, the number of nodes matching the DaemonSet's
+## own nodeSelector/nodeAffinity. Measured 2026-10-05: DESIRED equals the selector
+## match count for all 28 DaemonSets on this cluster, healthy or not — so a rule
+## comparing them can never fire on anything. The quo DaemonSet was never
+## inconsistent with its selector; the selector had stopped meaning what it was
+## written to mean. "This must cover every control-plane node" is INTENT, and intent
+## is the one thing the cluster does not record anywhere. So the two detectable
+## halves are:
+##
+##   1. a NODE lost a node-role.kubernetes.io/* label — every role-scoped selector
+##      silently stops covering it. Fully derived, no list, and it fires for
+##      consumers nobody thought about. This is the root cause.
+##   2. a role-scoped DaemonSet covers fewer READY nodes than its role has — the
+##      level check. This catches a selector that was wrong from BIRTH, which (1)
+##      cannot see because no role was ever lost.
+##
+## Both live in this file on purpose: they are one story, read and changed together.
+##
+## ⚠️ THIS CLUSTER IS THE TRAP, PERMANENTLY. quo has carried only {control-plane,
+## etcd} since the 2026-09-14 rebuild, so kube_node_role still reports
+## role="master" on 2 nodes and role="control-plane" on 3. The residue is invisible
+## and will stay that way — nothing will ever restore it, because nothing should:
+## `master` is deprecated and the fix is to stop selecting it. These rules are what
+## makes the residue harmless instead of load-bearing.
+##
+## ℹ️ kube_node_role (kube-state-metrics) is one series per (node, role) pair — the
+## cluster's own role vocabulary, so no rule here names a node or maintains a role
+## list. Provenance note: replayed over 30 d against vmsingle-mdapi on 2026-10-05.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: daemonset-role-coverage
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cluster-node-role.rules
+    rules:
+    - alert: NodeLostNodeRole
+      ## A node carries fewer node-role.kubernetes.io/* labels than it did two hours
+      ## ago. count(kube_node_role) per node IS that node's role count; comparing it
+      ## against its own value two hours back makes this a CHANGE detector, not a
+      ## level one, so a node that has always had two roles stays quiet.
+      ##
+      ## ⭐ The `or 0 * count by (node) (kube_node_info)` arms are load-bearing, not
+      ## tidiness. If a node drops to ZERO roles, kube_node_role stops emitting for
+      ## it and `<` has nothing to compare on that side — so without the arm the most
+      ## complete loss of role labels would be the one case that stayed silent. The
+      ## kube_node_info term also means a node created inside the last two hours has
+      ## no "before" to fall short of and cannot fire.
+      ##
+      ## ⚠️ `offset 2h` rather than a plain level check, because the condition clears
+      ## itself: on the node's next rebuild both sides see the same count and it goes
+      ## quiet. A "below its all-time maximum" rule would latch on forever.
+      ##
+      ## Replayed 2026-09-05..10-05: fires exactly ONCE — node quo, 09-14 06:45 ->
+      ## 08:00, ~1.2 h of condition, ~1.0 h of firing after `for:`. That is the
+      ## rebuild that cost quo `master`, ten minutes after it rejoined. Nothing else
+      ## in 30 days, including the 2026-10-03 triple-host-down — a node that goes
+      ## away and comes back keeps its role labels; the loss here was that quo came
+      ## back as a NEW member.
+      expr: |
+        (
+          count by (node) (kube_node_role)
+          or
+          0 * count by (node) (kube_node_info)
+        )
+        <
+        (
+          count by (node) (kube_node_role offset 2h)
+          or
+          0 * count by (node) (kube_node_info offset 2h)
+        )
+      for: 15m
+      labels:
+        service: '{{ $labels.node }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## internal topology signal; on its own nothing a visitor can observe
+        statuspage: exclude
+      annotations:
+        summary: "node {{ $labels.node }} lost a node-role label"
+        description: |
+          {{ $labels.node }} carries fewer node-role.kubernetes.io/* labels than it
+          did two hours ago. Every DaemonSet, nodeAffinity and scheduling rule that
+          selects the lost role silently stops covering this node — and a DaemonSet
+          still running on every OTHER node reports CURRENT == DESIRED == READY the
+          whole time, so it looks perfectly healthy while this node's share of
+          whatever it collects goes nowhere.
+          Precedent: rancher-logging-kube-audit-fluentbit on 2026-09-14 — quo
+          rejoined without `master`, one third of the control-plane audit stream
+          stopped shipping, and nothing fired for eight days (fleet !440).
+
+          Check what it lost, then whether anything role-scoped still misses it:
+            kubectl --context mdapi-prod-direct get node {{ $labels.node }} -o jsonpath='{.metadata.labels}' | tr ',' '\n' | grep node-role
+            kubectl --context mdapi-prod-direct get ds -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,SEL:.spec.template.spec.nodeSelector,DESIRED:.status.desiredNumberScheduled
+          A node that just came back from a rebuild is the usual cause: it rejoins
+          as a new member, and whichever legacy labels the surviving nodes still
+          carry are simply absent. That asymmetry is why the fix belongs in the
+          selector, not in a relabel that the next rebuild undoes — and why
+          RoleScopedDaemonSetUnderCovered below is the half that names the consumer.
+
+  - name: cluster-daemonset-coverage.workload
+    rules:
+    - alert: RoleScopedDaemonSetUnderCovered
+      ## THE LEVEL CHECK — the half that catches a selector wrong from BIRTH, and
+      ## the regression guard for !440 itself. The rancher-logging chart's
+      ## `controlplaneSelector` helper DEFAULTS to `master: "true"` whenever
+      ## additionalLoggingSources.rke2.enabled is true and only honours the
+      ## override, so dropping additionalLoggingSources.kubeAudit.nodeSelector from
+      ## the Fleet-owned Addon silently restores exactly the broken selector that
+      ## cost eight days. Nothing else in the estate would notice.
+      ##
+      ## ⛔ THE FOUR NAMES ARE THE ONE NON-DERIVABLE INPUT, and they are deliberate.
+      ## "Which nodes is this DaemonSet SUPPOSED to cover" is intent: it exists
+      ## nowhere in the cluster, and the DaemonSet's own nodeSelector — the obvious
+      ## place to derive it — is precisely the thing that goes wrong. What is NOT
+      ## listed is the node side: role counts come live from kube_node_role, so
+      ## adding, draining or rebuilding a control-plane or etcd node never needs an
+      ## edit here. Only a NEW role-scoped DaemonSet does — this is the list to
+      ## extend. Verified 2026-10-05: these are the only four on the cluster; all
+      ## other DaemonSets select `kubernetes.io/os` or nothing.
+      ##
+      ## ⭐ The right-hand side counts only READY nodes, and that is the whole
+      ## reason this rule is usable. A NotReady control-plane node emits no audit
+      ## events, so a DaemonSet that "misses" it is missing nothing — counting all
+      ## role nodes makes the rule fire on every node outage, which is noise that
+      ## !723's NodeNotReady already covers properly. With the readiness join,
+      ## 30 d of replay produces exactly three firing runs and all three are the
+      ## real thing: rancher-logging-kube-audit-fluentbit, 09-14 06:45 forward, the
+      ## eight-day gap in #1 (plus the two 10-20 min breaks at 11:10 and 22:55 while
+      ## quo was being pulled in and out of the cluster that day).
+      ##
+      ## ⭐ `max by (namespace, daemonset, role)` strips pod/instance/endpoint — the
+      ## kube-state-metrics coordinates. Measured: three different KSM pod names
+      ## appear across 30 d, and every one of them would otherwise mint a NEW alert
+      ## identity — resolving the firing alert and starting a fresh one at `for:`
+      ## zero. An alert about a coverage gap must not be reset by a restart of the
+      ## thing that measures it. ⚠️ This is NOT the vmalert-restart case that !733
+      ## fixed by pinning v1.153.0: that restores `for:` state for the SAME series,
+      ## whereas a changed label set is a different alert that never had any state
+      ## to restore. Unlike the rest of the rules here this expression aggregates;
+      ## that is why.
+      ##
+      ## The comparison is `<` only — over-coverage is not a thing, and `!=` would
+      ## flap through the scrape where a role count and DESIRED move out of step.
+      ##
+      ## `for: 1h` is flap headroom, not a noise threshold: with the readiness join
+      ## the replay is IDENTICAL at `for: 15m`, so nothing in 30 days depends on it.
+      ## It exists for a node mid-rebuild, where desired and role count settle a
+      ## scrape apart.
+      ##
+      ## ⛔ The rejected generic alternative, measured: `desired < count(kube_node_
+      ## info)` is quiet today (every DaemonSet but windows-exporter sits at 3), but
+      ## it false-fires on the first intentionally node-scoped DaemonSet — windows-
+      ## exporter, desired=0, is already one — and it cannot tell "scoped to a
+      ## subset on purpose" from "scoped to a subset by mistake". The four names
+      ## encode exactly that distinction.
+      ##
+      ## ⚠️ Fail-open by construction: if kube-state-metrics or the readiness series
+      ## disappear, the right-hand side empties and this stays silent. That is the
+      ## estate's general kube-state-metrics exposure, watched by meta-monitoring.
+      ##
+      ## Evaluated live 2026-10-05: 0 series.
+      expr: |
+        max by (namespace, daemonset, role) (
+          label_replace(kube_daemonset_status_desired_number_scheduled{namespace="cattle-logging-system",daemonset="rancher-logging-kube-audit-fluentbit"}, "role", "control-plane", "daemonset", ".*")
+          or label_replace(kube_daemonset_status_desired_number_scheduled{namespace="harvester-system",daemonset="kube-vip"}, "role", "control-plane", "daemonset", ".*")
+          or label_replace(kube_daemonset_status_desired_number_scheduled{namespace="etcd-priority",daemonset="etcd-priority"}, "role", "etcd", "daemonset", ".*")
+          or label_replace(kube_daemonset_status_desired_number_scheduled{namespace="monitoring",daemonset="etcd-metrics-proxy"}, "role", "etcd", "daemonset", ".*")
+        )
+        < on (role) group_left()
+        count by (role) (
+          kube_node_role
+          and on (node) (kube_node_status_condition{condition="Ready",status="true"} == 1)
+        )
+      for: 1h
+      labels:
+        service: '{{ $labels.daemonset }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## internal collection-coverage signal
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.daemonset }} covers only {{ $value }} of the cluster's {{ $labels.role }} nodes"
+        description: |
+          This DaemonSet is running on fewer READY nodes than the cluster has
+          carrying its role ({{ $labels.role }}) — and it will keep reporting N/N
+          READY while it does. A nodeSelector that matches fewer nodes does not
+          degrade a DaemonSet, it silently shrinks its fleet, and whatever it
+          collects from the missing node is collected by nobody.
+          Precedent: rancher-logging-kube-audit-fluentbit sat at 2/2 across
+          2026-09-14..09-22 selecting the legacy `master` label, one third of the
+          API-server audit stream going nowhere (fleet !440). The chart default for
+          that selector is STILL `master`, so this is a live regression path and not
+          only history.
+
+          Compare the selector with the labels the nodes actually carry:
+            kubectl --context mdapi-prod-direct -n {{ $labels.namespace }} get ds {{ $labels.daemonset }} -o jsonpath='{.spec.template.spec.nodeSelector}'
+            kubectl --context mdapi-prod-direct get nodes -L node-role.kubernetes.io/{{ $labels.role }}
+          Every RKE2 control-plane node carries control-plane and etcd; `master` is a
+          deprecated alias only the older nodes happen to keep. If the selector says
+          master, or the uncovered node came back from a rebuild, repoint the
+          selector at the role — relabelling the node only holds until the next
+          rebuild. For the kube-audit DaemonSet the lever is
+          additionalLoggingSources.kubeAudit.nodeSelector in the Fleet-owned Addon
+          (fleet/monitoring-logging/addon.yml); it sits at the kubeAudit level, NOT
+          under kubeAudit.fluentbit.

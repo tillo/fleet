@@ -1,0 +1,636 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "mdapi Renovate — EVERY container image in the fleet and ALL Fleet Helm chart versions. Both lanes are Renovate-owned since 2026-10-02; Keel is being retired. LANE A = tag + @sha256 digest, IfNotPresent: the tag keeps tracking upstream and Renovate pins the digest it resolves, so a moving :latest becomes a git commit instead of a live patch. LANE B = pinned version tag, IfNotPresent. POLICY VOCABULARY (see the 'lane policy' rules at the head of packageRules): update TYPES (major never auto-merges; minor/patch/digest do, per package), SOAK (minimumReleaseAge, safe on every registry because minimumReleaseAgeBehaviour is timestamp-optional), WINDOW (automergeSchedule, Europe/Zurich). ⛔ NO SECURITY AUTOMERGE LANE (infra-jypn, corrected 2026-10-07): the vulnerabilityAlerts block below and osvVulnerabilityAlerts are INERT in this repo — nothing auto-merges on an advisory, and an image or chart CVE is seen only when a human reads the Renovate MR. OSV alerts cover LANGUAGE datasources only, every dependency here is docker or helm, and enabledManagers lists no language manager; the flags are kept only for the day a language package is enabled. Read the block's own description before assuming otherwise. See operator ~/imagepolicy-study/PROPOSAL.md. ⚠️ The reasoning lives in the `description` of each rule below, not in a doc file: this repository carries manifests, not prose (README 'What this repository is'). ⚠️ ignorePaths holds the VENDORED upstream charts out of every manager — gitlab/charts/ (infra-h0xb) is the first. The kubernetes manager matches every .ya?ml and helm-values matches every values.ya?ml, so without it the 209 upstream files there become Renovate's, including upstream's own values.yaml, whose image refs this estate never deploys. When vendoring another chart, add its directory here: tests/test_gitlab_vendored_chart.py derives this from the .vendored marker and fails if the two disagree.",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommitsDisabled", "mergeConfidence:all-badges"],
+  "enabledManagers": ["kubernetes", "fleet", "custom.regex", "helm-values"],
+  "baseBranchPatterns": ["main"],
+  "automerge": false,
+  "minimumReleaseAgeBehaviour": "timestamp-optional",
+  "labels": ["renovate"],
+  "platformAutomerge": true,
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "description": "⛔ INERT IN mdapi/fleet — KEPT, NOT RELIED ON (infra-jypn, corrected 2026-10-07). No dependency in this repo can take this path. (1) OSV alerts are LANGUAGE-ONLY: the datasource→ecosystem map is util/vulnerability/ecosystem.js `datasourceToOsvEcosystem` in the PRODUCTION version 44.139.0 (42.99.0, used for local dry-runs, carries the same list inline as `Vulnerabilities.datasourceEcosystemMap` in workers/repository/process/vulnerabilities.js) = clojure/crate/go/golang-version/hackage/hex/maven/npm/nuget/packagist/pypi/rubygems. There is NO docker and NO helm entry, and fetchDependencyVulnerability() returns null ('Cannot map datasource … to OSV ecosystem') for anything outside it, so osvVulnerabilityAlerts can raise ZERO alerts here. Every dep this repo has is datasource `docker` (kubernetes + helm-values + the stream custom.regex) or `helm` (fleet manager + the gitlab custom.regex). (2) Even a language dep would not reach it: enabledManagers lists only kubernetes/fleet/custom.regex/helm-values, so no language manager runs, and there is no language manifest tracked anywhere in the repo. ⛔ It also cannot be scoped per package: the synthesized vulnerability rule's force is `{...packageFileConfig.vulnerabilityAlerts}`, where packageFileConfig = mergeChildConfig(getManagerConfig(config, manager), pFile) — the TOP-LEVEL config with packageRules NOT applied, so a packageRule-level vulnerabilityAlerts is never consulted — and workers/repository/updates/flatten.js strips `vulnerabilityAlerts` from every flattened update, so such a copy would not survive to a branch either. The block's other reader, workers/repository/init/vulnerability.js (GitHub Dependabot alerts, via platform.getVulnerabilityAlerts) is implemented ONLY by the github platform — this estate is GitLab, so it exits at 'No vulnerability alerts found'. ⚠️ Written 2026-06-29 believing it 'covers Docker/Helm advisories' and the belief outlived every audit, because a config description cannot fail: tests/test_renovate_has_no_osv_eligible_dependency.py now fails if either premise above stops holding. ⛔ Infra-h0xb D3 asked for vulnerabilityAlerts on the GitLab chart rule for the same reason — that is unbuildable for a helm chart and would be dead code; the gitlab rule's description says so and points at Windmill f/probe/gitlab_version_health as the real CVE oracle.",
+    "enabled": true,
+    "automerge": true,
+    "automergeSchedule": ["at any time"],
+    "minimumReleaseAge": "0 days",
+    "addLabels": ["security"]
+  },
+  "timezone": "Europe/Zurich",
+  "automergeSchedule": ["* 0-6 * * *"],
+  "gitLabIgnoreApprovals": true,
+  "configMigration": true,
+  "assignees": ["tillo"],
+  "prHourlyLimit": 2,
+  "prConcurrentLimit": 10,
+  "ignorePaths": ["gitlab/charts/**"],
+  "kubernetes": {
+    "description": "Matches every .ya?ml (widened 2026-09-13 from a [-deploy,-ds] filename gate that silently skipped ~20 pins). ⚠️ Was justified by 'packageRules[0] keeps the manager Default OFF' — that stopped being true on 2026-10-02 when the Lane-A migration turned manifest images ON BY DEFAULT. This pattern now reads more files AND proposes for them, which is the intent; the earlier wording is kept only as the reason the widen was safe at the time.",
+    "managerFilePatterns": ["/\\.ya?ml$/"],
+    "registryAliases": {
+      "zot.mdapi.ch/berriai": "ghcr.io/berriai"
+    }
+  },
+  "fleet": {
+    "managerFilePatterns": ["/(^|/)fleet\\.ya?ml$/"]
+  },
+  "helm-values": {
+    "description": "Reads image repository/tag pinned inside Helm values files (added 2026-09-12 — before it, NOTHING read a values.yml, so 12/14 values files carried unmanaged pins). One manager, not a dozen regexes.",
+    "managerFilePatterns": ["/(^|/)values\\.ya?ml$/"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Lane-B pins living inside Helm values files, invisible to the kubernetes manager (Lane-B blind-spot closure 2026-07-15): stream ca-pub static-serving image.",
+      "managerFilePatterns": ["/^stream/values\\.yml$/"],
+      "matchStrings": ["image: (?<depName>nginxinc/nginx-unprivileged):(?<currentValue>\\S+)"],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "infra-h0xb: the VENDORED Core GitLab Helm chart's pin (gitlab/fleet.yaml, ns bootstrap) — the release that was hand-installed outside Fleet AND outside Renovate until this bundle, so a GitLab CVE had no automated patch path. ⛔ WHY THIS MANAGER AND NOT THE fleet ONE: `chart:` there is a LOCAL PATH (./charts/gitlab), and the fleet manager returns skipReason `local-chart` for those BEFORE it ever looks for a repo (verified in renovate 42.99.0, modules/manager/fleet/extract.js: `checkIfStringIsPath(doc.chart)` precedes the repo check) — so the pin is invisible to it. A `repo:` cannot be added to make it visible: Fleet would then fetch the chart remotely and embed 2,079,280 B in the Bundle, which is the whole reason the tree is vendored and trimmed to ~495 KB in the first place (tools/ci/bundle-gate.py is the gate). So the pin is read here instead, off the `# renovate:` line gitlab/fleet.yaml carries above `version:`. ⛔ THAT COMMENT IS PART OF THE REGEX, deliberately. Renovate parses NO `# renovate:` comment syntax — the fields below come from the *Template keys, and a customManager's comment is decorative (hence no `# renovate:` line for the stream manager above). The one thing tying comment and config together is that matchStrings requires the comment VERBATIM, so the two cannot drift: edit or delete that line and the dependency silently disappears. tests/test_gitlab_chart_is_renovate_reachable.py runs THIS regex against THAT file, because a regex that stopped matching reports exactly the same green as one that found nothing. ⚠️ depName/packageName are both set EXPLICITLY and the rule downstream matches on depName: Renovate's PackageNameMatcher returns false (not an error) when packageName is unset — `if (!packageName) return false` — which is the litellm trap further down this file. versioning semver: GitLab chart versions are plain X.Y.Z.",
+      "managerFilePatterns": ["/^gitlab\\/fleet\\.yaml$/"],
+      "matchStrings": ["# renovate: datasource=helm depName=gitlab registryUrl=https://charts.gitlab.io\\n  version: (?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "gitlab",
+      "packageNameTemplate": "gitlab",
+      "datasourceTemplate": "helm",
+      "registryUrlTemplate": "https://charts.gitlab.io/",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "LANE POLICY · OWNERSHIP — manifest images are ON BY DEFAULT (2026-10-02). This replaces the `Default OFF` rule that stood here in the Keel era. Default OFF had exactly one justification: Keel owned the floating Lane-A refs, so Renovate had to be kept away from them or the two would fight over the live image. Retiring Keel removes that justification and leaves only its cost, which the estate paid four times — alpine/k8s (a year), the 12 values.yml files, litellm, OpenObserve (six weeks). The failure is silent by construction: a package with no opt-in rule is never evaluated, so it produces no MR, no dependency-dashboard row and no log line. Under ON, an image is Renovate's the moment it is committed. To keep one OUT, add a rule with matchPackageNames + enabled:false AFTER this one (last-wins).",
+      "matchManagers": ["kubernetes"],
+      "enabled": true
+    },
+    {
+      "description": "LANE POLICY · PINNING — pin the digest of every manifest image. This is the single mechanism that turns Lane A into something git can own: `latest`, `3-alpine` and `v2-alpine` are tags that move on their own, and @sha256 is what freezes the build they currently point at. It applies to Lane B too, so an upstream in-place rebuild of a pinned tag arrives as a `digest` MR instead of drifting unrecorded. Refs that already carry a digest are left alone. ⭐ `helm-values` joined 2026-10-02 (was kubernetes-only): without it, an image written into a Helm values file was neither digest-pinned nor digest-automerged, which is what kept `cribl` on Keel. helm-values replaces the tag IN PLACE with `tag@sha256:…` (`autoReplaceStringTemplate` in the manager), for the same reason the kubernetes manager appends to `image:` — a values-file ref has no separate digest field.",
+      "matchManagers": ["kubernetes", "helm-values"],
+      "pinDigests": true
+    },
+    {
+      "description": "LANE POLICY · DIGEST / LANE A — automerge, 1-day soak, overnight window. Placed HERE, ahead of the MR-only opt-out block, so a named exception further down still wins (last-match-wins per field). The soak is what makes the retirement of Keel safe for the `:latest` trackers: Keel rolled those within 4h of any upstream push with no review, so a soak plus a human-readable MR is a strictly narrower door than the one it replaces. Safe on every registry because minimumReleaseAgeBehaviour is timestamp-optional — where a registry publishes no releaseTimestamp (zot, most of ghcr) the age simply cannot be checked and the update passes, instead of freezing forever the way a default-behaviour soak would. ⭐ `helm-values` joined 2026-10-02, so this rule now covers EVERY manager that reads an image ref. Consequence to be aware of: every values-file pin in the estate (19 deps) gains digest automerge after the 1-day soak, which is the intent — a Lane-B values pin whose upstream tag is rebuilt in place should arrive as a commit, not drift. ⚠️ helm-values is still absent from the BLANKET MINOR+PATCH rule, so version updates in values files stay MR-only unless listed in GRADUATED.",
+      "matchManagers": ["kubernetes", "helm-values"],
+      "matchUpdateTypes": ["digest"],
+      "automerge": true,
+      "minimumReleaseAge": "1 day",
+      "labels": ["renovate", "automerge", "lane-a"]
+    },
+    {
+      "description": "LANE POLICY · LANE A PREDICATE — a pure ALIAS tag receives `digest` updates and NOTHING ELSE. ⭐ The line is drawn between a tag that CONTAINS A VERSION and one that does not: `latest`, `stable`, `edge`, `full`, `master` and friends carry no version, so there is nothing to bump — Lane A means the TAG keeps tracking upstream, the DIGEST is what git freezes, and the only update that may ever be offered is a new digest for the SAME tag. Anything with a number in it (`17`, `1.31-alpine`, `9-alpine`, `v2-alpine`, `2.11.4-alpine`) is a version and stays Lane B, keeping ordinary version updates plus digest pinning. ⛔ This rule was written WIDER first (numeric line tags included) and that was a mistake worth recording: it silently froze `nginxinc/nginx-unprivileged:1.31-alpine` at 1.31 — an image whose whole point is to keep taking nginx mainline upgrades — because 1.31 satisfies a 'line tag' shape just as well as 17 does, and the shape cannot tell the two intents apart. A tag with no version is unambiguous; a tag with one is a policy decision that belongs in a package list, not a regex. ⚠️ Expressed as a predicate rather than a list because the recurring failure in this repo is a LIST nobody remembered to update: this way a `:latest` image is Lane A on the commit that adds it. `matchCurrentValue` is a SEARCH, hence the anchors.",
+      "matchManagers": ["kubernetes", "helm-values"],
+      "matchCurrentValue": "/^(latest|stable|edge|rolling|main|master|develop|dev|nightly|full|alpine)$/",
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "enabled": false
+    },
+    {
+      "description": "Lane-B in-house images, X.Y.Z-mdapi.N (CI-minted). minor+patch auto-merge (trailing rule); majors human. trapeye-image's X.Y.Z is the upstream version, so a real upstream release reads minor/major and stops for review.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "registry.mdapi.ch/mdapi/unbound",
+        "registry.mdapi.ch/mdapi/nameserver",
+        "registry.mdapi.ch/mdapi/trapeye-image"
+      ],
+      "enabled": true,
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "In-house override of the LANE-A soak: auto-merge the -mdapi.N rebuilds + digests after CI green with NO soak. This rule sits AFTER LANE POLICY · DIGEST, so its `minimumReleaseAge: 0 days` wins for these (last-match-wins per field) — which is the point. A 1-day soak on an image this estate builds itself would delay nothing but its own CI output, and the earlier attempt at soaking these froze them for 82 days; pipeline-green is the real gate. Third-party Lane-A images keep the 1-day soak. ⭐ docker-mailserver added 2026-10-02 with the Keel retirement: rebuilt by CI every 4h (GitLab schedule `25 */4 * * *`, project 71) with a daily CACHEBUST, so its digest moves ~once a day, right at the 1-day soak boundary. Unlike the zot/ghcr images it DOES publish a releaseTimestamp (verified: image `created` = 2026-10-02T00:34:25Z via the GitLab manifest config blob), so the soak is enforceable rather than timestamp-optional — and a soak that can only just be satisfied each day is exactly the starvation shape that froze the three above for 82 days. Mail is also the one workload here whose every rollout is a visible outage (single RWO PVC → strategy Recreate, ~60s of ALL mail ports), so it should roll on its own CI's timing, not on a soak boundary.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "registry.mdapi.ch/mdapi/unbound",
+        "registry.mdapi.ch/mdapi/nameserver",
+        "registry.mdapi.ch/mdapi/trapeye-image",
+        "registry.mdapi.ch/mdapi/docker-mailserver"
+      ],
+      "matchUpdateTypes": ["patch", "digest"],
+      "automerge": true,
+      "labels": ["renovate", "automerge"],
+      "minimumReleaseAge": "0 days"
+    },
+    {
+      "description": "Lane-B upstream critical: zot. Manual review. NO soak (ghcr: no releaseTimestamp = permanent freeze); MR-only via the trailing ghcr opt-out.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/project-zot/zot-linux-amd64"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/project-zot/zot"
+    },
+    {
+      "description": "Lane-B upstream critical: Technitium DNS. Manual review with release notes + 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["technitium/dns-server"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/TechnitiumSoftware/DnsServer",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: SpiceDB. Tag rides the serving + migrate initContainers together, so a bump applies a datastore migration at rollout — a schema change, not a new binary. This rule exists because b13ff69's unreviewed Formbricks-v6 major took the app down 2h.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["authzed/spicedb"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/authzed/spicedb",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Fleet Helm charts: every chart pinned in a fleet.yaml is Renovate-managed, 3-day soak. This rule read 'MRs only (no automerge)' until 2026-10-02, which the config does not do. ⚠️ EFFECTIVE BEHAVIOUR (resolved 2026-10-02): minor+patch DO automerge — the BLANKET MINOR+PATCH rule below matches this manager and has since before 2026-07-15 (proven by renovate-bot merges, e.g. the openbao 0.x chart), so the 'Manual review' wording here has been false for months. ⛔ Enforcing it is one added `automerge: false` AFTER the blanket rule — deliberately NOT done here, because it would change merge autonomy estate-wide; owner decision open. Majors never automerge: nothing enables them, and the next rule adds a 7-day soak + major-upgrade label. Bumps the `version:` in the bundle's fleet.yaml; the chart deploys on the next Fleet reconcile after merge.",
+      "matchManagers": ["fleet"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days",
+      "addLabels": ["helm-chart"]
+    },
+    {
+      "description": "Fleet Helm chart MAJOR bumps: longer soak + extra-review label. Chart majors routinely carry breaking values/CRD changes, so never fast-track them.",
+      "matchManagers": ["fleet"],
+      "matchUpdateTypes": ["major"],
+      "minimumReleaseAge": "7 days",
+      "addLabels": ["helm-chart", "major-upgrade"]
+    },
+    {
+      "description": "Lane-B: keel Helm chart (Fleet manager). Keel can't reliably self-update, so Renovate owns its chart-version bumps. Manual review + 3-day soak.",
+      "matchManagers": ["fleet"],
+      "matchDepNames": ["keel"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/keel-hq/keel",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream stock: nginxinc/nginx-unprivileged (showcase + cert-host + stream ca-pub static serving; ca-pub comes in via the custom.regex manager). Pinned tag, Renovate-owned (not Keel), 3-day soak. ⚠️ EFFECTIVE BEHAVIOUR (resolved 2026-10-02): minor+patch DO automerge — the BLANKET MINOR+PATCH rule below matches this manager and has since before 2026-07-15 (proven by renovate-bot merges, e.g. the openbao 0.x chart), so the 'Manual review' wording here has been false for months. ⛔ Enforcing it is one added `automerge: false` AFTER the blanket rule — deliberately NOT done here, because it would change merge autonomy estate-wide; owner decision open.",
+      "matchManagers": ["kubernetes", "custom.regex"],
+      "matchPackageNames": ["nginxinc/nginx-unprivileged"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream stock: alpine/k8s (mail-reconciler CronJob kubectl/helm toolbox). Pinned tag, Renovate-owned (not Keel); sat invisible at 1.31.1 for ~a year before the 2026-07-15 blind-spot closure. 3-day soak. ⚠️ EFFECTIVE BEHAVIOUR (resolved 2026-10-02): minor+patch DO automerge — the BLANKET MINOR+PATCH rule below matches this manager and has since before 2026-07-15 (proven by renovate-bot merges, e.g. the openbao 0.x chart), so the 'Manual review' wording here has been false for months. ⛔ Enforcing it is one added `automerge: false` AFTER the blanket rule — deliberately NOT done here, because it would change merge autonomy estate-wide; owner decision open.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["alpine/k8s"],
+      "enabled": true,
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B: Lowcoder CE app images (api/node/frontend) — version-coupled, bump all three to the same tag together. Pinned, Renovate-owned, 3-day soak. ⚠️ EFFECTIVE BEHAVIOUR (resolved 2026-10-02): minor+patch DO automerge — the BLANKET MINOR+PATCH rule below matches this manager and has since before 2026-07-15 (proven by renovate-bot merges, e.g. the openbao 0.x chart), so the 'Manual review' wording here has been false for months. ⛔ Enforcing it is one added `automerge: false` AFTER the blanket rule — deliberately NOT done here, because it would change merge autonomy estate-wide; owner decision open.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "lowcoderorg/lowcoder-ce-api-service",
+        "lowcoderorg/lowcoder-ce-node-service",
+        "lowcoderorg/lowcoder-ce-frontend"
+      ],
+      "enabled": true,
+      "groupName": "lowcoder-ce",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: Open WebUI (chat.mdapi.ch). Runs Alembic migrations at startup, so no unattended multi-version jump. MR-only via trailing ghcr opt-out; NO soak (ghcr no releaseTimestamp).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/open-webui/open-webui"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/open-webui/open-webui"
+    },
+    {
+      "description": "Lane-B upstream critical: Frigate NVR. Moved off Keel 2026-09-13 after :stable → 0.18.0 unattended = safe-mode 24h (config can't self-migrate from a read-only ConfigMap). Bump + config migration must land in one reviewed commit. ⚠️ 0.MINOR.PATCH → feature releases read as 'minor' to the blanket rule; the ghcr opt-out is what holds them.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/blakeblackshear/frigate"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/blakeblackshear/frigate"
+    },
+    {
+      "description": "Lane-B: llama.cpp (bussola's narrator). Pinned, not Keel — a build jump can silently change prompt templates/CLI. MR-only, NO soak (ghcr).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/ggml-org/llama.cpp"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/ggml-org/llama.cpp"
+    },
+    {
+      "description": "Lane-B: Bussola, in-house. Pinned, not Keel — applies schema migrations at startup against live user data. Tag <version>-mdapi.<pipeline>.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["zot.mdapi.ch/mdapi/bussola"],
+      "enabled": true,
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "Lane-B: Kokoro-FastAPI TTS. Pinned, not Keel — a floating tag could change voice ids/response shape and the household silently stops being spoken to. MR-only, NO soak (ghcr).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/remsky/kokoro-fastapi-cpu"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/remsky/Kokoro-FastAPI"
+    },
+    {
+      "description": "Lane-B: Open Terminal. Pinned (repo has semver tags); MR-only via trailing ghcr opt-out (new component — first bumps get a human read).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["ghcr.io/open-webui/open-terminal"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/open-webui/open-terminal"
+    },
+    {
+      "description": "Lane-B upstream critical: LiteLLM — gateway for every estate LLM call. Added 2026-09-13 when CVE-2026-59822 found the pin tracked by NOTHING. MR-only: startup args are a version contract (v1.97.0 rejects --ui → CrashLoop). NO soak (zot timestamps unreliable, and ghcr reports none either). ⚠️ Repointed 2026-10-01 off zot.mdapi.ch/mdapi/litellm — a hand-push with NO pull-through behind it (any uncached tag answered 404 MANIFEST_UNKNOWN, so it could never be refreshed; same failure that LOST mdapi/python) — onto the ghcr.io pull-through, which self-heals. ⭐ Versions are looked up at ghcr.io, NOT at the mirror: `kubernetes.registryAliases` maps zot.mdapi.ch/berriai → ghcr.io/berriai, because zot's /tags/list is CACHED-ONLY and would leave this pin blind forever. The MR still bumps the zot.mdapi.ch reference, so the pull-through stays the only supply path. ⛔ Matched by `matchDepNames`, NOT `matchPackageNames`: registryAliases rewrites packageName to ghcr.io/berriai/litellm, so a matchPackageNames rule stops matching, the manager's Default OFF applies, and the pin freezes silently again — proven with a local Renovate run 2026-10-01. Verified in the same run: registryUrl https://ghcr.io, warnings [], update found v1.103.2, replace template still writes zot.mdapi.ch.",
+      "matchManagers": ["kubernetes"],
+      "matchDepNames": ["zot.mdapi.ch/berriai/litellm"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/BerriAI/litellm"
+    },
+    {
+      "description": "Lane-B backlog opt-in (2026-09-13): pins no manager could move (why tests/test_every_pinned_image_is_renovate_reachable.py exists). Mostly invisible behind the old filename gate; rest never opted in past Default OFF. ⭐ REDUNDANT since 2026-10-02 — the Lane-A migration turned the manager ON by default, so these are now reachable without an opt-in. Kept because deleting it changes nothing and this description is the record of WHY they were unreachable. All MR-only (catch-up jumps — paperless 2.20.15→3.1.3 is a major); graduate individually after the first bump.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "quay.io/keycloak/keycloak",
+        "guacamole/guacamole",
+        "guacamole/guacd",
+        "ghcr.io/paperless-ngx/paperless-ngx",
+        "registry.k8s.io/external-dns/external-dns",
+        "registry.k8s.io/kubectl",
+        "dxflrs/garage",
+        "zot.mdapi.ch/mdapi/openbao",
+        "docker.io/aquasec/kube-bench",
+        "aquasec/kube-bench",
+        "prom/snmp-exporter",
+        "rancher/harvester-eventrouter",
+        "zot.mdapi.ch/rancher/mirrored-kiwigrid-k8s-sidecar",
+        "tabbyml/tabby",
+        "ollama/ollama",
+        "docker.io/searxng/searxng",
+        "searxng/searxng",
+        "alpine/socat",
+        "ghcr.io/formbricks/formbricks",
+        "ghcr.io/formbricks/hub",
+        "cubejs/cube",
+        "registry.mdapi.ch/mdapi/jump-bastion"
+      ],
+      "enabled": true
+    },
+    {
+      "description": "Guacamole's two images are version-coupled — guacd speaks a wire protocol to the webapp and the project ships them as one release — so they must bump together or the jump seat's web door breaks in a way that looks like a Keycloak problem. docker.io supplies real releaseTimestamps, so a soak here works (unlike the ghcr pins).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["guacamole/guacamole", "guacamole/guacd"],
+      "groupName": "guacamole",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "In-house X.Y.Z-mdapi.N. Never auto-merges — it's the seat the estate is administered FROM; a bad bump removes the hands that fix it.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["registry.mdapi.ch/mdapi/jump-bastion"],
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)-mdapi\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "Group prometheus-community charts (pushgateway + blackbox-exporter) into one MR/automerge — shared upstream release cadence.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["prometheus-pushgateway", "prometheus-blackbox-exporter"],
+      "groupName": "prometheus-community"
+    },
+    {
+      "description": "Group Rook-Ceph operator + cluster charts so they ALWAYS bump together — a rook-ceph vs rook-ceph-cluster version skew is unsupported and risks the Ceph RGW store behind GitLab.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["rook-ceph", "rook-ceph-cluster"],
+      "groupName": "rook-ceph"
+    },
+    {
+      "description": "Group Evertrust charts (horizon, horizon-issuer, stream) — same vendor release train. Renovate skips them if it lacks repo.evertrust.io creds, in which case the group is a harmless no-op.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["horizon", "horizon-issuer", "stream"],
+      "groupName": "evertrust"
+    },
+    {
+      "description": "Lane-B upstream critical: Joplin Server (moved off Keel 2026-08-06 after an unannounced jump ran 4 migrations). minor+patch auto-merge; majors MR-only. 3-day soak.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["joplin/server"],
+      "enabled": true,
+      "sourceUrl": "https://github.com/laurent22/joplin",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B: caddy (auth proxy for k8s-mcp). Moved off Keel 2026-09-03. `2-alpine` is a major-line tag that rolls 2.x minors unattended — bad for a Caddyfile proxy. pinDigests so in-place rebuilds raise an MR. (Until the 2026-10-02 retirement this was a mixed-lane deploy with Keel kept for the other container; both refs in k8s-mcp-deploy.yml are Renovate's now.) NO soak (ghcr).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["library/caddy"],
+      "enabled": true,
+      "pinDigests": true,
+      "sourceUrl": "https://github.com/caddyserver/caddy"
+    },
+    {
+      "description": "Lane-B: eclipse-mosquitto MQTT bus. Moved off Keel 2026-09-03. `latest` crosses minors unattended (2.1 vs 2.0.22 lines) on a replicas=1 Recreate broker. Pinned + pinDigests. ⚠️ 2.1 line is -alpine-suffixed only — no plain `2.1.2`.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["eclipse-mosquitto"],
+      "enabled": true,
+      "pinDigests": true,
+      "sourceUrl": "https://github.com/eclipse-mosquitto/mosquitto"
+    },
+    {
+      "description": "Lane-B helper images (busybox, alpine/curl) — concrete semver pins; minor+patch auto-merge.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["busybox", "alpine/curl"],
+      "enabled": true
+    },
+    {
+      "description": "Lane-B: Wyoming voice stack (piper/whisper/openwakeword). Pinned, NOT Keel (created 2026-09-09 with keel policy:minor on a pinned tag = broken middle: Keel bumped live while git claimed old). minor+patch auto-merge; majors MR-only. NO soak (docker.io timestamps work, and a bad TTS is visible immediately).",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchPackageNames": [
+        "rhasspy/wyoming-piper",
+        "rhasspy/wyoming-whisper",
+        "rhasspy/wyoming-openwakeword"
+      ],
+      "enabled": true
+    },
+    {
+      "description": "LANE POLICY · BLANKET MINOR+PATCH — auto-merge every minor+patch, every manager (owner decision 2026-06-29). Majors are excluded here and nowhere enables them, so a major is always an MR a human merges. `digest` is deliberately NOT in this rule: it is the Lane-A update type and carries its own soak (see LANE POLICY · DIGEST above). NOT the last rule — the opt-outs below must follow it (last-match-wins per field).",
+      "matchManagers": ["kubernetes", "fleet", "custom.regex"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "labels": ["renovate", "automerge"]
+    },
+    {
+      "description": "Core GitLab Helm chart MR-only (gitlab/fleet.yaml, ns bootstrap, infra-h0xb) — ⛔ MUST follow the blanket minor+patch rule above, or a GitLab chart bump automerges. It is matched on depName because the custom.regex manager sets depName/packageName from templates and matchDepNames cannot silently stop matching the way matchPackageNames can. ⚠️ TWO independent things stop an unattended version jump and this rule is only the first: (1) ⭐ A RENOVATE BUMP IS A NOTIFICATION, NOT A FIX. It moves the pin in gitlab/fleet.yaml and nothing else — the tree under gitlab/charts/ is upstream content that only tools/vendor-gitlab-chart.py may rewrite — so tests/test_gitlab_vendored_chart.py fails the branch pipeline and the MR lands RED, unmergeable, until `python3 tools/vendor-gitlab-chart.py <version>` has moved both halves. (2) ⛔ THE NEWEST RELEASE IS NOT A PLAN: GitLab supports only the NEXT required stop (x.2/x.5/x.8/x.11, background migrations drained in between), and the chart's app version moves with it — from the 19.4.1 running here the next legal hop is 19.5, whatever Renovate proposes. /gitlab-upgrade is the runbook for that hop and ~/bootstrap/gitlab-howto.txt is the checklist it drives. ⛔ THERE IS NO CVE PATH FOR THIS DEP, which is why the human read above is the whole control: `helm` is absent from Renovate's OSV ecosystem map — verified in the version CI actually runs, 44.139.0 (`util/vulnerability/ecosystem.js` `datasourceToOsvEcosystem`; the 42.99.0 used for local dry-runs carries the same list inline as `Vulnerabilities.datasourceEcosystemMap` in workers/repository/process/vulnerabilities.js) — clojure/crate/go/golang-version/hackage/hex/maven/npm/nuget/packagist/pypi/rubygems only, so osvVulnerabilityAlerts can never raise an alert for a chart — and the top-level vulnerabilityAlerts block is read from the PACKAGE-FILE config (mergeChildConfig of the manager config, packageRules unapplied), so a packageRule here could not scope it even if a mapping existed. See the top-level vulnerabilityAlerts description (infra-jypn). The CVE oracle for GitLab stays Windmill f/probe/gitlab_version_health (hourly, asks GitLab's own version.gitlab.com); this rule is what turns its finding into a mergeable MR instead of a hand-run `helm upgrade`. ⚠️ 3-day soak matches the fleet-manager chart rule, and unlike the ghcr pins it is real here: the helm datasource publishes a releaseTimestamp per chart version, so minimumReleaseAgeBehaviour's timestamp-optional fallback does not apply.",
+      "matchManagers": ["custom.regex"],
+      "matchDepNames": ["gitlab"],
+      "minimumReleaseAge": "3 days",
+      "automerge": false,
+      "labels": ["renovate", "mr-only", "helm-chart"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "⛔ **This MR is a notification, not a fix.** It moves the pin to a chart version that the vendored tree under `gitlab/charts/` is not, so `fleet-validate` fails until the ONE command that moves both halves has been run:",
+        "```",
+        "python3 tools/vendor-gitlab-chart.py <new version>",
+        "```",
+        "Then confirm the rendered output is unchanged (`tools/ci/render-bundles.py`, diff) and commit both halves together. See the header of `gitlab/fleet.yaml`.",
+        "⚠️ **Do not take this version just because it is newest.** GitLab supports only the NEXT required stop (`x.2 / x.5 / x.8 / x.11`), with background migrations drained in between — from the 19.4.1 running here the next legal hop is 19.5. Read GitLab's upgrade-path notes for each hop and follow `/gitlab-upgrade`; it is the only place this release is watched for CVEs (`f/probe/gitlab_version_health`), because Renovate cannot raise a vulnerability alert for a Helm chart.",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "⚠️ Graduating this one does NOT make a bump self-merging — the branch pipeline stays red until the tree is re-vendored, so an automerged MR is merely an unmergeable one. What graduation would remove is the human read of GitLab's upgrade path, which is the entire reason this rule exists.",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "Bussola MR-only — MUST follow the blanket rule. ~/fleet push IS the deploy (bussola-release skill); schema migrations on live data. The MR stays open as the 'unreleased build' signal.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["zot.mdapi.ch/mdapi/bussola"],
+      "automerge": false,
+      "labels": ["renovate", "mr-only"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "ghcr pins MR-only — MUST follow the blanket rule. NO soak, and since 2026-10-02 a soak is a NO-OP here rather than a protection: ghcr.io tags carry no releaseTimestamp and the global minimumReleaseAgeBehaviour is now `timestamp-optional`, so any minimumReleaseAge on these images would pass immediately. The human merge is the review. ⚠️ Same reason the LANE-A 1-day digest soak does not bite for these images. Frigate's 0.MINOR.PATCH feature releases would otherwise auto-merge as 'minor'.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "ghcr.io/project-zot/zot-linux-amd64",
+        "ghcr.io/open-webui/open-webui",
+        "ghcr.io/open-webui/open-terminal",
+        "ghcr.io/ggml-org/llama.cpp",
+        "ghcr.io/remsky/kokoro-fastapi-cpu",
+        "ghcr.io/blakeblackshear/frigate"
+      ],
+      "automerge": false,
+      "labels": ["renovate", "mr-only"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "caddy + eclipse-mosquitto MR-only — MUST follow the blanket rule. Config-contract services; an unattended minor is the failure being protected against. Digest rebuilds stay MR-only (fine).",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": ["library/caddy", "eclipse-mosquitto"],
+      "automerge": false,
+      "labels": ["renovate", "mr-only"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "LiteLLM MR-only — MUST follow the blanket rule. Startup args are a version contract (--ui CrashLoop); reading the notes IS the review. ⛔ matchDepNames, not matchPackageNames: registryAliases rewrites packageName (see the rule above), and a non-matching rule here would quietly drop litellm back to automerge.",
+      "matchManagers": ["kubernetes"],
+      "matchDepNames": ["zot.mdapi.ch/berriai/litellm"],
+      "automerge": false,
+      "labels": ["renovate", "mr-only"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "MR-only — RESTORES the intent their own opt-in rules already declare. Each of these six carries a description ending in 'MR-only' (or 'boot-test each bump'), but none of them ever set automerge:false, so the blanket minor+patch rule further up was auto-merging them anyway — a description is not a policy. Found 2026-10-02 while auditing the lanes. technitium and spicedb sit BEFORE the blanket rule (so it overrode them); openobserve, otel-collector, openfga and plex-oidc sit AFTER it with no automerge field (so it still stood). ⚠️ spicedb is the sharpest of the six: its bump applies a datastore migration at rollout, and it was merging unattended.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "technitium/dns-server",
+        "authzed/spicedb",
+        "public.ecr.aws/zinclabs/openobserve-enterprise",
+        "public.ecr.aws/zinclabs/o2-sre-agent",
+        "zot.mdapi.ch/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib",
+        "docker.io/openfga/openfga",
+        "ghcr.io/tikibozo/plex-oidc-bridge"
+      ],
+      "automerge": false,
+      "labels": ["renovate", "mr-only"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "2026-09-13 backlog MR-only — MUST follow the blanket rule. First MR is a catch-up jump (paperless crosses a major); a human reads the notes once, then graduates entries.",
+      "matchManagers": ["kubernetes"],
+      "matchPackageNames": [
+        "quay.io/keycloak/keycloak",
+        "guacamole/guacamole",
+        "guacamole/guacd",
+        "ghcr.io/paperless-ngx/paperless-ngx",
+        "registry.k8s.io/external-dns/external-dns",
+        "registry.k8s.io/kubectl",
+        "dxflrs/garage",
+        "zot.mdapi.ch/mdapi/openbao",
+        "docker.io/aquasec/kube-bench",
+        "aquasec/kube-bench",
+        "prom/snmp-exporter",
+        "rancher/harvester-eventrouter",
+        "zot.mdapi.ch/rancher/mirrored-kiwigrid-k8s-sidecar",
+        "tabbyml/tabby",
+        "ollama/ollama",
+        "docker.io/searxng/searxng",
+        "searxng/searxng",
+        "alpine/socat",
+        "ghcr.io/formbricks/formbricks",
+        "ghcr.io/formbricks/hub",
+        "cubejs/cube",
+        "registry.mdapi.ch/mdapi/jump-bastion"
+      ],
+      "automerge": false,
+      "labels": ["renovate", "mr-only"],
+      "prBodyNotes": [
+        "---",
+        "#### This update will **not** automerge",
+        "`{{{depName}}}` is on an MR-only list, so it waits for you. To change that for **future** updates, tick a box below before merging — or add the matching label to this MR:",
+        "- [ ] <!--grad:{{{depName}}}:minor--> automerge future **minor + patch** &nbsp;·&nbsp; label `automerge:minor`",
+        "- [ ] <!--grad:{{{depName}}}:major--> automerge future **major** &nbsp;·&nbsp; label `automerge:major`",
+        "Picked up by Windmill `f/desk/renovate_graduate`, which opens an MR against `renovate.json`. Nothing changes until that MR merges."
+      ]
+    },
+    {
+      "description": "Hand values.ya?ml / fleet.ya?ml back to their own managers so a values-file pin isn't detected twice. MUST follow the opt-ins (last-wins is per FIELD). ⚠️ This ruled out the LAST hole in Default ON; both its cases closed 2026-10-02 with the Keel retirement. (1) `cribl/values.yml` — helm-values now carries the Lane-A pinDigests + digest rules, so this ref is Lane A like any manifest image. (2) `mail/docker-mailserver/values.yml` — CLOSED BY MOVING THE REF OUT of the values file: the chart hardcodes `{{ .Values.image.name }}:{{ .Values.image.tag }}` (`templates/deployment.yaml`) and accepts no `repository`/`tag` pair, so helm-values' heuristic (`key ending in 'image' + hasKey repository + hasKey tag|version`) can never match it — no values-file rule could ever have reached it. Its image is now declared in `mail/docker-mailserver/kustomize/deployment-image-pin.yaml`, a Deployment-shaped post-render patch, which the kubernetes manager reads. ⛔ This rule itself must STAY even though both cases are gone: a values file can legitimately contain whole Kubernetes objects (`mail`'s `extraDeploy` carries a ServiceAccount and an ExternalSecret), and without this gate the kubernetes manager would extract from those too and double-count them against helm.",
+      "matchManagers": ["kubernetes"],
+      "matchFileNames": ["**/values.yaml", "**/values.yml", "**/fleet.yaml", "**/fleet.yml"],
+      "enabled": false
+    },
+    {
+      "description": "Ceph: never propose Tentacle. Regex /^v19\\./ not range \"<20\" — fail-closed (a range parse error would fail OPEN to Tentacle). v20.2.x bluestore-tool asserts on tiny Longhorn iSCSI partitions → breaks OSD enum. Patch auto-merge in Squid after 3-day soak.",
+      "matchPackageNames": ["quay.io/ceph/ceph"],
+      "allowedVersions": "/^v19\\./",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Newly-tracked helm-values images get the 3-day soak (else they'd auto-merge same-day via the blanket rule). Adds a soak, not an opt-out.",
+      "matchManagers": ["helm-values"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: OpenObserve + o2-sre-agent. Moved off Keel with a digest but never opted in → NO lane owned them, frozen 6 weeks silently. ⚠️ Two images NOT version-coupled. ⚠️ Needs non-SIMD amd64 (AVX2-less Xeons SIGILL); v1.0.1 shipped no amd64. MR-only, boot-test each bump.",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchPackageNames": [
+        "public.ecr.aws/zinclabs/openobserve-enterprise",
+        "public.ecr.aws/zinclabs/o2-sre-agent"
+      ],
+      "enabled": true,
+      "sourceUrl": "https://github.com/openobserve/openobserve",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: OTel Collector (contrib). Opted in at introduction (never-opted-in = owned by NEITHER lane). MR-only, 3-day soak. ⚠️ zot pull-through needs the ghcr prefix allow-listed.",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchPackageNames": [
+        "zot.mdapi.ch/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib"
+      ],
+      "enabled": true,
+      "sourceUrl": "https://github.com/open-telemetry/opentelemetry-collector-releases",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: OpenFGA (O2 RBAC). Opted in at introduction. Each bump runs `openfga migrate` in init — read release notes. MR-only, 3-day soak.",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchPackageNames": [
+        "docker.io/openfga/openfga"
+      ],
+      "enabled": true,
+      "sourceUrl": "https://github.com/openfga/openfga",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: plex-oidc-bridge (plex-auth/). Holds the Plex OWNER token; third-party code — read every diff. MR-only, 3-day soak.",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/tikibozo/plex-oidc-bridge"
+      ],
+      "enabled": true,
+      "sourceUrl": "https://github.com/tikibozo/plex-oidc-bridge",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Lane-B upstream critical: OpenBao (secrets STANDBY). Repointed 2026-09-22 after zot LOST mdapi/openbao (NAME_UNKNOWN) onto the self-healing quay pull-through. ⛔ Other pin (openbao/fleet.yaml Helm object) is unreachable — bump both together. MR-only, 3-day soak.",
+      "matchManagers": [
+        "kubernetes"
+      ],
+      "matchPackageNames": [
+        "zot.mdapi.ch/openbao/openbao"
+      ],
+      "enabled": true,
+      "sourceUrl": "https://github.com/openbao/openbao",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "GRADUATED — minor+patch (promoted by the graduation checkbox / Windmill f/desk/renovate_graduate). MUST remain the LAST automerge rule (last-match-wins).",
+      "matchManagers": [
+        "kubernetes",
+        "fleet",
+        "custom.regex",
+        "helm-values"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/open-webui/open-webui",
+        "ghcr.io/formbricks/formbricks",
+        "cubejs/cube",
+        "caddy",
+        "registry.k8s.io/kubectl",
+        "quay.io/keycloak/keycloak",
+        "alpine/socat"
+      ],
+      "automerge": true,
+      "labels": [
+        "renovate",
+        "automerge",
+        "graduated"
+      ]
+    },
+    {
+      "description": "⛔ MR-ONLY — cloudnative-pg (the CloudNativePG OPERATOR chart, ns cnpg-system; beads infra-zkak; VERSION CAP LIFTED 2026-10-07, beads infra-h6mu). MUST sit BELOW the blanket minor+patch rule above, or a chart bump automerges. ⭐ THE CAP IS GONE AND THE CONDITION WRITTEN INTO IT WAS MET: it read '⛔ REMOVE THIS RULE ONLY WHEN `barmanObjectStore` is gone from this repo outside comments — `git grep -n barmanObjectStore -- '*.y*ml'` — because the migration lands one cluster at a time and ~/bootstrap/cnpg-recovery-manifest.yml moves LAST.' As of 2026-10-07 that holds: all seven CNPG clusters are on the Barman Cloud Plugin (MRs !784–!788, bead infra-h6mu), the fleet repo has ZERO live `spec.backup.barmanObjectStore` / `externalClusters[].barmanObjectStore` (that grep now returns only prose inside two rule descriptions), and ~/bootstrap/cnpg-recovery-manifest.yml is already plugin-shaped. WHY MR-ONLY RATHER THAN AUTOMERGE: the upgrade still moves the operator that every cluster's WAL archiving and base backups run through, and chart 0.30 is the first bump past an API removal, so it wants a human read. What NO LONGER applies is the reason a hard cap was chosen over `automerge: false` in the first place — with the in-tree API gone from both the backup and the recovery path, the bump can no longer invalidate a documented rebuild, so 'one click from a rebuild that cannot restore' is no longer true and a version ceiling would only block legitimate patches. ⚠️ Chart 0.30+ will now be PROPOSED, not suppressed: read its release notes for CRD changes beyond the barman removal before merging. Patch bumps inside the old cap (0.29.x, operator 1.30.x) still automerge normally through the blanket rule.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["cloudnative-pg"],
+      "automerge": false,
+      "labels": ["renovate", "mr-only", "helm-chart"]
+    },
+    {
+      "description": "⛔ MR-ONLY — plugin-barman-cloud (the Barman Cloud CNPG-I plugin, ns cnpg-system; beads infra-zkak). MUST sit below the blanket minor+patch rule. WHY A CHART BUMP HERE IS NOT A NORMAL CHART BUMP: the chart's appVersion IS its `sidecarImage.tag` (see its configmap: SIDECAR_IMAGE: repository:appVersion), and that sidecar is injected into EVERY instance pod of EVERY cluster whose `spec.plugins` names this plugin. So bumping the chart is a rolling restart of every migrated CNPG cluster — switchover on each primary included — and it bumps the component that WAL archiving and base backups run through. That has to be a human read, not an autocommit. ⚠️ NOT capped with allowedVersions, and since 2026-10-07 the operator above is not capped either (both are MR-only): the plugin chart README states it supports only the latest point release of the plugin, so sitting on a stale version is its own defect — the pin must be kept current deliberately, just not unattended. ⚠️ A bump also invalidates nothing in the archive: barman's on-disk layout is unchanged, so WAL files written by the previous sidecar stay readable.",
+      "matchManagers": ["fleet"],
+      "matchPackageNames": ["plugin-barman-cloud"],
+      "automerge": false,
+      "labels": ["renovate", "mr-only", "helm-chart"]
+    },
+    {
+      "description": "GRADUATED — major. Packages explicitly promoted to MAJOR automerge by ticking the graduation checkbox (or adding the automerge:major label) on their Renovate MR; appended automatically by Windmill f/desk/renovate_graduate. Owner decision 2026-09-22: unconditional, because several of these are demo or test deployments where breakage is acceptable so long as it is visible. A major is a breaking change by definition, so only packages named here automerge one. MUST stay last: packageRules are last-match-wins.",
+      "matchManagers": ["kubernetes", "fleet", "custom.regex", "helm-values"],
+      "matchUpdateTypes": ["major"],
+      "matchPackageNames": [
+        "alpine/socat"
+      ],
+      "automerge": true,
+      "labels": ["renovate", "automerge", "graduated", "major-automerge"]
+    }
+  ],
+  "hostRules": [
+    {
+      "description": "Read private mdapi registry tags. Credentials injected at runtime via RENOVATE_HOST_RULES (NOT committed).",
+      "matchHost": "registry.mdapi.ch",
+      "hostType": "docker"
+    },
+    {
+      "description": "zot serves /v2/ behind Basic auth — without this Renovate 401s every run. Creds via RENOVATE_HOST_RULES (Akeyless /mdapi/zot/zot-auth/password), NOT committed.",
+      "matchHost": "zot.mdapi.ch",
+      "hostType": "docker"
+    }
+  ]
+}

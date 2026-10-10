@@ -1,0 +1,36 @@
+## Cluster-side grype ignore list for upstream-image CVEs.
+##
+## This file is consumed by the `pod_image_cve_scan` Windmill job
+## (f/security/pod_image_cve_scan.py). It fetches the raw URL of this
+## file each scan run, parses the rules below, and filters matching
+## CVEs out of the per-image counts BEFORE publishing to Pushgateway.
+##
+## Use this when:
+##   - An upstream maintainer has decided a CVE is wont-fix (e.g.
+##     "this code path isn't reachable in our setup") AND the image
+##     isn't ours (so we can't drop a .grype.yaml into the project).
+##   - A CVE has no upstream fix yet, but the affected component is
+##     genuinely not exercised at runtime in our deployment.
+##
+## DO NOT use this for "annoying" CVEs that DO have fixes; the goal
+## is to keep the alert actionable. Every entry should justify itself
+## in its `note:` field.
+##
+## Rule schema (loose superset of grype's own .grype.yaml `ignore:`):
+##
+##   ignore:
+##   - vulnerability: CVE-2024-XXXX        # required: the CVE ID
+##     image:        "registry/.+:.+"      # optional: re.match against image
+##     package:                            # optional: only when from this pkg
+##       name:       libfoo
+##     note:         "upstream wont-fix; not exposed at runtime"
+##
+## When the optional fields are omitted, the rule matches any image and
+## any package. The `note:` is required for our own audit trail (not
+## enforced by the script, but please always include it).
+##
+## After editing this file, commit + push to fleet `main`. The next
+## scan run (every 6h) picks up the new rules; force-run earlier from
+## the Windmill UI if needed.
+
+ignore: []

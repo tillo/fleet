@@ -1,0 +1,125 @@
+## Zot orphan images — content the registry serves but could never fetch again.
+##
+## WHY THIS EXISTS. zot is a prefix-allowlisted pull-through mirror, not a
+## registry whose contents we own: `extensions.sync` maps a repo prefix to an
+## upstream and fetches on demand. An image hand-pushed into zot outside that
+## allowlist has NO re-pull path — nothing upstream has it. It keeps working
+## until the day a node no longer holds the layer (containerd cache eviction, a
+## reschedule onto a node that never had it, a blobstore loss), and then the pod
+## crashloops with ErrImagePull while the only copy is already gone.
+##
+## Measured 2026-09-22: three were already orphaned — mdapi/litellm (gone from
+## zot entirely, restored by skopeo by digest from ghcr), mdapi/openbao and
+## mdapi/python (alive only in one node's containerd cache). `mdapi/**` COVERED
+## all three, so a prefix-coverage test or a grep of the fleet repo for zot
+## hostnames would have called them healthy; only upstream existence separates
+## them from the ones that are fine. All three are still in zot's catalog today
+## and are reported as `in_use="false"` residue, which is why the alert below
+## keys on the in-use count rather than on any finding at all.
+##
+## Published daily (06:47 Zurich) by f/probe/zot_orphan_images, which reads the
+## live allowlist Secret, zot's authenticated catalog, the live workload specs
+## and each upstream registry with zot's own credentials. Staleness of the probe
+## itself needs no arm here — the generic BatchJobStale in 12-batch-jobs.yml
+## covers any job pushing <job>_last_run_timestamp_seconds. What DOES need an arm
+## is the probe being unable to see, which is ZotOrphanProbeBlind below.
+##
+## component: Platform — an unrecoverable image is a platform-level risk to the
+## workloads that run it. statuspage: exclude, because the condition is LATENT:
+## nothing is broken while the content is still cached, and degrading the public
+## page for a risk that has not bitten would be a lie to strangers.
+##
+## ⛔ NOT ALERTED HERE, DELIBERATELY: tag_missing / tag_not_allowlisted. Those
+## are real — zot could not re-fetch that exact tag either — but they are
+## recoverable by hand (skopeo by digest from the upstream that has the content),
+## and they are published as zot_orphan_findings_tag_{in_use,unused} for the
+## dashboard. An alert that is always on is functionally off, and a permanent
+## tag-level page would camouflage the repo-level one that costs data.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-zot-orphan-images
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-zot-orphan-images.rules
+    rules:
+    - alert: ZotOrphanImageInUse
+      ## Only the in-use count. zot_orphan_findings_unrecoverable_unused is the
+      ## same failure one step earlier and is the dashboard's business: alerting
+      ## on it would page about three images that have been stable residue since
+      ## September, every single day, for no action anyone would take.
+      expr: zot_orphan_findings_unrecoverable_in_use{job="zot_orphan_images"} > 0
+      ## The probe re-measures daily and Pushgateway holds the series between
+      ## runs, so this only rides out one blip in the push itself.
+      for: 15m
+      labels:
+        service: 'zot'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}zot{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $value }} image(s) a live workload runs exist nowhere but zot"
+        description: |
+          A running workload references an image that zot serves but could never
+          re-fetch: either nothing in zot's sync allowlist maps that repo, or the
+          upstream it maps to does not have it. The content exists nowhere else.
+          It is working right now only because some node still has the layers.
+
+          The moment one does not — cache eviction, a reschedule, a blobstore
+          loss — that pod crashloops on ErrImagePull and the image is gone for
+          good. This is the 2026-09-22 incident (mdapi/litellm, mdapi/openbao,
+          mdapi/python) caught before it bites instead of after.
+
+          The per-image rows are in the probe's job log and in the
+          zot_orphan_image{repo,ref,kind,in_use} series; each carries the
+          namespace/name of the workloads running it. To recover an image before
+          it is lost: find a registry that has the content and copy it by digest
+          into the upstream the allowlist maps to —
+            skopeo copy --all docker://<registry>/<repo>@<digest> \
+              docker://registry.mdapi.ch/mdapi/<repo>@<digest>
+          — after which zot can fetch it again. If the image is genuinely
+          unreproducible, mirror it out of zot first; the layers are still there.
+
+    - alert: ZotOrphanProbeBlind
+      ## Two ways this probe goes blind, and both look exactly like a clean
+      ## estate: an allowlisted upstream that answered nothing (its findings are
+      ## DISCARDED rather than published wrong, so the counts read 0), and a
+      ## catalog that could not be read (only REFERENCED repos get judged — which
+      ## is precisely the state mdapi/litellm was in on 2026-09-22: unreferenced,
+      ## and therefore invisible in exactly the run that should have caught it).
+      ##
+      ## Silence from a blind probe is not an all-clear, so it gets its own arm.
+      expr: |-
+        zot_orphan_upstream_probe_ok{job="zot_orphan_images"} == 0
+          or zot_catalog_ok{job="zot_orphan_images"} == 0
+      for: 1h
+      labels:
+        service: 'zot'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}zot{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot_orphan_images cannot see the whole estate — its silence means nothing"
+        description: |
+          zot_orphan_upstream_probe_ok=0: one of the upstream registries named in
+          zot's live allowlist failed EVERY probe, so every finding from it was
+          discarded instead of being reported as absent. Usual causes: the
+          zot-sync deploy token at registry.mdapi.ch was rotated without updating
+          Secret/zot-s3-config (sync-creds.json), or that upstream is down.
+
+          zot_catalog_ok=0: zot's /v2/_catalog could not be read or came back
+          implausibly short, so this run judged only repos a live workload
+          references — and unreferenced residue, the worst case, is exactly what
+          that misses. Usual causes: the Akeyless secret
+          /mdapi/zot/zot-auth/password rotated, or zot itself is down.
+
+          Check the run's job log for the FAIL line; it names the upstream or the
+          exception class.

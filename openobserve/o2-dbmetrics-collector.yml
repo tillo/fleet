@@ -1,0 +1,243 @@
+## Generic DB metrics collector: MongoDB / Redis(Valkey) / MariaDB → O2, 2026-09-29.
+##
+## Companion to o2-dbm-collector (Postgres DBM). O2's native DBM is Postgres-only;
+## these engines are covered the generic way — the otelcol-contrib `mongodb` / `redis` /
+## `mysql` receivers emit OTLP METRICS, which O2 ingests as ordinary metric streams
+## (no query text, no DBM views). MySQL receiver also speaks MariaDB.
+##
+## Scrapers ⇒ one replica + Recreate, so metrics are never double-counted (same
+## reason as the DBM collector). Runs in openobserve ns, so cross-ns DB passwords
+## are pulled from Akeyless via ExternalSecret (already escrowed, see targets ES).
+##
+## ⚠ mongo (single-member RS) needs `tls.insecure: true` — contrib 0.161.0 enables
+## TLS by default (configtls LoadTLSConfig), so an absent tls block ⇒ SSL handshake
+## ⇒ EOF against plaintext mongod; and `direct_connection: true` skips RS topology
+## discovery (robust to the single-member GHOST parking). aio-redis (nextcloud +
+## envuassu) DOES require auth (REDIS_HOST_PASSWORD, already in Akeyless).
+##
+## Deferred (not scrapeable from a collector pod, or zero data value):
+##   - oauth2-proxy redis-ha x4 (sentinel, emptyDir session caches — nothing to watch)
+##   - dms rspamd-redis (supervisor program inside docker-mailserver on 127.0.0.1;
+##     needs an exporter sidecar in that pod, out of scope here)
+##   - tenant-1/redis — ns runs default-deny-all (ingress only from the
+##     rke2-ingress-nginx front-door + LAN 192.168.1.0/24), so this collector
+##     cannot reach it. Monitoring it needs a NetworkPolicy ingress allow, which
+##     is a tenant-security decision; left to the tenant/owner.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-dbmetrics-auth
+  namespace: openobserve
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-dbmetrics-auth
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/openobserve/otel/ingest-authorization
+      secretKey: O2_OTLP_AUTHORIZATION
+---
+## One password per authed target. No new escrow: every path below already backs the
+## workload's own ExternalSecret, so the collector just re-reads the same credential.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-dbmetrics-targets
+  namespace: openobserve
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-dbmetrics-targets
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        REDIS_BOOTSTRAP_PASSWORD: "{{ .valkey }}"
+        REDIS_NEXTCLOUD_AIO_PASSWORD: "{{ .nextcloud }}"
+        REDIS_ENVUASSU_AIO_PASSWORD: "{{ .envuassu }}"
+        MYSQL_COIFFUREDREAMS_PASSWORD: "{{ .coiffuredreams }}"
+        MYSQL_IVODELLAMBROGIO_PASSWORD: "{{ .ivodellambrogio }}"
+        MYSQL_SPIDER3_PASSWORD: "{{ .spider3 }}"
+        MYSQL_ROUNDCUBE_PASSWORD: "{{ .roundcube }}"
+  data:
+    - remoteRef:
+        key: /mdapi/bootstrap/valkey/password
+      secretKey: valkey
+    - remoteRef:
+        key: /mdapi/nextcloud/nextcloud-aio-env-secret/REDIS_HOST_PASSWORD
+      secretKey: nextcloud
+    - remoteRef:
+        key: /mdapi/envuassu/nextcloud-aio-env-secret/REDIS_HOST_PASSWORD
+      secretKey: envuassu
+    - remoteRef:
+        key: /mdapi/coiffuredreams/mariadb-root-password
+      secretKey: coiffuredreams
+    - remoteRef:
+        key: /mdapi/ivodellambrogio/mariadb-root-password
+      secretKey: ivodellambrogio
+    - remoteRef:
+        key: /mdapi/spider3/mariadb-root-password
+      secretKey: spider3
+    - remoteRef:
+        key: /mdapi/mail/roundcube-mariadb-credentials/mariadb-root-password
+      secretKey: roundcube
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: o2-dbmetrics-collector
+  namespace: openobserve
+data:
+  config.yaml: |
+    receivers:
+      mongodb/horizon:
+        hosts:
+          - endpoint: horizon-mongodb.horizon.svc.cluster.local:27017
+        direct_connection: true
+        tls:
+          insecure: true
+        collection_interval: 60s
+      mongodb/stream:
+        hosts:
+          - endpoint: stream-mongodb.stream.svc.cluster.local:27017
+        direct_connection: true
+        tls:
+          insecure: true
+        collection_interval: 60s
+      redis/bootstrap_valkey:
+        endpoint: valkey.bootstrap.svc.cluster.local:6379
+        password: ${env:REDIS_BOOTSTRAP_PASSWORD}
+        collection_interval: 60s
+      redis/paperless_valkey:
+        endpoint: paperless-valkey.paperless.svc.cluster.local:6379
+        collection_interval: 60s
+      redis/paperless_kustodyan_valkey:
+        endpoint: paperless-kustodyan-valkey.paperless-kustodyan.svc.cluster.local:6379
+        collection_interval: 60s
+      redis/formbricks_valkey:
+        endpoint: formbricks-valkey.formbricks-kustodyan.svc.cluster.local:6379
+        collection_interval: 60s
+      redis/envuassu_nextcloud_aio:
+        endpoint: nextcloud-aio-redis.envuassu.svc.cluster.local:6379
+        password: ${env:REDIS_ENVUASSU_AIO_PASSWORD}
+        collection_interval: 60s
+      redis/nextcloud_nextcloud_aio:
+        endpoint: nextcloud-aio-redis.nextcloud.svc.cluster.local:6379
+        password: ${env:REDIS_NEXTCLOUD_AIO_PASSWORD}
+        collection_interval: 60s
+      mysql/coiffuredreams:
+        endpoint: mariadb.coiffuredreams.svc.cluster.local:3306
+        username: root
+        password: ${env:MYSQL_COIFFUREDREAMS_PASSWORD}
+        collection_interval: 60s
+      mysql/ivodellambrogio:
+        endpoint: mariadb.ivodellambrogio.svc.cluster.local:3306
+        username: root
+        password: ${env:MYSQL_IVODELLAMBROGIO_PASSWORD}
+        collection_interval: 60s
+      mysql/spider3:
+        endpoint: mariadb.spider3.svc.cluster.local:3306
+        username: root
+        password: ${env:MYSQL_SPIDER3_PASSWORD}
+        collection_interval: 60s
+      mysql/roundcube:
+        endpoint: roundcube-mariadb.mail.svc.cluster.local:3306
+        username: root
+        password: ${env:MYSQL_ROUNDCUBE_PASSWORD}
+        collection_interval: 60s
+
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 600
+        spike_limit_mib: 150
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+
+    exporters:
+      otlphttp/openobserve:
+        endpoint: http://openobserve.openobserve.svc.cluster.local:5080/api/default
+        headers:
+          Authorization: ${env:O2_OTLP_AUTHORIZATION}
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          queue_size: 1000
+
+    service:
+      telemetry:
+        metrics:
+          level: basic
+      pipelines:
+        metrics:
+          receivers: [mongodb/horizon, mongodb/stream, redis/bootstrap_valkey, redis/paperless_valkey, redis/paperless_kustodyan_valkey, redis/formbricks_valkey, redis/envuassu_nextcloud_aio, redis/nextcloud_nextcloud_aio, mysql/coiffuredreams, mysql/ivodellambrogio, mysql/spider3, mysql/roundcube]
+          processors: [memory_limiter, batch]
+          exporters: [otlphttp/openobserve]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: o2-dbmetrics-collector
+  namespace: openobserve
+  labels:
+    app.kubernetes.io/name: o2-dbmetrics-collector
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: o2-dbmetrics-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: o2-dbmetrics-collector
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otelcol
+          image: zot.mdapi.ch/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.161.0@sha256:43649a46ed32d3b2bfd9bd89e29884782d3c350492761b918ba227dd73ef3719
+          imagePullPolicy: IfNotPresent
+          args: ["--config=/conf/config.yaml"]
+          envFrom:
+            - secretRef:
+                name: o2-dbmetrics-auth
+            - secretRef:
+                name: o2-dbmetrics-targets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+      volumes:
+        - name: conf
+          configMap:
+            name: o2-dbmetrics-collector

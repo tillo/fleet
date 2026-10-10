@@ -1,0 +1,261 @@
+## Keep the DB-stored guardrails registered in each litellm process. Mounted
+## into the `guardrail-rearm` sidecar of litellm-deploy.yml.
+##
+## WHY THIS EXISTS. litellm 1.103.2 reaches the one routine that registers a
+## DB-stored guardrail in a proxy process's in-memory registry
+## (ProxyConfig._init_non_llm_objects_in_db -> _init_guardrails_in_db) from a
+## single caller, add_deployment(), and proxy_startup_event() reaches that
+## caller only inside `if store_model_in_db is True:` (proxy_server.py ~10231).
+##
+## This estate runs `store_model_in_db: false` deliberately -- turning it on
+## would make litellm persist config sections to the DB, i.e. a second writer
+## alongside Fleet, which is the source of truth. So the flag stays false, and
+## the consequence is that a fresh process NEVER loads the DB guardrail.
+##
+## ⛔ NOTHING ABOUT THAT FAILURE IS VISIBLE. The 11 cloud deployments keep
+## naming it in litellm_params.guardrails, so every manifest and every diff
+## still says "attached"; litellm still returns
+## `x-litellm-applied-guardrails: customer-data-guard` on every response (an
+## unresolved guardrail NAME is not an error, it is silently ignored); and
+## nothing is logged. Measured cost 2026-10-05/06: the guardrail was created at
+## 09:55:09Z and worked until the 14:00:50Z/14:01:48Z pod roll. Afterwards
+## metadata.guardrail_information in LiteLLM_SpendLogs was JSON null on 100% of
+## rows -- 950/950 on cn-deepseek-flash, 1885/1885 gateway-wide -- i.e. ~19h55m
+## during which every cloud door sent customer data upstream unmasked, with no
+## signal anywhere. It was found only because POST /guardrails/apply_guardrail
+## 404'd.
+##
+## ⚠️ ONE GUARDRAIL PER LIST ENTRY (2026-10-07). This script used to hardcode a
+## single guardrail through the scalar GUARDRAIL_NAME/GUARDRAIL_ID. That made the
+## re-arm coverage a hand-maintained fact living in the Deployment rather than in
+## the set of guardrails that actually exist -- and every DB guardrail is a
+## SEPARATE silent-disarm surface, because the failure above is per-process and
+## per-NAME: a guardrail this script does not know about is simply never re-armed
+## after a roll, and, exactly as before, nothing says so. So the script now takes
+## a list, GUARDRAILS="name=id,name=id", and walks all of it every cycle. The
+## scalar pair is still honoured when GUARDRAILS is empty or unusable, so
+## reverting only one of this ConfigMap / the Deployment cannot silently idle the
+## loop -- see parse_guardrails().
+##
+## The script carries NO secrets: it reads each guardrail row from the proxy's
+## own API and replays it back. litellm_params.custom_code DOES carry credentials
+## -- the Akeyless access-id/access-key for the deny-list secret on
+## customer-data-guard, and the mbp-mda detector bearer token on gheim-pii-guard
+## -- which is exactly why those guardrails are stored in the DB and never
+## declared here. gheim-rt-guard additionally carries the CipherTrust Manager
+## service credential, for the vault that seals the round-trip blobs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-guardrail-rearm
+  namespace: litellm
+data:
+  rearm.py: |
+    #!/usr/bin/env python3
+    """
+    Keep the DB-stored guardrails in THIS pod's litellm process.
+
+    POST /guardrails/apply_guardrail answers 404 "Guardrail '<name>' not found"
+    exactly when the guardrail is absent from this process's registry -- the
+    same condition that decides whether it runs on real traffic. On 404 the
+    script re-registers it by replaying the DB row through PUT /guardrails/{id},
+    which is the call the admin UI itself makes when a guardrail is edited.
+
+    The DB row stays the single source of truth: the script never invents a
+    definition, it re-reads what is stored and pushes that back, so it cannot
+    drift from what an operator sees at /ui/guardrails/.
+
+    ⛔ This process must NEVER exit. Pod readiness is all-containers-ready, so a
+    crash-looping sidecar would pull a healthy litellm replica out of the
+    Service and take the gateway down. Every path is guarded; failures log and
+    retry on the next cycle.
+
+    ⛔ It must never log its payload: litellm_params.custom_code carries
+    credentials (the Akeyless access-id/access-key for the deny-list secret, and
+    the mbp-mda detector bearer token). Only HTTP status codes and guardrail
+    NAMES are ever printed.
+    """
+
+    import json
+    import os
+    import time
+    import urllib.error
+    import urllib.request
+
+    BASE = "http://127.0.0.1:4000"
+    # "name=id,name=id". Falls back to the scalar pair when empty/unusable, so a
+    # partial rollback (this ConfigMap updated, the Deployment not, or vice
+    # versa) still re-arms something rather than idling silently.
+    GUARDRAILS = os.environ.get("GUARDRAILS", "").strip()
+    GUARDRAIL_NAME = os.environ.get("GUARDRAIL_NAME", "customer-data-guard")
+    GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID", "")
+    # A roll disarms every guardrail the instant the new process starts, and the
+    # sidecar re-arms them as soon as the proxy answers. This interval is the
+    # backstop for every OTHER way the registry can lose them, so it is a
+    # detection latency, not the primary control -- 5 min keeps the admin
+    # endpoint's access log readable (12 probe lines/hour/replica/guardrail).
+    try:
+        CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
+    except ValueError:
+        CHECK_INTERVAL = 300
+    # Used only when nothing is configured at all. An hour, not the check
+    # interval: that case is a config error nobody is waiting on, whereas the
+    # log line would otherwise repeat 12x an hour forever.
+    IDLE_INTERVAL = 3600
+    PROBE_TEXT = "guardrail-registration-probe"
+
+    # The four fields PUT accepts and the DB row stores. Anything else in the
+    # /info response is derived, not stored, and is rejected on write.
+    PUT_FIELDS = ("guardrail_id", "guardrail_name", "litellm_params", "guardrail_info")
+
+
+    def log(message):
+        print("[guardrail-rearm] %s" % message, flush=True)
+
+
+    def call(method, path, body=None, timeout=30):
+        """Return (status, parsed_json_or_None); status None means transport failure.
+
+        Never raises: a poll that fails must not end the process.
+        """
+        request = urllib.request.Request(
+            BASE + path,
+            data=None if body is None else json.dumps(body).encode(),
+            method=method,
+            headers={
+                "Authorization": "Bearer " + os.environ.get("LITELLM_MASTER_KEY", ""),
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                return response.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as error:
+            return error.code, None
+        except Exception:
+            return None, None
+
+
+    def wait_for_proxy(deadline_seconds=900):
+        """Block until the proxy on loopback answers. Its boot runs Prisma
+        migrations and takes ~40s, and the startup probe allows 600s."""
+        started = time.time()
+        while time.time() - started < deadline_seconds:
+            status, _ = call("GET", "/health/liveliness", timeout=5)
+            if status == 200:
+                return True
+            time.sleep(5)
+        return False
+
+
+    def parse_guardrails():
+        """The (name, id) pairs to keep registered, in order.
+
+        GUARDRAILS wins when it yields at least one usable pair; otherwise the
+        scalar GUARDRAIL_NAME/GUARDRAIL_ID pair is used. An entry that is not
+        "name=id" is dropped with a log line rather than aborting the list:
+        re-arming the guardrails that ARE well-formed beats re-arming none.
+        """
+        pairs = []
+        for entry in GUARDRAILS.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            name, separator, guardrail_id = entry.partition("=")
+            name = name.strip()
+            guardrail_id = guardrail_id.strip()
+            if separator and name and guardrail_id:
+                pairs.append((name, guardrail_id))
+            else:
+                log("ignoring malformed GUARDRAILS entry (want name=id)")
+        if pairs:
+            return pairs
+        if GUARDRAIL_ID:
+            return [(GUARDRAIL_NAME, GUARDRAIL_ID)]
+        return []
+
+
+    # Resolved once: the environment cannot change under a running process, and
+    # re-parsing per cycle would re-log any malformed entry forever.
+    TARGETS = parse_guardrails()
+
+
+    def is_registered(name):
+        """True / False / None (undeterminable)."""
+        status, _ = call(
+            "POST",
+            "/guardrails/apply_guardrail",
+            {"guardrail_name": name, "input_type": "request", "text": PROBE_TEXT},
+        )
+        if status == 200:
+            return True
+        if status == 404:
+            return False
+        return None
+
+
+    def rearm(name, guardrail_id):
+        status, info = call("GET", "/guardrails/%s/info" % guardrail_id)
+        if status != 200 or not isinstance(info, dict):
+            log("cannot read the %s row (HTTP %s); not re-arming this cycle" % (name, status))
+            return False
+        payload = {"guardrail": {field: info.get(field) for field in PUT_FIELDS}}
+        status, _ = call("PUT", "/guardrails/%s" % guardrail_id, payload)
+        if status != 200:
+            log("re-arm PUT failed for %s (HTTP %s)" % (name, status))
+            return False
+        log("re-armed %s in this process" % name)
+        return True
+
+
+    def cycle():
+        # Each guardrail is probed independently: one that is missing from the
+        # DB, or whose row cannot be read, must not stop the others being
+        # re-armed.
+        for name, guardrail_id in TARGETS:
+            state = is_registered(name)
+            if state is False:
+                log("%s is NOT registered in this process -- re-arming" % name)
+                rearm(name, guardrail_id)
+            elif state is None:
+                log("%s registration state undeterminable (proxy restarting?)" % name)
+
+
+    def main():
+        if not TARGETS:
+            # A misconfiguration, but it must IDLE, not spin. Every branch of
+            # main() has to block, because the __main__ guard re-enters it --
+            # a branch that returns would become a hot loop (measured: 24M log
+            # lines in 60s, which is a log flood in a container, not a bug
+            # report).
+            while True:
+                log("no guardrail configured (GUARDRAILS and GUARDRAIL_ID both empty); idling")
+                time.sleep(IDLE_INTERVAL)
+        if not os.environ.get("LITELLM_MASTER_KEY"):
+            log("LITELLM_MASTER_KEY is not set; cannot re-arm (will keep retrying)")
+        log("waiting for the proxy on %s" % BASE)
+        log("watching %d guardrail(s): %s" % (len(TARGETS), ", ".join(name for name, _ in TARGETS)))
+        log("proxy is up" if wait_for_proxy() else "proxy did not answer; continuing anyway")
+        while True:
+            try:
+                cycle()
+            except Exception as error:
+                log("cycle failed: %s: %s" % (type(error).__name__, error))
+            time.sleep(CHECK_INTERVAL)
+
+
+    if __name__ == "__main__":
+        # Outer guard as well as the per-cycle one: nothing may terminate this
+        # process, because that is what would make the POD unready -- and pod
+        # readiness is all-containers-ready, so it would take the gateway's
+        # healthy replica out of the Service with it.
+        while True:
+            try:
+                main()
+            except Exception as error:
+                log("unexpected: %s: %s" % (type(error).__name__, error))
+            # Sleep unconditionally. main() is not supposed to return at all;
+            # if it ever does, re-entering it with no delay turns that into a
+            # hot loop rather than a restart.
+            time.sleep(30)

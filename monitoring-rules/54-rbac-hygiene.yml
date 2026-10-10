@@ -1,0 +1,184 @@
+## RBAC hygiene, published by the Windmill probe `f/probe/rbac_hygiene`
+## (daily 05:17 Europe/Zurich).
+##
+## Why this group exists: on 2026-09-22 eight cluster-scoped RBAC objects were
+## found BY HAND while measuring CIS 5.1.1 — two granting `cluster-admin` to
+## ServiceAccounts in a `portainer` namespace deleted years earlier, one of them
+## sitting there since 2024. Nothing measured it, so nothing would have found the
+## next one. These rules are that measurement.
+##
+## ⚠️ Staleness is NOT covered here and that is deliberate: the probe is a
+## Windmill job, so the generic `BatchJobStale` in `12-batch-jobs.yml` joins it
+## through `windmill_schedule_interval_seconds` and already fires if it stops
+## running. (That is the opposite of `51-cis-benchmark.yml`, whose producer is a
+## Kubernetes CronJob and therefore needs its own staleness rule.)
+##
+## `component: Security` is INTERNAL on purpose. A leftover grant is a posture
+## finding, not a service outage; routing it to a public statuspage component
+## would degrade mdapi.statuspage.io in front of strangers for something no user
+## can observe.
+##
+## ⭐ Every threshold below is the MEASURED baseline of 2026-09-22 plus headroom,
+## and the baseline is written into each rule. A threshold at or below the status
+## quo fires on day one and teaches everyone to ignore the group.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rbac-hygiene
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-security.rbac-hygiene
+    rules:
+    ## Baseline 2026-09-22: 0. This is the exact class that was cleaned that day
+    ## — a binding to cluster-admin, or to a role granting *:*, whose subject
+    ## cannot currently exist. Inert only until something recreates the namespace
+    ## with the same account name, at which point the grant is live and silent.
+    ## Warning rather than info: it does not auto-resolve, and the blast radius
+    ## is the whole cluster.
+    - alert: RbacPrivilegedOrphan
+      expr: rbac_orphaned_bindings_privileged > 0
+      for: 15m
+      labels:
+        service: 'rbac'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} privileged RBAC binding(s) point at a subject that cannot exist"
+        description: |
+          A binding to cluster-admin — or to a ClusterRole granting *:* — names a
+          ServiceAccount whose namespace or account is gone. It grants nothing
+          today and everything the moment that name comes back.
+          Which one: rbac_orphaned_binding_detail{privilege="privileged"}
+          Remove the BINDING, never the ClusterRole: upstream roles are shared.
+          Back up first — see jump:~/rbac-orphans-20260922/ for the pattern.
+
+    ## Baseline 2026-09-22: 0, after the sweep. The subject's whole namespace is
+    ## gone, so nothing recreates that identity by accident — which makes any
+    ## non-zero reading a genuine leftover rather than a lazily-created account.
+    ## Info: real, actionable, but nothing is exposed while it holds.
+    - alert: RbacOrphanedBindingNamespaceGone
+      expr: rbac_orphaned_bindings_namespace_gone > 0
+      for: 1h
+      labels:
+        service: 'rbac'
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} RBAC binding(s) reference a namespace that no longer exists"
+        description: |
+          Left behind by an uninstall. Harmless while the namespace stays gone.
+          Which one: rbac_orphaned_binding_detail{reason omitted, see labels}
+          If it is privileged, RbacPrivilegedOrphan is firing too and takes
+          priority.
+
+    ## Baseline 2026-09-22: 2 — `cattle-cleanup-dfzgc` (a finished Rancher cleanup
+    ## Job whose ServiceAccount was collected) and `cdi-monitoring` (the KubeVirt
+    ## CDI chart naming a prometheus account it does not create). Both benign, both
+    ## expected to persist, hence `> 2` and not `> 0`: this rule watches GROWTH.
+    ## ⚠️ If either is ever cleaned up, lower this threshold with it — a threshold
+    ## parked above the real count is an alert that can never fire.
+    - alert: RbacOrphanedBindingGrowth
+      expr: rbac_orphaned_bindings_sa_missing > 2
+      for: 6h
+      labels:
+        service: 'rbac'
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} bindings name a missing ServiceAccount (accepted baseline 2)"
+        description: |
+          The namespace exists but the ServiceAccount does not. Weak signal on its
+          own — upstream charts reference accounts they never create, and some
+          controllers create theirs on demand — so only the rise above the two
+          known cases is reported.
+          Which ones: rbac_orphaned_binding_detail
+
+    ## Baseline 2026-09-22: 23, after removing the two Portainer bindings (was 25).
+    ## The level is inherited from Helm, Harvester and Rancher and is not itself a
+    ## finding; a NEW grant of cluster-admin is. Warning: nobody should acquire
+    ## cluster-admin without it being noticed.
+    - alert: RbacClusterAdminGrowth
+      expr: rbac_cluster_admin_bindings > 23
+      for: 1h
+      labels:
+        service: 'rbac'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} cluster-admin bindings, above the accepted baseline of 23"
+        description: |
+          Something was granted cluster-admin since 2026-09-22. Find it:
+          kubectl get clusterrolebinding -o json | jq -r
+            '.items[] | select(.roleRef.name=="cluster-admin") | .metadata.name'
+          If the grant is legitimate and permanent, raise this threshold in the
+          same commit that explains why.
+
+    ## Baseline 2026-09-22: 1 — `cattle-cleanup-dfzgc`, owned by a Job that is gone.
+    ## ⭐ A cluster-scoped object CANNOT be owned by a namespaced one: Kubernetes
+    ## refuses the link, so garbage collection never fires and the cascade only
+    ## LOOKS wired. `sandbox-sandbox` survived two years exactly that way. An
+    ## invalid ownerReferences is visually identical to a valid one, which is why
+    ## it needs a number rather than a reader.
+    - alert: RbacUncollectableOwnerRef
+      expr: rbac_invalid_owner_refs > 1
+      for: 6h
+      labels:
+        service: 'rbac'
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "{{ $value }} cluster-scoped RBAC objects can never be garbage collected (baseline 1)"
+        description: |
+          These name a namespaced owner, which Kubernetes will not honour for a
+          cluster-scoped object. Nothing will ever remove them automatically, so
+          they accumulate in silence until someone reads the list.
+          Deleting the object by hand is the only cleanup.
+
+    ## ⭐ Guards the probe's core assumption rather than the estate. The filter that
+    ## excludes Kubernetes' own RBAC (`kubernetes.io/bootstrapping=rbac-defaults`)
+    ## is what makes the counts above meaningful: without it the probe reports 12
+    ## findings of which 10 are noise. Baseline 2026-09-22: 56 skipped (49
+    ## ClusterRoleBindings + 7 RoleBindings). A collapse means upstream stopped
+    ## stamping that label and every count above is about to fill with built-ins.
+    - alert: RbacBuiltinFilterDegraded
+      expr: rbac_builtin_bindings_skipped < 40
+      for: 1h
+      labels:
+        service: 'rbac'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "RBAC probe skipped only {{ $value }} builtin bindings (baseline 56)"
+        description: |
+          The kubernetes.io/bootstrapping label has stopped matching as many
+          objects as it did. Either Kubernetes changed how it marks its own RBAC,
+          or the probe's filter broke. Until this is understood, treat the orphan
+          counts in this group as unreliable rather than as good news.
+
+    ## Fail-closed flag. The probe replaces its whole Pushgateway group on every
+    ## run, so on an API failure it pushes ONLY this gauge at 0 and every other
+    ## rbac_* series disappears — a missing number beats a stale reassuring one.
+    - alert: RbacHygieneCheckBroken
+      expr: rbac_hygiene_check_ok == 0
+      for: 30m
+      labels:
+        service: 'rbac'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "The RBAC hygiene probe could not read the cluster"
+        description: |
+          f/probe/rbac_hygiene ran and failed to list namespaces, ServiceAccounts
+          or RBAC objects, so nothing in this group is being measured right now.
+          Read the run in Windmill; the usual cause is the worker's
+          ServiceAccount losing read access to rbac.authorization.k8s.io.

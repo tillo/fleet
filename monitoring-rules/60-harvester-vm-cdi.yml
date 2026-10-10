@@ -1,0 +1,232 @@
+## The KubeVirt / CDI half of the residue from the 2026-10-05 rule-load finding.
+##
+## Ledger item alert:RancherMonitoringRulesNeverEvaluated (bead infra-s25w). 34
+## VMRule objects — 368 rules — sit in this cluster that the only rule evaluator
+## (vmalert-mdapi) never loads, because they are missing the `monitoring-stack:
+## mdapi` label it selects on. The per-concern diff found most of those concerns
+## covered anyway by our own 542-rule set; the residue needing a decision was six
+## items. This file is item (d), KubeVirt/CDI.
+##
+## ⛔ THE CLAIM WAS ABOUT THE RULES, NOT THE CONCERNS. Nothing here is "restoring
+## 368 lost alerts" — it is covering four specific concerns that the diff proved
+## had no cover on either side.
+##
+## WHY THIS IS A REAL GAP AND NOT A PAPER ONE. Our only VM-side availability
+## coverage is RancherMgmtVMNotRunning (37-rancher-mgmt.yml), which names ONE
+## namespace, and MacosVm* (49-macos-vm.yml), which watches a pod, not a KubeVirt
+## object. Measured 2026-10-05: mdapi-prod runs 10 VMs across 6 namespaces —
+## atlas/atlas-probe, ciphertrust/cm and honeypot/trapeye-vm-{dmz,lan-v2} were
+## running with no availability rule of any kind, while rancher-mgmt's three were
+## the only ones watched. CDI is deployed and serving (four cdi-* Deployments in
+## harvester-system) and had no rule at all, in the inert set or ours.
+##
+## ⛔ NO ALERT HERE FIRES ON A STANDING CONDITION — each was measured quiet against
+## the live cluster before it shipped, because an alert that is always on is
+## functionally off and camouflages its neighbours:
+##   VmStoppedUnexpectedly      empty (the three stopped VMs are stopped >8 days)
+##   CdiNotReady                0 series (kubevirt_cdi_cr_ready is 1)
+##   CdiMetricsMissing          empty (the metric is arriving)
+##   CdiDataVolumePending       0 series (kubevirt_cdi_datavolume_pending is 0)
+##
+## ⛔ THREE INERT VENDOR CONCERNS FROM THE SAME RESIDUE, DECLINED WITH THE
+## MEASUREMENT, so nobody re-proposes them:
+##   * KubeQuotaExceeded / KubeQuotaAlmostFull — the ONLY ResourceQuota in this
+##     cluster belongs to tenant-1, the namespace whose app availability is
+##     deliberately out of scope (user decision 2026-09-04). A quota rule that
+##     excludes the only instance it could ever match is dead code that reads as
+##     coverage, which is precisely the defect this whole item is about. Highest
+##     ratio there today: limits.ephemeral-storage 6 Gi / 8 Gi = 0.75. Revisit if
+##     a ResourceQuota appears in a namespace we do own.
+##   * KubeCPUOvercommit / KubeMemoryOvercommit — measured live in the vendor's own
+##     form, `sum(requests) - (sum(allocatable) - max(allocatable)) > 0`, they
+##     return +8.895 cores and +61.57 GB on this cluster TODAY. Adopting them
+##     verbatim ships a permanently-firing alert. The consequence that actually
+##     matters — pods that cannot schedule at all — is already covered by
+##     ClusterPendingPodsTooLong (12-batch-jobs.yml:1014), whose pushed snapshot
+##     refreshes hourly (measured: 24 pushes in the last 24h).
+##   * CDIStorageProfilesIncomplete / CDIDefaultStorageClassDegraded —
+##     kubevirt_cdi_storageprofile_info carries degraded="true" and complete="false"
+##     for the rook `ceph-filesystem` profile right now, so an alert on it is
+##     always-on. Whether that profile SHOULD be complete is a storage question,
+##     not a monitoring one.
+##
+## Kept out of 59-rule-load-coverage.yml on purpose: that file is the guard for the
+## rule-load defect itself (derived, change-shaped), this one is ordinary coverage.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: harvester-vm-cdi
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-kubevirt.vm-availability
+    rules:
+    - alert: VmStoppedUnexpectedly
+      ## The gap this file exists for: a KubeVirt VM in a namespace that has no
+      ## VM-side rule of its own has stopped, and it was running within the last
+      ## week and a half.
+      ##
+      ## ⛔ WHY IT IS CHANGE-SHAPED RATHER THAN `status_group != "running"`. Three of
+      ## the ten VMs in this cluster — ctf/kali and dsf-lab/sapiq-lab{,-u} — are
+      ## stopped ON PURPOSE and have been for months. A plain non-running rule would
+      ## be permanently on for those three, which is the wallpaper failure the
+      ## 2026-08-29 audit already found once in this estate. Requiring the VM to have
+      ## been running in the offset window excludes them by derivation, with no
+      ## maintained exclusion list to rot: they are simply never in the right-hand
+      ## side. A VM shut down deliberately goes quiet ~8 days later on its own.
+      ##
+      ## ⚠️ The offset window is load-bearing, not habit — the same reason
+      ## WorkloadLostAlertCoverage carries one. If the metric stops arriving the
+      ## right-hand side empties, but this rule's left side empties too, so the
+      ## failure is silence rather than a storm. Silence is covered instead by
+      ## KubeVirtMetricsMissing below, which is why that rule exists.
+      ##
+      ## ⛔ rancher-mgmt is excluded: RancherMgmtVMNotRunning (37-rancher-mgmt.yml)
+      ## already watches those three at severity critical with a 10m dwell, and a
+      ## second, slower, milder alert on the same event is pure noise. The filter is
+      ## on the LEFT operand only; the lookback stays whole because it is asking
+      ## "was this VM running", a question no exclusion should be able to answer.
+      expr: |
+        (
+          (kubevirt_vm_info{namespace!="rancher-mgmt", status_group!="running"} == 1)
+          and on (namespace, name)
+          max by (namespace, name) (
+            max_over_time((kubevirt_vm_info{namespace!="rancher-mgmt", status_group="running"} == 1)[7d:1h] offset 12h)
+          )
+        )
+      for: 15m
+      labels:
+        service: 'kubevirt'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "VM {{ $labels.namespace }}/{{ $labels.name }} stopped (was {{ $labels.status }}, running within the last week)"
+        description: |
+          {{ $labels.namespace }}/{{ $labels.name }} is no longer in status_group
+          "running", and it WAS running at some point in the previous 7 days — so this
+          is a change, not a VM that is meant to be off. Source is kubevirt_vm_info
+          from virt-CONTROLLER, which is emitted for every VM regardless of whether a
+          launcher pod exists: a VM whose launcher never came up is still visible here
+          (kubevirt_vmi_info is not — it comes from virt-handler per running launcher).
+
+          Check: kubectl --context mdapi-prod-direct -n {{ $labels.namespace }} get vm,vmi,pods
+                 kubectl --context mdapi-prod-direct -n {{ $labels.namespace }} describe vm {{ $labels.name }}
+
+          A VMI wedged Terminating on a wrangler.cattle.io finalizer is auto-healed
+          every 5m by f/heal/kubevirt_stuck_vmi_finalizer; KubeVirtVMIStuckFinalizer
+          (37-rancher-mgmt.yml) fires when that heal cannot clear it.
+
+    - alert: KubeVirtMetricsMissing
+      ## Monitor-the-monitor for the rule above. virt-controller's metrics are the
+      ## only source VmStoppedUnexpectedly has, so if the scrape stops the rule goes
+      ## silently blind — and a blind availability rule reads exactly like a healthy
+      ## fleet. Gated on the controller still existing, so decommissioning KubeVirt
+      ## is not an incident.
+      expr: |
+        absent(kubevirt_vm_info)
+        and on() (count(kube_deployment_spec_replicas{namespace="harvester-system", deployment="virt-controller"}) > 0)
+      for: 30m
+      labels:
+        service: 'kubevirt'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "virt-controller is running but publishing no kubevirt_vm_info"
+        description: |
+          The virt-controller Deployment exists in harvester-system and no
+          kubevirt_vm_info series has been scraped for 30m. VmStoppedUnexpectedly
+          cannot fire while this is true, so its silence right now means nothing.
+
+          Check: kubectl --context mdapi-prod-direct -n harvester-system get pods -l kubevirt.io=virt-controller
+                 kubectl --context mdapi-prod-direct -n harvester-system get servicemonitor,vmagent,scrapeconfig | grep -i kubevirt
+          Service is kubevirt-prometheus-metrics; a ServiceMonitor or VMServiceScrape
+          edit is the usual cause.
+
+  - name: app-kubevirt.cdi
+    rules:
+    - alert: CdiNotReady
+      ## CDI (Containerized Data Importer) is what turns an image into a PVC for
+      ## every VM here. cdi-* run in harvester-system and serve this cluster; if the
+      ## CDI CR is not ready, DataVolume imports, uploads and clones stop working —
+      ## VM provisioning breaks without any VM itself being broken, which is why no
+      ## other rule in this estate would notice.
+      ##
+      ## Emitted by the cdi-operator pod itself. Measured 1 (ready) on 2026-10-05.
+      expr: kubevirt_cdi_cr_ready < 1
+      for: 15m
+      labels:
+        service: 'kubevirt'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "CDI is not ready — VM image import/clone/upload is broken"
+        description: |
+          kubevirt_cdi_cr_ready has been below 1 for 15m. Every DataVolume operation
+          in this cluster goes through CDI, so VM provisioning is failing even though
+          running VMs are unaffected.
+
+          Check: kubectl --context mdapi-prod-direct -n harvester-system get cdi
+                 kubectl --context mdapi-prod-direct -n harvester-system get pods -l app.kubernetes.io/part-of=cdi
+                 kubectl --context mdapi-prod-direct -n harvester-system logs deploy/cdi-operator
+
+    - alert: CdiMetricsMissing
+      ## Monitor-the-monitor for CdiNotReady: the same blind-spot shape as
+      ## KubeVirtMetricsMissing above. Gated on the cdi-* Deployments still being
+      ## there so that removing CDI is not an incident.
+      expr: |
+        absent(kubevirt_cdi_cr_ready)
+        and on() (count(kube_deployment_spec_replicas{namespace="harvester-system", deployment=~"cdi-.*"}) > 0)
+      for: 30m
+      labels:
+        service: 'kubevirt'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "CDI workloads exist but publish no kubevirt_cdi_cr_ready"
+        description: |
+          cdi-* Deployments are present in harvester-system and the cdi-operator has
+          published no kubevirt_cdi_cr_ready for 30m. CdiNotReady cannot fire while
+          this is true — its silence right now is not evidence that CDI is healthy.
+
+          Check: kubectl --context mdapi-prod-direct -n harvester-system get pods -l app.kubernetes.io/part-of=cdi
+                 kubectl --context mdapi-prod-direct -n harvester-system get svc cdi-prometheus-metrics
+          The scrape job is cdi-prometheus-metrics.
+
+    - alert: CdiDataVolumePending
+      ## info on purpose: a DataVolume waiting on an import is routine and short, and
+      ## this must never page. Two hours of Pending is not routine — it is a stalled
+      ## import (missing source, a PVC that cannot bind, an unavailable storage
+      ## class) that will not clear itself, and it is worth being visible in the UI
+      ## before anyone notices the VM it was provisioning never arrived.
+      ##
+      ## Measured 0 on 2026-10-05.
+      expr: kubevirt_cdi_datavolume_pending > 0
+      for: 2h
+      labels:
+        service: 'kubevirt'
+        severity: info
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $value }} DataVolume(s) Pending for over 2h — import or clone stalled"
+        description: |
+          CDI has reported at least one DataVolume in Pending for more than two
+          hours. Normal imports sit in ImportScheduled/ImportInProgress and pass
+          through Pending in seconds, so this is a stall: the source may be
+          unreachable, the PVC may be unbindable, or the storage class may be
+          missing.
+
+          Check: kubectl --context mdapi-prod-direct get dv -A
+                 kubectl --context mdapi-prod-direct get pvc -A | grep -i pending
+                 kubectl --context mdapi-prod-direct -n harvester-system logs deploy/cdi-deployment

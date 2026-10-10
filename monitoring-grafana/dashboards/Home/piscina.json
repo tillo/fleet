@@ -1,0 +1,150 @@
+{
+ "title": "Piscina \u2014 pompa & energia",
+ "uid": "mdapi-piscina",
+ "schemaVersion": 40,
+ "editable": true,
+ "time": {
+  "from": "now-7d",
+  "to": "now"
+ },
+ "timezone": "browser",
+ "panels": [
+  {
+   "id": 1,
+   "title": "Potenza pompa (sintetica) vs export solare",
+   "type": "timeseries",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "ha-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 16,
+    "h": 9
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "ha-postgres"
+     },
+     "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS \"pompa W\" FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.pool_pump_power' AND s.state ~ '^-?[0-9.]+$' AND s.last_updated_ts BETWEEN EXTRACT(EPOCH FROM $__timeFrom()) AND EXTRACT(EPOCH FROM $__timeTo()) ORDER BY 1"
+    },
+    {
+     "refId": "B",
+     "format": "time_series",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "ha-postgres"
+     },
+     "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS \"export W\" FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.solar_panel_to_grid_w' AND s.state ~ '^-?[0-9.]+$' AND s.last_updated_ts BETWEEN EXTRACT(EPOCH FROM $__timeFrom()) AND EXTRACT(EPOCH FROM $__timeTo()) ORDER BY 1"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "watt"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 2,
+   "title": "Minuti di filtrazione oggi",
+   "type": "stat",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "ha-postgres"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 0,
+    "w": 8,
+    "h": 4
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "ha-postgres"
+     },
+     "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.pool_pump_runtime_today_min' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "m"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 3,
+   "title": "kWh oggi",
+   "type": "stat",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "ha-postgres"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 4,
+    "w": 8,
+    "h": 5
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "ha-postgres"
+     },
+     "rawSql": "SELECT TO_TIMESTAMP(s.last_updated_ts) AS time, s.state::float AS value FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.pool_pump_energy_daily' AND s.state ~ '^[0-9.]+$' ORDER BY s.last_updated_ts DESC LIMIT 1"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "kwatth"
+    },
+    "overrides": []
+   }
+  },
+  {
+   "id": 4,
+   "title": "Energia pompa per giorno (kWh)",
+   "type": "barchart",
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "ha-postgres"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 24,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "format": "time_series",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "ha-postgres"
+     },
+     "rawSql": "SELECT DATE_TRUNC('day', TO_TIMESTAMP(s.last_updated_ts)) AS time, MAX(s.state::float) AS \"kWh\" FROM states s JOIN states_meta sm ON s.metadata_id = sm.metadata_id WHERE sm.entity_id = 'sensor.pool_pump_energy_daily' AND s.state ~ '^[0-9.]+$' AND s.last_updated_ts BETWEEN EXTRACT(EPOCH FROM $__timeFrom()) AND EXTRACT(EPOCH FROM $__timeTo()) GROUP BY 1 ORDER BY 1"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "kwatth"
+    },
+    "overrides": []
+   }
+  }
+ ]
+}

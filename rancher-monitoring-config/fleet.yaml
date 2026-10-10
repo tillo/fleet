@@ -1,0 +1,26 @@
+defaultNamespace: cattle-monitoring-system
+namespace: cattle-monitoring-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  ## Adopt the pre-existing, hand-applied Harvester Addon CR (addon.yml) into this release
+  ## (fleet-conflict-resolve variant A: the object predates the bundle).
+  takeOwnership: true
+
+## Harvester upgrades bump the Addon's spec.version. Don't treat that as drift, so Fleet
+## never reverts an upgrade in progress (bump addon.yml afterwards; see its header).
+diff:
+  comparePatches:
+  - apiVersion: harvesterhci.io/v1beta1
+    kind: Addon
+    name: rancher-monitoring
+    namespace: cattle-monitoring-system
+    operations:
+    - {"op": "remove", "path": "/spec/version"}
+
+## Restore our Addon/HelmChartConfig if something else rewrites them (e.g. a Harvester upgrade
+## re-seeding valuesContent), as monitoring-logging does.
+correctDrift:
+  enabled: true

@@ -1,0 +1,48 @@
+## NetworkPolicy ENFORCING policy for the CI job pods in ns `gitlab-runner-builder`.
+## Isolation programme infra-az8.4; this workload is infra-az8.4.1.
+## ⭐ ENFORCING since 2026-10-07 — this DENIES. Promoted from the same 36h22m
+##    learn window as its sibling (2026-10-05T18:51:33Z -> 2026-10-07T07:13:15Z),
+##    suppression 0. Evidence: ~/ci-job-pods-netpol-analysis-20261007.md
+##    ⚠️ Its "NO distributed cache" claim is no longer just a config reading: the
+##       window's single RGW connection was attributed to the BOOTSTRAP runner by
+##       job tag_list, and this runner's 40-minute build emitted none. See the
+##       policy header.
+##
+## ⭐ THIS IS THE BETTER FIRST TARGET of the two, and the reason is scope:
+##      * the runner runs ONLY jobs tagged `builder-persistent` (`runUntagged:
+##        false`), so this is one known workload — the OpenWrt fork build — not
+##        "arbitrary code from 59 projects";
+##      * the namespace holds no GitLab services at all, so its legitimate
+##        internal peers are far fewer than bootstrap's;
+##      * it has NO distributed cache (cache_dir is local on the PVC, on purpose),
+##        so there is no cross-namespace S3 dependency to allow;
+##      * its job is compiling, so denying it the rest of the cluster costs it
+##        almost nothing.
+##    If only one of the two bundles is adopted, adopt this one.
+##
+## ⚠️ ON THE WORD "RAW": Fleet deploys EVERY bundle as a Helm release named
+##    `mdapi-prod-<dir>`, with or without a `helm:` block — this bundle becomes
+##    `mdapi-prod-netpol-gitlab-runner-builder` like any other. Checked
+##    2026-10-05: `kube-bench/` ships no `helm:` block at all and still has a live
+##    release whose objects carry Helm ownership annotations. So `helm:` is
+##    omitted here only because there are no options to set, not to opt out.
+##
+##    The second reason this is its own bundle: the sibling
+##    `gitlab-runner-builder/` sets `helm.chart` to the REMOTE gitlab-runner
+##    chart (`repo` + `chart` + `version`), and where a chart source is given the
+##    directory's own manifests are not rendered — the documented estate trap. So
+##    a raw NetworkPolicy dropped in THERE would very likely be ignored. (That
+##    trap is the estate's known one; it is not re-verified first-hand here.)
+##    Its `dependsOn: [external-secrets]` is the primary, recovery-relevant
+##    reason, and it is the same argument as for `bootstrap/`.
+##
+## ⛔ NO `dependsOn`, on purpose: the cluster must come up from scratch without
+##    this bundle, and a security observation layer must not sit in the
+##    dependency path of anything. `gitlab-runner-builder/` itself depends on
+##    external-secrets; adding the policy there would inherit that coupling for
+##    no benefit. Nothing depends on this bundle.
+##
+## ⛔ NO `namespace:` — Fleet would then create and own the namespace, and
+##    `gitlab-runner-builder` is already owned by its own bundle.
+##    `defaultNamespace` only names the target.
+defaultNamespace: gitlab-runner-builder

@@ -1,0 +1,98 @@
+## Who may talk to the litellm proxy.
+##
+## WHY IT EXISTS. litellm treats identity headers as fact. `x-litellm-customer-id`
+## and `x-litellm-end-user-id` are honoured with no configuration at all, and the
+## mapped X-OpenWebUI-User-Email (user_header_mappings, litellm-cm.yml) is taken
+## verbatim into the request's end-user record. So any workload that can open a TCP
+## connection to this Service could bill its own spend to someone else — and the
+## Open WebUI virtual key is not a secret from Open WebUI's own users, so that is
+## reachable without the master key. An application cannot defend a header that IS
+## the identity; the defence is that nobody else can send it.
+##
+## Same driver, same shape as fleet/bussola/bussola-netpol.yml, which this follows.
+##
+## The other half of the control is at the front door: litellm-ing.yml strips the
+## same headers on llm.mdapi.ch. Both are needed and neither subsumes the other.
+## This one covers the in-cluster path — Open WebUI and the other callers here reach
+## the Service directly and never traverse the ingress. That one covers a LAN client
+## going through the edge.
+##
+## The callers are the namespaces that actually hold a litellm key, taken from the
+## most recent use of each key in LiteLLM_SpendLogs rather than from a repo grep: a
+## grep of fleet alone misses `home-assistant` and `windmill`, whose model config
+## lives outside this repo.
+##
+## INGRESS ONLY, deliberately. litellm's egress is not the threat being modelled —
+## it has to reach the cloud providers, the in-cluster claude-shim, LM Studio on
+## mbp-mda and CoreDNS, and an egress allowlist here would be a second, unrelated
+## outage waiting to happen. Only Ingress is listed under policyTypes, so every
+## egress flow is untouched.
+##
+## ⛔ Deliberately NO `ipBlock: 192.168.1.0/24` for kubelet probes. It is not needed
+## here, and it is not harmless: it would let any LAN host reach a pod IP directly
+## and bypass the header strip in litellm-ing.yml, which is half of this control.
+## Calico (this is Canal — Flannel owns routing, Calico only the policy plane) does
+## not police host-to-local-workload traffic unless a HostEndpoint exists, and none
+## does (`kubectl get hostendpoints -A` is empty). Proven 2026-08-31 on a scratch
+## namespace: a pod with a real readinessProbe reached ready=true under a
+## default-deny NetworkPolicy that permitted only one pod label. The node-CIDR line
+## in bussola-netpol.yml is not what keeps ITS probes alive either, despite its
+## comment — do not copy it in as a required incantation. See memory
+## k8s_network_policy_plane_is_canal_not_calico_2026_08_31.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: litellm-only-from-known-callers
+  namespace: litellm
+spec:
+  podSelector:
+    matchLabels:
+      app: litellm
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        ## llm.mdapi.ch — the only way in from the LAN. Verified hostNetwork is
+        ## false, so the controller arrives with a pod IP and a namespaceSelector
+        ## matches it. The controller is selected rather than all of kube-system.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        ## Open WebUI — the front end that forwards the signed-in identity.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+        ## The SRE agent (o2-sre-agent reaches the Service; o2-dbm-collector talks
+        ## to litellm-pg, which is a different pod and not selected here).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openobserve
+        ## Document classifier.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: paperless
+        ## Assist conversation agent.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: home-assistant
+        ## Camera description generation.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: frigate
+        ## Reaches the in-cluster Service, never llm.mdapi.ch (see its deploy).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: bussola
+        ## Workspace scripts.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: windmill
+        ## This bastion: ccx and dsh call the Service directly with the master key.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jump
+      ports:
+        - protocol: TCP
+          port: 4000

@@ -1,0 +1,25 @@
+defaultNamespace: openwebui
+namespace: openwebui
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  # TLS for chat.mdapi.ch; same guard every ingress-owning bundle uses.
+  - name: mdapi-prod-cert-manager
+  # The gateway this whole app is a frontend for. Without it the deployment
+  # comes up and every model list is empty.
+  - name: mdapi-prod-litellm
+helm:
+  maxHistory: 25
+diff:
+  comparePatches:
+  # Open WebUI writes its own config rows at first boot and the operator tunes
+  # resources by hand under load; VPA-style drift on requests/limits would
+  # otherwise leave the bundle permanently "Modified" (same treatment as
+  # litellm/fleet.yaml).
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: openwebui
+    namespace: openwebui
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}

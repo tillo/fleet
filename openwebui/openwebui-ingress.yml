@@ -1,0 +1,55 @@
+## chat.mdapi.ch — SSO-gated by oauth2-proxy-portal, the same instance that
+## fronts start.mdapi.ch (portal/portal.yml is the reference for this block).
+##
+## NOTE there is no whitelist-source-range. This one is deliberately reachable
+## from the internet: the point of the service is friends and family, who are
+## not on 192.168.1.0/24. The gate is Keycloak (any valid tilloch-realm
+## account), not the source address. That is the opposite call from
+## litellm-ing.yml, which is LAN-only because it fronts a raw paid key with
+## nothing but a bearer token in front of it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openwebui
+  namespace: openwebui
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    ## oauth2-proxy-portal: no role restriction, every realm user may sign in.
+    ## The auth-url is the in-cluster Service (auth.mdapi.ch would send the
+    ## subrequest back out through the ingress); auth-signin is the public URL
+    ## because the browser follows it.
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-portal.oauth2-proxy.svc.cluster.local/portal/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/portal/oauth2/start?rd=https://$host$escaped_request_uri
+    ## Forwards the identity to Open WebUI's trusted-header auth. Requires
+    ## set_xauthrequest=true on the portal instance, which it has.
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-Email,X-Auth-Request-Preferred-Username
+    ## ModSec OFF — chat bodies are prose and code, which is precisely what CRS
+    ## false-positives on. Same reasoning as litellm-ing.yml (this is the same
+    ## traffic, one hop later) and the portal/kustodyan-mcp precedent. The
+    ## surface is SSO-gated.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    ## Token streaming is SSE: buffering it means the answer arrives in one
+    ## lump at the end, and a local cold prefill on mbp-mda can legitimately
+    ## run several minutes before the first token.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    ## RAG document uploads; the 1m default rejects anything real with a 413.
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: chat.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: openwebui
+            port:
+              number: 8080
+  tls:
+  - hosts:
+    - chat.mdapi.ch
+    secretName: openwebui-cert

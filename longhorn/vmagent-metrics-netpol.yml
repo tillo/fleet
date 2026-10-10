@@ -1,0 +1,33 @@
+## Allow the VictoriaMetrics vmagent (monitoring ns) to scrape the Longhorn
+## manager metrics endpoint (longhorn-manager :9500/metrics).
+##
+## Longhorn ships a NetworkPolicy `cattle-monitoring-prometheus` that allowed
+## ONLY the embedded rancher-monitoring Prometheus (cattle-monitoring-system) to
+## reach longhorn-manager. When that embedded Prometheus was retired
+## (2026-06-24 — VM became the sole metrics source), native longhorn_* metrics
+## stopped being collected (up{job="longhorn-backend"}=0; only our custom
+## Windmill longhorn_* metrics remained). This policy re-opens the scrape for
+## vmagent so native Longhorn metrics flow into VM and the Longhorn Grafana
+## dashboard renders. Scoped to monitoring/vmagent -> :9500 only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vmagent-longhorn-metrics
+  namespace: longhorn-system
+spec:
+  podSelector:
+    matchLabels:
+      app: longhorn-manager
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vmagent
+      ports:
+        - protocol: TCP
+          port: 9500

@@ -1,0 +1,175 @@
+## SearXNG — the web-search backend for chat.mdapi.ch.
+##
+## Lives in the openwebui bundle rather than its own, and has NO ingress: it is a
+## private backend with exactly one consumer, the same shape as
+## litellm/claude-shim-*. Nothing outside the cluster should reach it, and a
+## public SearXNG is an abuse magnet.
+##
+## Why SearXNG and not something else (checked against v0.11.1, 2026-08-26):
+## Open WebUI dispatches 29 search engines, but only four need no third-party
+## API key, and of those only searxng / openserp / yacy are self-hostable.
+## openserp drives a headless browser to scrape Google and is fragile; yacy
+## searches its own P2P index and has poor coverage for general questions.
+## SearXNG aggregates real upstream engines, needs no key, and is the one with
+## first-class support here.
+##
+## IMAGE LANE — pinned to a dated release tag (2026-09-02). This file used to
+## run Keel on :latest, argued from SearXNG being a stateless rolling release
+## with no semver for Renovate to reason about. That argument holds for
+## *rollback risk* but not for the two things that actually bit:
+##   1. it was the single image-policy violation in the estate (316/317 clean),
+##      and ImagePolicyFail fired continuously from 2026-08-27;
+##   2. :latest means the running version is whatever the registry served at the
+##      last pull — the bundle is not reproducible and a bad upstream push lands
+##      unreviewed, on a component that reaches the public internet on behalf of
+##      chat.mdapi.ch users.
+## SearXNG does publish immutable dated tags (2026.9.1-18af21159, several a
+## day), so pinning costs nothing but the bump. Bumping is deliberate: pick a
+## dated tag, put it below, let Fleet roll it once while you are watching.
+## Keel is intentionally NOT used here anymore — force+match-tag has nothing to
+## match on a pinned tag, and leaving it on would just re-open the same lane.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: openwebui
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: searxng
+  template:
+    metadata:
+      labels:
+        app: searxng
+    spec:
+      securityContext:
+        # uid/gid 977 baked into the image (verified by running it: the entrypoint
+        # warns loudly when /etc/searxng and /var/cache/searxng are not owned by
+        # searxng:searxng).
+        runAsUser: 977
+        runAsGroup: 977
+        fsGroup: 977
+      initContainers:
+      # SearXNG has no env interpolation of its own — settings_loader.py is a bare
+      # yaml.safe_load — and the search-provider keys must not sit in a
+      # git-managed ConfigMap, so the settings file is rendered here instead. The
+      # output lands in an emptyDir that the server then mounts as /etc/searxng;
+      # no SEARXNG_SETTINGS_PATH override is needed, because that is already the
+      # default lookup location.
+      - name: render-settings
+        image: docker.io/searxng/searxng:2026.8.22-9fea41204@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          # index() is a literal search, so a key containing / & | or \ cannot
+          # break the substitution the way a sed delimiter or regex would.
+          awk '{
+            while ((i = index($0, "${EXA_API_KEY}")) > 0)
+              $0 = substr($0, 1, i-1) ENVIRON["EXA_API_KEY"] substr($0, i+14)
+            while ((i = index($0, "${JINA_API_KEY}")) > 0)
+              $0 = substr($0, 1, i-1) ENVIRON["JINA_API_KEY"] substr($0, i+15)
+            print
+          }' /raw/settings.yml > /etc/searxng/settings.yml
+          # Fail closed: a surviving placeholder means the env var was empty, and
+          # SearXNG would otherwise take the literal "${EXA_API_KEY}" as its key
+          # and just return 401s that look like an engine being down.
+          if grep -q '[$]{EXA_API_KEY}\|[$]{JINA_API_KEY}' /etc/searxng/settings.yml; then
+            echo "settings.yml still holds an unrendered key placeholder" >&2
+            exit 1
+          fi
+        env:
+        - name: EXA_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: searxng-engines
+              key: EXA_API_KEY
+        - name: JINA_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: searxng-engines
+              key: JINA_API_KEY
+        volumeMounts:
+        - name: config
+          mountPath: /raw
+          readOnly: true
+        - name: config-rendered
+          mountPath: /etc/searxng
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+      containers:
+      - name: searxng
+        # Pinned to the dated release tag that is already running (it resolves
+        # to the same digest sha256:11a9b34c… the live pod reports), NOT :latest.
+        image: docker.io/searxng/searxng:2026.8.22-9fea41204@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        # The image's Granian default is GRANIAN_HOST="::". Pod IPs in this
+        # cluster are IPv4-only (single-stack, 10.52.0.0/16), so pin the bind
+        # explicitly rather than depend on v4-mapped acceptance on a v6 socket.
+        - name: GRANIAN_HOST
+          value: "0.0.0.0"
+        - name: SEARXNG_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: searxng-secret
+              key: SEARXNG_SECRET
+        volumeMounts:
+        # The rendered copy, not the ConfigMap: /etc/searxng now holds the output
+        # of the initContainer above, keys already substituted. The server only
+        # reads it, but an emptyDir is the mount that lets the initContainer write.
+        - name: config-rendered
+          mountPath: /etc/searxng
+        # __SEARXNG_DATA_PATH — the entrypoint requires this to exist as a
+        # writable directory. Nothing here needs to survive a restart.
+        - name: data
+          mountPath: /var/cache/searxng
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 50m
+            memory: 192Mi
+          limits:
+            memory: 512Mi
+      volumes:
+      # Mounted at /raw for the initContainer only — the server never sees this.
+      - name: config
+        configMap:
+          name: searxng-config
+      - name: config-rendered
+        emptyDir: {}
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  namespace: openwebui
+spec:
+  selector:
+    app: searxng
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP

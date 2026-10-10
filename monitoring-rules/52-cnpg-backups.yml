@@ -1,0 +1,227 @@
+## Generic CNPG backup-freshness alerting — every cluster, not one namespace.
+##
+## WHY (beads infra-bjzc)
+## Until now the ONLY in-cluster backup-freshness rule was
+## HomeAssistantRecorderBackupStale in 23-ha-recorder.yml, hard-scoped to
+## namespace home-assistant. The other six CNPG clusters had no equivalent.
+##
+## ⚠️ HONEST SCOPE — this is NOT the only backup check, and the bead overstated
+## the gap. f/probe/pvc_backup_coverage already DERIVES the cluster list from
+## the API and flags clusters with no working backup (no barman store, no
+## ScheduledBackup, never completed a base backup, or stale past its own
+## cadence); `PvcBackupUncovered` in 12-batch-jobs.yml alerts on its
+## pvc_backup_cnpg_nobarman_total. That probe remains the EXHAUSTIVE check and
+## is deliberately not duplicated here.
+##
+## What these rules add is RESOLUTION. The probe runs once a day, so its verdict
+## can be up to 24h behind the store — the same lag that made
+## restic_snapshot_freshness read 51h while B2 said 62h on 2026-09-19. These
+## rules evaluate continuously against the cluster's own barman catalog, so a
+## backup that stops being taken is caught in an hour rather than a day.
+##
+## ⛔ PREREQUISITE, and it was the actual bug: `spec.monitoring.enablePodMonitor`
+## must be true or a cluster publishes NO cnpg_collector_* metrics at all and
+## none of these rules can fire on it. On 2026-09-19 it was false on THREE of
+## the seven clusters — bootstrap/gitlab-pg, jump/guac-pg, paperless/paperless-pg
+## — which is part of why paperless-pg archived WAL happily while completing
+## zero base backups for months (beads infra-g80u). Enabled for all three in the
+## same MR as this file. A new CNPG cluster MUST set it, or it is invisible here.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cnpg-backups
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: cnpg-backups.freshness
+      rules:
+        ## ⭐⭐ 2026-10-07 (beads infra-zkak): THE SAME FACT NOW HAS TWO METRIC
+        ## NAMES, and both rules in this group must therefore match BOTH.
+        ##
+        ## In-tree backups publish  cnpg_collector_last_available_backup_timestamp.
+        ## A cluster migrated to the Barman Cloud Plugin publishes
+        ## barman_cloud_cloudnative_pg_io_last_available_backup_timestamp instead.
+        ##
+        ## ⛔ THE TRAP IS THE OLD SERIES, AND WHAT IT READS DEPENDS ON WHERE THE
+        ## CLUSTER CAME FROM. Three provenances, three different failures of the
+        ## unchanged rules -- so there is no single "it reads 0" story:
+        ##
+        ##   in-tree (never migrated)   both series live and equal          rules correct
+        ##   MIGRATED to the plugin     old series FROZEN at the last
+        ##                              in-tree backup (see below)           `> 0` keeps a
+        ##                                                                   non-zero value,
+        ##                                                                   age grows without
+        ##                                                                   bound -> FALSE
+        ##                                                                   WARNING ~26h after
+        ##                                                                   the migration, and
+        ##                                                                   forever after
+        ##   BORN on the plugin         old series reads 0                   `> 0` empties the
+        ##                                                                   vector -> goes
+        ##                                                                   SILENT; `== 0`
+        ##                                                                   -> FALSE CRITICAL
+        ##
+        ## Both non-in-tree rows are real and were measured on this estate
+        ## 2026-10-07, on the two cases the migration actually produces:
+        ##   * MIGRATED -- monitoring/grafana-pg, migrated that morning. A plugin
+        ##     backup completed at 07:55:48Z and the plugin series moved to it,
+        ##     while cnpg_collector_last_available_backup_timestamp stayed at
+        ##     02:30:16Z, the last backup the in-tree code ever took. Projecting the
+        ##     unchanged rule forward 24h (the frozen value cannot advance) puts the
+        ##     age at 29.4h and the rule FIRES on a cluster that is backing up fine.
+        ##   * BORN ON PLUGIN -- ns cnpg-drill, see ~/bootstrap/drills/cnpg-recovery/
+        ##     (45-* and 61-*), where the series is present and 0 from the start.
+        ##
+        ## ⛔ WHY THE MIGRATED CASE FREEZES RATHER THAN ZEROES, and this is the fact
+        ## worth remembering: cnpg_collector_last_available_backup_timestamp MIRRORS
+        ## Cluster.status.lastSuccessfulBackup; it is not read from the store
+        ## directly. The plugin records its truth on the ObjectStore
+        ## (.status.serverRecoveryWindow.<serverName>) and the operator stops
+        ## writing the Cluster status once `spec.backup` is gone -- so the last
+        ## in-tree value is simply never overwritten. Verified by reading all three
+        ## at once on grafana-pg: status 02:30:16Z == in-tree metric 02:30:16Z,
+        ## ObjectStore 07:55:48Z. A cluster that never had an in-tree value has
+        ## nothing to freeze, which is exactly why the drill saw 0.
+        ##
+        ## ⛔ `or` does NOT fix this. Set operators match on the label set IGNORING
+        ## __name__, so `in_tree or plugin` drops every plugin series (the labels
+        ## are identical) and reinstates the bug exactly. Selecting by __name__
+        ## regex and aggregating is what works.
+        ##
+        ## ⭐ Written to be correct WHETHER OR NOT a given cluster is migrated, so
+        ## nothing here has to change again as the other six follow. It also
+        ## survives CNPG 1.31 removing the in-tree metric outright.
+        ##
+        ## max() by namespace: only the PRIMARY reads the barman object-store
+        ## catalog; replicas publish this metric as 0. Without the aggregation a
+        ## replica's 0-series satisfies any staleness threshold and false-fires.
+        ## (Same reasoning as HomeAssistantRecorderBackupStale, which this
+        ## generalises — see 23-ha-recorder.yml.)
+        ##
+        ## `> 0` inside the max() drops the replica zeros. That makes this rule
+        ## fail OPEN for a cluster whose series are ALL zero — deliberately, so
+        ## that case gets its own, much louder rule below. The two are a pair:
+        ## this one means "backups ran and then stopped", the next means
+        ## "backups never ran at all". Never delete one without the other.
+        ##
+        ## 93600s = 26h: daily cadence + runtime + buffer, matching the existing
+        ## ha-recorder rule rather than inventing a second number.
+        ##
+        ## litellm is excluded by name: it is the one cluster with no
+        ## barmanObjectStore at all, an ACCEPTED exemption recorded in
+        ## ~/backup-readiness-report.py section 7 and beads infra-4882. It is
+        ## excluded here so the exemption is explicit and greppable, rather than
+        ## silently swallowed by the `> 0` filter.
+        - alert: CnpgBackupStale
+          expr: |
+            time() - max by (namespace) (
+              {__name__=~"cnpg_collector_last_available_backup_timestamp|barman_cloud_cloudnative_pg_io_last_available_backup_timestamp",
+               namespace!="litellm"} > 0
+            ) > 93600
+          for: 1h
+          labels:
+            service: '{{ or $labels.cluster "cnpg" }}'
+            severity: warning
+            component: Backups
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}: base backup {{ $value | humanizeDuration }} old"
+            description: |
+              No successful base backup has landed in this cluster's barman
+              object store for >26h. Continuous WAL archiving may still protect
+              PITR, but the base-backup anchor is aging and every restore means
+              a longer WAL replay.
+              Check: `kubectl -n {{ $labels.namespace }} get backups.postgresql.cnpg.io`
+              and the cluster's LastBackupSucceeded condition. Common causes:
+              instance-manager restart mid-backup; the object store rejecting
+              writes; a ScheduledBackup that was removed.
+              Store since 2026-09-19 is the in-cluster Ceph RGW over house-PKI
+              TLS (s3://cnpg-<cluster>), not the retired salt/pepper Garage.
+
+        ## ⭐ THE ONE THAT WOULD HAVE CAUGHT infra-g80u ON DAY ONE.
+        ## paperless-pg had barmanObjectStore CONFIGURED and WAL archiving
+        ## SUCCEEDING while never once completing a base backup. Everything
+        ## looked healthy; WAL without a base backup is NOT restorable. The
+        ## catalog reports 0 in that state, which the staleness rule above
+        ## cannot see because it filters zeros.
+        ##
+        ## No `for:` shorter than an hour: a freshly created cluster legitimately
+        ## reads 0 until its first base backup completes.
+        ##
+        ## ⭐ Unaffected by the migration, and worth saying so because it is the
+        ## rule the drill predicted would false-fire: on a MIGRATED cluster the
+        ## in-tree series is frozen non-zero (see the table above), so max() is
+        ## non-zero and this stays quiet. It is the BORN-ON-PLUGIN case -- a series
+        ## that is genuinely 0 -- that this rule is for, and there the plugin
+        ## series lifts it out of the `== 0` as soon as a real backup lands.
+        - alert: CnpgClusterNeverBackedUp
+          expr: |
+            max by (namespace) (
+              {__name__=~"cnpg_collector_last_available_backup_timestamp|barman_cloud_cloudnative_pg_io_last_available_backup_timestamp",
+               namespace!="litellm"}
+            ) == 0
+          for: 1h
+          labels:
+            service: '{{ or $labels.cluster "cnpg" }}'
+            severity: critical
+            component: Backups
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}: NO base backup has EVER completed"
+            description: |
+              The barman catalog reports no available backup at all. If WAL
+              archiving is succeeding this looks healthy from every other angle
+              and is NOT restorable — WAL replay needs a base backup to replay
+              onto. This is exactly the paperless-pg failure (beads infra-g80u),
+              which went unnoticed for months.
+              Check: `kubectl -n {{ $labels.namespace }} get cluster.postgresql.cnpg.io -o yaml`
+              for a backup stanza -- in-tree `spec.backup.barmanObjectStore`, or a
+              `plugins:` entry naming an `ObjectStore` -- and a ScheduledBackup, then
+              force one: `kubectl -n {{ $labels.namespace }} create -f -` with a
+              Backup CR, and watch it reach phase `completed`.
+              ⚠️ A brand-new cluster reads 0 until its first base backup lands;
+              that is what the 1h `for:` absorbs. Anything longer is real.
+
+    - name: cnpg-backups.instrumentation
+      rules:
+        ## Fail-closed companion: the cluster IS scraped (the collector is up)
+        ## but publishes no backup-catalog series, so neither rule above can
+        ## evaluate for it. Means the barman cloud catalog read is broken, or
+        ## the cluster has no backup stanza at all.
+        ##
+        ## Derived by set difference, so it needs no hand-maintained namespace
+        ## list — a list is what goes stale and produces false negatives exactly
+        ## where they hurt most. It cannot, however, see a cluster that is not
+        ## scraped AT ALL: that is what enablePodMonitor guarantees, and what
+        ## f/probe/pvc_backup_coverage catches independently from the API.
+        ## ⭐ 2026-10-07 (beads infra-zkak): the right-hand side is family-agnostic
+        ## for the same reason the two rules above are. On a migrated cluster the
+        ## old series survives, so this rule would behave -- but CNPG 1.31 removes
+        ## the in-tree backup code, and if the collector stops exporting the old
+        ## name entirely then EVERY cluster would look catalog-less and this would
+        ## fire estate-wide. Matching both names costs nothing and cannot go stale.
+        - alert: CnpgBackupCatalogMissing
+          expr: |
+            (count by (namespace) (cnpg_collector_up) > 0)
+              unless (count by (namespace) (
+                {__name__=~"cnpg_collector_last_available_backup_timestamp|barman_cloud_cloudnative_pg_io_last_available_backup_timestamp"}
+              ))
+          for: 1h
+          labels:
+            service: '{{ or $labels.cluster "cnpg" }}'
+            severity: warning
+            component: Backups
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}: scraped, but no backup-catalog metric"
+            description: |
+              cnpg_collector_up exists for this namespace but NEITHER the in-tree
+              nor the barman-cloud-plugin backup-catalog metric does, so both
+              backup-freshness rules are silently unable to evaluate here.
+              Either the CNPG collector's barman catalog read is failing, or the
+              cluster has no barman store configured at all -- neither an in-tree
+              `barmanObjectStore` nor a plugin `ObjectStore`.
+              Check the instance metrics endpoint and the operator logs:
+              `kubectl -n cnpg-system logs deploy/cnpg-controller-manager --tail=100`.

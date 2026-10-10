@@ -1,0 +1,38 @@
+defaultNamespace: monitoring
+namespace: monitoring
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+  # Allow the first install to adopt pre-existing K8s objects (created
+  # manually via `kubectl apply` before this bundle was added). Helm
+  # otherwise refuses to import them ("invalid ownership metadata") and
+  # the install loops. Set once on bundle creation; safe to keep on.
+  takeOwnership: true
+# Expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running pods.
+# The image is deliberately NOT stripped: git carries the resolved digest
+# (Renovate Lane A), so an image difference is a real change that must roll.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: grafana
+    namespace: monitoring
+    # resources: jsonPointers, not `operations`. Fleet (v0.15) applies operations
+    # in sequence and discards EVERY op for the object at the first one that
+    # fails. 2026-08-17 switched remove -> add "{}" because the dashboard-sidecar
+    # renders no resources (remove fails on an absent key; add tolerates that).
+    # But add still fails when the CONTAINER is absent, and Fleet also normalizes
+    # the live object's kubectl last-applied-configuration for its three-way
+    # diff: that annotation is stale here (it lists only container 0, no
+    # sidecar), so add .../containers/1 failed on every reconcile, ~190 agent
+    # error lines/h (infra-8f4.19). Each
+    # jsonPointer applies on its own and an absent path is skipped silently.
+    # container 1 = dashboard-sidecar: VPA(Auto) may write resources.
+    jsonPointers:
+    - /spec/template/spec/containers/0/resources
+    - /spec/template/spec/containers/1/resources

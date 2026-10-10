@@ -1,0 +1,16 @@
+# Phase-2 (2026-08-03): the logstream-leader chart still renders the original
+# Longhorn leader-config-claim; data moved to leader-config-claim-ceph and the
+# live old PVC was deleted. Delete-patch it out of the render (same pattern as
+# envuassu/nextcloud/kustomize/phase2-delete-old-pvcs.yaml). NO namespace on
+# purpose: the logstream-leader chart renders without one (0d1035e lesson) and
+# a namespaced patch finds no target.
+#
+# `$patch: delete` belongs at the DOCUMENT ROOT, not under metadata: nested
+# under metadata it silently no-ops and the PVC stays in the render — which is
+# what kept this bundle Modified from 2026-08-04 to 2026-08-08.
+# Verified with `helm template ... | kubectl kustomize`: 7 objects -> 6.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: leader-config-claim
+$patch: delete

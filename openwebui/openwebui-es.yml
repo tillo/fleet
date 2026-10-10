@@ -1,0 +1,82 @@
+## Secrets for the chat frontend. Both must exist in Akeyless BEFORE this
+## bundle can go green (the deployment will not start without them).
+##
+## OPENAI_API_KEY is a LiteLLM VIRTUAL KEY, not LITELLM_MASTER_KEY. The master
+## key is proxy-admin — it can mint keys, read every consumer's spend and edit
+## the gateway. A browser-facing app gets a scoped, revocable key instead.
+##
+## Minting it (requires litellm-pg from litellm/litellm-pg.yml to be up first,
+## since virtual keys live in that database):
+##
+##   curl -sX POST https://llm.mdapi.ch/key/generate \
+##     -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+##     -H 'Content-Type: application/json' \
+##     -d '{"key_alias":"openwebui",
+##          "models":["local-closed-qwen-small",
+##                    "local-closed-tiel-large","local-closed-gemma-large",
+##                    "local-tail-cn-flash-tiel-large","local-tail-cn-flash-gemma-large",
+##                    "local-tail-cn-pro-tiel-large","local-tail-cn-pro-gemma-large",
+##                    "local-tail-cn-flash-tiel-large-fast","local-tail-cn-flash-gemma-large-fast",
+##                    "local-tail-cn-pro-tiel-large-nothink","local-tail-cn-pro-gemma-large-nothink",
+##                    "cn-deepseek-flash","cn-deepseek-pro"],
+##          "max_budget":25,"budget_duration":"30d"}'
+##
+## `models` is the real control here: it decides what the household can reach.
+## Minted 2026-08-26 with the first three ids; RE-SCOPED 2026-10-01 to the
+## gemma-era eight (the five local-tail-cn-* rows are new) so the scope was
+## exactly the set Open WebUI offered. WIDENED 2026-10-10, when the local brain
+## was promoted to tiel-coder (!838) and the Open WebUI rows were renamed to the
+## tiel-large spelling: `models` REPLACES the array wholesale, so the widening
+## was done first and every gemma-large name was KEPT while its tiel-large twin
+## was ADDED — nothing could outrun its scope in the rename window. The five
+## gemma-large names are now litellm ALIASES of those same groups (see
+## litellm/litellm-cm.yml), so they grant no capability the tiel names do not;
+## they are kept deliberately, because chats already stored in webui.db name
+## them and would otherwise 400 on replay. Enforcement verified at the wire:
+## /v1/models under this key returns this scope and nothing wider.
+##
+## Deliberately NO `infra`/`infra-fable`: those silently fall through to the
+## cloud, which is a per-request privacy decision nobody at a chat prompt is
+## making consciously. The local-tail-cn-* rows above DO have a cloud tail, but
+## deliberately and visibly — the model description the household reads says so
+## in Italian.
+##
+## Deliberately NO `fable`/`opus`/`claude-*` either (owner decision 2026-08-26).
+## Those tails are claude-shim on the Max subscription, and since the Feb 2026
+## Consumer Terms, subscription OAuth tokens driving a third-party product are
+## explicitly banned. Open WebUI handed to friends and family is that pattern at
+## its most visible. Use the cn-deepseek-* rows for cloud-quality answers here;
+## keep the subscription tails for first-party tooling.
+##
+## Also excluded, measured 2026-10-01 rather than assumed: `work` and the
+## `claude-*-5-5` login doors (they need the CALLER's own claude.ai login in a
+## proxy header, which a browser app cannot supply — called with a plain virtual
+## key they fall through and answer from deepseek-flash, so the row would be
+## named Claude and serve DeepSeek), and `cn-to-us` (its head is DeepSeek, but a
+## DeepSeek outage would drive the Max subscription from this family-facing app).
+##
+##   akeyless create-secret -n /mdapi/openwebui/openwebui-secret/OPENAI_API_KEY  -v 'sk-...'
+##   akeyless create-secret -n /mdapi/openwebui/openwebui-secret/WEBUI_SECRET_KEY -v "$(openssl rand -hex 32)"
+##
+## WEBUI_SECRET_KEY signs session JWTs. Rotating it logs everyone out; losing it
+## is harmless beyond that (no data is encrypted with it by default).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openwebui-secret
+  namespace: openwebui
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openwebui-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/openwebui/openwebui-secret/OPENAI_API_KEY
+      secretKey: OPENAI_API_KEY
+    - remoteRef:
+        key: /mdapi/openwebui/openwebui-secret/WEBUI_SECRET_KEY
+      secretKey: WEBUI_SECRET_KEY

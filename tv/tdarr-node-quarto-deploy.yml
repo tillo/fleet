@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tdarr-node-quarto
+  namespace: tv
+spec:
+  selector:
+    matchLabels:
+      app: tdarr-node-quarto
+  replicas: 1
+  strategy:
+    # Recreate, never RollingUpdate: two pods must never hold the same
+    # nodeName against the server at the same time.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: tdarr-node-quarto
+        # Transcoder: pegs its CPU lid whenever a job runs, by design. Same
+        # exemption as the tdarr server, via the KSM pod-label allowlist in
+        # monitoring-rules/18-cpu-throttling.yml.
+        monitoring.mdapi.ch/cpu-throttle-exempt: "true"
+    spec:
+      priorityClassName: mdapi-low
+      # quarto only — the donated DL360 Gen10 worker: 1x Xeon Silver 4114
+      # (10c/20t, Skylake-SP, AVX-512) and no fio/SSD, so it contributes NO
+      # Ceph capacity and its CPU is the one resource worth spending here.
+      # The hostname is stable across the planned re-install, so this pin
+      # survives it.
+      nodeSelector:
+        kubernetes.io/hostname: quarto
+      containers:
+      - name: tdarr-node
+        # Lane A: floating tag carried WITH its digest, which is what Renovate
+        # bumps. The digest is not optional — without it the tag could roll and
+        # nothing would follow it, and fleet-validate's
+        # test_every_floating_image_has_an_updater.py fails the pipeline for it.
+        image: ghcr.io/haveagitgat/tdarr_node:latest@sha256:a24f19274a9862df73033997c15f69e7c473252bc8aeed789b2c09aa24a81414
+        # IfNotPresent, not Always: a digest is immutable, so re-pulling on every
+        # start buys nothing and makes the node fail to boot if ghcr is down.
+        imagePullPolicy: IfNotPresent
+        # ffmpeg is the load, so cpu is a ceiling not a reservation: request
+        # 1c to stay schedulable, allow 8c for two concurrent transcode
+        # workers. quarto has 10 physical cores (20 threads) — SMT HURTS
+        # llama.cpp-style decode badly and gives ffmpeg little, so the
+        # workers, not the thread count, are what should scale.
+        resources:
+          requests:
+            cpu: 1
+            memory: 2Gi
+          limits:
+            cpu: 8
+            memory: 8Gi
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        # Must not collide with the server's internal node, which is 'mdapi'.
+        - name: nodeName
+          value: quarto
+        # The server, not this pod's own address — the node dials out.
+        - name: serverIP
+          value: tdarr.tv.svc.cluster.local
+        # ⚠️ 8266, the node<->server channel. 8265 is only the web UI. This is
+        # why tv/tdarr-svc.yml had to gain a second port.
+        - name: serverPort
+          value: '8266'
+        # Mapped: this node shares /media with the server and mounts /temp at
+        # the same path, so no Tdarr path translators are needed.
+        - name: nodeType
+          value: mapped
+        - name: inContainer
+          value: 'true'
+        # Initial worker counts only — once the node registers, the values in
+        # the server DB (workerLimits) win.
+        - name: transcodecpuWorkers
+          value: '2'
+        - name: healthcheckcpuWorkers
+          value: '1'
+        volumeMounts:
+        - name: temp
+          mountPath: /temp
+        # Same RWX claim and same path as the server, so library paths, the
+        # source folders and the transcode cache all line up with no
+        # translation.
+        - name: tv
+          mountPath: /media
+        - name: configs
+          mountPath: /app/configs
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: temp
+        persistentVolumeClaim:
+          claimName: tdarr-temp-quarto
+      - name: tv
+        persistentVolumeClaim:
+          claimName: tv-v3-ceph
+      # Node identity is rebuilt from the env block above on every start, so
+      # neither of these needs to survive a restart.
+      - name: configs
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}

@@ -1,0 +1,24 @@
+{{- $externalAddresses := concat $.Values.global.pages.externalHttp $.Values.global.pages.externalHttps | uniq }}
+{{- if empty $externalAddresses }}
+{{- if eq "true" (include "gitlab.gatewayApi.route.enabled" .) -}}
+{{- if eq "true" (include "gitlab.gatewayApi.envoy.installRoutePolicies" .) -}}
+{{- if .Values.backendTrafficPolicy.spec -}}
+{{- $spec := deepCopy .Values.backendTrafficPolicy.spec }}
+{{- if not $spec.targetRefs }}
+{{-   $ref := dict "group" "gateway.networking.k8s.io" "kind" "HTTPRoute" "name" (include "fullname" .) }}
+{{-   $_ := set $spec "targetRefs" (list $ref) }}
+{{- end }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ template "fullname" . }}-btp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+spec:
+  {{- $spec | toYaml | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,223 @@
+# ENFORCING. Second real enforcement of the isolation programme (beads infra-az8.4),
+# after tv/enforce.flaresolverr. Promoted 2026-09-13 from 13.6h of learn mode on
+# `learn.nameserver` (fleet !260), which this policy REPLACES — that Log+Allow policy
+# is deleted in the same commit, because leaving it would let its blanket Allow
+# defeat this one (the lesson from the flaresolverr promotion).
+#
+# Analysis this was promoted on: ~/nameserver-netpol-analysis-20260913.md
+# 321,719 flows. Window validated first: netpol_log_journald_suppressed_1h max over
+# 13h = 0 on all three nodes, so no flow data was dropped.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ⛔ THIS IS THE PUBLIC AUTHORITATIVE NAMESERVER. `types: [Ingress, Egress]` means
+# default-deny in BOTH directions: a missing Allow below is a total outage of
+# public DNS for all 17 zones, not a degraded service.
+#
+# EMERGENCY: `kubectl -n nameserver delete networkpolicies.crd.projectcalico.org
+# enforce.nameserver` takes effect instantly but Fleet RE-CREATES it within ~90s,
+# so it only buys a window. The real revert is `git revert` + push.
+#
+# ⚠️ kubelet probes are not at risk: Calico does not police host->local-workload
+# traffic without a HostEndpoint (proven by experiment 2026-08-31). Watch the pod
+# stays 1/1 Ready anyway — that is the acid test.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ⭐ WHY TWO RULES HERE ARE NOT DERIVED FROM OBSERVED FLOWS
+#
+# The window is evidence of what happened, never proof that what did not happen is
+# unnecessary. Two paths carry REAL traffic and produced ZERO rows in 13.6h. A
+# generated policy would have omitted both — which is exactly why this programme
+# hand-authors policies (user decision, infra-eum8).
+#
+# 1. ZONE TRANSFER (ingress TCP/53). Zero AXFR in the window because no zone
+#    changed while we watched. Proven 2026-09-13 by deliberately bumping
+#    lithia.eu (serial 2026042060 -> ...61 -> ...62, record added then removed by
+#    exact rdata, both secondaries converged and the probe record is gone):
+#
+#      * outbound NOTIFY went DIRECTLY to the secondaries' real addresses
+#        (204.42.254.5 puck.nether.net, 69.65.50.223/.193 ns2.afraid.org)
+#      * the inbound AXFR came back from 192.168.1.254 — THE ROUTER — via
+#        iface_in=mgmt-br, NOT from the secondaries' own IPs.
+#
+#    ⭐ So ingress TCP/53 CANNOT be scoped to `allow-transfer`'s addresses. A rule
+#    written from that config would match nothing and silently break replication;
+#    the secondaries would go stale until SOA expiry, days later. TCP/53 is
+#    allowed from anywhere below, which is required for public DNS regardless.
+#    Source IPs are visible on UDP/53 (15,909 distinct in 13.6h) but NOT on TCP/53
+#    or 5353 — that asymmetry is the single most important fact in this policy.
+#
+# 2. WEBMIN ADMIN UI (ingress TCP/10000). Zero flows on port 10000 in 19h — nobody
+#    opened nsadmin.mdapi.ch during the window. The Ingress object and the
+#    nameserver-webmin Service are live, so enforcing without the rule below would
+#    break admin access the next time someone logged in, with no other symptom.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ⭐ WHAT CONVERGED, AND AT WHICH LEVEL — the promotion gate
+#
+# Split-half over the window: 4 distinct in-cluster source IPs in the first half,
+# 5 in the second (a new Windmill worker pod). The IP set did NOT converge and
+# never will, because worker pods churn. The WORKLOAD set was identical in both
+# halves — monitoring/blackbox, windmill/windmill-workers-default, jump/jump-bastion.
+# That is what "converged" means for a rule written with selectors, and it is why
+# nothing below allow-lists a pod IP.
+#
+# The public caller set (15,909 sources and climbing) is likewise irrelevant: this
+# policy allow-lists no addresses on 53, so its churn cannot break anything.
+
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.nameserver
+  namespace: nameserver
+spec:
+  order: 500
+  # No namespaceSelector: a namespaced policy already scopes to `nameserver`.
+  selector: app == "nameserver"
+  types:
+    - Ingress
+    - Egress
+
+  ingress:
+    # 1. PUBLIC DNS — the workload's entire purpose, and the zone-transfer path.
+    #    Not allow-listed by source: see the header. 221,850 UDP/53 flows from
+    #    15,909 distinct sources in 13.6h; TCP/53 carries both ordinary large
+    #    answers and AXFR, indistinguishable at the packet level.
+    - action: Allow
+      protocol: UDP
+      destination:
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [53]
+
+    # 2. PROXY-PROTOCOL EDGE (port 5353). named.conf has
+    #      listen-on port 5353 proxy plain { any; };
+    #      allow-proxy { 192.168.1.0/24; 10.0.0.0/8; };
+    #    so BIND still sees the real client behind the router's forwarding.
+    #    ⭐ Scoped to match allow-proxy, NOT to the single observed source
+    #    (192.168.1.254). Pinning .254 would make this rule and named.conf drift
+    #    apart silently the first time a second forwarder is added.
+    #    This is ~31% of all ingress flows: 89,320 TCP + 4,850 UDP in 13.6h.
+    - action: Allow
+      protocol: TCP
+      source:
+        nets:
+          - 192.168.1.0/24
+          - 10.0.0.0/8
+      destination:
+        ports: [5353]
+    - action: Allow
+      protocol: UDP
+      source:
+        nets:
+          - 192.168.1.0/24
+          - 10.0.0.0/8
+      destination:
+        ports: [5353]
+
+    # 3. WEBMIN ADMIN UI, reached only through ingress-nginx (nsadmin.mdapi.ch,
+    #    oauth2-proxy admin auth in front). NOT observed — see header note 2.
+    #    Selector-based: the controller is a DaemonSet and its pod IPs churn.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name == "rke2-ingress-nginx"
+      destination:
+        ports: [10000]
+
+    # 4. BASTION — privileged, all ports (user decision 2026-09-13: "bastions
+    #    should get special rights, kind of like mgmt unrouted networks").
+    #    Deliberately NOT port-scoped: the point of the seat is that an operator
+    #    can reach whatever they need to diagnose, including webmin directly and
+    #    TCP DNS, without a policy edit in the middle of an incident.
+    #    Observed in the window, but only as this analysis' own `dig`s (8 flows) —
+    #    it is allowed on intent, not on traffic volume.
+    - action: Allow
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "jump"
+        selector: app == "jump-bastion"
+
+    # 5. Everything else is denied, and logged first so a drop is answerable.
+    #    After this lands, every calico-packet ingress line for this workload is
+    #    a BLOCK: read it with
+    #      SELECT src, dpt FROM "netpol_flows" WHERE dst = '<nameserver pod IP>'
+    - action: Log
+    - action: Deny
+
+  egress:
+    # 1. CLUSTER DNS. Selector-based because CoreDNS is reached by pod IP
+    #    (observed: 10.52.1.108 and 10.52.2.123, 44 flows).
+    - action: Allow
+      protocol: UDP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+
+    # 2. ⭐ NOTHING ELSE INTERNAL. An authoritative nameserver has no business
+    #    reaching other cluster services or the LAN. Log before Deny so a block is
+    #    answerable — a policy that drops silently gets switched off after the
+    #    first mystery outage.
+    - action: Log
+      destination:
+        nets:
+          - 10.52.0.0/16       # pod CIDR
+          - 10.53.0.0/16       # service CIDR
+          - 192.168.1.0/24     # LAN: nodes, router, switches, iLO, NAS
+          - 169.254.169.254/32 # link-local metadata, belt and braces
+    - action: Deny
+      destination:
+        nets:
+          - 10.52.0.0/16
+          - 10.53.0.0/16
+          - 192.168.1.0/24
+          - 169.254.169.254/32
+
+    # 3. OUTBOUND DNS TO THE INTERNET. Two distinct uses, one rule:
+    #      * DNSSEC validation (`dnssec-validation auto`, `recursion no`) — root
+    #        and TLD servers, ~70 flows to a set that rotates and will never
+    #        converge, so it is not pinned to addresses.
+    #      * NOTIFY/SOA to the secondaries — proven to leave from here directly
+    #        to their real IPs (unlike the inbound AXFR; see header).
+    #    TCP/53 is allowed although the window shows no TCP egress: a DNSSEC
+    #    answer over 512 bytes falls back to TCP, and that is the same class of
+    #    unobserved-but-real path as the two in the header. Allowing it costs
+    #    nothing; omitting it would produce intermittent validation failures.
+    - action: Allow
+      protocol: UDP
+      destination:
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [53]
+
+    # 4. ⭐ EVERYTHING ELSE OUTBOUND IS DENIED. In practice this blocks exactly one
+    #    thing, deliberately: the container's apt traffic.
+    #
+    #    Cause, established 2026-09-13 rather than assumed: webmin's system-status
+    #    collector runs every 5 minutes with `collect_pkgs=1`
+    #    (/etc/webmin/system-status/config) and asks the package-updates module for
+    #    available-update counts; that module's `cache_time=6` HOURS
+    #    (/etc/webmin/package-updates/config) means every ~6h the call falls
+    #    through to a real `apt-get update` — deb.debian.org over TCP/80 and
+    #    download.webmin.com over TCP/443. Flow log shows a 6h02m cadence
+    #    (02:10:15 -> 08:12:10 -> 14:14:19) plus one 38s after pod start on a cold
+    #    cache.
+    #
+    #    It feeds a dashboard panel and nothing else. The image is immutable and
+    #    rebuilt in CI, so the pod could not act on the result even if it wanted
+    #    to. Blocking costs a stale "package updates available" count in webmin.
+    #    ⭐ The cleaner fix is `collect_pkgs=0` in the image, which stops the
+    #    traffic at source; this Deny is defence in depth and should stay either way.
+    - action: Log
+    - action: Deny

@@ -1,0 +1,64 @@
+## ⛔ WHY THIS FILE LIVES IN THIS BUNDLE, not next to the values that reference
+## it. `rook-ceph-cluster/` is a HELM bundle (fleet.yaml gives repo/chart/version
+## + valuesFiles), and Fleet renders only the chart for those -- a loose manifest
+## dropped in that directory is NEVER applied, silently, while the bundle still
+## reports Ready. That is exactly what happened on the first attempt: the
+## CephObjectStore picked up securePort from values.yml and the Certificate it
+## points at simply did not exist. This directory is the raw-manifest bundle for
+## the same namespace, so it is where the certificate has to be declared.
+##
+## TLS for the in-cluster S3 endpoint (Ceph RGW).
+##
+## WHY THIS EXISTS
+## As salt and pepper are decommissioned, their tenants move to this object
+## store: zot's images, the six CNPG barman stores, and the Longhorn backup
+## target. On the Garage side those clients dialled an nginx TLS terminator
+## running ON the storage hosts (:30288) -- built deliberately on 2026-09-05,
+## because before it `https://api.garage.home.tillo.ch` only encrypted the FIRST
+## hop: ingress-nginx terminated TLS and re-emitted PLAINTEXT across the LAN.
+##
+## ⛔ Moving those clients to `http://rook-ceph-rgw-...svc:80` would hand that
+## property straight back. Rook, Longhorn and CNPG pods are spread across qui,
+## quo and qua, so a pod on one node talking to an RGW pod on another crosses
+## the same physical network -- over an unencrypted VXLAN overlay. barman does
+## not encrypt, and neither does Longhorn's backupstore. Only restic and the
+## offsite crypt remotes are ciphertext before they leave the process.
+##
+## ⭐ Issued by the house PKI (Horizon CLM -> MDAPI Issuing CA 01), the same way
+## the Garage terminator's leaf is, so it auto-renews on the estate's 47-day
+## Evertrust cycle and there is no long-lived certificate here to rot. tls.crt
+## carries leaf + MDAPI Issuing CA 01, which is the full chain RGW must serve;
+## clients anchor on the MDAPI Root CA they already carry.
+##
+## ⛔ NO ipAddresses, deliberately: the Horizon profile SILENTLY DROPS IP SANs
+## (verified 2026-09-05 -- a request with IP SANs came back with zero of them
+## and no error anywhere). Clients must reach this endpoint BY NAME.
+##
+## ⭐ Both the short and the fully-qualified service name are listed. In-cluster
+## clients vary in which they use, and a name not in the SAN list fails closed
+## at the first upload rather than at apply time.
+##
+## ⚠️ Rook wants the secret named by `gateway.sslCertificateRef` in the SAME
+## namespace as the CephCluster. cert-manager writes a kubernetes.io/tls secret,
+## which Rook v1.20 consumes directly (tls.crt + tls.key) -- no `cert` key
+## repacking needed.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: rgw-tls
+  namespace: rook-ceph
+spec:
+  secretName: rgw-tls
+  commonName: rook-ceph-rgw-ceph-objectstore.rook-ceph.svc
+  dnsNames:
+    - rook-ceph-rgw-ceph-objectstore.rook-ceph.svc
+    - rook-ceph-rgw-ceph-objectstore.rook-ceph.svc.cluster.local
+    - rook-ceph-rgw-ceph-objectstore.rook-ceph
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    group: horizon.evertrust.io
+    kind: ClusterIssuer
+    name: horizon-private

@@ -1,0 +1,174 @@
+## Core GitLab (ns bootstrap) — infra-h0xb.
+##
+## This release was the last hand-installed thing on this cluster: `helm upgrade`
+## from ~/bootstrap/gitlab-values.yaml, outside Fleet and outside Renovate, so a
+## GitLab CVE had no automated patch path at all. The only watcher was the
+## hourly Windmill probe f/probe/gitlab_version_health, which can raise an alert
+## but cannot apply anything.
+##
+## ⛔ WHY THE CHART IS VENDORED UNDER charts/ AND NOT REFERENCED BY repo:
+## Fleet embeds a chart into the Bundle object it writes to etcd. Measured
+## 2026-10-06 with fleet v0.16.1 (tools/ci/bundle-gate.py's own invocation):
+##
+##     repo: https://charts.gitlab.io/   2,079,280 B  > the 1400 KiB FAIL mark
+##     charts/gitlab/ (vendored, trimmed)  494,814 B  < the 800 KiB warn mark
+##
+## (⚠️ It is a margin, not a constant, but NOT for the reason this said until
+## 2026-10-06. The bundle does NOT embed fleet.yaml or values.yaml: only the CHART's
+## files are embedded, each one gzipped then base64'd (verified on the live Bundle —
+## spec.resources[].content starts with the gzip magic H4sIAAAAAAAA/). fleet.yaml is
+## consumed into the Bundle's spec and values.yaml is summarised by
+## spec.valuesHash, so a COMMENT IN EITHER FILE MOVES THAT NUMBER BY ZERO BYTES.
+## Measured with tools/ci/bundle-gate.py: +3,240 B of comment here → 494,814
+## unchanged; +1,360 B of comment in values.yaml → 494,814 unchanged; adding
+## `keepResources: true` at column 0 (22 B of real spec) → 494,836. The driver is
+## the chart tree — 1,166,559 B vendored, ~494.8 KB in the Bundle.)
+##
+## so the upstream chart is vendored and nine unused subcharts are trimmed out of
+## the thirteen 10.4.1 ships (14 dependency entries -- two name the same subchart).
+## tools/vendor-gitlab-chart.py owns that tree and the trim; READ IT before
+## changing anything under charts/. tools/ci/bundle-gate.py is what measures this,
+## and it is the gate that would have caught a remote-chart bundle in the MR.
+##
+## The values file is the SAME file that was applied by hand (~/bootstrap/
+## gitlab-values.yaml). Adoption at chart 10.4.1 is intended to be a no-op:
+## `helm template` of this bundle is byte-identical to `helm template` of the
+## upstream 10.4.1 chart with the same values, apart from helm's own random
+## suffix on the webservice test-runner Pod name.
+##
+## ⭐ And the values are the live ones: `helm -n bootstrap get values gitlab` was
+## diffed key-for-key against values.yaml on 2026-10-06 — 104 keys on each side,
+## no key only on one side, no differing value. That is the check that matters
+## most here, because a values file that has drifted from the live release makes
+## the first reconcile silently REVERT whatever it lost, and nothing would say so
+## until something broke. Re-run that diff before any future adoption, and before
+## assuming this one is still a no-op.
+##
+## ⚠️ The release is at revision 153: Fleet's helm deployer continues the SAME
+## release (same name, same namespace), so the three-way merge bases on what
+## revision 153 recorded. It does not start a new one.
+defaultNamespace: bootstrap
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+
+# Adopt the existing release instead of refusing to touch it: `helm upgrade
+# --take-ownership` (Helm 3.17+/4) claims the objects that were created outside
+# this release. Without it the first reconcile fails with "invalid ownership
+# metadata" on every existing object.
+#
+# maxHistory matches the bootstrap/ bundle, which manages the rest of this
+# namespace.
+helm:
+  releaseName: gitlab
+  chart: ./charts/gitlab
+  # Must equal charts/gitlab/Chart.yaml's version — tests/test_gitlab_vendored_chart.py
+  # fails the build if they drift, because a mismatch means the vendored tree is
+  # not the tree this bundle claims to install.
+  #
+  # tools/vendor-gitlab-chart.py rewrites this line together with the tree, so the two
+  # halves of that one fact are written by one command and cannot be set apart by hand.
+  #
+  # ⛔ THE `# renovate:` LINE BELOW IS LOAD-BEARING, NOT DECORATION. It is the anchor
+  # the custom.regex manager in renovate.json matches on, and it must stay verbatim.
+  # tests/test_gitlab_chart_is_renovate_reachable.py runs that manager's real regex
+  # against this real file, because the failure mode it guards is silent: a regex that
+  # stopped matching reports exactly the same green as one that found nothing.
+  #
+  # Why it is tracked that way rather than by the fleet manager: `chart:` is a local
+  # path, and the fleet manager returns skipReason `local-chart` for those (verified
+  # against renovate 42.99.0 — modules/manager/fleet/extract.js checks the path BEFORE
+  # it looks for a repo). A `repo:` cannot be added to make it reachable: Fleet would
+  # then fetch the chart remotely, which is the 2,079,280 B bundle this vendoring
+  # exists to avoid.
+  #
+  # ⚠️ A Renovate bump arrives RED and stays unmergeable until the one command that
+  # moves BOTH halves has been run — the tree under charts/ is upstream content and
+  # nothing but tools/vendor-gitlab-chart.py may rewrite it:
+  #
+  #     python3 tools/vendor-gitlab-chart.py <new version>
+  #
+  # That is deliberate, not an unfinished edge: the MR is a NOTIFICATION, and what the
+  # notification means here is that someone must read GitLab's upgrade path. GitLab
+  # supports only the NEXT required stop (x.2/x.5/x.8/x.11, background migrations
+  # drained in between), so Renovate proposing the newest release is not a plan — from
+  # the 19.4.1 running here, the next legal hop is 19.5 whatever is newest.
+  # /gitlab-upgrade is the runbook for that hop; renovate.json's mr-only rule is what
+  # stops this number ever moving without a human.
+  # renovate: datasource=helm depName=gitlab registryUrl=https://charts.gitlab.io
+  version: 10.4.1
+  valuesFiles:
+    - values.yaml
+  takeOwnership: true
+  maxHistory: 25
+
+## ⛔ Load-bearing. Removing this line makes the documented rollback destructive.
+##
+## TOP-LEVEL ON PURPOSE — a sibling of `helm:`, never a key inside it.
+## keepResources maps to Bundle spec.keepResources, and the CRD declares it at
+## spec level (fields under spec.helm are atomic, chart, disableDNS,
+## disableDependencyUpdate, disablePreProcess, force, maxHistory, releaseName,
+## repo, skipSchemaValidation, takeOwnership, templateValues, timeoutSeconds,
+## values, valuesFiles, valuesFrom, version, waitForJobs — no keepResources
+## among them; verified against the live CRD, fleet v0.15.4).
+##
+## ⚠️ IT WAS WRITTEN INSIDE THE helm: BLOCK AND SILENTLY DID NOTHING. Fleet
+## prunes the unknown field, so the live Bundle carried NO spec.keepResources at
+## all and the Rancher App for this release reported
+## fleet.cattle.io/keep-resources: "false". Measured side by side 2026-10-06:
+## findmy/ and macos-vm/ have this key at column 0 and their Bundles carry
+## spec.keepResources: true; this bundle did not.
+##
+## What it protects: Fleet GARBAGE-COLLECTS the resources of a bundle it owns.
+## With this false, removing the `gitlab` path from the GitRepo — the documented
+## rollback, see ~/bootstrap/gitlab-howto.txt — would DELETE the Deployments,
+## Services and the Gitaly StatefulSet this bundle deployed. An outage, undone
+## only by putting the path back.
+##
+## ⚠️ It does NOT protect the Gitaly PVC, contrary to what this file claimed
+## until 2026-10-06. Deleting a StatefulSet does not delete its PVCs under the
+## default persistentVolumeClaimRetentionPolicy (Retain), so the repositories are
+## safer than that comment implied — the workload is not.
+##
+## ⛔ Verify on the LIVE BUNDLE, never by reading this file: the failure mode is
+## exactly a key that is present here and absent there.
+##   kubectl --context mdapi-rancher -n fleet-default get bundle mdapi-prod-gitlab \
+##     -o jsonpath='{.spec.keepResources}{"\n"}'     # must print: true
+keepResources: true
+
+# Post-renders the chart (the metallb/ and cribl/ pattern: Fleet feeds the
+# helm-rendered manifests in as the kustomize base). Exists for ONE field the
+# chart does not expose in values — the sidekiq startupProbe. See kustomize/.
+kustomize:
+  dir: kustomize
+
+## ⚠️ UNMANAGED LIVE STATE — what Fleet will NOT own after adoption
+##
+## Measured 2026-10-06 by diffing `helm template` of this bundle against the live
+## objects. Two things live on the GitLab Deployments that this chart never
+## templates. Neither is drift to "fix", and neither is a Fleet bug:
+##
+## 1. sidekiq startupProbe — real drift, HANDLED here by the kustomize post-render.
+##
+## 2. Four Reloader-injected env vars, on webservice / sidekiq / toolbox /
+##    gitlab-runner: STAKATER_GITLAB_<COMPONENT>_CONFIGMAP, each set to the 40-hex
+##    SHA-1 of the ConfigMap it watches. Reloader (ns reloader, the reloader/
+##    bundle) adds them so a config change actually rolls the pods.
+##
+##    They are absent from the chart, so Helm's three-way merge leaves them alone
+##    and they SURVIVE each reconcile — they are not being silently dropped.
+##    That is also why sidekiq can sit at deployment.kubernetes.io/revision 88
+##    with a revision the chart never produced. Expect exactly these four to
+##    appear in any future live-vs-render diff; do not add them to the chart.
+##
+## Anything ELSE new in such a diff is worth investigating — see the adoption
+## procedure in /home/tillo/gitlab-into-fleet-plan-2026-10-05.md.
+
+# GitLab needs objects this namespace gets from the sibling `bootstrap/` bundle:
+# the CNPG Cluster gitlab-pg, the valkey StatefulSet, and — the one that bites on
+# a cold cluster — the gitlab-runner-cache-s3 Secret that
+# bootstrap/gitlab-runner-cache-es.yml renders from Akeyless. Without the wait,
+# Fleet can install this release before that Secret exists and the runner pod
+# comes up referencing a Secret that is not there yet.
+dependsOn:
+- name: mdapi-prod-bootstrap

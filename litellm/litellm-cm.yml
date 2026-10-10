@@ -1,0 +1,1190 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: litellm
+data:
+  config.yaml: |
+    model_list:
+      # ⚠ THE LM STUDIO GROUPS USE hosted_vllm/ ON PURPOSE — DO NOT "CORRECT" IT TO
+      # openai/. That prefix is the fix for a real fault, not a typo.
+      #
+      # THE FAULT: Claude Code sends `thinking`. litellm bridges Anthropic
+      # /v1/messages to an openai/ backend over the RESPONSES API, emitting
+      # `reasoning: {effort: …}`. qwen3-coder is not a reasoning model, and that path
+      # corrupted the engine — measured on ONE loaded instance, transport the only
+      # variable:
+      #   direct /v1/chat/completions (stream or not)  16/16 clean
+      #   via the bridge WITH thinking                 word salad, empties, WEDGED
+      #   via the bridge WITHOUT thinking              clean but for truncation
+      #
+      # THE FIX (2026-08-25, verified at the wire). The routing lives in
+      # llms/anthropic/experimental_pass_through/adapters/handler.py ::
+      # _route_openai_thinking_to_responses_api_if_needed. Its FIRST guard is
+      #     if custom_llm_provider != "openai": return
+      # so any non-"openai" OpenAI-compatible prefix bypasses the bridge before the
+      # reasoning logic runs. Proven with two probe groups identical to the fail-closed
+      # local group except the prefix, requests carrying `thinking` AND a tool def:
+      #   openai/       -> POST /v1/responses         (x2, thinking on AND off)
+      #   hosted_vllm/  -> POST /v1/chat/completions  (x2)  + tool_use returned
+      #   openai_like/  -> HTTP 400, unusable: "Unmapped LLM provider for this
+      #                    endpoint" on /v1/messages, and it rejects reasoning_effort
+      # Tool calling was the acceptance criterion and survives: stop_reason=tool_use.
+      #
+      # NOT a total escape: `reasoning_effort` still reaches LM Studio, which logs
+      # "No valid custom reasoning fields found … cannot be converted to any custom
+      # KVs". Benign — it lands on /v1/chat/completions, the path measured clean.
+      #
+      # TWO EARLIER FIXES FAILED HERE (46a123e drop_params/additional_drop_params,
+      # b19f3e1 model_info.supports_reasoning:false; both reverted in 25e29f9). They
+      # targeted the LATER supports_reasoning guard, whose lookup runs against the
+      # UNDERLYING model name, not the group — so config-level model_info never
+      # reaches it. b19f3e1 is the cautionary one: its probe looked like a pass
+      # (bad=0, no junk, no wedge) while the wire showed 8/8 still on /v1/responses.
+      # JUDGE A FIX HERE AT THE WIRE, NEVER ON OUTPUT QUALITY.
+      #
+      # ⛔ TWO LEVERS THAT LOOK LIKE THE ANSWER AND ARE NOT (verified at the wire
+      #    2026-10-02 on v1.103.2 — mock upstream + throwaway proxies in a litellm
+      #    pod, no live config touched):
+      #   * `model_info.supported_endpoints` is an OPT-IN ALLOWLIST for native
+      #     passthroughs, NEVER a denylist, and it is not read on this path at all.
+      #     supported_endpoints ["/v1/chat/completions"] -> still POST /v1/responses.
+      #   * `LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true` gates only
+      #     the OUTER dispatch (messages/handler.py::_should_route_to_responses_api).
+      #     The rewrite below runs later, inside the translation handler, so the
+      #     request STILL lands on /v1/responses. Not an escape hatch either.
+      #
+      # ⭐ WHAT supported_endpoints DOES DO — a real alternative, by a DIFFERENT
+      #    mechanism, NOT a substitute for the prefix:
+      #   supported_endpoints containing "/v1/messages" opts the deployment into
+      #   NATIVE, UNTRANSLATED passthrough (messages/handler.py::
+      #   _deployment_passes_through_anthropic_messages -> OpenAILikeAnthropicMessagesConfig):
+      #   litellm forwards the raw Anthropic body to {api_base}/v1/messages, and this
+      #   branch is taken BEFORE the Responses check, so the bridge is never reached.
+      #   It works only because mbp-mda LM Studio really speaks the Anthropic API.
+      #   Measured against it 2026-10-02: genuine `thinking` blocks, `tool_use`,
+      #   multi-turn tool_result round-trip, system + cache_control and streaming all
+      #   clean, engine alive after. Against a backend WITHOUT /v1/messages it would
+      #   404 — worse than today — so it is NOT a general replacement for the prefix.
+      #   Applied below to the thinking-bearing local doors only. The -nothink
+      #   door keeps the chat/completions path on purpose: its lever IS the
+      #   litellm_params `reasoning_effort: none`, which the native path never sends.
+      #
+      # Separately: the MLX engine corrupted on its own under load, so mbp-mda moved
+      # to a GGUF/llama.cpp build on 2026-08-25. See memory
+      # lmstudio_maxtokens_reserved_from_context_and_mlx_batch_crash_2026_08_24.
+      #
+      # ═══════════════ NAMING (Option B, adopted 2026-09-27) ═══════════════
+      # <locality>-<failover>-<family>-<size>[-<variant>]
+      #   locality : local (mbp-mda LM Studio) | us (Anthropic) | cn (DeepSeek)
+      #   failover : closed (fail-closed) | tail-cn-pro | tail-cn-flash (cloud tail)
+      #   family   : tiel | gemma | qwen | claude | deepseek | nomic
+      #   size     : large | small | embed
+      #   variant  : -nothink (reasoning off) | -fast (60s failover) | -wg / -wifi (road)
+      #
+      # ⭐ 2026-09-27 RE-ROUTING (user decision, cost): every local-model cloud tail
+      # moved off Anthropic onto DeepSeek — opus → ds-pro, fable → ds-flash. Claude
+      # Opus/Fable/Sonnet/Haiku survive only as DIRECT cloud models (us-claude-*).
+      # Old group names still resolve via `router_settings.model_group_alias` below;
+      # delete that map once SpendLogs shows zero old-name traffic.
+      #
+      # ═══════════════ SOURCE OF TRUTH FOR WHICH MODELS WE RUN ═══════════════
+      # Two local anchors. Every local group aliases these (*BIG_LOCAL / *SMALL_LOCAL)
+      # instead of repeating the model string, so swapping a model is a ONE-LINE edit
+      # on the `model:` line here. YAML resolves anchors before LiteLLM sees the
+      # document, so the groups still receive plain strings. An anchor must be DEFINED
+      # BEFORE it is aliased, which is why these two groups come first.
+      #
+      # Swapping a model is NOT complete here: the identifier must match what mbpmda
+      # actually serves (~/.config/lmstudio/production-model on the laptop) and four
+      # direct-to-LM-Studio consumers that bypass this gateway — ~/.dsh/settings.yaml,
+      # ~/.dsh/doors/local.patch.yml, ~/.dsh/profiles/local/cordis.patch.yml,
+      # ~/lmstudio-tools/lm-doctor.sh. Full checklist:
+      # ~/lmstudio-tools/litellm-gemma-promotion.md on mbpmda.
+      #
+      # ⭐ 2026-10-10 PROMOTION — the local brain moved off gemma-4-26b-a4b onto
+      # tiel-coder-35b-a3b-mtp (UD-IQ4_XS, 16.88 GiB), the eval pick: t8 6/6 ×2 and
+      # t9 8/10 ×2, beating the incumbent's 4/6 and 7/10 without a size penalty.
+      # `&BIG_LOCAL` is the ONE line that changed; every local group aliases it.
+      # The `-large` family token became `tiel` across every local group and door
+      # (one vocabulary), so the pre-rename `…-gemma-large` spellings survive only
+      # as `model_group_alias` + paired `fallbacks` rows further down.
+      - model_name: local-tail-cn-pro-tiel-large
+        litellm_params:
+          model: &BIG_LOCAL hosted_vllm/tiel-coder-35b-a3b-mtp  # NOT openai/ — see note at top
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600   # SAME reasoning as the block below the public aliases.
+                                 # Carries the chain (-> -wg -> cn-deepseek-pro), so on
+                                 # the 20s global fail-fast it leaked to the cloud on
+                                 # every cold prefill (~400-600s). Unreachable hosts
+                                 # still fail in ~0s here, so this does not delay the
+                                 # tail when the laptop is off; it only waits when the
+                                 # model is UP BUT SLOW, which is the case that should
+                                 # wait. (was `infra` / `approfondito`)
+        model_info: &NATIVE_ANTHROPIC_MESSAGES
+          supported_endpoints: ["/v1/messages"]   # see the two ⛔/⭐ blocks at the top
+
+      # --- small local companion: lookups, titles, summaries -------------------
+      - model_name: local-closed-qwen-small
+        litellm_params:
+          model: &SMALL_LOCAL hosted_vllm/qwen3-4b
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900   # fail-closed: no cloud tail, so the 20s global
+                                 # fail-fast buys nothing here. A cold GGUF prefill is
+                                 # ~400s (lean preamble) / ~600s (full). (was `veloce`)
+
+      # --- Home Assistant Assist (ns home-assistant -> this Service) ----------
+      #
+      # A SEPARATE GROUP rather than reusing the fail-closed qwen, even though the
+      # model is on the same box. The qwen door is fail-closed; HA was given a
+      # DeepSeek tail by explicit user decision (2026-09-07), and putting that tail
+      # on the shared small-model door would silently change the privacy posture of
+      # every other consumer of it. Same model, different policy => different group.
+      #
+      # ⚠️ WHAT REACHES THE TAIL — with llm_hass_api, assist_pipeline keeps only
+      # HassGetState and media-search local; every turn-on/turn-off is MEANT to go to
+      # the model, and in practice every probe returned processed_locally=False. So
+      # device commands DO become prompts, alongside free-form questions and the
+      # exposed entity/area names in the Assist tool schema. That is why the
+      # always-on voice pipeline ("Casa", used by the phone and watch) was left on
+      # conversation.home_assistant, and this door serves a second, deliberately
+      # selected pipeline ("Casa LLM").
+      #
+      # ⭐ Model choice measured, not assumed (2026-09-07, no max_tokens, as HA
+      # sends): qwen3-4b answered in 0.6-2.5s but with real Italian errors;
+      # gemma-4-26b-a4b (the brain at the time of the measurement) took 6.5s prose /
+      # 1.8s tool call and was correct. ⚠️ The brain became tiel-coder-35b-a3b-mtp on
+      # 2026-10-10 — the latency figures above are gemma's; re-measure if it matters.
+      # ⚠️ It is a REASONING model: ~410 of 461 completion tokens were reasoning.
+      # With a small max_tokens the budget is consumed by reasoning and content comes
+      # back EMPTY. HA's litellm integration sends no max_tokens at all, so this is
+      # safe here — anything else calling this door must not cap it low.
+      - model_name: local-tail-cn-flash-tiel-large-fast
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          ## ⚠️ 60, NOT 600 — deliberate exception (user decision 2026-09-07).
+          ## Everywhere else a big request_timeout exists to stop a COLD local
+          ## prefill (~400-600s) from timing out into the cloud tail: there, waiting
+          ## is the privacy-preserving answer. Here the opposite is wanted: this door
+          ## answers a person waiting for their house to reply, and a fallback that
+          ## fires only after ten minutes provides no availability at all. A cold or
+          ## slow local model now fails over to DeepSeek after 60s — acceptable only
+          ## because this door already has an accepted cloud tail (ds-flash).
+          ## Still its OWN timeout rather than the 20s global: 20s would fail over
+          ## even on a WARM turn (measured 6.5s prose, 17.2s first HA turn), making
+          ## the local model nearly pointless. 60 clears the warm case and gives up
+          ## on the cold one. (was `casa`)
+          request_timeout: 60
+
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # --- local: one LM Studio on the laptop, reached over WireGuard ONLY.
+      #     ⭐ 2026-09-30: the wired/wifi/WG split is GONE (user decision). WG is the
+      #     one path that works both at home and away, so it is now the only one; the
+      #     -wifi/-wg duplicate deployments were deleted with it. Measured from inside
+      #     the cluster with the laptop away: WIRED -> no route in 0.5s, WIFI -> no
+      #     route in 4.1s, WG -> HTTP 200 in 0.1s. The LAN hops were pure dead weight
+      #     whenever the laptop was not home — and a chain paid ~4.6s for them once
+      #     (allowed_fails=1 puts them in a 30s cooldown).
+      #     ⚠️ CONSEQUENCE, flagged not hidden: the old cloud chains reached the cloud
+      #     through a WG hop with request_timeout 60, while the LAN primaries used
+      #     600/900. Collapsing keeps each SURVIVING group's own timeout, so a cold
+      #     local prefill now waits 600s before the cloud tail where it previously
+      #     waited 60s. One line per group to change if fast hand-over is preferred.
+      #     api_base values are injected from Akeyless (see litellm-es.yml) so no
+      #     internal hostname lands in this public repo. LMSTUDIO_WIRED_URL /
+      #     LMSTUDIO_WIFI_URL stay in the Secret deliberately: unreferenced env in a
+      #     Secret is not a permission, and it is the one-line revert path.
+      - model_name: local-closed-tiel-large
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY # real token since 2026-08-19
+          request_timeout: 900   # fail-closed door: no cloud tail, so the 20s global
+                                 # fail-fast buys nothing here. (was `local-only`)
+        model_info: *NATIVE_ANTHROPIC_MESSAGES
+
+      # --- the cheap-tail local door (was `infra-fable`). Tail re-routed from Fable
+      #     to DeepSeek flash on 2026-09-27.
+      - model_name: local-tail-cn-flash-tiel-large
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600   # same as the pro-tail group; the cold-prefill leak
+                                 # and the reasoning are identical.
+        model_info: *NATIVE_ANTHROPIC_MESSAGES
+
+      # --- the pro-tail local door with the brain's THINKING OFF (2026-09-24). For the
+      # O2 SRE agent (opencode agent loop, incident RCA). Same wired -> WG -> cloud
+      # chain and the same timeouts as the pro-tail group; the ONLY difference is
+      # reasoning_effort: none.
+      # Why: in thinking mode gemma-4 sometimes closes its thought with a LITERAL
+      # "</think>" string instead of its real end-of-thought token. LM Studio then
+      # keeps everything after it, including a valid "<|tool_call>call:…<tool_call|>",
+      # inside reasoning_content, and the turn ends finish=stop with no tool call and
+      # no text. opencode sees an empty final message, and the RCA comes back empty.
+      # reasoning_effort=none is the one switch LM Studio honours for gemma-4
+      # (chat_template_kwargs.enable_thinking and reasoning.effort are silently
+      # ignored). With it: reasoning_content=0 and clean tool_calls.
+      # ⚠️ ALL of the above was measured on gemma-4 (2026-09-24). The brain became
+      # tiel-coder-35b-a3b-mtp on 2026-10-10: RE-VERIFY that reasoning_effort=none
+      # still yields reasoning_content=0 before trusting this door for the O2 SRE
+      # agent, and that the "</think>"-in-reasoning failure is even still the mode.
+      # Kept separate on purpose: other doors keep thinking mode. (was `infra-sre`)
+      - model_name: local-tail-cn-pro-tiel-large-nothink
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600
+          reasoning_effort: none
+
+      # --- FAIL-CLOSED DOORS (2026-09-03, simplified 2026-09-30) -----------
+      #
+      # A fail-closed door has NO entry in `fallbacks`, so a chain that reaches it
+      # ENDS there. That is what keeps it fail-closed, and it is unchanged by the
+      # WG-only collapse: the property preserved is "never leaves YOUR OWN box",
+      # not "never leaves the LAN" — a WireGuard tunnel to the same laptop is still
+      # the same box, so routing these doors over WG keeps them fail-closed while
+      # making them work away from home instead of breaking at the front door.
+      #
+      # request_timeout 900 (not the 60 the cloud-tailed doors use): 60 exists only
+      # to reach the cloud within a minute. With no tail there is nothing to hurry to,
+      # and a lost LM Studio pin JIT-loads the model in ~40s.
+      # --- EMBEDDINGS (2026-09-17) — the first non-chat model on this gateway --
+      #
+      # Served by the SAME LM Studio on mbp-mda as the LLM, ALONGSIDE it rather than
+      # instead of it — LM Studio routes /v1/embeddings by model TYPE.
+      #
+      # ⚠️ nomic-embed-text v1.5: 768 dims, ctx 2048. A consumer's chunk size must
+      # stay well under 2048 tokens. Changing the model changes the VECTOR SPACE, so
+      # every consumer's index must be rebuilt — not a swap you can make quietly.
+      #
+      # ⭐ FAIL-CLOSED BY CONSTRUCTION: the chain below ends at another local embed
+      # hop, and there is deliberately NO cloud embedding deployment on this gateway.
+      # Adding one would silently hand every RAG consumer a cloud tail for the full
+      # text of everything it indexes.
+      - model_name: local-closed-nomic-embed
+        litellm_params:
+          model: &LOCAL_EMBED hosted_vllm/text-embedding-nomic-embed-text-v1.5
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 900
+        model_info:
+          mode: embedding
+      # --- Anthropic DIRECT cloud models (2026-08-18 shim). These are the only
+      #     remaining Anthropic groups, kept for large projects and subagent
+      #     coordination by user decision 2026-09-27. All shim-backed = Max
+      #     subscription, no per-token bill.
+      #     request_timeout 300: the global 20s is the LM Studio fail-fast and would
+      #     guillotine a real agentic turn.
+      #
+      #     ⭐ 2026-09-30: a Max subscription is a FLAT FEE WITH A PERIODIC CAP, so
+      #     these are the only groups here whose failure mode is "fine, then a hard
+      #     error until the window resets". They are therefore the only ones whose
+      #     tail is a QUALITY decision rather than an availability one: Claude while
+      #     the quota lasts, DeepSeek flash once it is spent (rows in
+      #     litellm_settings.fallbacks below). The tail is flash, NOT pro — user
+      #     decision, "pro is only required for very advanced work".
+      #     ⛔ us-claude-haiku gets NO tail on purpose: it is the VISION path (Frigate,
+      #     HA llmvision camera images). ⚠️ REASON CORRECTED 2026-09-30 — the old
+      #     "DeepSeek is not verified for vision" was FALSE. DeepSeek flash really
+      #     does see, verified live on BOTH wire protocols (a swapped left/right
+      #     two-colour image came back swapped), and its docs list image input.
+      #     The exclusion still stands, on a different fact: litellm's DeepSeek CHAT
+      #     adapter strips image parts outright on the /v1/chat/completions route
+      #     these consumers use, so a flash tail would answer BLIND with no error.
+      #     A loud failure beats a confident wrong answer about a camera frame.
+      #     (DeepSeek PRO is separately blind and does not error either — it answers
+      #     around a literal "[Unsupported Image]". Never tail a vision path to pro.)
+      #
+      #     cooldown_time 1800, NOT the global 30s: the cap lasts hours, and a 30s
+      #     cooldown would re-probe the dead shim on every request. ⛔ It goes in
+      #     litellm_params — `model_info` ACCEPTS this key and silently ignores it
+      #     (router.py reads litellm_params only). Verified from source 2026-09-30.
+      - model_name: us-claude-opus
+        litellm_params:
+          model: openai/claude-opus-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+      - model_name: us-claude-fable
+        litellm_params:
+          model: openai/claude-fable-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+      - model_name: us-claude-sonnet
+        litellm_params:
+          model: openai/claude-sonnet-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+      - model_name: us-claude-haiku
+        litellm_params:
+          model: openai/claude-haiku-4-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+          guardrails: ["customer-data-guard"]
+      # --- Claude on the CALLER's own login (2026-10-01). litellm 1.97 forwards a client's
+      #     `Authorization: Bearer sk-ant-oat…` to anthropic/ deployments (proxy key rides in
+      #     x-litellm-api-key), so Claude Code keeps its TOOLS — the shim above drops them.
+      #     ⛔ api_key is a deliberate NON-key: with none, litellm falls back to the env
+      #     ANTHROPIC_API_KEY and a login-less caller would bill per token. It fails closed.
+      #     Names = Claude Code's own ids, so its built-in /model picker works through here.
+      #     The haiku twin is NOT the vision path (that is us-claude-haiku): login-only.
+      #     Zero prices: a flat-fee subscription, not the per-token list price litellm knows.
+      #     ⛔ Zero EVERY priced key: Claude Code writes the 1-HOUR cache (its own price key)
+      #     and web search is billed per query — leaving either out logs list-price spend.
+      - model_name: claude-opus-5-5
+        litellm_params:
+          model: anthropic/claude-opus-5-5
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+        model_info: &FLAT_FEE
+          input_cost_per_token: 0
+          output_cost_per_token: 0
+          cache_creation_input_token_cost: 0
+          cache_creation_input_token_cost_above_1hr: 0
+          cache_read_input_token_cost: 0
+          search_context_cost_per_query:
+            search_context_size_low: 0
+            search_context_size_medium: 0
+            search_context_size_high: 0
+      - model_name: claude-fable-5-1
+        litellm_params:
+          model: anthropic/claude-fable-5-1
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+        model_info: *FLAT_FEE
+      - model_name: claude-sonnet-5-5
+        litellm_params:
+          model: anthropic/claude-sonnet-5-5
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+        model_info: *FLAT_FEE
+      - model_name: claude-haiku-4-5-20251001
+        litellm_params:
+          model: anthropic/claude-haiku-4-5-20251001
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard"]
+        model_info: *FLAT_FEE
+      # --- DeepSeek (2026-08-24): the cheap tier, reachable through the gateway as
+      #     well as direct. These two groups keep NO fallbacks entry: they are the
+      #     TAIL-LESS CONTROL of the failover matrix, and the busiest groups here, so
+      #     a silent move onto the Claude subscription during a DeepSeek outage is
+      #     exactly what must not happen by accident.
+      #
+      #     ⛔ PROVENANCE, corrected 2026-09-30. This block used to say the two groups
+      #     were tail-less because "an implicit cross-operator hop moves the payload to
+      #     a different company under different law without a decision being made."
+      #     That was AGENT-AUTHORED (commit c338c40, 2026-08-24) and was never a user
+      #     policy: the user was asked and confirmed they never expressed it, and had
+      #     given the opposite guidance the day before (2026-08-23 — cloud risk is
+      #     JURISDICTION-NEUTRAL; provider nationality is not a privilege).
+      #     Quote it as configuration that exists, never as a rule the user set.
+      #     The cn->us direction is legitimate and is implemented deliberately as its
+      #     own opt-in group below rather than as a tail on these two.
+      #     Caching needs no client flags — DeepSeek caches automatically on the
+      #     request prefix; litellm surfaces the counters as
+      #     usage.prompt_tokens_details.cached_tokens.
+      - model_name: cn-deepseek-flash
+        litellm_params:
+          model: deepseek/deepseek-v4-flash
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+          guardrails: ["customer-data-guard"]
+      - model_name: cn-deepseek-pro
+        litellm_params:
+          model: deepseek/deepseek-v4-pro
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+          guardrails: ["customer-data-guard"]
+
+      # --- `cn-to-us` (2026-09-30) = the MISSING QUADRANT: DeepSeek first, Claude if
+      #     DeepSeek cannot answer. All four cases now exist BY NAME:
+      #       us -> cn     work, us-claude-opus/-fable/-sonnet (+ their old-name rows)
+      #       cn -> us     cn-to-us                                        <-- this one
+      #       us, no tail  us-claude-haiku
+      #       cn, no tail  cn-deepseek-flash, cn-deepseek-pro
+      #     ⛔ A SEPARATE GROUP on purpose, NOT a tail on cn-deepseek-flash. That group
+      #     is the default for the skill fleet, the dispatcher, dsh and open-webui;
+      #     a tail there would move ALL of them onto the Claude Max subscription
+      #     during any DeepSeek outage — automation eating the human's quota. Opt-in
+      #     keeps the blast radius at whoever asked for it by name.
+      #     Tail is sonnet, not opus: the tail should be the cheap capable draw on
+      #     the Max cap. us-claude-sonnet itself tails to cn-deepseek-flash, so the
+      #     chain can revisit DeepSeek once — bounded and terminating, measured in a
+      #     pod 2026-09-30 (a 2-cycle walks each hop once, then raises).
+      #     Named for the route, like every door (was `backstop`, a role word; no
+      #     consumer ever sent it, so no alias).
+      - model_name: cn-to-us
+        litellm_params:
+          model: deepseek/deepseek-v4-flash
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+          guardrails: ["customer-data-guard"]
+
+      # ── Auto router for the OpenObserve SRE agent (2026-10-01) ─────────────
+      # The tier is decided per request by litellm's complexity router (heuristic
+      # classifier: keyword weights over the LAST real user message). Built for
+      # `o2-sre-agent` (opencode), whose ~20-step investigations ask the same
+      # question at every step, so a request cannot be classified differently from
+      # its neighbours mid-investigation.
+      #
+      # ⛔ THE TAIL IS THE AUTO GROUP'S, NOT THE TIER TARGET'S. litellm looks the
+      # chain up by the name the client SENT, so the single row below applies to
+      # every tier. Two consequences: a `local-closed-*` tier WOULD BE SERVED BY
+      # THAT CLOUD TARGET the moment it failed (measured 2026-10-01 — never put one
+      # here), and the local tier cannot keep a different tail from the others.
+      # The row is byte-identical to local-tail-cn-pro-tiel-large-nothink's own
+      # tail, so the local path behaves exactly as before; the DeepSeek tiers have
+      # no tail of their own to lose.
+      #
+      # ⚠ Deliberately NO Claude tier. `us-claude-*` is the text-only shim (tools
+      # dropped) and `claude-*-5-5` needs the CALLER's own claude.ai login, which a
+      # service has not got — a Claude tier here would either break the agent's tool
+      # calls or silently collapse to the tail. Revisit if the agent gets a login.
+      # ⚠ Keep the params bare: a param on this entry overrides the target's own
+      # (a request_timeout here would replace the local brain's 600).
+      - model_name: auto-local-tiel-cn-pro
+        litellm_params:
+          model: auto_router/complexity_router
+          complexity_router_config:
+            tiers:
+              SIMPLE:    local-tail-cn-pro-tiel-large-nothink
+              MEDIUM:    local-tail-cn-pro-tiel-large-nothink
+              COMPLEX:   cn-deepseek-pro
+              REASONING: cn-deepseek-pro
+
+    # ── `-gheim` twins: the ROUND-TRIP PII guard, opt-in by name (2026-10-08) ──
+    #
+    # `gheim-rt-guard` writes `<PERSON_1>.<blob>` in the request, the blob being
+    # CipherTrust Manager ciphertext of the real value, and the response pass
+    # unseals it and restores the plaintext — the caller reads its own data back
+    # while the upstream never sees it in clear. Nothing is stored, so there is no
+    # at-rest PII. Its row is `default_on: false`, so it runs ONLY where a model
+    # entry names it; the rows below are that opt-in and the only such rows.
+    #
+    # ⭐ A TWIN KEEPS ITS BASE'S GUARDRAILS AND ADDS `gheim-rt-guard` — it does not
+    # replace them. The floor (`customer-data-guard`, the customer-name denylist)
+    # stays on the cloud twins exactly as on its base. MEASURED 2026-10-08 through
+    # `/guardrails/apply_guardrail`, in BOTH orders: the floor leaves a
+    # `<PERSON_1>.<blob>` sentinel untouched — blob intact, no nesting — and the
+    # value still restores. The old nesting observation on `cn-deepseek-flash` was
+    # PRE-idempotence-fix: masking now drops any span overlapping a sentinel
+    # already present, so a second pass cannot re-seal a blob.
+    # `tests/test_gheim_twin_matches_its_base.py` holds every twin to "base's
+    # params, plus exactly the name `gheim-rt-guard`", so editing a base cannot
+    # leave a silently stale twin.
+    #
+    # ⛔ NEVER add `gheim-pii-guard` to a twin. It and `gheim-rt-guard` mask the
+    # same spans to DIFFERENT sentinels, so what reaches the upstream depends on
+    # which ran last; the mask-only sibling would also destroy the blob and the
+    # round trip with it. A twin is for round-tripping, so its guard list is its
+    # base's plus this one name and nothing else.
+    #
+    # ⭐ A twin MAY carry a tail, but EVERY hop must land on a twin (2026-10-08, user
+    # decision, option (ii)). The rule used to be "no `fallbacks` entry on a twin at
+    # all"; that was too strong, and it forced a door whose whole identity IS "Claude,
+    # then DeepSeek flash" to become a hard failure the moment the Max quota ran out.
+    # The intent was narrower and is now the assertion itself: a twin must never hand
+    # the request to a group that does NOT carry the round trip, mid-round-trip, with
+    # the sentinels already in the text. The constraint is therefore on the TARGET — a
+    # twin's chain stays on `-gheim` names end to end — not on the presence of a row.
+    # ⚠️ The twins that keep NO row (`us-claude-sonnet-gheim`, `us-claude-haiku-gheim`)
+    # are unchanged and still fail loudly; nothing about them was relaxed.
+    # `tests/test_gheim_twin_matches_its_base.py` enforces the target rule on every twin.
+    #
+    # ⚠ The twins are what `ccx`/`dsh` reach as the `-gheim` DOORS; their rows
+    # live in `~/.config/llm-doors/doors.conf` on the seat, not in this repo.
+    # The local twins take NO floor: the local doors carry none by design
+    # (nothing leaves the box), and adding one here would change that posture.
+    #
+    # Cost: one gheim detector call plus CM seal (request) and unseal (response)
+    # per masked request, on top of the base's own path. That is the price of the
+    # round trip and is why these are separate, opt-in rows rather than a default.
+      - model_name: cn-deepseek-flash-gheim
+        litellm_params:
+          model: deepseek/deepseek-v4-flash
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+      - model_name: cn-deepseek-pro-gheim
+        litellm_params:
+          model: deepseek/deepseek-v4-pro
+          api_key: os.environ/DEEPSEEK_API_KEY
+          request_timeout: 300
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+      - model_name: us-claude-sonnet-gheim
+        litellm_params:
+          model: openai/claude-sonnet-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+      - model_name: us-claude-haiku-gheim
+        litellm_params:
+          model: openai/claude-haiku-4-5
+          api_base: http://claude-shim.litellm.svc.cluster.local:8085/v1
+          api_key: "shim"
+          request_timeout: 300
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+      # --- the CALLER-LOGIN twins (2026-10-08, user decision). `work-gheim` — the door
+      #     the agents daemon and background sessions run through — resolves to
+      #     `claude-opus-5-5-gheim`; the other three exist so that a `-gheim` door's
+      #     small/fast model is guarded too (a door's `small` is a real request path:
+      #     Claude Code sends titles and quick lookups there).
+      #     ⚠️ These KEEP the base's tail, one hop to `cn-deepseek-flash-gheim`. That is
+      #     the whole of option (ii): `work`'s identity is Claude-then-DeepSeek-flash, so
+      #     a Max-cap exhaustion must slide sideways, not become a hard failure — but the
+      #     hop target is a TWIN, so the round trip is never dropped part-way through.
+      #     `model_info: *FLAT_FEE` is the base's, unchanged: still a flat-fee
+      #     subscription, and the gheim detector call is not a per-token charge.
+      - model_name: claude-opus-5-5-gheim
+        litellm_params:
+          model: anthropic/claude-opus-5-5
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+        model_info: *FLAT_FEE
+      - model_name: claude-fable-5-1-gheim
+        litellm_params:
+          model: anthropic/claude-fable-5-1
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+        model_info: *FLAT_FEE
+      - model_name: claude-sonnet-5-5-gheim
+        litellm_params:
+          model: anthropic/claude-sonnet-5-5
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+        model_info: *FLAT_FEE
+      - model_name: claude-haiku-4-5-20251001-gheim
+        litellm_params:
+          model: anthropic/claude-haiku-4-5-20251001
+          api_key: "client-login-required"
+          request_timeout: 600
+          cooldown_time: 1800
+          guardrails: ["customer-data-guard", "gheim-rt-guard"]
+        model_info: *FLAT_FEE
+      # ⚠️ NO `model_info: *NATIVE_ANTHROPIC_MESSAGES` on this twin, and it is not an
+      # oversight. That list's `/v1/messages` opts the deployment into NATIVE,
+      # UNTRANSLATED passthrough — the raw body goes to `{api_base}/v1/messages`, a
+      # path that resolves no deployment, so a guardrail is never applied. Its base
+      # takes that path deliberately (genuine `thinking` blocks, cache_control, see
+      # the block at the top of this file); a twin cannot, because the guardrail IS
+      # the point. Dropping it hands the request back to litellm's translation layer,
+      # which is where the hooks run — and `hosted_vllm/` keeps that on
+      # `/v1/chat/completions` (measured at the wire 2026-08-25, tool_use intact), so
+      # the Responses bridge that corrupted the engine is not re-entered.
+      # `lint.py`'s [LITELLM-GUARDRAIL-PASSTHROUGH] rule fails the build on the
+      # combination, and `tests/test_gheim_twin_matches_its_base.py` asserts it again
+      # on the twins specifically. Trade, stated plainly: this twin gives up native
+      # Anthropic passthrough in exchange for a round trip that actually happens.
+      - model_name: local-tail-cn-pro-tiel-large-gheim
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600
+          guardrails: ["gheim-rt-guard"]
+      # (the -nothink twin has no model_info either, and needs none: its base keeps the
+      #  chat/completions path on purpose, because its lever is `reasoning_effort: none`
+      #  and the native path never sends it.)
+      - model_name: local-tail-cn-pro-tiel-large-nothink-gheim
+        litellm_params:
+          model: *BIG_LOCAL
+          api_base: os.environ/LMSTUDIO_WG_URL
+          api_key: os.environ/LMSTUDIO_API_KEY
+          request_timeout: 600
+          reasoning_effort: none
+          guardrails: ["gheim-rt-guard"]
+
+    # ── Web search (2026-10-01) ───────────────────────────────────────────────
+    # Exposes POST /v1/search to every virtual key — an empty search-tool allowlist
+    # means allow-all, so no existing key needs editing.
+    # Backend is the SearXNG that already serves chat.mdapi.ch (fleet/openwebui),
+    # so this adds a consumer, not a second scraper. `searxng` is the one search
+    # provider here that needs no API key.
+    # ⚠ The instance's `formats: [html, json]` override (searxng-cm.yml) is load
+    # bearing: upstream ships html-only and every JSON call 403s without it.
+    # ⛔ Does NOT reach Claude: anthropic runs web_search natively and litellm skips
+    # interception for it by design, so this neither replaces nor discounts it.
+    search_tools:
+      - search_tool_name: searxng
+        litellm_params:
+          search_provider: searxng
+          api_base: http://searxng.openwebui.svc.cluster.local:8080
+      # Keyed providers, added 2026-10-01. `search_tools` is a LIST, so these are
+      # additive named tools (/v1/search/tavily, /v1/search/serper) and searxng
+      # stays the default — Open WebUI could not do this, its search engine is a
+      # single value, so pointing it at a keyed provider would drop the aggregator.
+      # No api_key here on purpose: litellm falls back to the server-side
+      # TAVILY_API_KEY / SERPER_API_KEY from env (see litellm-es.yml), which keeps
+      # the value out of this ConfigMap. That fallback is also refused if a caller
+      # supplies its own api_base — a deliberate anti-exfiltration check upstream.
+      - search_tool_name: tavily
+        litellm_params:
+          search_provider: tavily
+      - search_tool_name: serper
+        litellm_params:
+          search_provider: serper
+
+    litellm_settings:
+      # ── OTLP tracing to OpenObserve (2026-09-22) ──────────────────────────
+      # Endpoint/protocol/headers are env on the Deployment (see litellm-deploy.yml +
+      # litellm-es.yml); this key is what actually turns the exporter on.
+      #
+      # `custom_callbacks` (2026-10-02) strips NUL-escape `pattern`s from tool
+      # schemas on deepseek deployments only, so a Claude 429 can still fall back
+      # to cn-deepseek-* when the request carries Claude Code's `Artifact` tool.
+      # Resolved by file path next to this config (see litellm-callbacks-cm.yml).
+      #
+      # The customer-data guard that used to be registered here (2026-10-05) is
+      # retired -- it is now the native, DB-stored guardrail `customer-data-guard`
+      # (see the comment at the end of custom_callbacks.py below, and each cloud
+      # model_list entry's own `litellm_params.guardrails`).
+      callbacks: ["otel", "custom_callbacks.deepseek_tool_schema_sanitizer"]
+      # Content logging ON (option a, 2026-09-29): spans carry llm_input/llm_output
+      # (both full-text-indexed by OpenObserve) and SpendLogs stores the same bodies.
+      # Bound = the traces stream's 30-day retention override AND the 30-day SpendLogs
+      # retention below, never the 365-day default. If too loose, option (b) = mask in
+      # Cribl before ingest. (turn_off_message_logging removed; absence = content on.)
+      fallbacks:
+        # ⭐ TWO KINDS OF CHAIN LIVE IN THIS LIST — read the tail, not the length.
+        # A chain ending in cn-deepseek-* or us-claude-* is a CLOUD chain. A chain
+        # with NO entry here is FAIL-CLOSED: the local groups (local-closed-*) have
+        # deliberately no row, so the chain stops at the laptop. The closed qwen door
+        # MUST NOT gain a cloud tail — that would ship session titles and summaries
+        # off-box without a decision being made.
+        #
+        # Since the 2026-09-30 WG-only collapse there is one local hop per chain, so
+        # the chains below are simply "local -> its cloud tail". The former
+        # wired -> WG -> cloud shape existed only because two NICs could disagree.
+        - local-tail-cn-pro-tiel-large:       ["cn-deepseek-pro"]
+        - local-tail-cn-pro-tiel-large-nothink: ["cn-deepseek-pro"]
+        - local-tail-cn-flash-tiel-large:     ["cn-deepseek-flash"]
+        - local-tail-cn-flash-tiel-large-fast: ["cn-deepseek-flash"]
+        # --- fail-closed doors: NO row at all, which is what makes them fail-closed.
+        #     local-closed-tiel-large / -qwen-small / -nomic-embed are single WG
+        #     deployments with no tail; the old wired->wifi->WG rows went with the
+        #     deleted hops. Do not add a row here.
+        # --- Claude Max quota spent -> DeepSeek flash (2026-09-30). The only chains
+        #     here whose HEAD is a cloud group: a flat-fee subscription that runs out
+        #     is the one failure a local-first chain cannot express, so the tail is a
+        #     quality decision, not an availability one. Flash, not pro (user).
+        #     ⛔ CONTAINMENT, verified 2026-09-30 and NARROWED the same day: exactly ONE
+        #     chain below falls back *to* an us-claude-* group, and it does so on purpose
+        #     — `cn-to-us` -> us-claude-sonnet, the cn->us quadrant (also sent as its
+        #     `cn-to-us--anthropic-picker` twin, same chain). Nothing else
+        #     reaches a Claude group, so a tail added to us-claude-* still cannot leak
+        #     Claude into any other door.
+        #     ⛔ us-claude-haiku is absent on purpose — vision path, see its block.
+        - us-claude-opus:   ["cn-deepseek-flash"]
+        - us-claude-fable:  ["cn-deepseek-flash"]
+        - us-claude-sonnet: ["cn-deepseek-flash"]
+        # --- TRANSITION: the same chains again, keyed by the OLD names.
+        # ⛔ model_group_alias does NOT carry fallbacks. The Router picks the
+        # deployment through the alias, but looks fallbacks up by the name the
+        # client SENT (kwargs["model"], exact match). Without these rows every
+        # consumer still on an old name keeps routing and silently LOSES failover.
+        # Measured 2026-09-27 in-pod with mock_testing_fallbacks against this file:
+        # infra / infra-sre / local-wg raised instead of falling back; with these
+        # rows they fell back down the same chain as their target. Delete each row
+        # together with its model_group_alias entry, never one without the other.
+        - approfondito:   ["cn-deepseek-pro"]
+        - infra:          ["cn-deepseek-pro"]
+        - infra-sre:      ["cn-deepseek-pro"]
+        - infra-fable:    ["cn-deepseek-flash"]
+        - casa:           ["cn-deepseek-flash"]
+        # ⛔ 2026-09-30: the fail-closed old names (local-only, veloce, local-small,
+        # local-embed) have NO row here, exactly like their targets — an alias does not
+        # inherit its target's chain, so a row was only ever needed to add the dead
+        # wired/wifi/WG hops. Deleting the row IS the fail-closed behaviour.
+        # The -wg / -wifi alias rows (casa-wg, local-wg*, local-small-*, local-embed-*)
+        # went with the aliases themselves: those names described a transport, and there
+        # is only one transport now.
+        # --- The Anthropic OLD names, same rule as the rows above (each pairs with
+        #     its model_group_alias entry; delete them together). These do NOT
+        #     inherit the new group's tail, which is exactly why they are spelled
+        #     out here. claude-haiku-4-5 is absent — vision path, see its block.
+        - opus:           ["cn-deepseek-flash"]
+        - fable:          ["cn-deepseek-flash"]
+        - claude-opus-5:  ["cn-deepseek-flash"]
+        - claude-fable-5: ["cn-deepseek-flash"]
+        - claude-sonnet-5: ["cn-deepseek-flash"]
+        # --- `work` = "real work": Claude while the Max quota lasts, then flash.
+        #     ⛔ PERMANENT, NOT part of the transition shim — never delete it with the
+        #     old-name rows above. It needs its own row because an alias does NOT
+        #     inherit its target's fallbacks (the lookup is by the name the client
+        #     SENT) — measured 2026-09-27, see the note further up.
+        - work:           ["cn-deepseek-flash"]
+        # --- the caller-login Claude groups: same Claude-then-flash policy as us-claude-*.
+        - claude-opus-5-5:           ["cn-deepseek-flash"]
+        - claude-fable-5-1:          ["cn-deepseek-flash"]
+        - claude-sonnet-5-5:         ["cn-deepseek-flash"]
+        - claude-haiku-4-5-20251001: ["cn-deepseek-flash"]
+        # --- the caller-login TWINS (2026-10-08). ⭐ A twin's tail is a TWIN, never the
+        #     base's `cn-deepseek-flash`: the point of the door is that no hop drops the
+        #     round trip. `work-gheim` needs its own row for the same reason `work` does
+        #     — an alias does NOT inherit its target's fallbacks (the lookup is by the
+        #     name the client SENT). Option (ii): `work`'s Claude-then-flash identity is
+        #     preserved, with the flash hop guarded.
+        - work-gheim:                      ["cn-deepseek-flash-gheim"]
+        - claude-opus-5-5-gheim:           ["cn-deepseek-flash-gheim"]
+        - claude-fable-5-1-gheim:          ["cn-deepseek-flash-gheim"]
+        - claude-sonnet-5-5-gheim:         ["cn-deepseek-flash-gheim"]
+        - claude-haiku-4-5-20251001-gheim: ["cn-deepseek-flash-gheim"]
+        # --- the cn -> us QUADRANT (2026-09-30). PERMANENT, like `work` above — keep
+        #     it when the old-name transition rows retire. See the group's own block
+        #     for why it is a separate group rather than a tail on cn-deepseek-flash.
+        - cn-to-us:       ["us-claude-sonnet"]
+        # --- the auto router's tail, shared by every tier (the SENT name decides the
+        #     chain). Same target as the local tier's own tail, so nothing moves.
+        - auto-local-tiel-cn-pro: ["cn-deepseek-pro"]
+        # --- ⭐ TRANSITION (2026-10-10 promotion): the pre-rename local group names.
+        #     An alias does NOT inherit its target's fallbacks (the lookup is by the
+        #     name the client SENT), so each old tailed name repeats its tail.
+        #     `local-closed-gemma-large` has NO row — it is fail-closed by design, and
+        #     so is its new name. Retires with the alias rows above.
+        - local-tail-cn-pro-gemma-large:         ["cn-deepseek-pro"]
+        - local-tail-cn-pro-gemma-large-nothink: ["cn-deepseek-pro"]
+        - local-tail-cn-flash-gemma-large:       ["cn-deepseek-flash"]
+        - local-tail-cn-flash-gemma-large-fast:  ["cn-deepseek-flash"]
+        - auto-local-gemma-cn-pro:               ["cn-deepseek-pro"]
+        # --- the `--anthropic-picker` twins, each repeating its target's chain (an alias
+        #     does not inherit it). local-closed-* twins have NO row: that keeps them
+        #     fail-closed, exactly like their targets.
+        - local-tail-cn-pro-tiel-large--anthropic-picker:          ["cn-deepseek-pro"]
+        - local-tail-cn-pro-tiel-large-nothink--anthropic-picker:  ["cn-deepseek-pro"]
+        - local-tail-cn-flash-tiel-large--anthropic-picker:        ["cn-deepseek-flash"]
+        - local-tail-cn-flash-tiel-large-fast--anthropic-picker:   ["cn-deepseek-flash"]
+        - cn-to-us--anthropic-picker:                               ["us-claude-sonnet"]
+        - work--anthropic-picker:                                   ["cn-deepseek-flash"]
+        - work-gheim--anthropic-picker:                             ["cn-deepseek-flash-gheim"]
+      num_retries: 0            # don't retry a dead endpoint; fall over immediately
+      request_timeout: 20
+      allowed_fails: 1          # one failure trips the cooldown
+      cooldown_time: 30         # skip a downed path for 30s instead of re-timing-out
+
+    router_settings:
+      # Old -> new group names (transition shim, 2026-09-27). litellm picks the
+      # deployment of the new group for an incoming old `model`, so consumers can be
+      # flipped one at a time. It does NOT inherit the new group's fallbacks — see
+      # the old-name rows at the end of litellm_settings.fallbacks. Key scopes: an
+      # alias passes auth if EITHER the alias or its target is in the key's list.
+      # ⛔ CORRECTED 2026-09-30: fallback HOPS are NOT key-scope-checked in litellm
+      # 1.97.0 — `enforce_fallback_model_access` does not exist, and only fallbacks
+      # present in the REQUEST BODY are checked at auth time; router-config chains
+      # never are. This comment claimed the opposite; the 2026-09-27 key widening was
+      # harmless but unnecessary. Delete this map, the old-name fallback rows and the
+      # old entries in the scoped keys together, once SpendLogs shows zero old-name
+      # traffic. ⛔ EXCEPT the `work` and `cn-to-us` rows — permanent intent doors.
+      # ⚠️ 2026-09-30: the 10 transport aliases (local-wifi/-wg/-wg-sre/-wg-fable/
+      # -wg-closed, local-small-wifi/-wg, local-embed-wifi/-wg, casa-wg) are ALREADY
+      # gone — they named a NIC, and the WG-only collapse removed the concept. That is
+      # a different retirement from this shim and does not wait on it.
+      model_group_alias:
+        approfondito: local-tail-cn-pro-tiel-large
+        infra: local-tail-cn-pro-tiel-large
+        infra-sre: local-tail-cn-pro-tiel-large-nothink
+        infra-fable: local-tail-cn-flash-tiel-large
+        casa: local-tail-cn-flash-tiel-large-fast
+        local-only: local-closed-tiel-large
+        veloce: local-closed-qwen-small
+        local-small: local-closed-qwen-small
+        local-embed: local-closed-nomic-embed
+        # --- ⭐ TRANSITION (2026-10-10 promotion): the pre-rename local group
+        #     names. The local family token became gemma -> tiel on every local
+        #     group and door; these rows keep any consumer still sending the old
+        #     spelling routing. ⛔ Pair each tailed one with a row in
+        #     litellm_settings.fallbacks (an alias does NOT inherit its target's
+        #     tail). Retire with the other old-name rows when SpendLogs is quiet.
+        local-tail-cn-pro-gemma-large:          local-tail-cn-pro-tiel-large
+        local-tail-cn-pro-gemma-large-nothink:  local-tail-cn-pro-tiel-large-nothink
+        local-tail-cn-flash-gemma-large:        local-tail-cn-flash-tiel-large
+        local-tail-cn-flash-gemma-large-fast:   local-tail-cn-flash-tiel-large-fast
+        local-closed-gemma-large:               local-closed-tiel-large
+        auto-local-gemma-cn-pro:                auto-local-tiel-cn-pro
+        # ⭐ 2026-10-08 (Stage 2 of the door cleanup): the BARE words point at the
+        # CALLER-LOGIN groups, not the claude-shim ones. Why this mattered: the short
+        # spelling is what a human types, and the one-hyphen neighbours differ in model
+        # GENERATION (`claude-opus-5` vs `claude-opus-5-5`), in credentials (shim vs your
+        # own claude.ai login) AND in tool capability (the shim drops tools, the login
+        # path keeps them). Pointing the easy spelling at the worse destination is how a
+        # request gets silently answered by the wrong generation. So: bare `opus`/`fable`/
+        # `sonnet` = the login doors; the shim keeps its full, unambiguous name only.
+        # ⚠️ `sonnet` had NO alias before this — a raw `sonnet` was a 400, not the shim.
+        # The old-name transition rows (`claude-opus-5`, …) still point at the shim and
+        # retire with SpendLogs (see the block above); `claude-haiku-4-5` is the VISION
+        # path and stays on the shim — a service has no claude.ai login.
+        # ⚠️ `doors.conf` is the other half: the aliases moved there in the same change,
+        # and `doors-doctor` fails unless the two layers agree on every spelling.
+        opus: claude-opus-5-5
+        fable: claude-fable-5-1
+        sonnet: claude-sonnet-5-5
+        claude-opus-5: us-claude-opus
+        claude-fable-5: us-claude-fable
+        claude-sonnet-5: us-claude-sonnet
+        claude-haiku-4-5: us-claude-haiku
+        ds-flash: cn-deepseek-flash
+        ds-pro: cn-deepseek-pro
+        # ⛔ PERMANENT (2026-09-30), NOT part of the transition shim: the intent door
+        # for "real work" — Claude until the Max quota is spent, then flash. Pairs
+        # with the `work` row in litellm_settings.fallbacks (an alias does not
+        # inherit its target's fallbacks). Consumer: the `work` door in
+        # ~/.config/llm-doors/doors.conf (ccx only). 2026-10-01: now the CALLER-LOGIN
+        # opus, not the shim, so Claude Code keeps its tools; a login-less caller lands
+        # on the flash tail. Still no dsh path: the Max subscription stays Claude-Code-only.
+        work: claude-opus-5-5
+        # ⭐ `work-gheim` (2026-10-08) = `work` + the round-trip PII guard, same shape
+        #     exactly: an alias to the guarded TWIN of `work`'s own target, with its own
+        #     fallbacks row whose tail is `cn-deepseek-flash-gheim`. The agents daemon and
+        #     the background sessions run through this door, which is the reason the user
+        #     asked for it by name. Consumer: the `work-gheim` door in
+        #     ~/.config/llm-doors/doors.conf.
+        work-gheim: claude-opus-5-5-gheim
+        # --- `<name>--anthropic-picker` (2026-10-01): DISPLAY-ONLY twins, so Claude Code's
+        #     /model picker can list them. It shows only gateway ids matching
+        #     /(claude|anthropic)/i (hardcoded in the client), which hid every DeepSeek,
+        #     local and intent name. Same destination as the name before `--`; nothing but
+        #     a Claude Code picker should send these. 'anthropic', never 'claude': the
+        #     client keys model-family features on 'claude'. PERMANENT, not transition
+        #     shim; each chained one has its own fallback row. Not for the embed model.
+        local-tail-cn-pro-tiel-large--anthropic-picker:         local-tail-cn-pro-tiel-large
+        local-tail-cn-pro-tiel-large-nothink--anthropic-picker: local-tail-cn-pro-tiel-large-nothink
+        local-tail-cn-flash-tiel-large--anthropic-picker:       local-tail-cn-flash-tiel-large
+        local-tail-cn-flash-tiel-large-fast--anthropic-picker:  local-tail-cn-flash-tiel-large-fast
+        local-closed-tiel-large--anthropic-picker:              local-closed-tiel-large
+        local-closed-qwen-small--anthropic-picker:               local-closed-qwen-small
+        cn-deepseek-flash--anthropic-picker:                     cn-deepseek-flash
+        cn-deepseek-pro--anthropic-picker:                       cn-deepseek-pro
+        cn-to-us--anthropic-picker:                              cn-to-us
+        work--anthropic-picker:                                  claude-opus-5-5
+        work-gheim--anthropic-picker:                            claude-opus-5-5-gheim
+
+    general_settings:
+      # Background health checks, back 2026-10-02 but SCOPED to the three fail-closed
+      # local groups. The 2026-08-18 removal was for two costs an allowlist does not
+      # have: every probe was a real paid completion against the cloud shim
+      # deployments, and the normally-asleep wifi backend hung 600 s (health checks
+      # ignore request_timeout and use a 60 s budget of their own). Neither applies
+      # to local groups only, and the wifi groups no longer exist.
+      #
+      # Effect: while mbp-mda is off, these three AND their aliases (local-only,
+      # veloce, local-small, local-embed) drop out of /v1/models, /v1/models/{id} and
+      # /model/info, so no picker offers a door whose only outcome is a 900 s hang.
+      # Measured on a clone in ns litellm-upgrade-probe: model_count_total=51,
+      # model_count_enabled=4, healthy 3 / unhealthy 1.
+      #
+      # Presentation-only and FAIL-OPEN: a hidden model is still ROUTED if called by
+      # name, and an absent or stale health state hides nothing. health_check_routing
+      # stays off -- all 18 groups have one deployment each and the router bypasses
+      # the health filter when it would empty a group, so that key is inert here.
+      #
+      # ⛔ Setting litellm_settings.allowed_fails_policy (a DICT, not the scalar
+      # allowed_fails already there) would silently kill the filter below:
+      # router.py returns an empty unhealthy set whenever a policy is present.
+      #
+      # ⛔ background_health_check_model_groups is an EXACT-NAME allowlist, NOT a
+      # glob: a new local group is neither probed nor hidden until it is named here.
+      # Only the fail-closed groups belong on it -- local-tail-cn-* has a cloud
+      # fallback and still serves when the laptop is down, so hiding it would remove
+      # working capability. Interval lag runs BOTH ways: up to 5 min to hide, and up
+      # to 5 min to come back after the laptop wakes. Do not quote the `true` below.
+      background_health_checks: true
+      health_check_interval: 300
+      health_check_concurrency: 1     # sequential: a sleeping laptop costs 3x60 s, not a burst
+      background_health_check_model_groups:
+      - local-closed-tiel-large
+      - local-closed-qwen-small
+      - local-closed-nomic-embed
+      model_list_healthy_only: true
+
+      # --- Cross-pod shared state (Valkey) -----------------------------------
+      # The two replicas keep per-pod in-memory state by default, so everything
+      # the proxy tracks per key -- tpm/rpm counters, spend, and the Router's
+      # cooldown / session-affinity pins -- is only half-enforced: each pod
+      # counts the traffic that happened to land on it. coordination_redis
+      # points BOTH the proxy's usage tracking and the Router cache at one
+      # shared Valkey so the replicas agree.
+      #
+      # This is coordination state, NOT a response cache: litellm_settings.cache
+      # stays unset, so no completion is ever cached or replayed. Enabling
+      # `cache` would set router.cache_responses and start serving cached
+      # answers -- a behaviour change this block deliberately does not make.
+      #
+      # Reuses bootstrap/valkey (Valkey 9) rather than standing up a Redis: it
+      # is already the cluster's shared cache, it is reachable across
+      # namespaces on 6379 (neither ns has a NetworkPolicy), and its credential
+      # is already in Akeyless at /mdapi/bootstrap/valkey/password, so nothing
+      # new is created. `namespace` scopes every key litellm writes under its
+      # own prefix so it cannot collide with the ~39k keys other consumers
+      # already hold in that db0.
+      #
+      # ⛔ Deliberate opt-in: a malformed block or one naming no connection
+      # target makes the proxy FAIL TO BOOT (proxy_server._init_coordination_
+      # redis raises). Losing Valkey at runtime only costs the sharing, not the
+      # proxy. Connection params are validated against CoordinationRedisParams;
+      # `namespace` is a pass-through extra.
+      coordination_redis:
+        host: valkey.bootstrap.svc.cluster.local
+        port: 6379
+        password: os.environ/VALKEY_PASSWORD
+        namespace: litellm
+      # Let the replicas share ONE health-check pass instead of each probing the
+      # three local-closed groups on its own (they coordinate on a Valkey lock).
+      # Gated on coordination_redis resolving above, so it is inert without it.
+      use_shared_health_check: true
+
+      master_key: os.environ/LITELLM_MASTER_KEY
+
+      # NOTE: there is no `ui:` key in general_settings -- an earlier attempt set
+      # `ui: true` here and it was inert. The admin UI at /ui is always served once
+      # master_key is set; it was failing with "Not connected to DB!" because
+      # DATABASE_URL was absent, which is now injected from the CNPG secret in
+      # litellm-deploy.yml (see litellm-pg.yml).
+
+      # Admin-UI login hardening, 2026-10-05. While this is unset the UI signs a
+      # proxy_admin in with UI_USERNAME/UI_PASSWORD out of litellm-env-secret, and
+      # every page then carries litellm's "Environment-credential login is enabled"
+      # banner. One predicate drives both -- is_env_credential_login_enabled()
+      # (proxy/auth/login_utils.py) feeds the login gate AND the banner -- so the
+      # banner cannot be silenced without turning that login path off.
+      #
+      # ⛔ LOCKOUT RISK -- THE PREREQUISITE IS NOT IN THIS REPO. With this true,
+      # username/password login succeeds ONLY for a DB user row whose `user_email`
+      # equals the typed username and which has a password set: `_sign_in` looks the
+      # user up by user_email (case-insensitively) and verifies the stored hash.
+      # UI_USERNAME/UI_PASSWORD AND the master-key fallback are both rejected.
+      # So the DB row must exist BEFORE this line merges:
+      #
+      #   POST /user/new    {"user_email": ..., "user_role": "proxy_admin",
+      #                      "auto_create_key": false}
+      #   POST /user/update {"user_id": ..., "password": ...}   # obeys
+      #                                          general_settings.password_policy_*
+      #
+      # Created 2026-10-05 for tillo@tillo.ch (proxy_admin, auto_create_key
+      # false so no unused virtual key is minted); the password is in Akeyless at
+      # /mdapi/litellm/ui-admin/password. Proven end-to-end the same day:
+      # POST /v2/login -> 200 + token. ⚠ The UI calls /v2/login, NOT /login --
+      # /login is the legacy SSO helper and answers 401 for a DB password even when
+      # the row and the stored scrypt hash are both correct.
+      #
+      # Recovery: the master key still administers the proxy over the API
+      # (Authorization: Bearer <LITELLM_MASTER_KEY>) and never passes through this
+      # gate. To restore env-credential login, delete this line and let the
+      # stakater reloader roll the pod -- the env creds stay in Akeyless on purpose
+      # so that recovery works.
+      #
+      # ⛔ Deleting UI_USERNAME/UI_PASSWORD instead does NOT help: with UI_PASSWORD
+      # unset the master key becomes the env password, which is still env-credential
+      # login and the banner stays.
+      disable_env_credential_login: true
+
+      # The model_list in THIS FILE stays the single source of truth. With a DB
+      # attached, litellm would otherwise let the UI write model definitions into
+      # Postgres and merge them at runtime — which would quietly outrank the
+      # hosted_vllm/ prefix fix and the fallback chains above.
+      store_model_in_db: false
+
+      # SpendLogs grows one row per request and nothing prunes it by default; it now
+      # also stores prompt/response bodies (content logging on), so bound it short.
+      maximum_spend_logs_retention_period: "30d"
+      maximum_spend_logs_retention_interval: "1d"
+
+      # Attribute spend to the PERSON, not just the key. Open WebUI forwards the
+      # signed-in identity when ENABLE_FORWARD_USER_INFO_HEADERS=true and litellm
+      # reads the mapped header into the request's end-user field.
+      #
+      # `user_header_name` (single header) is [DEPRECATED] in v1.103.2 — see the
+      # field description in proxy/_types.py. `user_header_mappings` replaces it and
+      # is the only form that can also name the ROLE. Role `customer` means the
+      # header value becomes an end-user record (auto-upserted), which is exactly
+      # what the deprecated key did, so this is a behaviour-preserving migration.
+      # Mappings are checked first and the deprecated key is only a fallback
+      # (proxy/auth/auth_utils.py), so leaving both set would be ambiguous — this
+      # replaces it outright.
+      user_header_mappings:
+        - header_name: "X-OpenWebUI-User-Email"
+          litellm_user_role: customer
+
+  # ── proxy callbacks module ───────────────────────────────────────────────
+  # Holds the DeepSeek tool-schema sanitizer (2026-10-02) and the customer-data
+  # guard (2026-10-05). One module, because a ConfigMap key is the only way to
+  # land a .py next to config.yaml -- see the mount note below.
+  #
+  # A SECOND KEY of THIS ConfigMap, so the file lands next to config.yaml in
+  # /etc/litellm -- the only place get_instance_fn looks
+  # (litellm/proxy/types_utils/utils.py: spec_from_file_location on
+  # <config dir>/<module>.py), which is why `litellm_settings.callbacks` names it
+  # `custom_callbacks.deepseek_tool_schema_sanitizer` with no PYTHONPATH.
+  #
+  # ⛔ Do NOT split this into its own ConfigMap mounted with subPath onto
+  # /etc/litellm/custom_callbacks.py: the image has no /etc/litellm (that dir is
+  # created only by THIS volume's mount), and runc then refuses the container with
+  # "... /etc/litellm/custom_callbacks.py: not a directory" => CrashLoopBackOff.
+  # Verified on a clone 2026-10-02.
+  #
+  # ⛔ A syntax/import error here fails CONFIG LOAD => both replicas CrashLoop.
+  # The module imports litellm's own CustomLogger plus stdlib os/re; every path
+  # is total, and both callbacks return None on any input they do not own.
+  custom_callbacks.py: |
+    """litellm proxy callbacks.
+
+    DeepSeek's OpenAI-compatible endpoint validates JSON-Schema `pattern` with a
+    regex engine that rejects a NUL escape (`\\0`). Claude Code ships an `Artifact`
+    tool whose string params carry `"pattern": "^[^\\0]*$"` -- a no-NUL input-hygiene
+    guard -- so EVERY tool-bearing Claude Code request is rejected the moment it
+    falls back from a rate-limited Claude group (`work`, `claude-*`) onto a
+    `cn-deepseek-*` deployment:
+
+        400 Invalid schema for function 'Artifact': "^[^\\0]*$" is not a "regex"
+
+    That promotes a transient Anthropic 429 into a hard failure: the fallback dies,
+    litellm finds no further hop, and the client is handed the original 429 instead
+    of a DeepSeek answer.
+
+    Fix: drop any `pattern` carrying a NUL escape from tool/function parameter
+    schemas, on deepseek deployments ONLY. Measured 2026-10-02 against the live
+    endpoint: DeepSeek accepts ordinary character classes AND lookaheads -- the NUL
+    escape is the sole rejection -- so nothing else is touched and the Anthropic
+    primary request stays byte-identical to today.
+    """
+    from typing import Any
+
+    from litellm.integrations.custom_logger import CustomLogger
+
+
+    def _strip_nul_patterns(node: Any) -> int:
+        """Recursively delete `pattern` keys whose value contains a NUL escape."""
+        removed = 0
+        if isinstance(node, dict):
+            for key in list(node.keys()):
+                value = node[key]
+                if key == "pattern" and isinstance(value, str) and "\\0" in value:
+                    del node[key]
+                    removed += 1
+                else:
+                    removed += _strip_nul_patterns(value)
+        elif isinstance(node, list):
+            for item in node:
+                removed += _strip_nul_patterns(item)
+        return removed
+
+
+    class DeepSeekToolSchemaSanitizer(CustomLogger):
+        """Runs per deployment attempt, so it also covers router fallback steps
+        (utils.py dispatches it inside the wrapped call the router re-enters on
+        every retry and every fallback hop)."""
+
+        async def async_pre_call_deployment_hook(self, kwargs, call_type=None):
+            model = str(kwargs.get("model") or "")
+            if not model.startswith("deepseek/"):
+                return None
+            for key in ("tools", "functions"):
+                if isinstance(kwargs.get(key), list):
+                    _strip_nul_patterns(kwargs[key])
+            return kwargs
+
+
+    deepseek_tool_schema_sanitizer = DeepSeekToolSchemaSanitizer()
+
+    # The customer-data guard that used to live here (2026-10-05 -- 2026-10-05)
+    # is retired: it is now the native, DB-stored guardrail `customer-data-guard`
+    # (litellm 1.103.2's `custom_code` integration, created via POST /guardrails,
+    # visible and manageable at /ui/guardrails/ -- never declared here, since a
+    # hand-written CustomGuardrail class can only be config-declared and can
+    # never be created or toggled from the DB/UI). It fetches the deny-list
+    # directly from Akeyless at call time using a role scoped to read only that
+    # one secret (litellm-customer-denylist-ro), so neither the terms nor a
+    # broad credential pass through this ConfigMap, litellm-env-secret, or the
+    # pod's own environment at all. Scoping onto cloud-only deployments is now
+    # declarative: see `litellm_params.guardrails: ["customer-data-guard"]` on
+    # each cloud model_list entry above -- the native interface's apply_guardrail
+    # never receives api_base, so the old api_base-sniffing approach could not be
+    # ported as-is. See litellm_native_guardrail_system_mechanics_2026_10_05 and
+    # customer_guard_migration_to_native_db_guardrail_2026_10_05 for the full
+    # mechanics and the reasoning behind every one of those choices.
+    #
+    # `gheim-pii-guard` (2026-10-07) is the second DB guardrail and follows the
+    # same pattern: not declared here, created via POST /guardrails. It masks PII
+    # in request text using the gheim-ch-560m token classifier served on mbp-mda
+    # and reached over WireGuard -- the same cluster->Mac path LMSTUDIO_WG_URL
+    # uses, not loopback and not the LAN name, since this code runs in a pod. It
+    # returns `<PERSON_1>`-style sentinels and merges the word-piece spans the
+    # model emits, so one name does not become `<PERSON_1>mple`. It is INERT:
+    # default_on is false and no model names it, so it runs only on an explicit
+    # POST /guardrails/apply_guardrail until someone scopes it.
+    #
+    # ⛔ Its fail-open property lives in the CODE, not in litellm_params.
+    # Measured 2026-10-07: a probe guardrail that raised returned HTTP 500 even
+    # with fail_on_error=false and unreachable_fallback=fail_open on the row, so
+    # apply_guardrail wraps its body and returns allow() on any exception. The
+    # sandbox has no os and no import, so the detector's bearer token is a literal
+    # in custom_code -- which is exactly why this row is in the DB and not here.
+    # An unreachable detector therefore allows the request (after a flag), and a
+    # clockless circuit breaker (3 consecutive failures, then skip 50 calls)
+    # stops every guarded call paying the connect timeout while the Mac is away.
+    # The estate-wide floor remains `customer-data-guard`, which is in-cluster and
+    # needs nothing from mbp-mda. See gheim_pii_roundtrip_evaluation_2026_10_07.
+    #
+    # `gheim-rt-guard` (2026-10-08) is the third DB guardrail and the ROUND-TRIP
+    # counterpart of `gheim-pii-guard`: same detector, but instead of replacing a
+    # span with a bare `<PERSON_1>` it replaces it with `<PERSON_1>.<blob>`, where
+    # the blob is the CipherTrust Manager ciphertext of the real value (CM Crypto
+    # API, AES-GCM, the key named by id). On the response pass it finds those
+    # sentinels and restores the plaintext, so the model works on data that is
+    # opaque to it while the caller still reads the real thing.
+    #
+    # ⭐ Chosen backend: CM Crypto as a STATELESS reversible oracle -- the
+    # ciphertext comes back inline and nothing is stored, so there is no at-rest
+    # PII, nothing to expire and no read-back API. OpenBAO KV v2 is the fallback
+    # and sits behind one `VAULT_BACKEND` constant; every blob's first byte names
+    # the backend that can unseal it, so flipping backends cannot mis-read old
+    # blobs. See ciphertrust_manager_crypto_api_and_service_users_2026_10_08.
+    #
+    # ⛔ The row's `mode` MUST be a LIST, ["pre_call", "post_call"]. With
+    # `pre_call` alone LiteLLM registers only the request hook, so the request
+    # is masked and the response pass never runs -- the caller reads sentinels
+    # back instead of the real values. Measured 2026-10-08: the direct
+    # POST /guardrails/apply_guardrail with input_type=response restored the
+    # value correctly the whole time, which is what made the chat-path failure
+    # look like a model-fidelity problem rather than a missing hook.
+    #
+    # ⛔ Two failure modes are handled in the CODE, as with gheim-pii-guard.
+    # Detector or vault unreachable degrades to the MASK-ONLY floor (a blob-free
+    # `<PERSON_1>`), never to clear text; and a blob that will not unseal is left
+    # in place rather than mangled. `fail_on_error`/`unreachable_fallback` on the
+    # row do NOT make a raising hook fail open -- measured 2026-10-07 -- so the
+    # whole body is wrapped.
+    #
+    # ⛔ Never attach this and gheim-pii-guard to the same model: they mask the
+    # same spans to different sentinels, so the result depends on which ran last.

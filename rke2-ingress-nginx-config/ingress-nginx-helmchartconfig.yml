@@ -1,0 +1,318 @@
+## rke2-ingress-nginx chart overrides.
+##
+## ─── Why this file exists in git ──────────────────────────────────────────────
+## Until 2026-09-15 this HelmChartConfig was a node-local manifest at
+## /var/lib/rancher/rke2/server/manifests/rke2-ingress-nginx-config.yaml, owned by
+## RKE2's addon controller (k3s.cattle.io/v1 Kind=Addon). That meant it had to be
+## written identically to all three server nodes by hand, and a node rebuild would
+## silently drop it — including the memory bound below, whose whole purpose is to
+## stop this workload taking a node down. rke2-coredns-config/ was already the
+## precedent for owning an RKE2 packaged-component override from git; this follows it.
+##
+## Migration (2026-09-15): the live object was pre-stamped with Helm ownership
+## metadata so Fleet could adopt it in place rather than delete-and-recreate — a
+## delete would have reverted the chart to defaults (losing default-ssl-certificate
+## and tcp-services-configmap) for the length of a rollout. The node-local manifests
+## were removed only after Fleet ownership was confirmed.
+
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-ingress-nginx
+  namespace: kube-system
+spec:
+  ## Carried over explicitly from the node-local manifest. It was present on the
+  ## live object and is easy to lose silently in a migration like this.
+  failurePolicy: reinstall
+  valuesContent: |-
+    controller:
+      metrics:
+        enabled: true
+      ## ─── Memory bound ───────────────────────────────────────────────────────
+      ## Added 2026-09-15 after the qui node-wedge of 2026-09-14 09:21Z.
+      ##
+      ## The chart default is `requests: {cpu: 100m, memory: 90Mi}` with NO limit,
+      ## which is a fiction here: the generated nginx.conf carries 80 separate
+      ## `modsecurity_rules` blocks, each `Include`-ing the full OWASP CRS, so the
+      ## nginx MASTER process alone measures 4.69 GiB RSS (~58 MB x 80
+      ## instantiations of a 2.2 MB rule tree). Steady working set per controller
+      ## is 2.5-5.3 GiB, and the VIP-holding replica sits nearer 4 GiB because
+      ## `ingress-expose` is externalTrafficPolicy: Local.
+      ##
+      ## Worse, it ratchets: flat for hours, then STEPS UP ~2 GiB on a config
+      ## reload and never gives it back. Measured 09-14: qua held 2.74 GiB for 4 h
+      ## then stepped to 4.82 GiB and stayed; quo went 3.00 -> 4.78 GiB on the same
+      ## cluster-wide reload. qui, with only 12.5 GiB MemAvailable against qua's
+      ## 59 GiB, went 4.86 -> 11.29 GiB in 30 min instead: MemAvailable collapsed
+      ## 13.1 -> 5.2 GiB, PSI memory-full hit 8%, file cache was squeezed 9.2 ->
+      ## 3.4 GiB, whatever pets /dev/watchdog missed its 30 s deadline, and iLO's
+      ## ASR reset the box. The same mechanism took the control plane down on
+      ## 2026-08-23 (`leaderelection lost` on qui AND qua) with the controller at
+      ## 16.1 GiB — twice the limit set here, so expect OOM kills.
+      ##
+      ## `limits.memory` is a BACKSTOP, not the fix: the container is OOM-killed
+      ## and restarts clean instead of taking the node down, and the kill also
+      ## resets the reload ratchet. The durable fix is to stop instantiating the
+      ## CRS 80 times — see ~/hang-evidence-2026-09-15.md §8.1.
+      ##
+      ## ─── History of this number, because it moved twice in one day ──────────
+      ## 8Gi (first attempt) OOMKilled a freshly-rolled controller on qua at
+      ## 2026-09-15 10:31Z: with the CRS still instantiated 80 times, a reload
+      ## transiently held the old AND new rule sets, ~4.7 GiB each, on top of a
+      ## ~4 GiB working set. Reloads are cluster-wide, so all three controllers
+      ## would have OOMed together — a worse outage than the node wedge the limit
+      ## exists to prevent. Raised to 12Gi as a stopgap.
+      ##
+      ## Then the CRS consolidation landed and the picture changed completely.
+      ## Measured after the cut-over: nginx master RSS 73 MB (was 4.69 GiB) and a
+      ## per-controller working set of ~200-240 MiB (was 2.5-5.3 GiB). A reload
+      ## now duplicates ~60 MB, not ~4.7 GiB.
+      ##
+      ## So 2Gi is roughly 8x the measured steady state and leaves ample room for
+      ## a reload, while actually bounding a runaway — which 12Gi against a 230 MB
+      ## workload did not.
+      ##
+      ## The request comes down with it, to 512Mi. 3Gi was honest against a
+      ## multi-GiB working set; against ~230 MiB it is dishonest in the other
+      ## direction, and over-reserving 2.5 GiB on each of three nodes is 7.5 GiB
+      ## of allocatable withheld from everything else — which matters directly,
+      ## because the cluster cannot currently lose a node and reschedule.
+      ## 512Mi is ~2x the measured steady state, so it is still honest headroom
+      ## rather than the 90Mi fiction this started as.
+      ##
+      ## (requests must be <= limits; 3Gi against a 2Gi limit is rejected outright.)
+      ##
+      ## Deliberately NO cpu limit: CPU throttling on the ingress data path is its
+      ## own outage mode (cf. monitoring-rules/18-cpu-throttling.yml).
+      resources:
+        requests:
+          cpu: 100m
+          memory: 512Mi
+        limits:
+          memory: 2Gi
+      config:
+        allow-snippet-annotations: "true"
+        annotations-risk-level: "Critical"
+        use-forwarded-headers: "true"
+        proxy-real-ip-cidr: "10.0.0.0/8,192.168.1.0/24,100.64.0.0/10"
+        worker-processes: "2"
+        worker-shutdown-timeout: "60s"
+        ## ─── Access log: JSON, and carrying $host ───────────────────────────
+        ## Added 2026-09-23 after a rate-limit incident could not be attributed.
+        ##
+        ## ⛔ The DEFAULT ingress-nginx log format contains NO `$host`. A line reads
+        ##   192.168.1.254 - - [23/Sep/2026:08:08:00 +0000] "POST /api/states/x
+        ##   HTTP/2.0" 200 403 "-" "curl/8.21.0" 337 0.009
+        ##   [home-assistant-home-assistant-8123] [] 10.52.0.147:8123 403 0.010 200 <id>
+        ## so the only trace of the vhost is `$proxy_upstream_name`, which is
+        ## namespace-service-port — it cannot separate two hosts sharing a service,
+        ## nor two ingresses on one host. Searching the shipped logs for a hostname
+        ## therefore returns NOTHING, which reads exactly like "the logs are not
+        ## collected". They were: O2 holds ~40k ingress-controller records an hour.
+        ##
+        ## That is what made the 2026-09-22 start.mdapi.ch 503 bursts unattributable
+        ## (see memory start_mdapi_ch_503s_are_the_rate_limiter_2026_09_23). The
+        ## other candidate source does not help either: ModSecurity only audits rule
+        ## MATCHES, and a request refused by `limit_req` never reaches ModSecurity.
+        ##
+        ## JSON rather than a wider plain format because the same container's modsec
+        ## audit output is already JSON and arrives in O2 as STRUCTURED FIELDS over
+        ## this very pipeline (fluentbit -> Cribl -> O2), whereas the access log
+        ## lands as one opaque `_raw` string that can only be LIKE-matched.
+        ## `log-format-escape-json` is mandatory here — without it a quote in a
+        ## user-agent produces invalid JSON.
+        ##
+        ## Numeric fields ($status, $body_bytes_sent, $request_length, $request_time)
+        ## are deliberately UNQUOTED so they arrive as numbers. $upstream_status and
+        ## $upstream_response_time stay quoted: they are `-` when there is no
+        ## upstream, and a comma-separated list after a retry — both invalid as bare
+        ## JSON numbers.
+        ##
+        ## Cost: ~406k access lines/day, growing ~250 -> ~600 B each, so roughly
+        ## +140 MB/day against the 200 GB/day licence (0.07%).
+        ##
+        ## This is a `config:` key, so it is a ConfigMap change and an nginx RELOAD,
+        ## not a DaemonSet roll.
+        ## ─── $rum_accept_encoding: keep gzip for everything but the HTML ────
+        ## Added 2026-09-23.
+        ##
+        ## The RUM rollout injects its script with nginx `sub_filter`, and
+        ## sub_filter cannot rewrite a COMPRESSED upstream response — hence the
+        ## `proxy_set_header Accept-Encoding "";` in each instrumented ingress.
+        ## But `proxy_set_header` applies to every request matching the location,
+        ## so it also stripped compression from JS, CSS and JSON.
+        ##
+        ## Measured before changing anything: on an instrumented host a script
+        ## asset came back `Content-Encoding: NONE` (webmail jquery.min.js,
+        ## 88,983 B); the equivalent asset on an uninstrumented host came back
+        ## `gzip` (gitlab runtime.*.bundle.js). ingress-nginx does not re-compress
+        ## on the way out, so those were real bytes on the wire, on every page
+        ## view, for every RUM-instrumented site.
+        ##
+        ## This map clears Accept-Encoding ONLY for requests that ask for HTML —
+        ## i.e. the document navigation sub_filter actually rewrites. Browsers
+        ## send `Accept: text/html,...` for a navigation and `*/*`, `text/css`
+        ## or `image/*` for subresources, so those keep their compression.
+        ##
+        ## ⛔ Ingresses reference this as $rum_accept_encoding. It is defined here
+        ## at http level and MUST exist before any of them use it: nginx treats an
+        ## unknown variable as a config error and refuses to load, which would
+        ## freeze every ingress on the cluster, not just the RUM ones.
+        http-snippet: |
+          map $http_accept $rum_accept_encoding {
+              default        $http_accept_encoding;
+              "~*text/html"  "";
+          }
+        log-format-escape-json: "true"
+        log-format-upstream: >-
+          {"time":"$time_iso8601","remote_addr":"$remote_addr",
+          "x_forwarded_for":"$proxy_add_x_forwarded_for","host":"$host",
+          "method":"$request_method","uri":"$uri","request_uri":"$request_uri",
+          "protocol":"$server_protocol","status":$status,
+          "body_bytes_sent":$body_bytes_sent,"request_length":$request_length,
+          "request_time":$request_time,"referer":"$http_referer",
+          "user_agent":"$http_user_agent","namespace":"$namespace",
+          "ingress":"$ingress_name","service":"$service_name",
+          "upstream_name":"$proxy_upstream_name","upstream_addr":"$upstream_addr",
+          "upstream_status":"$upstream_status",
+          "upstream_response_time":"$upstream_response_time","req_id":"$req_id"}
+        ## ─── ModSecurity, loaded ONCE ────────────────────────────────────────
+        ## These three keys put `modsecurity on;`, our rule set, and the OWASP CRS
+        ## into the http{} block (nginx.tmpl lines 94-106), so the CRS is parsed a
+        ## single time instead of once per ingress.
+        ##
+        ## The snippet is deliberately one Include line: nginx caps a quoted config
+        ## parameter at its 4 KiB read buffer, and the 17 KiB rule set fails with
+        ## "too long parameter, probably missing terminating ' character".
+        ## The rules therefore live in the ingress-modsec-global ConfigMap.
+        ##
+        ## Order matters. The template emits this snippet BEFORE the CRS include,
+        ## so our id:900200 is parsed first and wins — ModSecurity is first-wins on
+        ## duplicate rule IDs — which is what makes the global REST method list
+        ## effective. Reverse the order and 911100 silently re-narrows the methods.
+        ##
+        ## ⛔ This CANNOT be enabled while any ingress still carries its own
+        ## `modsecurity-snippet` with a CRS Include. Both rule sets merge and nginx
+        ## refuses the config with "Rule id: 901001 is duplicated", which is why the
+        ## 88 per-ingress annotations are removed in this same commit rather than
+        ## in a preceding one. Verified with `nginx -t` on the controller image.
+        enable-modsecurity: "true"
+        enable-owasp-modsecurity-crs: "true"
+        modsecurity-snippet: |
+          Include /etc/nginx/modsec-global/modsec-global.conf
+        ## ─── OpenTelemetry tracing (2026-09-22) ──────────────────────────────
+        ## This is a ConfigMap change, so it is an nginx RELOAD, not a DaemonSet
+        ## roll. Read the memory-bound history above before touching it: reloads
+        ## here are cluster-wide and used to ratchet memory, though that was the
+        ## 80x CRS instantiation and the working set is ~230 MiB since the
+        ## consolidation.
+        ##
+        ## ⭐ The module IS shipped in rancher/nginx-ingress-controller
+        ## v1.14.3-hardened3 — /etc/nginx/modules/otel_ngx_module.so, 503,696
+        ## bytes, verified in the running pod. (Check it with a PAIRED ls: a
+        ## bare `ls | head` truncated the listing alphabetically and made it look
+        ## absent, and `find` is not even in that image, so a find-based "0 hits"
+        ## is a false zero.)
+        ##
+        ## ⚠️ nginx CANNOT reach OpenObserve directly. Its OTel options include no
+        ## Authorization header and it speaks otlp-grpc only, while OpenObserve's
+        ## ingest 401s without a credential. It therefore points at the in-cluster
+        ## collector (openobserve/o2-otel-collector.yml), which is where the
+        ## Akeyless-backed credential is attached.
+        enable-opentelemetry: "true"
+        otlp-collector-host: "otel-collector.openobserve.svc.cluster.local"
+        otlp-collector-port: "4317"
+        otel-service-name: "ingress-nginx"
+        ## ⛔ Without this every ingress span arrives with an EMPTY
+        ## operation_name — measured immediately after enabling: 519 spans, all
+        ## nameless. They still count toward ingestion and still build a service
+        ## graph, but you cannot tell which route any of them describes, which is
+        ## most of the value gone.
+        ##
+        ## ⚠️ Deliberately NOT $uri or $request_uri. Those are effectively
+        ## unbounded cardinality on a public estate — every scanned path, every
+        ## query string, every honeypot probe becomes its own operation, and the
+        ## operation list stops being readable long before it stops growing.
+        ## $ingress_name is set per location by the generated config (130
+        ## occurrences in nginx.conf, e.g. `set $ingress_name "gitlab-gitlab-pages"`)
+        ## and is exactly one value per app, which is the granularity a service
+        ## graph wants.
+        opentelemetry-operation-name: "$request_method $ingress_name"
+        ## ─── Sampling ratio: 0.5, and here is the arithmetic ─────────────────
+        ## RE-MEASURED 2026-09-23 (the 09-22 figures below it are superseded):
+        ##   319,960 requests in 24h, from ingress_access — nearly double the
+        ##     168,795 measured on 09-22, because that stream now captures every
+        ##     vhost rather than a sample of them
+        ##   885 bytes per span, from the live traces stream (233.3 MB / 276,463
+        ##     spans) — LOWER than the 1,189 previously assumed
+        ##   277,520 spans/day at the current 0.5
+        ##
+        ## Cost today: ~246 MB/day at 0.5, ~491 MB/day at 1.0. Against the
+        ## enterprise ceiling, now 200 GB/day rather than 50, that is 0.12% and
+        ## 0.25%. Steady-state ingestion is ~23.4 GB/day, so volume remains NOT
+        ## the binding constraint at either ratio.
+        ##
+        ## Kept at 0.5 anyway, deliberately. The reason for 0.5 was never the
+        ## ceiling — it is the storm case. This estate fronts public services
+        ## (mail, Nextcloud, Tor webtunnel/snowflake bridges, honeypots) and its
+        ## history records traffic storms. A 10x storm is ~2.5 GB/day at 0.5 and
+        ## ~5 GB/day at 1.0, on top of whatever the storm does to pod_logs. The
+        ## bigger licence makes that 4x less threatening, but it does not turn
+        ## "no measured problem" into a reason to change a deliberate setting.
+        ##
+        ## Why not 0.1: the Service Graph and Service Catalog are aggregate
+        ## features and would converge fine, but 1-in-10 makes "find the trace for
+        ## THIS 502" a coin toss you usually lose.
+        ##
+        ## ⭐ The SLOs do NOT depend on this. They are built on ingress_access,
+        ## which is every request, precisely because traces are sampled — so
+        ## raising the ratio would buy debugging certainty, not SLI accuracy.
+        ## To change it, redo the two measurements above — do not adjust it
+        ## because a trace was missing.
+        otel-sampler: "TraceIdRatioBased"
+        otel-sampler-ratio: "0.5"
+        otel-sampler-parent-based: "true"
+        ## ⛔ Deliberately NOT trusting client-supplied traceparent. The default is
+        ## true, which on an INTERNET-FACING ingress means any caller can set a
+        ## sampled traceparent and force 100% sampling — an ingestion-amplification
+        ## vector against a licence ceiling, available to anyone who can reach
+        ## port 443. With this false, nginx always makes its own ratio decision.
+        ## The cost is that a trace started outside the cluster does not continue
+        ## through nginx, which costs us nothing today: the only other emitter is
+        ## litellm, called in-cluster and never through this ingress.
+        opentelemetry-trust-incoming-span: "false"
+      extraArgs:
+        tcp-services-configmap: "kube-system/rke2-ingress-nginx-tcp-services"
+        dynamic-configuration-retries: "30"
+        default-ssl-certificate: "cattle-system/tls-ingress"
+      livenessProbe:
+        initialDelaySeconds: 120
+        periodSeconds: 10
+        failureThreshold: 5
+        timeoutSeconds: 1
+        successThreshold: 1
+      readinessProbe:
+        initialDelaySeconds: 120
+        periodSeconds: 10
+        failureThreshold: 5
+        timeoutSeconds: 1
+        successThreshold: 1
+      extraVolumes:
+        - name: modsec-plugins
+          configMap:
+            name: nextcloud-rule-exclusions-plugin
+        ## The global ModSecurity rule set (modsec-global-cm.yml, same bundle).
+        ## Mounted here AHEAD of being referenced, deliberately: adding a volume
+        ## changes the DaemonSet and rolls all three controllers, whereas turning
+        ## the WAF on later is a ConfigMap change that only reloads nginx. Doing
+        ## the roll first keeps the actual cut-over to a reload.
+        - name: modsec-global
+          configMap:
+            name: ingress-modsec-global
+      extraVolumeMounts:
+        - name: modsec-plugins
+          mountPath: /etc/nginx/modsec-plugins
+          readOnly: true
+        - name: modsec-global
+          mountPath: /etc/nginx/modsec-global
+          readOnly: true

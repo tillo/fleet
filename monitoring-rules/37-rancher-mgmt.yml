@@ -1,0 +1,125 @@
+## rancher-mgmt management-plane guards (2026-08-20, after the mgmt-2
+## memory-stall: the VMs' virt-launcher pods ran with limits == guest
+## memory, so a guest reaching its ceiling — which Linux pagecache always
+## does — squeezed qemu at the host cgroup and froze the whole VM (kubelet
+## stall 13:32-13:40 local, Rancher 503 ~15min, second occurrence of the
+## 08-17 collapse family). Fixed with guest=8Gi/limits=9Gi headroom; this
+## rule pages if a launcher ever creeps toward its limit again — from the
+## PROD stack, so it works while the mgmt plane itself is down.
+## Companion: the rancher-mgmt-ui blackbox probe (10-blackbox-probes.yml)
+## catches the user-facing 503 through the generic SyntheticProbeFailing
+## rule. Ledger: ext:rancher-mgmt-memory-saturation.
+##
+## 2026-10-04 (ledger ext:rancher-mgmt-plane-down-20261003, beads infra-khdu):
+## the group below covers the 2026-10-03 outage — rancher-mgmt-2's VMI sat
+## Terminating ~10h on a single stuck wrangler.cattle.io/* finalizer, so
+## RunStrategy=RerunOnFailure could not create a replacement VMI, VIP .30 went
+## ownerless, and ALL Fleet reconciliation stalled estate-wide for 9h54m.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-rancher-mgmt
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-rancher-mgmt.vm-memory
+    rules:
+    - alert: RancherMgmtVMMemorySqueeze
+      expr: |
+        max by (pod) (
+          container_memory_working_set_bytes{namespace="rancher-mgmt", container="compute"}
+        )
+          / on (pod) group_left()
+        max by (pod) (
+          kube_pod_container_resource_limits{namespace="rancher-mgmt", resource="memory", container="compute"}
+        )
+        > 0.97
+      for: 10m
+      labels:
+        service: 'rancher'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.pod }}: VM memory at {{ $value | humanizePercentage }} of its pod limit"
+        description: |
+          A rancher-mgmt virt-launcher is within 3% of its host-side memory
+          limit for 10m+. When it reaches the limit, the host cgroup squeezes
+          qemu and the GUEST WORLD-FREEZES (kubelet stall, Rancher outage,
+          fleet-agent disconnect) — 2026-08-17 and 2026-08-20 incidents.
+          Expected posture: guest=8Gi, limits=9Gi (1Gi qemu headroom); the
+          gap between guest ceiling and pod limit should keep this quiet.
+          Check: kubectl --context mdapi-prod-direct -n rancher-mgmt get vm
+          -o yaml | grep -A3 'memory\|limits' ; guest RSS growth inside the
+          VM (rancher pods have 3Gi limits since 2026-08-20 — a leak beyond
+          that OOM-restarts one pod instead of starving the node).
+
+  ## 2026-10-04 — the 2026-10-03 control-plane outage (ledger
+  ## ext:rancher-mgmt-plane-down-20261003, beads infra-khdu). Companion heal:
+  ## f/heal/kubevirt_stuck_vmi_finalizer (every 5m).
+  ##
+  ## ⛔ Why the metric source is load-bearing: kubevirt_vmi_info is emitted by
+  ## virt-HANDLER per RUNNING launcher, so the wedged VMI — which had no
+  ## virt-launcher pod at all — had no series, and an alert on it would never
+  ## have fired. kubevirt_vm_info is emitted by virt-CONTROLLER for every VM
+  ## regardless of launcher state, and it lives in the PROD stack, so it works
+  ## while the mgmt plane itself is down — the same property that makes this
+  ## file the right home.
+  ##
+  ## ⛔ Why critical: the existing RancherMgmtMemberUnreachable is severity
+  ## warning -> Pushover priority -1 (silent). Measured 2026-10-03: one mgmt VM
+  ## down took the whole plane down 9h54m and nothing paged. Here a single mgmt
+  ## VM non-running is a prod outage, not an N-1 nicety.
+  ##
+  ## for:10m rides out the accepted daily 04:30-04:34Z Leap Micro maintenance
+  ## restart (ledger node:rancher-mgmt:daily-maintenance-restart; the kubelets
+  ## restart but the VMIs stay Running) and any ordinary VM restart (~40s).
+  - name: app-rancher-mgmt.vm-availability
+    rules:
+    - alert: RancherMgmtVMNotRunning
+      expr: |
+        kubevirt_vm_info{namespace="rancher-mgmt", status_group="non_running"} == 1
+      for: 10m
+      labels:
+        service: 'rancher'
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "rancher-mgmt VM {{ $labels.name }} is not running — management-plane member down"
+        description: |
+          {{ $labels.name }} has been non-running for >10m (virt-controller, prod
+          stack). The mgmt plane needs all three; on 2026-10-03 one VM down took
+          the whole plane down 9h54m and stalled Fleet estate-wide.
+          Check: kubectl --context mdapi-prod-direct -n rancher-mgmt get vmi
+                 kubectl --context mdapi-prod-direct -n rancher-mgmt get vm -o wide
+          A VMI stuck Terminating on a wrangler.cattle.io finalizer is auto-healed
+          every 5m by f/heal/kubevirt_stuck_vmi_finalizer; if this is still firing,
+          the routine fix did not take.
+          Memory: rancher_mgmt_plane_down_mgmt2_vmi_failed_no_rerunonfailure_2026_10_03.md
+
+    - alert: KubeVirtVMIStuckFinalizer
+      ## The CONDITION itself, from the heal's own detection: a VMI Terminating
+      ## past the heal's 10-min dwell that the heal has NOT cleared. A wedged
+      ## object the routine fix could not un-wedge needs a human — this is that
+      ## signal. (It stays quiet whenever the heal works, which is the point.)
+      expr: |
+        max by (namespace, name) (kubevirt_stuck_vmi_finalizer_detected_age_seconds) > 900
+      for: 10m
+      labels:
+        service: 'kubevirt'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.name }}: VMI stuck Terminating {{ $value | humanizeDuration }} on a wrangler finalizer"
+        description: |
+          A VMI has been Terminating >15m carrying a wrangler.cattle.io/* finalizer.
+          f/heal/kubevirt_stuck_vmi_finalizer clears it every 5m; this firing means
+          the routine fix has not taken and the object needs a look.
+          Check: kubectl --context mdapi-prod-direct -n {{ $labels.namespace }} get vmi {{ $labels.name }} -o jsonpath='{.metadata.deletionTimestamp} {.metadata.finalizers}'
+          Memory: rancher_mgmt_plane_down_mgmt2_vmi_failed_no_rerunonfailure_2026_10_03.md

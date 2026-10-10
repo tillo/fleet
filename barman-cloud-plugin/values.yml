@@ -1,0 +1,41 @@
+# Values for the Barman Cloud CNPG-I plugin (chart plugin-barman-cloud).
+#
+# ⛔ Deliberately thin. This chart supports ONLY the latest point release of the
+# plugin, and it derives both containers' tags from its own appVersion, so the
+# chart version pinned in fleet.yml is the single version knob on purpose.
+# Pinning `image.tag` / `sidecarImage.tag` here would create a SECOND knob that
+# can disagree with the chart — the skew that support statement rules out.
+
+replicaCount: 1
+
+# The plugin logs the barman-cloud invocations it runs (WAL archive, base
+# backup, restore, retention delete). `info` is the chart default, declared
+# rather than inherited so a chart default change is visible as a git diff.
+logLevel: info
+
+# CRDs: created by this chart. The ObjectStore CRD is the whole point — without
+# it every cluster still on the in-tree barmanObjectStore has nowhere to migrate
+# to.
+crds:
+  create: true
+
+# Client + server certificates and their self-signed Issuer, all namespaced in
+# cnpg-system. The operator and the plugin authenticate to each other over mTLS;
+# the operator only connects to a plugin whose Service carries the
+# cnpg.io/pluginClientSecret / pluginServerSecret / pluginPort annotations,
+# which this chart sets.
+certificate:
+  createClientCertificate: true
+  createServerCertificate: true
+  createIssuer: true
+
+# The plugin and its sidecars are invoked per backup / per WAL segment, not per
+# query: small and bursty. Declared explicitly so VPA or a future limit change
+# is a reviewed commit rather than a live edit.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

@@ -1,0 +1,36 @@
+# openwrt-repo: serves the mdapi OpenWrt package feed (signed APKv3 indexes and
+# the .apk files they index) and the built firmware images, to its one consumer,
+# the bpi-r4 edge router.
+#
+# ⛔ No Ingress here, and that is the whole point of the design.
+#
+# The estate's ingress trusts X-Forwarded-For from 10.0.0.0/8 and 192.168.1.0/24
+# (rke2-ingress-nginx-controller: use-forwarded-headers=true with
+# proxy-real-ip-cidr covering both), so `whitelist-source-range` is a filter on a
+# header the peer chooses. Measured 2026-10-04 against litellm's /32 entry
+# (192.168.164.3), from a trusted peer: 403 with no header, 200 with
+# `X-Forwarded-For: 192.168.164.3`, 403 again with an untrusted address. So any
+# LAN host or in-cluster pod can walk through a whitelist that is supposed to
+# admit one address.
+#
+# That matters because the feed carries the `jumpfail` package, which ships
+# files/env-manifest.txt -- a map of every credential store on the estate, by
+# path and filename -- plus an internal runbook inventory and the public WAN
+# range. Audit 2026-10-03. "Only bpi-r4 may read this" therefore has to be a real
+# control, not a header check.
+#
+# So: a MetalLB LoadBalancer (see svc.yml) whose externalTrafficPolicy: Local
+# preserves the true TCP source address, and an allowlist in the pod's own nginx
+# (configmap-nginx.yml) evaluated against that address. Nothing in the path
+# rewrites it and there is no header to forge.
+#
+# The same service serves firmware at a stable unversioned URL, which is the
+# transport the router's own image-download needs.
+defaultNamespace: openwrt-repo
+namespace: openwrt-repo
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  # The ExternalSecret below needs the ClusterSecretStore from this bundle.
+  - name: mdapi-prod-external-secrets

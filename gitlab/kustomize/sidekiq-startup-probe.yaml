@@ -1,0 +1,46 @@
+# sidekiq startupProbe — the one field of this release that lives outside the chart.
+#
+# WHY. A FRESH sidekiq Rails boot can take 4-5 minutes before its :3808 health
+# server binds — measured on the 10.0.0 -> 10.0.1 bump on 2026-06-07, amplified by
+# post-incident cluster load. The chart's livenessProbe (initialDelaySeconds 20,
+# periodSeconds 60, failureThreshold 3) kills the container at ~140-200s, so a
+# cold sidekiq crash-loops and never converges. A startupProbe moves the liveness
+# clock: it gets 60 x 10s = 10 minutes to succeed, and liveness only starts once
+# it does.
+#
+# ⛔ The sidekiq subchart templates ONLY livenessProbe and readinessProbe
+# (charts/gitlab/charts/sidekiq/templates/deployment.yaml) — there is no
+# startupProbe key in any values file, which is why this is a post-render and not
+# a values entry.
+#
+# Until this bundle existed the probe was a hand `kubectl patch` that had to be
+# re-checked after every upgrade (gitlab-howto.txt). It survived revisions 146,
+# 147 and 153 only because Helm's three-way merge reconciles the fields it
+# manages and the chart never sets this one. Now Helm manages it, so it is
+# reviewed like everything else — and forgotten never.
+#
+# ⚠️ Do NOT "verify" this by grepping a render for `startupProbe`: chart 10.3.2+
+# renders one on GITALY's StatefulSet too (a grpc probe on 8075), so a bare grep
+# hits while saying nothing about sidekiq. Check the owning document.
+#
+# Strategic-merge keys on container name, so it patches the `sidekiq` container
+# and leaves liveness/readiness (and their server-set defaults) alone.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab-sidekiq-all-in-1-v2
+  namespace: bootstrap
+spec:
+  template:
+    spec:
+      containers:
+      - name: sidekiq
+        startupProbe:
+          httpGet:
+            path: /liveness
+            port: 3808
+            scheme: HTTP
+          failureThreshold: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1

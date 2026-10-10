@@ -1,0 +1,325 @@
+## Dedicated CNPG Postgres for the LiteLLM proxy's own state (2026-08-26).
+##
+## WHY IT EXISTS: the admin UI at llm.mdapi.ch/ui answered every action with
+## "Authentication Error, Not connected to DB!". That string comes from
+## litellm/proxy/management_endpoints/*.py, guarded by `if prisma_client is
+## None`, and prisma_client is built only when DATABASE_URL is set
+## (proxy_server.py:999-1001). No config flag or CLI switch substitutes for a
+## database -- LiteLLM keeps virtual keys, teams, budgets and SpendLogs in
+## Postgres, so the UI is inert without one.
+##
+## It also unlocks the thing the chat frontend needs: a VIRTUAL KEY. Open WebUI
+## must not hold LITELLM_MASTER_KEY (that key is proxy-admin: it can mint keys
+## and read every other consumer's spend). With a DB we issue it a scoped,
+## revocable sk-... instead.
+##
+## Sizing: keys + spend rows only, tens of MB. Model routing lives in
+## litellm-cm.yml under git, so the CONFIG was already durable; this DB holds the
+## state that is not.
+##
+## ⭐ 2026-10-07 (user decision): barman ADDED. This file used to argue the
+## opposite -- "No barman here, unlike grafana-pg/guac-pg: this DB holds nothing
+## that cannot be reconstructed by re-minting keys. Durability = Longhorn
+## 2-replica + the recurring backup groups the label enforcer applies
+## automatically." The exemption was reasonable as written, but it protected the
+## wrong asset. litellm-cm.yml under git covers routing, and re-minting a key
+## restores ACCESS -- neither reconstructs the accumulated rows: virtual keys,
+## teams, budgets already consumed, and the SpendLogs record of which key was
+## used where. "Tens of MB" is a claim about today, not a property; the table
+## grows with usage. And the durability it did have is volume-level: Longhorn
+## 2-replica plus the label-enforcer backup groups are snapshots of a PVC, not a
+## database backup -- no PITR, and nothing leaves the cluster.
+##
+## ⭐ LANDED IN TWO STEPS, deliberately. Step 1 (this commit) is the store alone:
+## the bucket, the CA/region secrets and the ObjectStore below -- none of which
+## the Cluster references yet, so NO pod is touched and nothing can fail closed.
+## Step 2 wires `spec.plugins` + the ScheduledBackup. The split is not ceremony:
+## it sidesteps the pre-reconcile-hook race (beads infra-n02m) that hit 4 of the
+## 5 plugin migrations, where the operator reconciles the Cluster before the
+## plugin holds the ObjectStore in its cache, the hook returns Requeue:false with
+## stopReconciliation:true, and that Cluster's reconcile STOPS DEAD -- WAL
+## archiving failing closed while `ContinuousArchiving` still reads stale-True.
+## Letting the store reconcile first removes the race instead of documenting it.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: litellm-pg
+  namespace: litellm
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+  ## switchover, NOT the default in-place restart: a restart-requiring change (e.g. a
+  ## shared_preload_libraries edit) otherwise restarts the PRIMARY in place, a full DB
+  ## outage (grafana-pg, 2026-09-24: ~3 min of connection refused). Switchover promotes
+  ## the replica first, so only the switchover gap remains.
+  primaryUpdateMethod: switchover
+
+  ## ⭐ 2026-10-07, step 2 of 2 (user decision: barman for litellm pg too). This
+  ## wires the cluster to the ObjectStore declared further down; until now the
+  ## store existed and NOTHING referenced it, so no pod was touched and nothing
+  ## could fail closed. That was the point of the split -- see the header above.
+  ## The plugin refuses a cross-namespace store, so `barmanObjectName` names the
+  ## ObjectStore in THIS namespace, and the bucket lives inside that store, not
+  ## here.
+  ##
+  ## ⛔ EXPECT A ~3.5 MIN WRITE OUTAGE WHEN THIS LANDS, and `primaryUpdateMethod:
+  ## switchover` -- set right above precisely to avoid in-place primary restarts
+  ## -- does NOT avoid this one. Adding the WAL-archiver sidecar forces the
+  ## operator to recreate the primary rather than switch over:
+  ##     "Primary is missing the WAL-archiver sidecar; recreating it in place
+  ##      instead of switching over"
+  ## (operator log on the gitlab-pg migration, 2026-10-07: primary NotReady
+  ## 08:52:32Z -> 08:56:06Z). All five migrations paid it. It is a one-off cost
+  ## of the migration, not something the plugin keeps doing.
+  ## ⚠️ That makes this the one migration whose WINDOW matters most: litellm is
+  ## on the critical path for every LLM door, so a write outage here is not a
+  ## dashboard going stale, it is every key lookup and every SpendLogs row. The
+  ## five siblings were merged in a chosen window for less than this.
+  ##
+  ## ⭐ `serverName` is stated EXPLICITLY even though its default is the cluster
+  ## name. barman keys the archive as <destinationPath>/<serverName>/, and here
+  ## that path is fixed by the FIRST write -- there is no earlier archive to
+  ## disagree with, so a wrong default would not fail loudly, it would just
+  ## become the wrong archive and only surface at restore time. (It cannot go on
+  ## the ObjectStore: `configuration.serverName` is rejected there by CEL with
+  ## FieldValueForbidden -- the plugin parameter is the only place it is
+  ## accepted.)
+  ##
+  ## ⛔ There is deliberately NO `spec.backup` stanza -- not a trimmed one, none at
+  ## all. Under the plugin the store config lives on the ObjectStore and the
+  ## schedule on the ScheduledBackup below; an in-tree `spec.backup` would be a
+  ## second, competing declaration of the same thing.
+  ## ⭐ `enabled: true` is DECLARED, not left to the operator. The CRD defaults it
+  ## into the entry, so omitting it does not mean "off" -- it means git and the API
+  ## server disagree forever. That is not hypothetical, and it is MEASURED rather
+  ## than assumed (2026-10-07): git omits it on all SEVEN migrated clusters, while
+  ## live carries `enabled: true` on every one of them -- seven real drifts.
+  ## ⚠️ Fleet surfaced only ONE of those, `mdapi-prod-jump` (guac-pg) -- the bundle
+  ## that led here. The other six are drift you cannot see by reading
+  ## modifiedStatus, which is the worse half: a visible drift gets fixed, an
+  ## invisible one accumulates. The same class as the `inherit: true` line below,
+  ## which is written out there for this exact reason. Bead infra-ppqv carries the
+  ## fix for the seven. There is no reason to add an eighth.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      enabled: true
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: litellm-pg
+        serverName: litellm-pg
+
+  ## Same lesson as ha-recorder-pg (2026-06-15) and grafana-pg: soft
+  ## anti-affinity lets both instances co-locate. `required` is always
+  ## satisfiable at 2 instances on 3 nodes and is what actually survives a
+  ## node loss -- and litellm is on the critical path for every LLM door.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    ## O2 Database Monitoring (2026-09-24): server-side top queries read pg_stat_statements,
+    ## which must be PRELOADED. Changing this list restarts Postgres; with
+    ## primaryUpdateMethod: switchover the replica is promoted first.
+    shared_preload_libraries:
+      - pg_stat_statements
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    ## Lossless failover, preferred keeps availability when the standby is down
+    ## (same shape as grafana-pg / ha-recorder-pg).
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## Read-only monitoring login for the O2 DBM collector (openobserve/o2-dbm-collector.yml).
+  ## pg_monitor = read pg_stat_* / pg_stat_statements; it cannot read table data.
+  ## Password: Akeyless /mdapi/litellm/litellm-pg-o2dbm/password.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        # CNPG defaults inherit to true; declared so git matches the live
+        # object (mdapi-prod-jump sat Modified on this one field 09-25..28).
+        inherit: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: litellm-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: litellm
+      owner: litellm
+      ## No `secret:` -- CNPG generates the litellm-pg-app secret itself, which
+      ## carries a ready-made `uri` key. litellm-deploy.yml consumes that
+      ## directly as DATABASE_URL. This is the jump/guacamole.yml pattern: the
+      ## password is only ever needed in-cluster, so routing it through Akeyless
+      ## would add a rotation coupling for nothing.
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # Quoted: CNPG stores the quantity as a string; an unquoted int renders
+      # as a perpetual Fleet "Modified" diff (1 vs "1").
+      cpu: "1"
+      memory: 1Gi
+---
+## Password for the o2_dbm login (O2 Database Monitoring). CNPG requires a basic-auth
+## secret whose username matches the role name.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: litellm-pg-o2dbm
+  namespace: litellm
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: litellm-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/litellm/litellm-pg-o2dbm/password
+      secretKey: password
+---
+## Declares pg_stat_statements in `litellm` (the O2 DBM receiver reads the view there).
+## Adopting the existing database is safe: owner litellm is the CURRENT owner (checked in
+## pg_database), and databaseReclaimPolicy defaults to retain, so deleting this object
+## never drops the database.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: litellm-pg-litellm
+  namespace: litellm
+spec:
+  name: litellm
+  owner: litellm
+  cluster:
+    name: litellm-pg
+  extensions:
+    - name: pg_stat_statements
+      ensure: present
+---
+## The barman store for litellm-pg, as a barmancloud.cnpg.io ObjectStore
+## (2026-10-07). Modeled on monitoring-grafana/grafana-pg.yml, which is what this
+## file's own exemption note pointed at.
+##
+## ⭐ Unlike the five migrations, nothing moved here -- there is no former
+## `spec.backup.barmanObjectStore` block to translate, so the usual "moved
+## verbatim" check does not apply and neither does the empty-archive trap: the
+## bucket below did not exist before this commit, so it is empty BY CONSTRUCTION
+## and the first write into it is the first backup.
+##
+## ⛔ These two fields have no in-tree counterpart here, and both are OBLIGATORY
+## rather than optional -- each fails differently:
+##   * `serverName` is NOT set on this object. The CRD forbids it (CEL,
+##     FieldValueForbidden: "use the 'serverName' plugin parameter in the Cluster
+##     resource"); it belongs on the Cluster. Step 2 states it EXPLICITLY rather
+##     than leaning on the cluster-name default, because barman keys the archive
+##     as <destinationPath>/<serverName>/ and the two must agree from the first
+##     write -- there is no earlier archive to notice a mismatch against.
+##   * `retentionPolicy` FAILS SILENTLY if forgotten -- nothing complains and
+##     nothing prunes, so the bucket grows without bound. It lives on the STORE
+##     under the plugin, not on the cluster.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: litellm-pg
+  namespace: litellm
+spec:
+  configuration:
+    ## Own bucket, claimed by the ObjectBucketClaim in litellm/cnpg-rgw-backup.yml.
+    destinationPath: s3://cnpg-litellm-pg
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    ## The house CA chain (MDAPI Root + MDAPI Issuing CA 01), checked into this
+    ## namespace as rgw-transit-ca.yml. TLS is not optional here: the RGW pods sit
+    ## on other physical nodes and barman does not encrypt, so an http endpoint
+    ## would put the WAL on an unencrypted VXLAN overlay.
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-litellm-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-litellm-pg
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    ## Compressed, because CNPG's defaults are neither: with no `data:`/`wal:`
+    ## block there is ONE upload worker and NO compression anywhere. grafana-pg
+    ## ran that way to a 70.6 GiB bucket for a Grafana database. jobs: 1 (not 2)
+    ## because this cluster's CPU limit is 1 core and its DB is far smaller than
+    ## grafana-pg's.
+    data:
+      compression: gzip
+      jobs: 1
+    wal:
+      compression: gzip
+  ## ⚠️ Read by the plugin's backup path, so it prunes on the next backup rather
+  ## than retroactively. 14d matches grafana-pg / openfga-pg / guac-pg.
+  retentionPolicy: "14d"
+---
+## The schedule for litellm-pg's barman archive (2026-10-07, step 2 of 2).
+##
+## ⭐ 02:20 is a FREE slot, checked against the other seven rather than picked for
+## looking tidy: they sit at 02:15 (bussola), 02:30 (grafana), 02:40 (guac and
+## openfga, which already share), 02:50 (paperless) and 03:00 (gitlab,
+## ha-recorder). Eight barman jobs contending for one RGW window would serialise
+## into the morning and make a slow night look like a broken backup.
+##
+## ⛔ `immediate: true` is NOT set, and that is a deliberate correction of the
+## obvious move. It reads like the right way to prove a brand-new archive works,
+## and it is not: a ScheduledBackup with `immediate: true` RE-FIRES ON EVERY
+## APPLY, so every Fleet reconcile would take a fresh backup of the litellm DB
+## (bootstrap/cnpg-cluster.yml carries the same warning, learned the same way).
+## The one-shot that proves this archive is taken BY HAND, once, outside Fleet --
+## see the step-2 MR body for the exact command.
+##
+## ⛔ `method` + `pluginConfiguration` are REQUIRED now, and their absence fails
+## in the most misleading way available: a ScheduledBackup with no `method` takes
+## IN-TREE backups, and this cluster has no in-tree store any more -- so every
+## night it would fail, and the failure would read as a backups problem rather
+## than as a half-finished migration. Same two fields the seven siblings carry
+## (beads infra-h6mu / infra-zkak).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: litellm-pg-daily
+  namespace: litellm
+spec:
+  schedule: "0 20 2 * * *"
+  backupOwnerReference: self
+  immediate: false
+  cluster:
+    name: litellm-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
