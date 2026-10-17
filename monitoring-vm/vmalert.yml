@@ -1,0 +1,113 @@
+## vmalert evaluates VMRules (auto-converted from PrometheusRule CRs by the
+## operator's prometheus_converter). Reads from vmsingle, alerts to the
+## dedicated VMAlertmanager (`mdapi`).
+##
+## Phase 3/4 finished long ago — and the "bundled Rancher Prometheus still
+## delivers" half of that migration note is now FALSE (verified 2026-10-04:
+## `kubectl get prometheus -A` returns nothing, and cattle-monitoring-system
+## holds only the operator plus kube-state-metrics and node-exporter). This
+## vmalert is the only rule evaluator on the cluster and the VMAlertmanager
+## below is the only delivery path. Do not assume any other component
+## evaluates rules.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlert
+metadata:
+  name: mdapi
+  namespace: monitoring
+spec:
+  ## ── image ─────────────────────────────────────────────────────────────────
+  ## Pull via the in-cluster Zot cache; see vmsingle.yml for the pattern.
+  ##
+  ## ⚠️ The tag is PINNED ON PURPOSE (2026-10-05). Do not drop it and let the
+  ## operator default apply: v1.153.0 is the first release containing the fix
+  ## for "a vmalert restart re-bases an alert's `for:` timer", reproduced
+  ## 2026-10-04 on alert:RgwOffsiteBackupFailing (beads infra-acd0).
+  ##
+  ## What went wrong through v1.152.0: Group.Start ran the first evaluation
+  ## FIRST and restored alert state only afterwards (Group.restore →
+  ## AlertingRule.restore). That first eval had already remote-written
+  ## ALERTS{alertstate="pending"} and a re-based ALERTS_FOR_STATE (activeAt =
+  ## restart time) into vmsingle — the very series the restore then reads back.
+  ## With replicaCount 2 across a rolling update, the re-based value overwrote
+  ## the good one and every later replica restored the reset timer: a
+  ## still-firing alert sat PENDING for its whole `for:` window while the firing
+  ## series went stale, so Alertmanager read a genuine recovery. It only shows
+  ## when `for:` outlives the gap between restarts — which is why a 30h alert
+  ## hid it for two days.
+  ##
+  ## v1.153.0 (VictoriaMetrics/VictoriaMetrics#11401, commit 1d34e15f010d)
+  ## deletes Group.restore and threads a remote-read querier into the FIRST
+  ## exec only: restore now runs inside exec() before any time series are built,
+  ## queried at `ts` over the full -remoteRead.lookback. A restored alert goes
+  ## straight to FIRING, so nothing is re-based and no transient pending sample
+  ## is published.
+  ##
+  ## This is the only pinned tag in monitoring-vm/ — the others deliberately
+  ## follow the operator default. Drop this pin again once the operator's
+  ## default vmalert is >= v1.153.0 (operator v0.75.0, the current latest,
+  ## still defaults to v1.152.0).
+  image:
+    repository: zot.mdapi.ch/victoriametrics/vmalert
+    tag: v1.153.0
+  imagePullSecrets:
+    - name: zot-pull
+  evaluationInterval: 30s
+  datasource:
+    url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+  remoteRead:
+    url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+  remoteWrite:
+    url: http://vmsingle-mdapi.monitoring.svc.cluster.local:8429
+  notifier:
+    url: http://vmalertmanager-mdapi.monitoring.svc.cluster.local:9093
+  ## Phase 4: only evaluate VMRules carrying `monitoring-stack: mdapi`.
+  ## Vendor / chart-bundled rules (Watchdog, InfoInhibitor, KubeNode*,
+  ## Longhorn vendor rules, …) are intentionally left to the bundled
+  ## Rancher Prometheus so the chart stays pristine.
+  selectAllByDefault: false
+  ruleSelector:
+    matchLabels:
+      monitoring-stack: mdapi
+  ruleNamespaceSelector: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+  ## ── HA / placement ─────────────────────────────────────────────────────────
+  ## Changed 2026-10-04 (ledger item ext:control-plane-restart-unalerted).
+  ##
+  ## This Deployment is the ONLY rule evaluator on the cluster: there are no
+  ## Prometheus CRs left, and cattle-monitoring-system runs just the operator's
+  ## kube-state-metrics and node-exporter. Every alert in monitoring-rules/
+  ## lives or dies with these pods.
+  ##
+  ## It was replicaCount 1 with NO affinity, and scheduled onto qua — a
+  ## control-plane node. On 2026-10-03 qua's apiserver went down
+  ## (05:59:00-06:00:30Z) and the alerter was restarted by the very event it
+  ## exists to report: last self-sample 05:58:30Z, replacement pod up
+  ## 06:15:25Z. For ~17 minutes nothing evaluated any rule — and the rule that
+  ## watches vmalert itself is self-masked, not merely slow:
+  ## MonitoringComponentDown lists vmalert-mdapi, but it needs 5m of
+  ## unavailable replicas and the surviving state is evaluated by vmalert, so by
+  ## the time the deployment is available again the instantaneous expression is
+  ## false. ALERTS{deployment="vmalert-mdapi"} has never had a single sample.
+  ##
+  ## 2 replicas, anti-affined by hostname, so no single-node event can remove
+  ## the evaluator. Duplicate alerts are deduplicated by Alertmanager (identical
+  ## label sets => one notification); the duplicated ALERTS / self-metrics
+  ## remote-written to vmsingle are identical values under the same series.
+  ## Three nodes exist and all are control-plane, so "pin off the control-plane"
+  ## is not available — anti-affinity is what provides the separation.
+  ## ⚠️ This does NOT cover both replicas dying together (total stack loss);
+  ## that stays the deadman WatchdogMdapi via healthchecks.io.
+  replicaCount: 2
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: vmalert
+              app.kubernetes.io/instance: mdapi

@@ -1,0 +1,85 @@
+## DeepSeek account credit — the balance that pays for the estate's cheap automation.
+##
+## WHY THIS EXISTS (2026-09-30). At 04:32 UTC the DeepSeek account hit
+## "Insufficient Balance": infra-health and backlog-sync both errored that run and
+## nothing said so. It surfaced only because a spend audit happened to read the
+## automation ledger the same morning. The estate had just moved its cheap
+## automation onto DeepSeek Flash to cut cost, which turned a cost optimisation
+## into an availability dependency with no alarm on it. litellm records spend per
+## call but knows nothing about the account's remaining credit — this probe is the
+## only thing that sees the cliff coming.
+##
+## Published every 4h by f/probe/deepseek_balance_health. Staleness of the probe
+## itself needs no arm here: the generic BatchJobStale in 12-batch-jobs.yml covers
+## any job pushing <job>_last_run_timestamp_seconds, and its cadence join was
+## verified to resolve for this job.
+##
+## component: Automation is an INTERNAL component, so the adapter never publishes
+## these to mdapi.statuspage.io (statuspage: exclude repeats that explicitly). An
+## internal automation credit is not visitor-observable, and a spend figure is not
+## something to show strangers.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-llm-spend
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-llm-spend.rules
+    rules:
+    - alert: DeepSeekBalanceLow
+      ## $10 floor. BURN is what sets it: after the move to Flash the estate spends
+      ## ~$1-3 a weekday, so $10 is a few days of cover — enough to top up without
+      ## urgency. During the 26-30 Sep DeepSeek-Pro design spree it ran $21-29 a
+      ## WEEKDAY, where $10 is half a day; raise the floor if heavy ds-pro work
+      ## resumes. Per-workload breakdown: ~/ds-pro-spend-analysis-2026-09-30.md
+      expr: deepseek_balance_usd < 10
+      ## 15m rides out one bad reading; the probe re-measures every 4h.
+      for: 15m
+      labels:
+        service: 'deepseek'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}litellm{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "DeepSeek balance is {{ $value }} {{ $labels.currency }} — automation stops when it reaches 0"
+        description: |
+          The account behind the litellm gateway's cheap models is nearly spent. At
+          zero, every automation run on a DeepSeek model fails — as happened on
+          2026-09-30, unnoticed for hours.
+          Top up at platform.deepseek.com, then confirm the new figure:
+            f/probe/deepseek_balance_health   (or read its last job log)
+          Note the balance covers BOTH the Pro and Flash models; it is one account.
+
+    - alert: DeepSeekBalanceProbeFailing
+      ## The probe could not read the balance: Akeyless unreachable, the key revoked
+      ## or rotated without updating /mdapi/deepseek/api-key, or DeepSeek's API down.
+      ## The balance is UNMEASURED, not necessarily empty — but while this fires,
+      ## DeepSeekBalanceLow is blind, which is the state that made the 09-30 outage
+      ## invisible in the first place.
+      ## On failure the probe PUTs probe_success=0 alone, so every other series of
+      ## this job is absent on purpose: a stale "balance is fine" can never outlive
+      ## the reading that produced it. So absence of deepseek_balance_usd is
+      ## EXPECTED here and is not a second signal.
+      expr: deepseek_balance_probe_success == 0
+      for: 1h
+      labels:
+        service: 'deepseek'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}litellm{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "deepseek_balance_health cannot read the DeepSeek balance"
+        description: |
+          The last job log's FAIL line carries the exception class. Usual causes:
+          the DeepSeek key was rotated without updating Akeyless
+          (/mdapi/deepseek/api-key), cm.mdapi.ch is unreachable, or the DeepSeek API
+          is down. A 200 carrying no balance_infos is treated as a failure too —
+          an unreadable answer is not a zero balance.

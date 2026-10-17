@@ -1,0 +1,221 @@
+## etcd quorum / member-health alerts.
+##
+## Backed by RKE2 etcd's own metrics (etcd_server_has_leader, one series per
+## member), surfaced via the etcd-metrics-proxy DaemonSet (fleet/etcd-metrics/).
+##
+## Closes the detection gap from the 2026-06-10 outage: a member was removed
+## mid-maintenance, leaving a fragile 2-member etcd that then hit a ReadIndex
+## deadlock under load -> API down. Nothing alerted on "running on 2 members"
+## because all 3 nodes were still Ready (so node-readiness alerts miss it) and
+## etcd's own metrics weren't scraped. EtcdMemberMissing now fires on exactly
+## that state.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-etcd-quorum
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cluster-etcd-quorum.rules
+    rules:
+    - alert: EtcdMemberMissing
+      ## One etcd_server_has_leader series per reporting member. 3 expected.
+      ## If a member is down or was removed from the cluster, its series goes
+      ## absent and the count drops -> we are on a fragile 2-member quorum.
+      ## 10m `for` rides out a brief proxy/scrape blip or a planned member
+      ## reshuffle; never sit on 2 members (go to 1 via cluster-reset or back to 3).
+      expr: count(etcd_server_has_leader) < 3
+      for: 10m
+      labels:
+        service: 'etcd'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}kube-system{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "etcd reporting {{ $value }} members (expected 3)"
+        description: |
+          Fewer than 3 etcd members are reporting. A member is down or was removed
+          -- etcd is on a fragile 2-member quorum (the exact 2026-06-10 failure mode:
+          a 2-member etcd ReadIndex-deadlocked under recovery I/O and took the API down).
+          Restore to 3 members BEFORE any node reboot. If a 2-member state is
+          unavoidable, drop to a single-member `rke2 server --cluster-reset` rather than
+          sitting on 2. (If all 3 nodes are Ready, also check the etcd-metrics-proxy
+          DaemonSet pod on the silent node -- a dead proxy looks like a missing member.)
+
+    - alert: EtcdQuorumLost
+      ## etcd_server_has_leader == 1 when a member can see a leader. If fewer
+      ## than 2 of 3 members see a leader, quorum is gone.
+      expr: sum(etcd_server_has_leader) < 2
+      for: 2m
+      labels:
+        service: 'etcd'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}kube-system{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "etcd quorum at risk -- only {{ $value }} member(s) see a leader"
+        description: |
+          Fewer than 2 etcd members report a leader -- quorum is lost or about to be.
+          The Kubernetes API will be unstable/unavailable. Recover with a single-member
+          `rke2 server --cluster-reset` on the healthiest node, then sequentially rejoin
+          the others (see qui_etcd_member_removed_rejoin_pending).
+
+    - alert: EtcdNoLeader
+      expr: max(etcd_server_has_leader) == 0
+      for: 1m
+      labels:
+        service: 'etcd'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}kube-system{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "etcd has no leader"
+        description: |
+          No etcd member reports a leader -- quorum is lost and the Kubernetes API
+          is down. Immediate recovery required (single-member cluster-reset + rejoin).
+
+    - alert: ControlPlaneApiserverDown
+      ## Names the event itself, which nothing else did: on 2026-08-28 quo's
+      ## rke2-server/containerd restarted (apiserver down ~5 min, 53 containers
+      ## killed, 6 CNPG primaries cycled) and the alert layer described it only
+      ## as unrelated 1-3 min downstream blips. One node's apiserver/:6443
+      ## target down while the other two stay up IS the control-plane restart.
+      ## (etcd_server_leader_changes_seen_total was the alternative signal, but
+      ## it is not scraped here — only etcd_server_has_leader is.)
+      ##
+      ## `for: 1m`, down from 2m (2026-10-01). 2m MISSED the real thing: on
+      ## 2026-09-30 18:57:00-18:58:15Z qua's apiserver was down only ~75s, so
+      ## the rule never fired — and that sub-2-minute outage still cascaded into
+      ## a cluster-wide lease stall that restarted the control-plane components
+      ## and ~29 workloads. NOT 30s: job="apiserver" is scraped every 30s
+      ## (measured), so 30s would be a single scrape and one missed scrape would
+      ## page. 1m = two consecutive failed scrapes, which catches a 75s outage
+      ## while still riding out a one-scrape blip.
+      ##
+      ## ⛔ `for: 1m` DID NOT HOLD — replaced 2026-10-04. Replayed against
+      ## vmsingle for the two real single-node outages since:
+      ##   10-03 05:59:00-06:00:30Z qua .193  — expr true for 4 consecutive scrapes
+      ##   10-04 01:34:30-01:35:30Z quo .192  — expr true for 3 consecutive scrapes
+      ## and `ALERTS{alertname="ControlPlaneApiserverDown"}` over 7d has
+      ## alertstate value ["pending"] ONLY — it has never once fired. Two
+      ## independent causes, both addressed here:
+      ##
+      ##  1. `for` is counted on vmalert's EVALUATION grid, which is not aligned
+      ##     to the 30s SCRAPE grid. A ~90s outage yields 3 true scrapes but only
+      ##     one or two aligned evaluations, so the pending state never ages to
+      ##     1m before `up` returns to 1. The "two consecutive failed scrapes"
+      ##     condition was therefore moved OUT of `for` and INTO the expression,
+      ##     where it is measured on the scrape grid, with `for: "0"` (quoted --
+      ##     see the note on the value below). Same
+      ##     protection (a single missed scrape still cannot page), no dependence
+      ##     on evaluation alignment. Fires ~60-75s into an outage.
+      ##  2. On 10-03 the outage ALSO restarted vmalert itself — it was a single
+      ##     replica with no affinity, scheduled on qua, a control-plane node —
+      ##     so nothing evaluated this (or any) rule for ~17 minutes. Fixed in
+      ##     fleet/monitoring-vm/vmalert.yml (2 replicas + podAntiAffinity).
+      ##     Both halves are required: a correct expression is still silent if the
+      ##     only evaluator is down. See ledger item
+      ##     ext:control-plane-restart-unalerted.
+      expr: |
+        up{job="apiserver"} == 0
+          and (up{job="apiserver"} offset 30s == 0)
+          and on () (count(up{job="apiserver"} == 1) == 2)
+      ## ⚠️ QUOTED deliberately: the CRD declares `for` as a STRING, so a bare
+      ## YAML `for: 0` is an integer and the API server rejects the rule
+      ## ("Invalid value: \"integer\""). Verified by server-side dry-run
+      ## 2026-10-04: 0 -> rejected, "0" -> accepted. model.ParseDuration also
+      ## accepts the bare string "0".
+      for: "0"
+      labels:
+        service: 'apiserver'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "apiserver on {{ $labels.instance }} is down while the other two are up"
+        description: |
+          A single control-plane node's apiserver target is down ({{ $labels.instance }})
+          while the other two serve — how a full control-plane node restart first
+          presents. Check the node; a reboot is the usual cause, and the downstream
+          restart/leader-election blips follow from it.
+
+    - alert: ApiserverMajorityUnavailable
+      ## The COMPLEMENT of ControlPlaneApiserverDown above, and the hole it leaves.
+      ## That rule requires `count(up{job="apiserver"} == 1) == 2` — it fires when
+      ## exactly ONE apiserver is down. So it is structurally incapable of firing
+      ## when the API is MOSTLY OR WHOLLY gone, which is the shape of every
+      ## cluster-wide event this estate has had. The inert packaged rule KubeAPIDown
+      ## would have covered it; nothing loaded here did (measured 2026-10-05 against
+      ## all 531 loaded rules).
+      ##
+      ## ⭐ The expression deliberately does NOT distinguish the two ways to lose
+      ## the API, because the alert layer cannot tell them apart and pretending
+      ## otherwise is how a blind spot stays blind:
+      ##   (1) the API is genuinely down / lost quorum — `count(... == 1)` drops;
+      ##   (2) nothing is being COLLECTED at all — total scraper or TSDB blackout,
+      ##       where every `up` series disappears. `or on() vector(0)` turns that
+      ##       absence into a firing signal instead of the healthy-looking silence
+      ##       it produces everywhere else.
+      ## (2) is not hypothetical. Replayed over 2026-09-05..10-05:
+      ##   09-14 00:30-00:36Z and 11:13-11:25Z  — vmalert ALIVE and writing ALERTS
+      ##                                            while count(up) was EMPTY
+      ##   10-03 06:01-07:32Z                   — the whole cluster-down window
+      ##   plus the June run. On 09-14 11:18-11:25 the healthchecks.io deadman
+      ##   stayed SILENT through it: it tests Alertmanager and vmalert liveness and
+      ##   the external path, never whether anything is being collected, and
+      ##   vmagent-mdapi is a SINGLE replica (on quo). This rule is what closes that.
+      ##
+      ## `< 2` means majority loss, not total loss: 2 of 3 up (1 down) stays
+      ## ControlPlaneApiserverDown's job, so the two never double-fire.
+      ## `for: 2m` filters the 3 single-scrape blips in the same window. NOT the
+      ## two-sample trick used above: this expression has no per-instance series to
+      ## carry an `offset`, and its two failure modes are both minutes-long.
+      ## ⛔ Scrape-HEALTH gates (`count(up) >= N`) were tried and rejected: they
+      ## suppress every real event too, because a real cluster-wide outage IS a
+      ## partial blackout. The double signal is not a false positive — it is the
+      ## same event seen from both ends, and the description says so.
+      ##
+      ## critical: this is the API. It pages even though it cannot reach the public
+      ## page (see statuspage below).
+      expr: |
+        (count(up{job="apiserver"} == 1) or on() vector(0)) < 2
+      for: 2m
+      labels:
+        service: 'apiserver'
+        severity: critical
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect: the visitor-facing
+        ## question during an API outage is answered by the application rules that
+        ## fire from the workloads themselves, and the external deadman. A metrics
+        ## blackout must never degrade the PUBLIC Platform component on its own.
+        statuspage: exclude
+      annotations:
+        summary: "apiserver: fewer than 2 instances reachable (or metrics collection is blind)"
+        description: |
+          Fewer than two of the three apiserver scrape targets report up. Two
+          readings, and the alert cannot tell you which — check both:
+
+          (a) THE API IS DOWN or has lost quorum:
+                kubectl --context=mdapi-prod-direct get --raw /readyz
+                kubectl --context=mdapi-prod-direct get --raw /livez
+              If kubectl is answering, the API is up and you are in case (b).
+              Then check etcd: EtcdQuorumLost / EtcdNoLeader should be firing too.
+
+          (b) METRICS COLLECTION IS BLIND — no series at all, for everything:
+                kubectl --context=mdapi-prod -n monitoring get pods -o wide | grep -E 'vmagent|vmsingle'
+                kubectl --context=mdapi-prod -n monitoring logs deploy/vmagent-mdapi --tail=50
+              vmagent-mdapi is a SINGLE replica and is the only writer into
+              vmsingle-mdapi. If it is gone, every rule in the estate is reading a
+              frozen database and nothing else will tell you.
+
+          Either way this is the top of the escalation tree: the external deadman
+          (healthchecks.io) covers the case where vmalert itself is dead, and it
+          goes quiet when vmalert survives and the DATA is what died.

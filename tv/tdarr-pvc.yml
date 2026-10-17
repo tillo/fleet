@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tdarr-server
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tdarr-configs
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tdarr-temp-ceph
+  labels:
+    app.mdapi.ch/phase2: migrated
+spec:
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+# Scratch volume for the quarto transcode node (tv/tdarr-node-quarto-deploy.yml).
+# ceph-FILESYSTEM/RWX, not ceph-block/RWO like tdarr-temp-ceph above: a Tdarr
+# "mapped" node is documented to keep its source AND cache at the same location
+# as the server, so the cache has to be a volume more than one pod can mount.
+# RWO would pin it to whichever node attached it first and the new node could
+# never start. CephFS is slower scratch than RBD, which is fine here —
+# transcoding is CPU-bound, not cache-I/O-bound.
+# ⚠️ Separate from tdarr-temp-ceph, so this is its own cache. If Tdarr turns out
+# to require ONE shared cache, the follow-up is to point the server's /temp at
+# this same claim (one-line change in tdarr-deploy.yml) — not to grow this one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tdarr-temp-quarto
+spec:
+  storageClassName: ceph-filesystem
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi

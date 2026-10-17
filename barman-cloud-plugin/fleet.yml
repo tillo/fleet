@@ -1,0 +1,37 @@
+defaultNamespace: cnpg-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+# ⛔ This bundle MUST land in cnpg-system — that is not a preference.
+# The CloudNativePG operator only discovers CNPG-I plugins by watching Services
+# in ITS OWN namespace (operator_controller: `OperatorNamespace`, set from the
+# operator's install namespace). A plugin Service anywhere else is invisible and
+# the cluster's `spec.plugins` entry is then rejected as an unknown plugin.
+#
+# ⛔ `defaultNamespace` only — never `namespace:`. A bundle pinned with
+# `namespace:` FORCES every resource into it and silently DROPS cluster-scoped
+# ones; this chart creates an ObjectStore CRD, ClusterRoles and a
+# ClusterRoleBinding, so `namespace:` would deploy a plugin with no CRD and no
+# RBAC while Fleet still reported the bundle Ready (tests/test_namespaced_bundle_no_cluster_scoped.py).
+#
+# cert-manager first: the chart mints the plugin's TLS pair and FAILS the install
+# if the issuer cannot sign. cnpg first: the plugin needs the operator's CRDs
+# (Cluster/Backup) to exist for its RBAC and watches.
+dependsOn:
+  - name: mdapi-prod-cloudnative-pg
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+  releaseName: barman-cloud-plugin
+  repo: https://cloudnative-pg.github.io/charts
+  chart: plugin-barman-cloud
+  # Lane B: pinned, and Renovate-OWNED but deliberately NOT automerged — see the
+  # `plugin-barman-cloud` rule in renovate.json. A bump here moves
+  # `sidecarImage.tag` (the chart's appVersion), and the plugin injects that
+  # sidecar into EVERY instance pod of EVERY cluster that uses it: the bump is a
+  # rolling restart of every migrated CNPG cluster, switchover included.
+  # This is the replacement for the in-tree `spec.backup.barmanObjectStore`,
+  # which CloudNativePG removes in 1.31 (beads infra-zkak).
+  version: 0.8.1
+  valuesFiles:
+    - values.yml

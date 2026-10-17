@@ -1,0 +1,26 @@
+## RGW S3 identity for the `config-backups` bucket, moving off the salt/pepper
+## Garage. Rook writes the keys to secret
+## rook-ceph-object-user-ceph-objectstore-config-backup; they are mirrored to
+## Akeyless /mdapi/config-backup/rgw/{access-key,secret-key} and then into the
+## Windmill variables g/all/CONFIG_BACKUP_S3_* that every producer already reads.
+##
+## ⭐ ONE identity for the whole bucket on purpose. Nine Windmill jobs write here
+## -- network-gear and NAS configs, Technitium zones, chassis BMC logs, the
+## Joplin pg_dump, OpenObserve metadata, Scrypted's volume, and the two OpenBao
+## archives -- and they all resolve the SAME four variables
+## (CONFIG_BACKUP_S3_ENDPOINT / _ACCESS_KEY / _SECRET_KEY / _REGION), plus
+## _ENDPOINT_DIRECT for the two OpenBao jobs. That is why the move needs no code
+## change in any of them: repoint the variables and every producer follows.
+##
+## ⚠️ Contents are sensitive even though they are configuration: OpenBao raft
+## snapshots and the age-encrypted secrets archive land here. The OpenBao
+## material is encrypted before upload; the device configs are not, which is why
+## this client must use the RGW TLS listener (:443) and not :80.
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: config-backup
+  namespace: rook-ceph
+spec:
+  store: ceph-objectstore
+  displayName: Estate configuration backups

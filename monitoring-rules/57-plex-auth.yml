@@ -1,0 +1,74 @@
+## plex-oidc-bridge, the Plex sign-in used ONLY to prove identity on
+## start.mdapi.ch/request (ns `plex-auth`, 2026-09-24).
+##
+## Selectors are NAMESPACE-WIDE (see 50-findmy.yml): a name-pinned selector is how
+## the second workload in a namespace is born uncovered.
+##
+## Why warning, not critical: nothing signs IN through the bridge. While it is down
+## the "Continue with Plex" button fails and the plain request form (ALTCHA) still
+## works, so no one is locked out of anything; a Plex-verified request just has to
+## wait.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-plex-auth
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-plex-auth.workload
+    rules:
+    - alert: PlexAuthDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="plex-auth", deployment=~".+"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="plex-auth", deployment=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "plex-oidc-bridge" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}plex-auth{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "plex-auth/{{ $labels.deployment }} has unavailable replicas"
+        description: |
+          The Plex OIDC bridge (plex-auth.mdapi.ch) proves Plex identity for the
+          "Continue with Plex" button on start.mdapi.ch/request. While it is down
+          that button fails; the ordinary request form still works. Check
+          `kubectl -n plex-auth get pods` and the pod log: a failing owner token
+          shows as "initial friend list fetch failed".
+
+    ## ⚠️ Keep this arm even though it matches nothing today: the coverage probe
+    ## treats a namespace-only selector as covering both kinds.
+    - alert: PlexAuthStatefulSetUnavailable
+      expr: |
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace="plex-auth", statefulset=~".+"
+            }
+            - kube_statefulset_status_replicas_available{
+              namespace="plex-auth", statefulset=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "plex-oidc-bridge" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}plex-auth{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "plex-auth/{{ $labels.statefulset }} has unavailable replicas"
+        description: |
+          A StatefulSet in the plex-auth namespace has no available replica.

@@ -1,0 +1,292 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: gitlab-pg
+  namespace: bootstrap
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  primaryUpdateStrategy: unsupervised
+  ## switchover, NOT the default in-place restart: a restart-requiring change (e.g. a
+  ## shared_preload_libraries edit) otherwise restarts the PRIMARY in place, a full DB
+  ## outage (grafana-pg, 2026-09-24: ~3 min of connection refused). Switchover promotes
+  ## the replica first, so only the switchover gap remains.
+  primaryUpdateMethod: switchover
+
+  ## ⭐ 2026-09-19: without this the CNPG collector is never scraped, so
+  ## cnpg_collector_last_available_backup_timestamp does not exist for this
+  ## cluster and NO backup-freshness alert can fire on it — on GitLab's own
+  ## database. Three of the seven CNPG clusters were blind this way.
+  ## See monitoring-rules/52-cnpg-backups.yml.
+  monitoring:
+    enablePodMonitor: true
+
+  ## Keep primary + replica on different nodes. CNPG defaults to *soft*
+  ## (preferred) anti-affinity, which can let both copies co-locate on one
+  ## node during a rolling restart -- then a node loss takes out both and the
+  ## replica buys zero protection (the trap ha-recorder-pg hit 2026-06-15).
+  ## required is always satisfiable here (2 instances, 3 nodes).
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "400"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+    # GitLab's required extensions, plus pg_stat_statements which our
+    # bundled bitnami install already has loaded.
+    shared_preload_libraries:
+    - pg_stat_statements
+
+    ## Synchronous replication so a CNPG failover is lossless (RPO 0): the
+    ## primary waits for the standby to confirm each commit. Default async
+    ## drops the last unreplicated writes on promotion. dataDurability:
+    ## preferred falls back to async if the standby is down so GitLab writes
+    ## never stall on a missing replica. (Mirrors ha-recorder-pg; CNPG >=1.25.)
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## Read-only monitoring login for the O2 DBM collector (openobserve/o2-dbm-collector.yml).
+  ## pg_monitor = read pg_stat_* / pg_stat_statements; it cannot read table data.
+  ## Password: Akeyless /mdapi/bootstrap/gitlab-pg-o2dbm/password.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        # CNPG defaults inherit to true; declared so git matches the live
+        # object (mdapi-prod-jump sat Modified on this one field 09-25..28).
+        inherit: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: gitlab-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: gitlabhq_production
+      owner: gitlab
+      # CNPG auto-creates a Secret `gitlab-pg-app` with the generated
+      # password. We read it post-deploy and stage it in akeyless / GitLab
+      # values for the cutover.
+      postInitTemplateSQL:
+      - CREATE EXTENSION IF NOT EXISTS pg_trgm
+      - CREATE EXTENSION IF NOT EXISTS btree_gist
+      - CREATE EXTENSION IF NOT EXISTS amcheck
+      - CREATE EXTENSION IF NOT EXISTS pg_stat_statements
+
+  ## ⭐ 2026-10-07 (beads infra-zkak): WAL archiving + base backups now go through
+  ## the Barman Cloud Plugin. This replaced `spec.backup.barmanObjectStore` -- the
+  ## in-tree field the operator's own CRD marks deprecated and REMOVES in CNPG 1.31.
+  ## The store config moved verbatim to the `ObjectStore` resource below; only
+  ## `retentionPolicy` changed shape, because the plugin defines it on the store.
+  ##
+  ## ⛔ THIS CLUSTER WENT SECOND, on purpose. It is the one with a recovery runbook
+  ## that reads the SAME removed API, so it is the one where an operator upgrade
+  ## past 1.30 would hurt most; it followed monitoring/grafana-pg, which ran the
+  ## migration first and proved the plugin writes WAL and a base backup into its
+  ## own existing bucket.
+  ##
+  ## ⭐ `serverName` is stated EXPLICITLY even though the documented default is the
+  ## cluster name. barman keys the archive as <destinationPath>/<serverName>/, so a
+  ## default that differed from the in-tree one would not fail -- it would silently
+  ## START A NEW ARCHIVE and orphan the existing PITR history at
+  ## s3://cnpg-gitlab-pg/gitlab-pg/. A redundant line is the cheap side of that
+  ## trade. (It cannot go on the ObjectStore: `configuration.serverName` is
+  ## REJECTED there by CEL with FieldValueForbidden -- the plugin parameter is the
+  ## only place it is accepted.)
+  ##
+  ## ⛔⛔ The recovery path reads a DIFFERENT half of this file's design:
+  ## ~/bootstrap/cnpg-recovery-manifest.yml carries the same migration for the
+  ## rebuild case, where this stanza becomes a fresh serverName. Both must move
+  ## together -- migrating only this one leaves the runbook pointing at an API that
+  ## the next operator upgrade deletes.
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: gitlab-pg
+        serverName: gitlab-pg
+---
+## The barman store for gitlab-pg, as a barmancloud.cnpg.io ObjectStore
+## (beads infra-zkak, 2026-10-07). Contents are the cluster's former
+## `spec.backup.barmanObjectStore` block, moved verbatim into `spec.configuration`.
+##
+## ⛔ The plugin defines retention on the STORE, not on the cluster, so
+## `retentionPolicy` lives at `spec.retentionPolicy` below. ⚠️ This one fails
+## SILENTLY if forgotten -- nothing complains and nothing prunes, and the bucket
+## simply grows. `s3 ls` is the only place it would ever show.
+##
+## ⭐ Same store, same bucket, same credentials as before -- only the writer changes,
+## so the existing PITR history at s3://cnpg-gitlab-pg/gitlab-pg/ stays continuous.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: gitlab-pg
+  namespace: bootstrap
+spec:
+  configuration:
+    # WAL + base backups land in Garage on salt/pepper (independent of
+    # the prod cluster's storage layer). Switched 2026-05-13 from
+    # api.minio.home.tillo.ch as part of MinIO retirement (#19).
+    destinationPath: s3://cnpg-gitlab-pg
+    ## ⭐ 2026-09-19: moved off the salt/pepper Garage to the IN-CLUSTER Ceph
+    ## RGW, as part of retiring both those hosts. This is the "local" half of
+    ## the backup architecture: short-window PITR and granular restore live
+    ## here; the offsite copy is a separate, client-side-encrypted channel.
+    ##
+    ## ⛔ NEW bucket name on purpose. The Garage bucket was `gitlab-pg-backup`;
+    ## reusing it would mean a half-applied change (new store, stale
+    ## endpointURL) kept writing to Garage and SUCCEEDED, silently. With a
+    ## distinct name that mistake fails closed with NoSuchBucket.
+    ##
+    ## ⛔⛔ Changing destinationPath starts an EMPTY archive. WAL archiving
+    ## alone is not a backup -- paperless-pg proved that with 33k objects and
+    ## zero base backups. A one-shot Backup is taken immediately after this
+    ## lands, and a completed base backup is the only acceptable evidence.
+    ## ⭐ Under the plugin that evidence is NOT `Cluster.status.lastSuccessfulBackup`
+    ## any more -- that field stays empty (measured 2026-10-07 on the drill).
+    ## Read it off the ObjectStore instead (apiVersion barmancloud.cnpg.io/v1 --
+    ## the bare `objectstore` short name also resolves to ceph.rook.io, so qualify it):
+    ##   kubectl -n bootstrap get objectstore.barmancloud.cnpg.io gitlab-pg \
+    ##     -o jsonpath='{.status.serverRecoveryWindow.gitlab-pg.lastSuccessfulBackupTime}'
+    ##
+    ## ⭐ TLS restored. !369 landed this store on plain http, which handed
+    ## back exactly the property the Garage terminator was built for on
+    ## 2026-09-05: pods on qui/quo/qua reach an RGW pod on another node across
+    ## the physical LAN, over an UNENCRYPTED VXLAN overlay, and barman does not
+    ## encrypt. "It stays in the cluster" was the wrong reassurance -- the
+    ## cluster is three separate machines. RGW now carries its own house-PKI
+    ## leaf (rook-ceph-objectstore-users/rgw-tls-cert.yml) and this dials it.
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    ## The CA here is the house chain (MDAPI Root + MDAPI Issuing CA 01), which
+    ## is what a Horizon-issued RGW leaf chains to.
+    ## ⭐ Renamed garage-transit-ca -> rgw-transit-ca on 2026-09-21, across all
+    ## six namespaces at once. Contents byte-identical; the old name was the
+    ## last thing on the estate still calling Garage a live dependency.
+    ## ⛔ CORRECTED 2026-10-07 (beads infra-zkak). This used to read: "Changing
+    ## this name costs NOTHING here: measured on CNPG 1.30, the instance pods do
+    ## not reference the secret at all (the operator resolves endpointCA through
+    ## the API at backup time), so there is no pod-spec change and no switchover."
+    ## That was TRUE of the in-tree `spec.backup.barmanObjectStore` block this store
+    ## was moved from -- re-measured 2026-10-07, no cluster still on the in-tree
+    ## stanza has its CA secret in a pod spec. It is FALSE here. The plugin PROJECTS
+    ## the CA into every instance pod, as a `barman-certificates` volume (source:
+    ## this secret, key ca.crt) mounted at /barman-certificates on the
+    ## plugin-barman-cloud sidecar, one directory per referenced store:
+    ##   /barman-certificates/<objectStoreName>/barman-ca.crt
+    ## keyed on the ObjectStore's NAME, not on serverName. So the secret IS in the
+    ## pod spec, and a rename is a pod-affecting change until re-measured otherwise.
+    ## ⚠️ The projection is built ONCE and never revisited -- the operator adds the
+    ## volume only if it is ABSENT, so a RUNNING cluster repointed at a store with a
+    ## different NAME keeps the old store's directory and barman fails on the
+    ## missing file:
+    ##   SSL validation failed for <url> [Errno 2] No such file or directory  (exit 4)
+    ## That reads like a stale-archive failure and is not one -- check this volume
+    ## first. Drill that proves it: ~/bootstrap/drills/cnpg-recovery/README.md.
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-gitlab-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-gitlab-pg
+        key: AWS_SECRET_ACCESS_KEY
+      # Garage validates the SigV4 region scope on HeadBucket; barman
+      # defaults to us-east-1, so the region must be set explicitly.
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+      immediateCheckpoint: false
+      jobs: 2
+  ## Enforcement moved here with the value unchanged.
+  retentionPolicy: "14d"
+---
+# Daily base backup at 03:00 Europe/Zurich.
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: gitlab-pg-daily
+  namespace: bootstrap
+spec:
+  cluster:
+    name: gitlab-pg
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  immediate: false
+  ## ⛔ Required after the plugin migration (beads infra-zkak). Without these two
+  ## fields this ScheduledBackup keeps taking IN-TREE backups of a cluster that no
+  ## longer has a `spec.backup` stanza -- so every night it would fail, and the
+  ## failure would look like a backup problem rather than an unmigrated object.
+  ##
+  ## ⭐ Schedule and immediate are unchanged: the cadence is not part of what moved.
+  ## The one-shot proving backup after this lands is taken by hand, not by flipping
+  ## this to true -- a ScheduledBackup with immediate: true re-fires on every apply.
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+---
+## Password for the o2_dbm login (O2 Database Monitoring). CNPG requires a basic-auth
+## secret whose username matches the role name.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gitlab-pg-o2dbm
+  namespace: bootstrap
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: gitlab-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          ## CNPG only re-reads a password secret it WATCHES: without this label a role that was
+          ## reconciled before ESO created the secret stays "pending-reconciliation" forever
+          ## (gitlab-pg / ha-recorder-pg, 2026-09-24), and a rotated password is never applied.
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/bootstrap/gitlab-pg-o2dbm/password
+      secretKey: password
+---
+## Declares pg_stat_statements in `gitlabhq_production` (the O2 DBM receiver reads the view there).
+## Adopting the existing database is safe: owner gitlab is the CURRENT owner (checked in
+## pg_database), and databaseReclaimPolicy defaults to retain, so deleting this object
+## never drops the database.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: gitlab-pg-gitlabhq-production
+  namespace: bootstrap
+spec:
+  name: gitlabhq_production
+  owner: gitlab
+  cluster:
+    name: gitlab-pg
+  extensions:
+    - name: pg_stat_statements
+      ensure: present

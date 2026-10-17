@@ -1,0 +1,51 @@
+# One public host. Everything that can carry a survey answer — the response endpoints, the
+# application pages that display responses — goes through the Kustodyan gateway, which also
+# serves the role-management page on /kustodyan. The rest (sign-in, link surveys, static
+# assets) goes straight to Formbricks.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: formbricks-kustodyan
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # ModSec OFF — JSON APIs and the Next.js app trip CRS false positives.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [formbricks-kustodyan.mdapi.ch]
+      secretName: formbricks-kustodyan-tls
+  rules:
+    - host: formbricks-kustodyan.mdapi.ch
+      http:
+        paths:
+          - path: /api/v1/client            # respondents submitting answers
+            pathType: Prefix
+            backend: &gateway
+              service:
+                name: formbricks-gateway
+                port:
+                  number: 8080
+          - path: /api/v2/client
+            pathType: Prefix
+            backend: *gateway
+          - path: /api/v1/management/responses   # the management API
+            pathType: Prefix
+            backend: *gateway
+          - path: /api/v2/management/responses
+            pathType: Prefix
+            backend: *gateway
+          - path: /workspaces                # every application page that shows a response
+            pathType: Prefix
+            backend: *gateway
+          - path: /kustodyan                 # role management, served by the proxy itself
+            pathType: Prefix
+            backend: *gateway
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: formbricks
+                port:
+                  number: 3000

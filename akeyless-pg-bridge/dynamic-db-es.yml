@@ -1,0 +1,27 @@
+# PoC consumer seam: ESO fetches a short-lived READ-ONLY Postgres credential from the
+# Akeyless dynamic-secret producer (minted through the WireGuard bridge by the existing
+# CM-VM gateway) and materializes it into a k8s Secret, refreshing before the 30m TTL.
+# A workload reads paperless-pg-rw directly (in-cluster) with these rotating creds.
+# Portability: swap secretStoreRef to `openbao` later and consumers don't change.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-dynamic-db
+  namespace: akeyless-pg-bridge
+spec:
+  refreshInterval: 20m              # < 30m TTL: re-mint before the role expires
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: paperless-dynamic-db
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/dynamic/paperless-pg-readonly
+        property: user
+      secretKey: username
+    - remoteRef:
+        key: /mdapi/dynamic/paperless-pg-readonly
+        property: password
+      secretKey: password

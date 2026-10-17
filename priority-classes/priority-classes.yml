@@ -1,0 +1,40 @@
+# Workload priority tiers (2026-07-04 N-1 / resource program).
+#
+# Under node-pressure eviction and scheduler preemption, pods without a
+# PriorityClass (priority 0) are all equal — mail competed with media.
+# Three tiers fix the ordering; creating them has ZERO effect until a
+# workload sets priorityClassName (assignment happens gradually per bundle,
+# since it recreates pods).
+#
+#   mdapi-critical  100000  mail, idp, dns, ingress-adjacent, nextclouds
+#   mdapi-default     1000  global default — anything unlabelled
+#   mdapi-low          100  media/tv, honeypot, batch; never preempts anyone
+#
+# (System classes sit far above: system-* at 2e9, longhorn/rancher/kubevirt
+# at 1e9 — user tiers deliberately stay below all of them.)
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-critical
+value: 100000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Family-facing core services (mail, idp, dns, cloud) — evicted last among user workloads."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-default
+value: 1000
+globalDefault: true
+preemptionPolicy: PreemptLowerPriority
+description: "Default for all user workloads without an explicit class."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-low
+value: 100
+globalDefault: false
+preemptionPolicy: Never
+description: "Media, honeypots, batch — first evicted under pressure, never preempts others."

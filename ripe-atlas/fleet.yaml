@@ -1,0 +1,37 @@
+defaultNamespace: atlas
+namespace: atlas
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+dependsOn:
+  # The VM's cloud-init Secret is rendered by an ExternalSecret.
+  - name: mdapi-prod-external-secrets
+helm:
+  maxHistory: 25
+  # Namespace, image and VM were created with kubectl while this bundle was
+  # written — the image has to exist before the VM can name its generated
+  # StorageClass. They carry no Helm ownership metadata without this.
+  takeOwnership: true
+
+# KubeVirt and the Harvester webhooks complete a VirtualMachine after admission.
+# Everything that could be pinned has been pinned in the manifest instead
+# (firmware UUID/serial, MAC, maxSockets, architecture, machine type, node
+# affinity); this is the measured remainder, and without it the bundle would sit
+# permanently Modified.
+diff:
+  comparePatches:
+  - apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    name: atlas-probe
+    namespace: atlas
+    jsonPointers:
+    # Derived from limits by the overcommit webhook, using cluster-wide ratios
+    # that would rot if the result were hard-coded here.
+    - /spec/template/spec/domain/resources/requests
+    # Serialised as an explicit null on the pod template.
+    - /spec/template/metadata/creationTimestamp
+    # Controller bookkeeping written after creation.
+    - /metadata/annotations/harvesterhci.io~1vmRunStrategy
+    - /metadata/annotations/kubevirt.io~1latest-observed-api-version
+    - /metadata/annotations/kubevirt.io~1storage-observed-api-version
+    - /metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration

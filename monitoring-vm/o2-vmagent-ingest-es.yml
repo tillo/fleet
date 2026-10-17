@@ -1,0 +1,32 @@
+## Credential for vmagent's SECOND remoteWrite (per-workload metrics → OpenObserve,
+## see vmagent.yml). Since 2026-09-24 this is an O2 ORG INGESTION TOKEN named `vmagent`
+## (o2oi_…, Basic `vmagent:<token>`), not a service account. It is INGEST-ONLY: 401 on every
+## read, delete and settings route (RBAC Phase 0, see RBAC-STUDY.md). The old service account
+## vmagent-ingest@mdapi.ch could delete streams because O2 RBAC is off.
+##
+## A wrong or missing token fails CLOSED and quietly: O2 answers 401, and vmagent
+## buffers to remoteWrite.tmpDataPath and retries. vmsingle is a separate URL
+## with its own queue, so it is unaffected.
+## ⚠️ Test ingest through the in-cluster Service, never the public URL: the ingress WAF answers
+## 403 to snappy-encoded test bodies, for root too.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-vmagent-ingest
+  namespace: monitoring
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-vmagent-ingest
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "vmagent"
+        password: "{{ .token }}"
+  data:
+  - remoteRef: { key: /mdapi/openobserve/vmagent/ingestion-token }
+    secretKey: token

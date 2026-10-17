@@ -1,0 +1,47 @@
+---
+# ⭐ 2026-09-21: rgw-frigate-s3 replaces garage-frigate-s3. Same Akeyless keys, same
+# RGW user, same bucket -- only the names change. The old ExternalSecret is removed
+# in the follow-up commit, once the Deployment references this one, so that no pod
+# ever points at a Secret that does not exist yet.
+#
+# ⛔ The rclone remote is renamed with it. RCLONE_CONFIG_<NAME>_* IS the remote
+# definition, so the env prefix and the `rclone copy ... <name>:${BUCKET}` in
+# frigate-deploy.yml are ONE unit and must move in the same change -- renaming
+# either alone leaves rclone with no remote by that name.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: rgw-frigate-s3
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: rgw-frigate-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        RCLONE_CONFIG_RGW_TYPE: "s3"
+        # Recordings are operational data -> kept in-cluster, NOT off-site backups.
+        # RGW user 'frigate' (rook-ceph-objectstore-users/objectstoreuser-frigate.yml).
+        # ⚠️ Akeyless path still reads /mdapi/frigate/garage-s3/* -- renaming a live
+        # credential path is a separate create -> repoint -> verify -> delete cycle,
+        # and is NOT bundled into a Kubernetes-object rename.
+        RCLONE_CONFIG_RGW_PROVIDER: "Ceph"
+        RCLONE_CONFIG_RGW_ENDPOINT: "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:80"
+        RCLONE_CONFIG_RGW_REGION: "us-east-1"
+        RCLONE_CONFIG_RGW_ACCESS_KEY_ID: "{{ .access_key }}"
+        RCLONE_CONFIG_RGW_SECRET_ACCESS_KEY: "{{ .secret_key }}"
+        BUCKET: "frigate-recordings"
+
+  data:
+    - remoteRef:
+        key: /mdapi/frigate/garage-s3/access_key
+      secretKey: access_key
+    - remoteRef:
+        key: /mdapi/frigate/garage-s3/secret_key
+      secretKey: secret_key

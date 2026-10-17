@@ -1,0 +1,23 @@
+# WireGuard key material for the DMZ<->cluster bridge, delivered from Akeyless.
+# Lets the EXISTING CM-VM Akeyless gateway reach in-cluster paperless-pg via the
+# tunnel, so dynamic-secret producers work without exposing Postgres.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: wg-csm-bridge
+  namespace: akeyless-pg-bridge
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: wg-csm-bridge
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/wireguard/csm-bridge/pod-private-key
+      secretKey: private-key
+    - remoteRef:
+        key: /mdapi/wireguard/csm-bridge/psk
+      secretKey: psk

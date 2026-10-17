@@ -1,0 +1,27 @@
+---
+# ⭐ 2026-09-21: rgw-openobserve-s3-creds replaces garage-openobserve-s3-creds. The
+# Akeyless paths moved to /mdapi/openobserve/rgw/* back on 2026-06-17; the secret name
+# was kept then "so o2-sts is unchanged". Garage is retired, so the name is now simply
+# wrong, and o2-sts is updated alongside in the follow-up commit.
+#
+# ⛔ Added before the StatefulSet is repointed on purpose: refreshInterval is 5m, and
+# openobserve cannot start without ZO_S3_ACCESS_KEY / ZO_S3_SECRET_KEY. Renaming in one
+# step risks the log store being down for a whole refresh interval.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: rgw-openobserve-s3-creds
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: rgw-openobserve-s3-creds
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/rgw/access-key }
+    secretKey: access_key
+  - remoteRef: { key: /mdapi/openobserve/rgw/secret-key }
+    secretKey: secret_key

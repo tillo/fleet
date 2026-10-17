@@ -1,0 +1,323 @@
+certmanager-issuer:
+  email: tillo@tillo.ch
+disableWait: true
+gitlab:
+  # gitlab-pages re-enabled 2026-06-08 (docs.mdapi.ch is a Pages custom domain).
+  gitlab-pages:
+    image:
+      pullPolicy: IfNotPresent
+    maxReplicas: 3
+    minReplicas: 1
+    ingress:
+      tls:
+        secretName: pages-cert
+  # Chart 10 default tag "16.8.0" is wrong; upstream registry only has v-prefixed tags.
+  gitlab-exporter:
+    image:
+      tag: v16.8.0
+      pullPolicy: IfNotPresent
+  gitlab-shell:
+    maxReplicas: 3
+    minReplicas: 1
+  kas:
+    ingress:
+      tls:
+        secretName: kas-cert
+    maxReplicas: 3
+    minReplicas: 1
+  sidekiq:
+    concurrency: 10
+    # Upstream CNG image, version supplied by the chart. The custom
+    # zot.mdapi.ch/mdapi/gitlab-sidekiq-ee build was retired 2026-09-04: its only
+    # remaining content was ENV SIDEKIQ_CONCURRENCY/SIDEKIQ_TIMEOUT, and the chart
+    # sets both in the pod spec, which overrides the image ENV — the running
+    # process read concurrency 10 (from the line above), never the image's 25.
+    # Its cache-limit sed patches had already been dead since 19.1; see
+    # global.appConfig note and ~/bootstrap/gitlab-howto.txt.
+    image:
+      pullPolicy: IfNotPresent
+    maxReplicas: 6
+    minReplicas: 3
+    resources:
+      requests:
+        cpu: 900m
+        memory: 2Gi
+      limits:
+        memory: 2560Mi
+  toolbox:
+    # No tag pin: the chart already ships the matching gitlab-toolbox-ee version,
+    # so pinning it only created a second thing to remember on every upgrade — and
+    # forgetting it is what leaves a 19.0.1 toolbox beside a 19.3.1 webservice.
+    image:
+      pullPolicy: IfNotPresent
+    backups:
+      objectStorage:
+        backend: s3
+        config:
+          key: config
+          secret: gitlab-s3cfg-secret
+      cron:
+        enabled: true
+        schedule: "0 2 * * *"
+        extraArgs: "--skip registry,artifacts,uploads,builds,pages,lfs,packages,terraform_state,ci_secure_files,external_diffs"
+        persistence:
+          enabled: false
+        backoffLimit: 1
+  webservice:
+    # Upstream CNG image, version supplied by the chart. The custom
+    # zot.mdapi.ch/mdapi/gitlab-webservice-ee build was retired 2026-09-04: once its
+    # two obsolete cache-limit sed patches were removed it was a pure passthrough of
+    # upstream — same CMD, plus a Docker HEALTHCHECK that Kubernetes ignores outright
+    # (liveness/readiness come from the pod spec). It had also created a circular
+    # dependency, since the build lived in GitLab's OWN registry, which is what the
+    # zot mirror existed to work around.
+    image:
+      pullPolicy: IfNotPresent
+    # Two replicas MUST NOT share a node (2026-09-05). The chart default is
+    # global.antiAffinity: soft = preferredDuringScheduling weight 1, which the
+    # scheduler is free to ignore — and did: both 5Gi replicas landed on qui and
+    # took it to 99% of memory requests. Frigate is pinned to qui by the Coral
+    # USB TPU and uses strategy Recreate, so when Keel force-rolled it at
+    # 2026-09-04 17:39Z the replacement could not fit, and the NVR was down ~4h
+    # until a replica was moved off by hand. Two replicas of an HA service on one
+    # node also defeat the point of having two. `hard` =
+    # requiredDuringSchedulingIgnoredDuringExecution; safe here because the HPA
+    # tops out at 3 replicas and the cluster has 3 nodes. Scoped to webservice
+    # deliberately — do NOT promote this to global.antiAffinity, which would also
+    # bind components whose replica count can exceed the node count.
+    antiAffinity: hard
+    hpa:
+      maxReplicas: 3
+      # min 2 (was 1): a single replica is overwhelmed by concurrent CI git
+      # clones during scheduled-pipeline fan-outs / storage stress, returning
+      # 502 (workhorse "badgateway: context canceled") on get_sources and
+      # failing image-builder pipelines. Two replicas spread the clone load.
+      # HPA still scales to 3 on CPU. (2026-06-15)
+      minReplicas: 2
+    # Chart 10 requires explicit ingress.path on each deployment for an Ingress
+    # to render (the implicit default: { ingress: { path: / } } was dropped).
+    deployments:
+      default:
+        ingress:
+          path: /
+    ingress:
+      annotations:
+        # RUM: inject the self-hosted browser SDK into HTML responses only.
+        # $rum_accept_encoding is defined as an http-level map in
+        # fleet/rke2-ingress-nginx-config so JS/CSS keep their gzip; a bare
+        # `Accept-Encoding ""` here would strip compression from every
+        # asset GitLab serves. Scoped to webservice on purpose --
+        # global.ingress.annotations would also hit registry, kas and pages.
+        nginx.ingress.kubernetes.io/configuration-snippet: |
+          proxy_set_header Accept-Encoding $rum_accept_encoding;
+          sub_filter_types text/html;
+          sub_filter_once on;
+          sub_filter '</head>' '<script defer src="https://rum.mdapi.ch/rum.js"></script></head>';
+      tls:
+        secretName: gitlab-cert
+    resources:
+      requests:
+        cpu: 500m
+        memory: 4Gi
+      limits:
+        memory: 5Gi
+    workhorse:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 1Gi
+        limits:
+          memory: 2Gi
+  gitaly:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 1Gi
+      limits:
+        memory: 1280Mi
+gitlab-runner:
+  runners:
+    tags: "mdapi"
+    # Also pick up untagged jobs (not just mdapi-tagged) so CI jobs that omit
+    # `tags: [mdapi]` (e.g. fleet-lint, ad-hoc buildkit) aren't stuck pending
+    # with no eligible runner. Applied at registration; existing runners also
+    # flipped server-side 2026-06-12.
+    runUntagged: true
+    # S3 cache credentials: ExternalSecret bootstrap/gitlab-runner-cache-s3 (fleet
+    # bootstrap/gitlab-runner-cache-es.yml, Akeyless /mdapi/gitlab/rgw/*). The chart
+    # projects it to /secrets; the entrypoint exports CACHE_S3_ACCESS_KEY/SECRET_KEY
+    # and register fills AccessKey/SecretKey into [runners.cache.s3] below. Never
+    # inline them again - this file is headed for the fleet repo (infra-h0xb.2).
+    cache:
+      secretName: gitlab-runner-cache-s3
+    config: |
+      [[runners]]
+        [runners.kubernetes]
+          # Added 2026-09-15. Build pods had NO memory bound: measured over 30 days,
+          # the openwrt build (project 33) peaks at 10.6 GiB and two concurrent jobs
+          # peaked at 21.2 GiB, none of it reserved and none of it capped. That is the
+          # same unbounded-spike shape that wedged qui on 2026-09-14.
+          # 12Gi leaves real headroom over the measured 10.6 GiB peak; the point is to
+          # bound the tail, not to shrink the build.
+          memory_limit = "12Gi"
+          memory_request = "1Gi"
+          helper_memory_limit = "512Mi"
+          service_memory_limit = "1Gi"
+          image = "alpine"
+          pod_annotations = { "container.apparmor.security.beta.kubernetes.io/build" = "unconfined" }
+          # tmpfs build_dir was attempted but reverted: 30Gi hit "no space"
+          # mid-build, 50Gi exposed a meson/ninja race where glib2 compile
+          # picks up gresource-tool.c before elfutils-install populates
+          # staging_dir/usr/include/libelf.h — disk-backed builds are slow
+          # enough to serialize this naturally. See #5026 attempts 7468/7473.
+          # If revisited: would need to either reduce -j parallelism, add an
+          # explicit glib2-after-elfutils dep, or pin only ccache+dl to tmpfs.
+          #[runners.kubernetes.pod_security_context]
+            #run_as_user = 1000
+            #run_as_group = 1000
+            #fs_group = 1000
+        [runners.cache]
+          Type = "s3"
+          Path = "gitlab-runner"
+          Shared = true
+          [runners.cache.s3]
+            ServerAddress = "rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:80"
+            BucketName = "gitlab-runner-cache"
+            BucketLocation = "us-east-1"
+            Insecure = true
+global:
+  appConfig:
+    backups:
+      tmpBucket: gitlab-tmp-backups
+    ciSecureFiles:
+      enabled: true
+    dependencyProxy:
+      enabled: true
+    externalDiffs:
+      enabled: true
+    lfs:
+      bucket: gitlab-lfs
+    object_store:
+      connection:
+        secret: gitlab-object-storage-secret
+      enabled: true
+    omniauth:
+      allowSingleSignOn:
+      - openid_connect
+      autoLinkUser:
+      - openid_connect
+      blockAutoCreatedUsers: false
+      enabled: true
+      externalProviders:
+      - google_oauth2
+      - github
+      providers:
+      - secret: gitlab-omniauth-google-secret
+      - secret: gitlab-omniauth-mdapi-secret
+      - secret: gitlab-omniauth-github-secret
+      syncProfileFromProvider:
+      - openid_connect
+    terraformState:
+      enabled: true
+  certificates:
+    customCAs:
+    - secret: gitlab-customcas-secret
+  hosts:
+    domain: mdapi.ch
+  ingress:
+    # Chart 10 default flipped to `enabled: false` (preferring Gateway API).
+    # We keep ingress-nginx, so re-enable explicitly.
+    enabled: true
+    annotations:
+      acme.cert-manager.io/http01-edit-in-place: true
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      kubernetes.io/tls-acme: true
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    class: nginx
+    provider: nginx
+  # Chart 10.0.0 enables Gateway API by default. We use ingress-nginx → disable.
+  # `installEnvoy: false` is the condition on the `gateway-helm` dependency in the
+  # chart's Chart.yaml, so THAT is what stops the envoy subchart being installed.
+  # A top-level `envoy-gateway: {enabled: false}` block used to sit in this file
+  # claiming to do it; that name matched no dependency of chart 10 and was removed
+  # 2026-10-06 (infra-h0xb.4, render-diffed as a no-op).
+  gatewayApi:
+    enabled: false
+    installEnvoy: false
+    # Chart 10 defaults this to TRUE (root values.yaml), and the bundled
+    # certmanager-issuer subchart renders its Job/RBAC/ConfigMap when
+    # `gatewayApi.configureCertmanager OR ingress.configureCertmanager` is true.
+    # We use ingress-nginx + ClusterIssuer letsencrypt-prod, so the chart-managed
+    # Issuer was never used. Turning it off removes the hook Job and its RBAC.
+    configureCertmanager: false
+  minio:
+    enabled: false
+  pages:
+    # Re-enabled 2026-06-08: docs.mdapi.ch IS a Pages-served custom domain (the
+    # 2026-05-26 "no active Pages projects" assumption was wrong). Chart 10 needs
+    # external object storage; reuse the in-cluster Garage connection secret +
+    # the pre-existing gitlab-pages bucket (063d8a26, content intact).
+    enabled: true
+    objectStore:
+      bucket: gitlab-pages
+      connection:
+        secret: gitlab-object-storage-secret
+        key: connection
+  # External Postgres (CNPG-managed) — bundled bitnami postgresql subchart left
+  # rendered for 7-day burn-in rollback target; will set install:false after.
+  psql:
+    host: gitlab-pg-rw.bootstrap.svc.cluster.local
+    port: 5432
+    database: gitlabhq_production
+    username: gitlab
+    password:
+      secret: gitlab-pg-app
+      key: password
+  # External Redis (Valkey) — bundled bitnami redis subchart removed in chart 10.0.0.
+  # `password:` key renamed to `auth:` per 9.11.4 deprecation notice.
+  redis:
+    host: valkey.bootstrap.svc.cluster.local
+    port: 6379
+    auth:
+      enabled: true
+      secret: valkey-password
+      key: password
+  registry:
+    bucket: gitlab-registry
+  time_zone: Europe/Zurich
+
+installCertmanager: false
+nginx-ingress:
+  enabled: false
+# Bundled Prometheus disabled 2026-07-05 — redundant with the cluster's
+# VictoriaMetrics (vmsingle). Frees ~1.8Gi RAM + a 150Gi PVC. Scaled to 0
+# immediately; this install:false removes it on the next `helm upgrade`.
+prometheus:
+  install: false
+  server:
+    persistentVolume:
+      size: 150Gi
+registry:
+  hpa:
+    maxReplicas: 6
+    minReplicas: 3
+  ingress:
+    annotations:
+      # Pin a client IP to a single registry pod via consistent hashing.
+      # The chunked-upload state lives in S3 (Garage). Under retry-after-
+      # disconnect on large blobs, a buildkit retry routed to a different
+      # registry pod sees stale offset metadata and returns HTTP 416
+      # RESUMABLE_BLOB_UPLOAD_INVALID. Triggered by the 172 MiB keycloak
+      # java-21-openjdk-headless layer on 2026-05-26 (no other layer in the
+      # fleet is large enough to hit this race).
+      nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+    tls:
+      secretName: registry-cert
+  storage:
+    key: config
+    secret: gitlab-registry-storage-secret
+# GitLab DB and cache are external (CNPG `gitlab-pg` + Valkey via
+# global.psql/global.redis). Chart 10.0.0 dropped the bundled bitnami
+# postgresql + redis subcharts entirely — top-level keys removed.
+# Old PVCs (data-gitlab-postgresql-{0,read-0}, redis-data-gitlab-redis-master-0)
+# can be deleted now (Retain reclaim policy keeps them on Longhorn).

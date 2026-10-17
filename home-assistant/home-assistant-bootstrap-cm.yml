@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Renamed from `home-assistant-config` on 2026-05-14: configuration.yaml now
+  # lives on the PVC (home-assistant-data) and is no longer mounted from this
+  # ConfigMap. This object is kept as a *bootstrap* / disaster-recovery seed —
+  # not mounted by default. To use in an emergency, re-add the subPath volume +
+  # mount in home-assistant-deploy.yml and redeploy.
+  name: home-assistant-bootstrap
+  namespace: home-assistant
+data:
+  configuration.yaml: |
+    # ──────────────────────────────────────────────────────────────────────────
+    # mdapi Home Assistant — bootstrap configuration.yaml
+    #
+    # Routine edits to configuration.yaml live on the PVC (home-assistant-data)
+    # and apply via `homeassistant.reload_all` — no pod restart needed. This
+    # ConfigMap is *not mounted by default*; it's preserved in Fleet as a
+    # disaster-recovery seed: a minimal, device-free starting point that lets
+    # HA boot cleanly behind the existing ingress and CORS posture.
+    #
+    # To use as a recovery seed:
+    #   1. Re-add the home-assistant-config volume + subPath mount in
+    #      home-assistant-deploy.yml.
+    #   2. Redeploy. HA starts with this minimal config.
+    #   3. Add integrations back via the UI (or restore configuration.yaml
+    #      from a Longhorn snapshot of the PVC).
+    #
+    # Anything beyond what's here was device/credential-specific and stripped
+    # 2026-05-14 to keep this readable as a starting point.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Bundled HA basics: frontend, recorder, history, logbook, mobile_app, etc.
+    default_config:
+
+    # Themes are PVC-resident under /config/themes/. Folder may be empty.
+    frontend:
+      themes: !include_dir_merge_named themes
+
+    # Free, no-credential TTS. Other providers can be layered on later.
+    tts:
+      - platform: google_translate
+
+    # UI-managed scripts/automations/scenes live alongside on the PVC. Comment
+    # these three lines out if you're booting on a fresh PVC where they don't
+    # exist yet.
+    automation: !include automations.yaml
+    script: !include scripts.yaml
+    scene: !include scenes.yaml
+
+    # Reverse-proxy posture: traffic enters via rke2-ingress-nginx
+    # (home.mdapi.ch). The trusted_proxies block covers the cluster pod/service
+    # CIDRs plus the home LAN; if HA itself moves clusters, only this list and
+    # cors_allowed_origins need to change. ip_ban_enabled gives a basic
+    # brute-force safety net independent of the WAF.
+    http:
+      cors_allowed_origins:
+        - https://home.mdapi.ch
+      use_x_forwarded_for: true
+      trusted_proxies:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+      ip_ban_enabled: true
+      login_attempts_threshold: 50
+
+    # Zero-config auto-discovery integrations — safe to leave on; they only
+    # activate once matching hardware/credentials show up.
+    shelly:
+    bluetooth:

@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: ivodellambrogio
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ivodellambrogio
+    spec:
+      imagePullSecrets:
+        - name: mdapi-registry
+      containers:
+        - name: ivodellambrogio
+          image: registry.mdapi.ch/mdapi/ivodellambrogio:latest@sha256:1f979e9856afdfc13b6ffdb5f2f9d06f170bf0b4661534a57a3209b3b18bb81e
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 512Mi
+            limits:
+              memory: 768Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+spec:
+  selector:
+    app: ivodellambrogio
+  ports:
+    - port: 80
+      targetPort: 80

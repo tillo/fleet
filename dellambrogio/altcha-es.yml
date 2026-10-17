@@ -1,0 +1,27 @@
+# HMAC key for the self-hosted ALTCHA captcha on dellambrogio.ch.
+#
+# ALTCHA is proof-of-work: the browser burns a little CPU, and nothing about the
+# visitor is sent to a third party. It replaced Google reCAPTCHA v3, which on
+# this site had been verifying tokens without ever reading the SCORE — the only
+# signal v3 produces — so the form was effectively ungated for years.
+#
+# This key signs challenges and authenticates the solutions coming back. Both
+# html/altcha-challenge.php and html/send.php FAIL CLOSED if it is empty: an
+# absent secret must never degrade to "everyone passes", which is the same
+# failure the reCAPTCHA check had.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: altcha-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: altcha-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/dellambrogio/altcha-hmac-secret
+      secretKey: ALTCHA_HMAC_SECRET

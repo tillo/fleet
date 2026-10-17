@@ -1,0 +1,24 @@
+# Post-renders the vendored GitLab chart (see ../fleet.yaml). Fleet feeds the
+# helm-rendered manifests in as the kustomize base, then applies these patches —
+# the same pattern as metallb/, cribl/ and envuassu/nextcloud/.
+#
+# Only one patch: the sidekiq startupProbe, which the chart templates no value
+# for. Read the patch file before touching it — it carries the incident history.
+patchesStrategicMerge:
+- sidekiq-startup-probe.yaml
+
+# ⚠️ Deliberately NO `diff.comparePatches` in ../fleet.yaml, unlike metallb/ and
+# cribl/. Those suppress fields the chart does not manage but the live object has
+# (Keel-era image strings). Here there is nothing to suppress: the chart renders
+# NO `replicas` on any HPA-managed Deployment — gitlab-pages, -shell, kas,
+# -registry, -sidekiq-all-in-1-v2 and -webservice-default — so Fleet and the HPA
+# cannot fight over it. Measured 2026-10-06 by rendering this bundle and reading
+# the live Deployments: live replicas 1/1/1/3/4/2 are all HPA- or default-set,
+# none chart-set. A comparePatch with nothing to patch would only muffle a real
+# drift later.
+#
+# ⚠️ Also deliberately NOT folded in: a `ttlSecondsAfterFinished` on the
+# migrations Job. The live Job has none, and adding one would delete completed
+# migration Jobs — and their logs — which is a behaviour change, not part of an
+# adoption that is otherwise a no-op. Worth a separate decision (the Job has no
+# TTL, so every values change orphans the previous one).

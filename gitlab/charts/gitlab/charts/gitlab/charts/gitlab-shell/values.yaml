@@ -1,0 +1,270 @@
+# Default values for gitlab-shell.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+image:
+  repository: registry.gitlab.com/gitlab-org/build/cng/gitlab-shell
+  # pullPolicy: IfNotPresent
+  # pullSecrets: []
+  # tag: master
+service:
+  name: gitlab-shell
+  type: ClusterIP
+  internalPort: 2222
+  externalTrafficPolicy: Cluster
+  # nodePort: xxx
+  # allocateLoadBalancerNodePorts: true
+  # loadBalancerIP: x.x.x.x
+  # loadBalancerSourceRanges:
+  # - x.x.x.x/yy
+  # externalIPs:
+  # - x.x.x.x
+  # - y.y.y.y
+
+init:
+  image: {}
+    # repository:
+    # tag:
+  resources:
+    requests:
+      cpu: 50m
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    runAsNonRoot: true
+    capabilities:
+      drop: [ "ALL" ]
+
+# Tolerations for pod scheduling
+tolerations: []
+
+# Pod-level DNS configuration. Overrides `global.dnsConfig` when set.
+# See https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-dns-config
+dnsConfig: {}
+
+# Priority class assigned to pods
+priorityClassName: ""
+
+global: {}
+
+enabled: true
+annotations: {}
+podLabels: {}
+common:
+  labels: {}
+serviceLabels: {}
+workhorse: {}
+  # by default, Workhorse is a part of the webservice Pods / Service
+  # scheme: 'http'
+  # host: '0.0.0.0'
+  # serviceName: 'webservice'
+  # port: 8181
+resources:
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #  cpu: 100m
+  #  memory: 128Mi
+  requests:
+    cpu: 0
+    memory: 6M
+maxUnavailable: 1
+minReplicas: 2
+maxReplicas: 10
+
+gatewayRoute:
+  enabled: null
+  sectionName: "gitlab-ssh"
+  gatewayName: ""
+  gatewayNamespace: ""
+  # TCPRoute graduated to v1 in Gateway API 1.6, and Envoy Gateway 1.9 reconciles only v1.
+  # Set this to gateway.networking.k8s.io/v1alpha2 for implementations that do not serve v1 yet.
+  apiVersion: "gateway.networking.k8s.io/v1"
+  annotations: {}
+
+# Envoy Gateway BackendTrafficPolicy rendered for the GitLab Shell TCPRoute
+# when PROXY protocol is enabled. Set `spec: null` to skip rendering the policy.
+backendTrafficPolicy:
+  spec:
+    proxyProtocol:
+      version: V2
+
+# When using traefik ingress
+traefik:
+  entrypoint: gitlab-shell
+  apiVersion: ""
+  # ingressClassName for the IngressRouteTCP. Set it when Traefik's kubernetesCRD provider is scoped to a class (see docs)
+  ingressClassName: ""
+  tcpAnnotations: {}
+  tcpMiddlewares: []
+
+hpa:
+  # targetAverageValue: 100m  # DEPRECATED: in favor of `hpa.cpu.targetAverageValue` below
+  cpu:
+    targetType: AverageValue  # Utilization or AverageValue
+    targetAverageValue: 100m
+    # targetAverageUtilization: 75
+  # memory:
+  #   targetType: Utilization  # Utilization or AverageValue
+  #   targetAverageValue: 1G
+  #   targetAverageUtilization: 75
+  # Note that the HPA is limited to autoscaling/v2beta1, autoscaling/v2beta2 and autoscaling/v2
+  customMetrics: []  # Overrides HPA metrics definition
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+
+keda:
+  enabled: false
+  ## See https://keda.sh/docs/2.10/concepts/scaling-deployments/#scaledobject-spec
+  pollingInterval: 30
+  cooldownPeriod: 300
+  # minReplicaCount: 2
+  # maxReplicaCount: 10
+  # fallback:
+  #   failureThreshold: 3
+  #   replicas: 6
+  # hpaName: keda-hpa-{scaled-object-name}
+  # restoreToOriginalReplicaCount: false
+  # behavior: {}
+  # triggers: []
+
+deployment:
+  terminationGracePeriodSeconds: 30
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    successThreshold: 1
+    failureThreshold: 3
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    successThreshold: 1
+    failureThreshold: 2
+  strategy: {}
+  # revisionHistoryLimit: 10
+
+logging:
+  format: "json"
+  sshdLogLevel: "ERROR"
+
+config:
+  clientAliveInterval: 0
+  loginGraceTime: 60
+  maxStartups:
+    start: 10
+    rate: 30
+    full: 100
+  # If using Traefik, see https://doc.traefik.io/traefik/routing/services/#proxy-protocol
+  proxyProtocol: false
+  proxyPolicy: "use"
+  proxyHeaderTimeout: 500ms
+  ciphers: []
+  kexAlgorithms: []
+  macs: []
+  publicKeyAlgorithms: []
+  gssapi:
+    enabled: false
+    libpath: "libgssapi_krb5.so.2"
+    keytab:
+      #secret:
+      key: keytab
+    krb5Config: ""
+    servicePrincipalName: ""
+  lfs:
+    pureSSHProtocol: false
+  pat:
+    enabled: true
+    allowedScopes: []
+  # Topology Service gRPC client (Cells routing) for GitLab Shell.
+  # This `enabled` flag controls whether GitLab Shell uses the Topology Service.
+  # It must be set explicitly; it does not inherit the global Cells setting.
+  # The Topology Service address is read from
+  # global.appConfig.cell.topologyServiceClient.address. Whether the client uses
+  # mTLS is a separate concern: it is enabled when the global Cells setting
+  # (global.appConfig.cell.enabled) is enabled.
+  topologyService:
+    enabled: false
+    # cellEndpoint describes how GitLab Shell reaches the cell internal API
+    # resolved by the Topology Service. Defaults match CellsDev and CellsProd.
+    # Override these values if a deployment uses a different internal API
+    # endpoint. The port always overrides any port returned by the Topology Service.
+    cellEndpoint:
+      # URL scheme for resolved cell internal API requests: http or https
+      scheme: "https"
+      # Internal API port
+      port: 8181
+  # Trusted user CA keys for instance-level SSH certificate authentication (gitlab-sshd only)
+  trustedUserCAKeys:
+    secret: ""
+    keys: []
+
+## Allow to overwrite under which User and Group the Pod will be running.
+securityContext:
+  runAsUser: 1000
+  fsGroup: 1000
+  # fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: "RuntimeDefault"
+
+## Allow to overwrite the specific security context under which the gitaly container is running.
+containerSecurityContext:
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+
+## Enable deployment to use a serviceAccount
+serviceAccount:
+  enabled: false
+  create: false
+  annotations: {}
+  ## Used for local override of global ServiceAccount token mounting
+  # automountServiceAccountToken: false
+  ## Name to be used for serviceAccount, otherwise defaults to chart fullname
+  # name:
+
+metrics:
+  enabled: false
+  port: 9122
+  path: /metrics
+  serviceMonitor:
+    enabled: false
+    additionalLabels: {}
+    endpointConfig: {}
+  # DEPRECATED
+  annotations: {}
+
+networkpolicy:
+  enabled: false
+  egress:
+    enabled: false
+    rules: []
+  ingress:
+    enabled: false
+    rules: []
+  annotations: {}
+
+## Allow to select ssh daemon that would be executed inside container
+## Possible values: openssh, gitlab-sshd
+sshDaemon: openssh
+
+affinity:
+  podAntiAffinity:
+    topologyKey:
+  nodeAffinity:
+       key:
+       values:
+
+## Topology spread constraints rely on node labels to identify the topology domain(s) that each Node is in.
+## Ref: https://kubernetes.io/docs/concepts/workloads/pods/pod-topology-spread-constraints/
+topologySpreadConstraints: []
+ # - labelSelector:
+ #     matchLabels:
+ #       app: name
+ #     maxSkew: 1
+ #     topologyKey: topology.kubernetes.io/zone
+ #     whenUnsatisfiable: DoNotSchedule
