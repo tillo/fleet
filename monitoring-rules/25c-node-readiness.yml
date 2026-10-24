@@ -1,0 +1,232 @@
+## Node-loss detection: readiness, scrape-target, and collection-blind, added 2026-10-05.
+##
+## ⛔ None of this existed. Measured 2026-10-05 across all 531 loaded alerting rules:
+## NOTHING in the estate evaluated `kube_node_status_condition{condition="Ready",
+## status="true"} == 0`, and nothing evaluated `up{job="node-exporter"}` or
+## `up{job="kubelet"}` at all — neither `== 0` nor `absent()`. The two rules that
+## do read these metrics never alert on them:
+##   * StaleNodeTaint (25b) requires the node to be READY — it is the inverse
+##     signal (a taint left behind on a node that came back).
+##   * AtlasTargetUnreachableWorldwide uses Ready==0 only inside an `unless`, as
+##     a suppressor, never as the thing being alerted on.
+## So a node going NotReady produced no alert naming the node. The only node-ish
+## signals were downstream and indirect (EtcdMemberMissing / CephMonDownQuorumAtRisk
+## / Longhorn volume alerts), which describe the consequence and send you to the
+## storage layer rather than to the node.
+##
+## This matters here more than in a normal cluster: all three nodes (qui/quo/qua)
+## are control-plane AND storage hosts, and the 2026-10-03 event was all three
+## hanging together. That event was caught by the external deadman because vmalert
+## died with them — but a SINGLE node going NotReady, which is survivable and much
+## more common, was silent.
+##
+## Three distinct gaps. Every rule below was replayed against vmsingle over
+## 2026-09-05..2026-10-05 before being written:
+##   * NodeNotReady         — the node says it is not ready (13 events in 30d)
+##   * NodeScrapeTargetDown — its target answers 0 but still EXISTS
+##   * *Unscraped           — the target is GONE from the scrape config, so `up==0`
+##                            cannot fire at all. This is the blind spot behind the
+##                            whole of 10-03 and 09-14 (x2); vmalert stayed alive
+##                            through every one of them.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cluster-node-readiness
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cluster-node-readiness.workload
+    rules:
+    - alert: NodeNotReady
+      ## `status="true" == 0` is true when the Ready condition is false OR unknown
+      ## — kube-state-metrics emits one series per (condition, status) pair, with
+      ## 1 on the current status and 0 on the others, so this catches a node whose
+      ## kubelet stopped posting either way. Verified live 2026-10-05: 3 series
+      ## (qui/quo/qua), all 1.
+      ##
+      ## ⭐ THE TWO-SCRAPE FORM IS DELIBERATE, and it is NOT the same as `for: 2m`.
+      ## vmalert's `for` counts evaluations on the 30s EVALUATION grid, which is not
+      ## aligned with the 30s SCRAPE grid (they run on independent phases): an event
+      ## lasting 1m30s can present as a single sample and never satisfy `for: 2m`.
+      ## Replayed over 2026-09-05..10-05 — 13 node events, and `for: 2m` misses
+      ## three of them (qua 09-11 and 10-03 at 1-1.5m, quo 09-14 09:35). Putting the
+      ## confirmation in the EXPRESSION — a sample now AND a sample one scrape ago —
+      ## with `for: "0"` catches all 13 while still requiring the condition to
+      ## persist ~1m, so a single-sample blip does not page. Same shape and same
+      ## reasoning as ControlPlaneApiserverDown in 24-etcd-quorum.yml, which carries
+      ## the long-form explanation; read that comment before changing this.
+      ## ⚠️ `for: "0"` must be a quoted STRING — the CRD rejects a bare 0.
+      ##
+      ## `max by (node)` collapses duplicates if kube-state-metrics is rescheduled
+      ## mid-event (two pods briefly exporting the same node).
+      ##
+      ## ⚠️ Dependencies and limits, all real:
+      ##  * kube-state-metrics is a SINGLE replica (cattle-monitoring-system, qui).
+      ##    If it goes away this reads absent and cannot fire — it is itself in
+      ##    MonitoringComponentDown (16-monitor-the-monitoring.yml).
+      ##  * if the node that dies hosts the surviving vmalert replica, or all three
+      ##    go at once, nothing here can fire. That case is the deadman
+      ##    (WatchdogMdapi) plus EtcdQuorumLost / EtcdNoLeader.
+      ## ℹ️ `node` is a kube-state-metrics label; it is what names the subject.
+      expr: |
+        max by (node) (kube_node_status_condition{condition="Ready",status="true"}) == 0
+          and max by (node) (kube_node_status_condition{condition="Ready",status="true"} offset 30s) == 0
+      for: "0"
+      labels:
+        service: '{{ or $labels.node $labels.nodename $labels.instance "cluster-nodes" }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect: a single NotReady node is
+        ## survivable (PDBs spread the evictions) and, while it is NotReady, any
+        ## customer-visible effect reaches the public page through the application
+        ## rules that actually fire. Same judgement as ControlPlaneApiserverDown.
+        statuspage: exclude
+      annotations:
+        summary: "node {{ $labels.node }} is NotReady"
+        description: |
+          Node {{ $labels.node }} has reported Ready=false (or unknown) on two
+          consecutive scrapes (~1 minute). Pods on it are evicted after the 300s
+          toleration; because every node here is also a control-plane and storage
+          host, check the storage layer next if it does not come back quickly.
+
+          Check, in order:
+            kubectl --context=mdapi-prod get node {{ $labels.node }} -o wide
+            kubectl --context=mdapi-prod describe node {{ $labels.node }} | tail -30
+            kubectl --context=mdapi-prod get pods -A --field-selector spec.nodeName={{ $labels.node }}
+          Then the node itself over SSH (`{{ $labels.node }}`), and the iLO IML if
+          it is unresponsive — journald is silent by design on these Harvester
+          hosts (hpwdt.pretimeout=0).
+
+    - alert: NodeScrapeTargetDown
+      ## The second half of the gap: node-exporter (1 target per node, DaemonSet in
+      ## cattle-monitoring-system) and kubelet (3 targets per node, one per
+      ## metrics_path — /metrics, /metrics/cadvisor, /metrics/probes) are the ONLY
+      ## source of node-level metrics. If a target stops answering, every
+      ## saturation/disk/PSI rule for that node goes quiet with no signal that it
+      ## did — a healthy-looking silence. Nothing evaluated `up` for either job
+      ## before 2026-10-05.
+      ##
+      ## ⚠️ This rule CANNOT see a target that is GONE from the scrape config
+      ## rather than answering 0: no series, no `up==0`. That is the third gap —
+      ## NodeExporterUnscraped / KubeletUnscraped below. They are a pair; change
+      ## them together.
+      ##
+      ## `max by (job, instance, node)` is deliberate leniency: kubelet is scraped
+      ## via three endpoints per node, and one of them being disabled must not page.
+      ## The alert fires only when EVERY endpoint for that (job, instance) is down —
+      ## i.e. the target is genuinely gone, not partly reconfigured.
+      ## `node` is in the grouping so kubelet series (which carry it) name the node
+      ## as `service`. node-exporter series carry NO `node` label and fall back to
+      ## `instance`, which is the node's IP — map it with
+      ## `kubectl get node -o wide`.
+      ##
+      ## `for: 15m` rides out an exporter restart or a node reboot. Replayed
+      ## 2026-09-05..10-05: fires for qui 09-07, quo 09-14 00:37-06:03, qua 09-05 /
+      ## 09-14 12:02-12:32 / 09-14 22:58-23:34; does NOT fire for the 11-minute qui
+      ## gap 09-14 09:22-09:33 or for single-scrape blips.
+      ##
+      ## statuspage: exclude — this is about our ability to SEE the node, not
+      ## about the node being unhealthy. Same reasoning as SnmpTargetDown.
+      expr: max by (job, instance, node) (up{job=~"kubelet|node-exporter"}) == 0
+      for: 15m
+      labels:
+        service: '{{ or $labels.node $labels.nodename $labels.instance "cluster-nodes" }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.job }} target {{ $labels.instance }} unreachable for 15m"
+        description: |
+          The {{ $labels.job }} scrape target {{ $labels.instance }} has been
+          down for 15 minutes. Node-level metrics for whatever that target
+          covers are no longer being collected, so the node alerts that depend
+          on them cannot fire — a silent gap, not a symptom.
+
+          Check the exporter pod for that node and the node's own reachability:
+            kubectl --context=mdapi-prod -n cattle-monitoring-system get pods -o wide | grep node-exporter
+            kubectl --context=mdapi-prod get node -o wide
+          If the node itself is down, expect NodeNotReady at the same time.
+
+  - name: cluster-node-readiness.collection
+    rules:
+    - alert: NodeExporterUnscraped
+      ## The third gap, and the one that hid the 2026-10-03 event from us.
+      ## `up==0` needs a series; a target dropped from the scrape configuration has
+      ## none, so NodeScrapeTargetDown is silent exactly when collection is wholly
+      ## gone. Replayed 2026-09-05..10-05 over absent(up{job="node-exporter"}):
+      ## 09-14 00:30-00:36, 09-14 11:13-11:25, 10-03 06:01-07:32, plus the June run.
+      ##
+      ## ⭐ In all of them vmalert stayed ALIVE and kept writing ALERTS, and the
+      ## healthchecks.io deadman was silent — WatchdogMdapi only tests Alertmanager
+      ## and vmalert liveness and the external path, never whether anything is being
+      ## COLLECTED. vmagent-mdapi is a SINGLE replica (on quo), so a collection
+      ## blackout is precisely the self-blindness the deadman cannot cover and this
+      ## rule can. ApiserverMajorityUnavailable (24-etcd-quorum.yml) covers the same
+      ## shape when the blackout is total; this one still works when the apiserver IS
+      ## being scraped and the node exporters are not.
+      ##
+      ## `absent()` is the only correct form here — `== 0` cannot match nothing.
+      ## `for: 10m` keeps a vmagent config reload from paging, and leaves the 2m
+      ## total-blackout signal to ApiserverMajorityUnavailable.
+      ## ℹ️ No `namespace` label: absent() drops every label, so any value here
+      ## would be invented rather than read. node-exporter really lives in
+      ## cattle-monitoring-system.
+      expr: absent(up{job="node-exporter"})
+      for: 10m
+      labels:
+        service: node-exporter
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect
+        statuspage: exclude
+      annotations:
+        summary: "node-exporter is not being scraped at all"
+        description: |
+          No `up{job="node-exporter"}` series exists: every per-node exporter
+          target has been dropped from the scrape configuration, or vmagent's
+          config was not reloaded. Nothing that reads node_exporter_* metrics can
+          fire while this is true, and it produces no other symptom.
+
+          Check:
+            kubectl --context=mdapi-prod -n monitoring get pods -o wide | grep -E 'vmagent|vmsingle'
+            kubectl --context=mdapi-prod -n monitoring logs deploy/vmagent-mdapi --tail=50
+            # are the monitor objects still there?
+            kubectl --context=mdapi-prod -n cattle-monitoring-system get servicemonitor | grep -i node
+
+    - alert: KubeletUnscraped
+      ## Same gap, for the kubelet job. Scoped to metrics_path="/metrics"
+      ## deliberately: that is where the kubelet's own metrics live, and a config
+      ## that keeps /metrics/cadvisor but drops /metrics would leave every
+      ## kubelet_* and container-runtime rule blind with `up{job="kubelet"}` still
+      ## non-empty. `absent()` of the /metrics subset is the honest check.
+      ##
+      ## The kubelet series do carry `node`, so this one names the node — but only
+      ## when the WHOLE subset is gone, which is the case worth alerting on.
+      ## ℹ️ No `namespace` label: absent() drops every label (kubelet series say
+      ## namespace="kube-system", but that is not readable here).
+      expr: absent(up{job="kubelet",metrics_path="/metrics"})
+      for: 10m
+      labels:
+        service: kubelet
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect
+        statuspage: exclude
+      annotations:
+        summary: "kubelet /metrics is not being scraped at all"
+        description: |
+          No `up{job="kubelet",metrics_path="/metrics"}` series exists. kubelet_*
+          and container-runtime metrics are no longer being collected for ANY node,
+          while the cadvisor and probes endpoints may still be fine — so
+          `up{job="kubelet"} == 0` cannot see this.
+
+          Check the kubelet ServiceMonitor / scrape config and vmagent:
+            kubectl --context=mdapi-prod -n cattle-monitoring-system get servicemonitor | grep -i kubelet
+            kubectl --context=mdapi-prod -n monitoring logs deploy/vmagent-mdapi --tail=50

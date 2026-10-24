@@ -1,0 +1,40 @@
+# Public on purpose: the Mac may be off-LAN (corporate VPN), and Little Snitch
+# fetches this on a timer without any credentials. Confidentiality therefore
+# rests on the PATH being a bearer capability (see lsrules-es.yml) — which also
+# means the request URI must not be logged anywhere: ingress access logs go to
+# Loki and would leak the token on every single fetch.
+#
+# `rules.mdapi.ch` is covered by the *.mdapi.ch wildcard A record, so no DNS
+# change is needed; letsencrypt-prod issues the cert here.
+#
+# ⛔ ModSecurity off, same reasoning as mta-sts: this endpoint serves one static
+# JSON file to a client with no query strings. A WAF false positive would break
+# the subscription silently (Little Snitch would keep the old rules), and
+# availability beats inspection for a file whose whole job is to be fetchable.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lsrules
+  namespace: mac-rules
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: rules.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: lsrules
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - rules.mdapi.ch
+    secretName: lsrules-cert

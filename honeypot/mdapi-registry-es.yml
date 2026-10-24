@@ -1,0 +1,29 @@
+## Pull credentials for registry.mdapi.ch. Needed since the ClusterIP decoy moved
+## to mdapi/trapeye-image (the upstream agent rebuilt with a corrected certificate
+## validity window) — mdapi/* projects are private, so an anonymous pull returns
+## 403 and the pod sits in ImagePullBackOff. Same shape as the other 17 namespaces;
+## the Akeyless value is the group-level `cluster-registry-pull` deploy token
+## (read_registry only).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mdapi-registry
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: mdapi-registry
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: '{{ .encodedUserPass | toString }}'
+
+  data:
+    - remoteRef:
+        key: /mdapi/honeypot/mdapi-registry
+      secretKey: encodedUserPass

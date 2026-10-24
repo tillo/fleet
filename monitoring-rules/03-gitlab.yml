@@ -1,0 +1,115 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-gitlab
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-gitlab.workload
+    rules:
+    - alert: GitLabWebserviceUnavailable
+      expr: |
+        ( kube_deployment_spec_replicas{
+            namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+          }
+          - kube_deployment_status_replicas_available{
+            namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+          }
+        ) > 0
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab webservice {{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: "gitlab.mdapi.ch will be unreachable. Check: kubectl -n bootstrap logs deployment/{{ $labels.deployment }}"
+
+    - alert: GitLabGitalyDown
+      expr: |
+        kube_statefulset_status_replicas_ready{
+          namespace="bootstrap", statefulset=~"gitlab-gitaly.*"
+        } < kube_statefulset_status_replicas{
+          namespace="bootstrap", statefulset=~"gitlab-gitaly.*"
+        }
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Gitaly statefulset {{ $labels.statefulset }} degraded"
+        description: "Git operations will fail. Check: kubectl -n bootstrap logs sts/{{ $labels.statefulset }}"
+
+    - alert: GitLabSidekiqDown
+      ## 2026-09-23 (user-approved, ledger alert:GitLabSidekiqDown): was
+      ## `spec_replicas - status_replicas_available > 0`, which is HPA-blind —
+      ## spec is driven by hpa gitlab-sidekiq-all-in-1-v2 (min 3, max 6), so
+      ## every scale-up read as "down" until the new pod was Ready. Now keyed on
+      ## the Deployment's own Available=false condition, which the controller
+      ## computes against spec minus maxUnavailable (25%): a 3->4 scale-up keeps
+      ## Available=true, losing an existing pod does not.
+      ## Replayed 07-25..09-23 as a sustained-10m condition: the scale-up-only
+      ## episodes (07-29T01:58, 08-23T08:28, 08-25T05:12, 08-27T12:52 and the
+      ## 09-14T00:50-00:58 tail) drop out; the real outages (07-29 and 09-03,
+      ## available 0) and the node-event pod losses stay. Known limit: at
+      ## 25% of 3 the floor is 0, so ANY pod unavailable 10m+ fires, and a
+      ## scale-up jump of 2+ pods at once can still trip it.
+      ## max by() folds the `reason` label, which changes with the condition.
+      expr: |
+        max by (namespace, deployment) (
+          kube_deployment_status_condition{
+            namespace="bootstrap", deployment=~"gitlab-sidekiq-.*",
+            condition="Available", status="false"
+          }
+        ) == 1
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Sidekiq {{ $labels.deployment }}: Deployment not Available"
+        description: "The Deployment has reported Available=false for 10m (fewer available replicas than spec minus maxUnavailable) — not an HPA scale-up in progress. Background jobs (CI runners, emails, repository indexing) will queue up."
+
+    - alert: GitLabPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="bootstrap", pod=~"gitlab-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.pod }}/{{ $labels.container }} restarting frequently"
+
+    - alert: GitLabBackupCronJobMissed
+      expr: |
+        time() - kube_cronjob_status_last_successful_time{
+          namespace="bootstrap", cronjob="gitlab-toolbox-backup"
+        } > 36 * 3600
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "GitLab backup CronJob hasn't succeeded in {{ $value | humanizeDuration }}"
+        description: |
+          Schedule is daily at 02:00. >36h means at least one missed run.
+          Check: kubectl -n bootstrap get jobs | grep toolbox-backup

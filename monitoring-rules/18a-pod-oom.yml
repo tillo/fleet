@@ -1,0 +1,124 @@
+## Catch an OOM kill anywhere in the estate, not just in mail.
+##
+## WHY THIS EXISTS. Until 2026-10-23 the ONLY OOM rule in the estate was
+## MailPodOOMKilled (01-mail.yml), pinned to namespace="mail". An OOM anywhere
+## else was invisible. On 2026-10-22 openobserve-0 was OOMKilled 11-12 times an
+## HOUR for seven hours, then flapped for a day; nobody was told. It surfaced
+## only because a session happened to be reading that pod for an unrelated
+## reason, and the pod's own restart count was the evidence. That is a detector
+## gap, not an unlucky week: pod_logs search, f/probe/media_activity_to_o2 and
+## f/probe/waf_novelty_audit were failing in the same windows.
+##
+## ⛔ WHY NOT container_oom_events_total. It looks like the obvious counter and
+## is not usable: cAdvisor's counter RESETS with the container, and a restart
+## creates a NEW time series, so increase() over any window reads ~0 for exactly
+## the event it should catch. Measured 2026-10-23 while writing this: 0 OOM
+## events in 6h/24h/7d, against five pods carrying reason="OOMKilled" and a pod
+## that had been killed an hour earlier.
+##
+## ⛔ AND WHY NOT `last_terminated_reason == 1` ALONE. It is a GAUGE that
+## PERSISTS after the kill - on 2026-10-23, five pods had been carrying
+## reason="OOMKilled" for days (harvester-system x2, horizon-issuer, jump/
+## guacamole, rook-ceph-operator). Firing on the bare gauge is permanent
+## wallpaper, the exact failure the alert-coverage work complains about. The
+## alert therefore joins the gauge to the RESTART COUNTER: an OOM matters when
+## the container actually went down.
+##
+## ⛔ `mail` IS EXCLUDED, and that is not an oversight: MailPodOOMKilled
+## (01-mail.yml) already covers it, with `component: Mail` and NO statuspage
+## exclusion - mail is a public service, so its OOMs are allowed to reach the
+## status page, which this Platform-level rule explicitly is not. Without the
+## exclusion one mail OOM sends two notifications for one incident. If the mail
+## rule is ever removed, remove this exclusion in the same MR.
+##
+## No opt-out label yet, deliberately. If a workload turns out to OOM by design,
+## the fix is a pod-template label AND surfacing it through the KSM label
+## allowlist in rancher-monitoring-config (see the
+## monitoring.mdapi.ch/cpu-throttle-exempt precedent in 18-cpu-throttling.yml) -
+## not a quiet namespace exclusion here.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-pod-oom
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-pod-oom.kills
+    rules:
+    - alert: PodOOMKilled
+      ## A single OOM kill. `for:` is deliberately absent: the [15m] increase
+      ## already debounces, and the condition stays true for the whole window,
+      ## so a `for:` could only delay a message about something that already
+      ## happened. The `unless` hands the flapping case to PodOOMKilledRepeated
+      ## so one incident produces one notification, not two.
+      expr: |
+        (
+          increase(kube_pod_container_status_restarts_total{namespace!="mail"}[15m]) > 0
+          and on (namespace, pod, container)
+          kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+        )
+        unless on (namespace, pod, container)
+        (
+          increase(kube_pod_container_status_restarts_total{namespace!="mail"}[1h]) >= 3
+          and on (namespace, pod, container)
+          kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+        )
+      labels:
+        service: '{{ or $labels.container "pod" }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## An OOM is an internal capacity signal; it only becomes user-visible
+        ## once something downstream notices. The status page carries the
+        ## downstream alerts, not this one.
+        statuspage: exclude
+      annotations:
+        summary: "OOMKilled: {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }}"
+        description: |
+          Container {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }}
+          was killed by the kernel for exceeding its memory limit, and its last
+          termination reason is still OOMKilled.
+
+          Compare the cap against what it was actually using - a limit that is
+          too small and a genuine leak look identical from here:
+            kubectl -n {{ $labels.namespace }} logs {{ $labels.pod }} -c {{ $labels.container }} --previous --tail=200
+
+          Past kills of this container are in the 15m restart counter and in
+          OpenObserve's pod_logs stream (logs.mdapi.ch). If the pod restarts
+          again within the hour this escalates to PodOOMKilledRepeated.
+
+    - alert: PodOOMKilledRepeated
+      ## The O2 shape: 11-12 kills an hour. A pod that OOMs once is a data
+      ## point; a pod that OOMs repeatedly is down, and everything behind it is
+      ## down with it. Three restarts in an hour is past "a burst" and into
+      ## "this is not working".
+      expr: |
+        (
+          increase(kube_pod_container_status_restarts_total{namespace!="mail"}[1h]) >= 3
+          and on (namespace, pod, container)
+          kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+        )
+      for: 10m
+      labels:
+        service: '{{ or $labels.container "pod" }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "OOMKILL LOOP: {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} restarted {{ $value | humanize }}x in 1h"
+        description: |
+          Container {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }}
+          has restarted at least three times in the last hour and its last
+          termination was an OOM kill. Anything it serves is degraded or down now.
+
+          This is the openobserve-0 shape from 2026-10-22 (11-12 kills/hour for
+          seven hours, unnoticed). Ask whether the LIMIT is wrong or the workload
+          changed - the hourly-max working set tells you which:
+            max_over_time(container_memory_working_set_bytes{namespace="{{ $labels.namespace }}",pod="{{ $labels.pod }}"}[1h])
+            container_spec_memory_limit_bytes{namespace="{{ $labels.namespace }}",pod="{{ $labels.pod }}",container="{{ $labels.container }}"}
+          A working set that sits just under the limit is a sizing problem; one
+          that grows without bound is a leak. Fix the sizing in the Fleet
+          manifest, not with a kubectl patch.

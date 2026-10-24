@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-apache
+  namespace: envuassu
+spec:
+  # Recreate (not RollingUpdate) so a new pod is never scheduled before the old
+  # one terminates and detaches the RWX volume — prevents transient cross-node
+  # mount of pvc nextcloud-aio-nextcloud, which wedges Longhorn (engine
+  # migration unsupported here, see envuassu/nextcloud/kustomize sibling
+  # patches on -nextcloud and -notify-push for the same reason).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+        - name: nextcloud-aio-apache
+          # A2 (infra-ka2): explicit request floors sized from the VPA
+          # recommender's targets — VPA Auto does NOT mutate envuassu pods
+          # (works in other namespaces; tracked separately). No limits.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+          imagePullPolicy: IfNotPresent
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: io.kompose.service
+                operator: In
+                values:
+                - nextcloud-aio-nextcloud
+            topologyKey: "kubernetes.io/hostname"

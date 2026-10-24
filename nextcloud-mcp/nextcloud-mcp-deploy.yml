@@ -1,0 +1,114 @@
+## nextcloud-mcp — the read-only Nextcloud Files connector for chat.mdapi.ch.
+##
+## One user, one token, one view: Open WebUI sends the caller's own Keycloak
+## access token, this pod exchanges it for a token minted for Nextcloud alone
+## (RFC 8693, aud=nextcloud) and speaks WebDAV with THAT. Nothing here is a
+## shared credential for the household's files, and no tool writes.
+##
+## Code and CI: gitlab.mdapi.ch/mdapi/nextcloud-mcp. Graph of the exchange and
+## the why: ~/openwebui-per-user-data-20261021.md, bead infra-47nq.1.
+##
+## ⚠️ ALLOWED_GROUPS is load-bearing, not a nicety. Nextcloud's user_oidc bearer
+## path auto-provisions an account for any token it can validate, so a user the
+## gate refuses must be refused HERE, before the exchange — otherwise the first
+## tool call of any Keycloak account mints an empty Nextcloud account for it.
+## `Nextcloud` is exactly the set of realm users who already have one (measured
+## 2026-10-22: 33 members, and the claim carries bare group names because the
+## realm's `groups` client scope maps with full.path=false).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-mcp
+  namespace: nextcloud-mcp
+  labels:
+    app: nextcloud-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nextcloud-mcp
+  template:
+    metadata:
+      labels:
+        app: nextcloud-mcp
+    spec:
+      ## The process never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: nextcloud-mcp
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nextcloud-mcp
+          ## Lane A: floating tag + resolved digest (Renovate owns the bump) +
+          ## IfNotPresent, so a node that already has the layer does not re-pull
+          ## and a registry outage does not stop a restart.
+          image: zot.mdapi.ch/mdapi/nextcloud-mcp:latest@sha256:d72b884a8441a4c42bca1c7ef2c3da285163cfeefc96a12a533708c6bda80561
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: NEXTCLOUD_BASE
+              value: https://cloud.mdapi.ch
+            - name: KEYCLOAK_ISSUER
+              value: https://idp.mdapi.ch/realms/tilloch
+            ## Audience this pod insists on in the token Open WebUI hands it.
+            - name: EXPECTED_AUDIENCE
+              value: openwebui-mcp
+            ## Audience it exchanges for. Nextcloud's SelfEncodedValidator
+            ## requires aud to contain the provider client id `nextcloud`.
+            - name: TARGET_AUDIENCE
+              value: nextcloud
+            - name: MCP_CLIENT_ID
+              value: nextcloud-mcp
+            ## RFC 9728 `resource` — must be the URL Open WebUI actually calls.
+            - name: RESOURCE_URL
+              value: http://nextcloud-mcp.nextcloud-mcp.svc.cluster.local:8080/mcp
+            - name: ALLOWED_GROUPS
+              value: Nextcloud
+            - name: PORT
+              value: "8080"
+            - name: MCP_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-mcp-env
+                  key: MCP_CLIENT_SECRET
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ## Baseline is a thin proxy (a few tens of MiB); 256Mi leaves room for
+          ## a 400 kB file body several times over without inviting the OOM
+          ## kill that a tighter limit would.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 96Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+      imagePullSecrets:
+        - name: zot-pull

@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # Pod-level k8s admission defaults written explicitly so Fleet
+      # drift detection doesn't flag the bundle Modified after admission
+      # fills them in on the live state. Same reason for the per-container
+      # terminationMessage* + port protocol fields below.
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+        - name: postgres
+          # 18 moved PGDATA to /var/lib/postgresql/18/docker, so the volume has
+          # to be mounted at /var/lib/postgresql as a whole — see the
+          # volumeMounts note below. The 17.11 cluster this replaces is still
+          # on the volume at wants_an_empty_folder/ (rollback: restore this
+          # image and the old mountPath+subPath, and re-point the DB at it).
+          image: mirror.gcr.io/postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
+          imagePullPolicy: IfNotPresent
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          # `resources: {}` is here so Fleet's comparePatches `op:remove`
+          # on /containers/0/resources finds the path and succeeds — JSON
+          # Patch is atomic, so one missing path voids the whole patch.
+          resources: {}
+          env:
+            - name: TZ
+              value: Europe/Zurich
+            - name: POSTGRES_USER
+              value: "keycloak"
+            - name: POSTGRES_DB
+              value: "keycloak"
+            - name: POSTGRES_LOG_STATEMENT
+              value: "all"
+          envFrom:
+            - secretRef:
+                name: postgres-env-secret
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          volumeMounts:
+            # PGDATA is /var/lib/postgresql/18/docker in the 18 image. Mount
+            # the PVC one level up (no subPath): mounting at .../data leaves
+            # PGDATA outside the volume, and the entrypoint either refuses to
+            # start (it finds the old cluster and prints "upgrading the Docker
+            # image without upgrading the underlying database") or, with no old
+            # cluster in sight, initdb's an empty one. Both are wrong.
+            - name: postgres-data
+              mountPath: /var/lib/postgresql
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data

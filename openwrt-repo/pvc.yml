@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwrt-repo
+  labels:
+    app: openwrt-repo
+  annotations:
+    # Read by f/probe/pvc_backup_coverage. This volume is a MIRROR of a GitLab
+    # repo (see external-secret.yml: the syncer pulls from the forge, CI does
+    # not push into the cluster), so it is re-creatable and is not a backup
+    # source. Declared here rather than in the probe's hand-maintained EXEMPT
+    # list, which had already gone stale on four different subjects
+    # (ledger alert:PvcBackupUncovered, approved 2026-10-18).
+    mdapi.ch/backup-exempt: "mirror of a GitLab repo; re-creatable, not a backup source"
+spec:
+  # RWO and a single replica: the syncer is the only writer, and a release
+  # directory is published by rename, which needs one filesystem view.
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

@@ -1,0 +1,531 @@
+## Watchdog rules for the monitoring/alerting/logging plane itself.
+##
+## If Cribl dies, log-based alerts go silent.
+## If fluentd dies, Cribl receives nothing, log-based alerts go silent.
+## If the statuspage adapter dies, Alertmanager webhooks 5xx and
+##   statuspage components don't update.
+## If the Alertmanager AC matcher strategy gets reverted by a chart
+##   upgrade, no team=mdapi alerts route anywhere.
+## If Alertmanager cannot reload its config, or its notification integrations
+##   start failing, alerts are accepted and then dropped — see the
+##   meta-monitoring.alertmanager group, added 2026-10-05.
+## If vmalert re-bases an alert's `for:` timer on restart, that alert can
+##   silently never fire no matter how long its condition stays true — see the
+##   meta-monitoring.alert-state group, added 2026-10-07 (infra-acd0/infra-1ps8).
+##
+## All rides the existing Pushover path so a problem in *one* signal
+## class doesn't silently mask all the others.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: meta-monitoring-stack
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: meta-monitoring.workload
+    rules:
+    - alert: MonitoringComponentDown
+    ## SELECTOR CORRECTED 2026-08-29, found by f/probe/alert_coverage_check on its
+    ## first run. Two problems, both invisible from reading the rule:
+    ##  * `monitoring-grafana` matched NOTHING — the deployment is named `grafana`.
+    ##    Verified: kube_deployment_spec_replicas{deployment="monitoring-grafana"}
+    ##    returns 0 series. A dead entry in a live regex reads as coverage.
+    ##  * The entire VictoriaMetrics stack was absent from the list. vmsingle-mdapi
+    ##    is the metrics DATABASE and vmagent-mdapi is the scraper — the two pieces
+    ##    everything else in this file depends on — and neither had ANY availability
+    ##    alert, from any rule. vmalert, the operator and snmp-exporter likewise.
+    ## ⚠️ vmsingle going down is partly self-masking (no database, no alerting), so
+    ## this is a best-effort signal; the deadman WatchdogMdapi via healthchecks.io is
+    ## what actually survives that case. vmagent and vmalert dying are NOT self-
+    ## masking and are exactly what this now catches.
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace=~"cribl|monitoring|cattle-logging-system",
+              deployment=~"logstream-leader|rancher-logging|blackbox|grafana|pushgateway|prometheus-adapter|kube-state-metrics|vmsingle-mdapi|vmagent-mdapi|vmalert-mdapi|vm-operator-victoria-metrics-operator|snmp-exporter"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace=~"cribl|monitoring|cattle-logging-system",
+              deployment=~"logstream-leader|rancher-logging|blackbox|grafana|pushgateway|prometheus-adapter|kube-state-metrics|vmsingle-mdapi|vmagent-mdapi|vmalert-mdapi|vm-operator-victoria-metrics-operator|snmp-exporter"
+            }
+          ) > 0
+        )
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "vmagent-mdapi" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "monitoring stack: {{ $labels.namespace }}/{{ $labels.deployment }} down ({{ $value }} replicas unavailable)"
+        description: |
+          A component of the monitoring/alerting/logging plane is down.
+          Other alerts in the affected signal class may be silently failing.
+
+    ## SPLIT OUT OF MonitoringComponentDown 2026-09-02. Same expression, one
+    ## deployment, one label different — and that label is the whole point.
+    ##
+    ## statuspage-adapter is the process that PUBLISHES the public statuspage.
+    ## While it is down it publishes nothing; when it comes back, its reconcile
+    ## loop reads the still-active alert about its own outage and PATCHes the
+    ## component that alert maps to. With component=Platform and severity=critical
+    ## that resolved to `Platform=major_outage` on the PUBLIC page on 2026-09-01,
+    ## caused by nothing worse than a 34-minute image pull. The adapter was
+    ## reporting itself, to customers, as a platform outage.
+    ##
+    ## It cannot stay in the shared rule: MonitoringComponentDown covers 12
+    ## deployments in one series, so there is no way to exclude one of them by
+    ## label. Hence the split. Everything else about the signal is unchanged —
+    ## it still pages at critical, it just cannot reach the public page.
+    - alert: StatuspageAdapterDown
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{namespace="monitoring", deployment="statuspage-adapter"}
+            - kube_deployment_status_replicas_available{namespace="monitoring", deployment="statuspage-adapter"}
+          ) > 0
+        )
+      for: 5m
+      labels:
+        service: 'statuspage-adapter'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "statuspage-adapter down ({{ $value }} replicas unavailable)"
+        description: |
+          The public statuspage stops tracking reality while this is down —
+          components keep whatever status they last had. Nothing else is
+          affected; internal alerting (Pushover, the healthchecks.io deadman)
+          does not route through the adapter.
+
+    - alert: MonitoringStatefulSetDown
+      expr: |
+        kube_statefulset_status_replicas_ready{
+          namespace=~"cribl|monitoring|cattle-logging-system",
+          statefulset=~"rancher-logging-root-fluentd"
+        } < kube_statefulset_status_replicas{
+          namespace=~"cribl|monitoring|cattle-logging-system",
+          statefulset=~"rancher-logging-root-fluentd"
+        }
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "vmagent-mdapi" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "monitoring stack: {{ $labels.namespace }}/{{ $labels.statefulset }} ready < desired"
+        description: |
+          A monitoring/alerting StatefulSet is not at full strength.
+          Same risk as MonitoringComponentDown — silent gap in alerting.
+
+    - alert: FluentBitDaemonSetDegraded
+      expr: |
+        kube_daemonset_status_number_unavailable{
+          namespace="cattle-logging-system", daemonset=~"rancher-logging-root-fluentbit.*"
+        } > 0
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "vmagent-mdapi" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "fluent-bit DS has {{ $value }} unavailable replicas"
+        description: |
+          One or more nodes are not shipping pod logs to Cribl.
+          Log-based alerts from those nodes' workloads are blind.
+
+    - alert: PushgatewayMissingScripts
+      ## When Pushgateway has been up for a day but nothing is pushing yet,
+      ## the staleness backstop in app-batch-jobs only fires after >24h.
+      ## This is an info-level reminder that no batch jobs are reporting.
+      expr: |
+        absent(
+          {__name__=~".+_last_run_timestamp_seconds", job!=""}
+        ) and on() (time() - kube_pod_start_time{namespace="monitoring", pod=~"pushgateway-.*"}) > 86400
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "vmagent-mdapi" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: info
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "pushgateway has no jobs pushing"
+        description: "Pushgateway is up but no batch jobs are publishing *_last_run_timestamp_seconds. Either nothing's been migrated yet, or every script has stopped running."
+
+    ## ⛔ 2026-10-04 — detect a pushgateway restart that silently REVERTED accepted pushes.
+    ##
+    ## Pushgateway persists to a PVC, but only every --persistence.interval (5m —
+    ## fleet/monitoring-pushgateway/values.yml). A push accepted between the last
+    ## flush and the pod's death is lost: the replacement pod replays the snapshot
+    ## and the group comes back holding its PREVIOUS value. The pusher was told 2xx
+    ## (f/lib/mdapi.pushgw ends in raise_for_status), so the job record stays green
+    ## and nothing anywhere reports the loss.
+    ##
+    ## The damage is downstream and misleading: every *_last_run_timestamp_seconds
+    ## staleness rule (BatchJobStale in app-batch-jobs, plus the per-job rules) then
+    ## fires describing a job that DID run — sending the operator to debug healthy
+    ## code. That is exactly what happened on 2026-10-03 (ledger
+    ## alert:PVReclaimPolicyAuditStale): the cluster restarted ~06:01Z, the 06:00:37Z
+    ## push was reverted, and a 36h staleness alert fired ~12h later about an audit
+    ## that had run perfectly and whose push had been acknowledged.
+    ##
+    ## push_time_seconds is the group's own stamp and is part of the persisted state,
+    ## so it is reverted too — which makes the rollback directly detectable: a group
+    ## whose push_time predates the CURRENT pushgateway process came from the
+    ## snapshot. That is also true for a floor of jobs that simply have not run since
+    ## the restart, so this alerts on the SHARE, not the count: measured
+    ## 2026-09-27..10-04, the floor sits at 1-6 of ~154 groups (0.6-4%) and the one
+    ## real restart took it to 45-52%. Over that week this rule fires only on the
+    ## 10-03 restart — never on the floor. Re-baseline if the estate changes shape,
+    ## and note it is a consequence-detector: it explains other alerts, it is not a
+    ## symptom of its own.
+    - alert: PushgatewayRestartRevertedPushes
+      expr: |
+        count(push_time_seconds < on() group_left() process_start_time_seconds{job="pushgateway"})
+          /
+        count(push_time_seconds) > 0.15
+      for: 30m
+      labels:
+        service: pushgateway
+        namespace: monitoring
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect (same reasoning as app-batch-jobs)
+        statuspage: exclude
+      annotations:
+        summary: "pushgateway: {{ $value | humanizePercentage }} of pushed groups hold pre-restart values"
+        description: |
+          A large share of the metrics stored in pushgateway predate its current
+          process, so they were restored from the PVC snapshot rather than by a live
+          push. Any push accepted in the ~5m before the restart that replaced this pod
+          was silently REVERTED to its previous value — the pusher received a 2xx and
+          its job record is green.
+
+          Read this together with any PushgatewayGroupStale / BatchJobStale / per-job
+          staleness alert firing at the same time: those may be describing a job that
+          actually ran. Check the job's own run record (Windmill) before treating a
+          staleness alert as a dead job.
+
+          Benign on a job that simply has not run since the restart — that is the
+          floor this rule tolerates. What is not benign is that the same silence can
+          hide a push that was accepted and then lost.
+
+  - name: meta-monitoring.statuspage-adapter
+    rules:
+    - alert: StatuspageAdapterUnhealthy
+      ## Synthetic probe checks /healthz on the adapter Service. If down,
+      ## AM webhooks 5xx → statuspage components stop updating.
+      ##
+      ## statuspage: exclude — ADDED 2026-09-02, and the reason is structural,
+      ## not noise-tuning. This alert is about the PUBLISHER. While it fires the
+      ## adapter cannot publish anything, so the label can only take effect on
+      ## recovery — at which point the reconcile loop reads a still-active alert
+      ## and PATCHes the component it maps to. On 2026-09-01 that is exactly what
+      ## happened: a 34-minute image-pull gap (single replica, Recreate) ended
+      ## with the adapter publishing `Platform=major_outage` to the PUBLIC page,
+      ## three times, describing its own restart. A status publisher must never
+      ## be able to report itself as a customer-facing outage — the honest
+      ## external signal for "the adapter is down" is the healthchecks.io deadman
+      ## and Pushover, both of which are outside this loop.
+      expr: probe_success{instance="http://statuspage-adapter.monitoring.svc.cluster.local:8080/healthz"} == 0
+      for: 3m
+      labels:
+        service: 'statuspage-adapter'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "statuspage adapter /healthz failing"
+        description: "Alertmanager webhooks to the adapter will 5xx; public statuspage components won't reflect actual outages."
+
+  - name: meta-monitoring.embedded-retired
+    rules:
+    - alert: EmbeddedMonitoringResurrected
+      ## The bundled rancher-monitoring SERVER stack (Prometheus / Alertmanager
+      ## / Grafana / prometheus-adapter) was intentionally retired 2026-06-24 in
+      ## favour of VictoriaMetrics — disabled via the rancher-monitoring-config
+      ## HelmChartConfig (`enabled: false`). If any of these workloads is running
+      ## again, a Harvester upgrade or a manual change re-rendered the chart and
+      ## overrode the Fleet disable: VM is now double-scraped and the dead-
+      ## datasource confusion is back. Re-assert the HelmChartConfig (Fleet
+      ## should self-heal within a reconcile; investigate if it doesn't).
+      ## `for: 30m` rides out the transient re-render during a Harvester upgrade.
+      expr: |
+        kube_statefulset_replicas{
+          namespace="cattle-monitoring-system",
+          statefulset=~"prometheus-rancher-monitoring-prometheus|alertmanager-rancher-monitoring-alertmanager"
+        } > 0
+        or
+        kube_deployment_spec_replicas{
+          namespace="cattle-monitoring-system",
+          deployment=~"rancher-monitoring-grafana|rancher-monitoring-prometheus-adapter"
+        } > 0
+      for: 30m
+      labels:
+        service: 'rancher-monitoring'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "embedded rancher-monitoring resurrected: {{ $labels.statefulset }}{{ $labels.deployment }}"
+        description: |
+          A retired embedded rancher-monitoring server component is running
+          again (VictoriaMetrics is meant to be the sole source). Most likely a
+          Harvester upgrade re-rendered the chart. Verify rancher-monitoring-config's
+          HelmChartConfig still carries the `enabled: false` flags and that Fleet
+          has reconciled it; then confirm the embedded Prometheus/AM/Grafana/adapter
+          are gone again.
+
+  ## Alertmanager's OWN health, added 2026-10-05.
+  ##
+  ## ⛔ Nothing covered this before. Two separate holes:
+  ##  * MonitoringComponentDown does NOT include vmalertmanager — its regex lists
+  ##    vmsingle-mdapi, vmagent-mdapi and vmalert-mdapi, and vmalertmanager is a
+  ##    StatefulSet anyway, so the deployment-based expression could never see it.
+  ##    MonitoringStatefulSetDown matches only rancher-logging-root-fluentd.
+  ##    Measured 2026-10-05: the ONLY thing covering "Alertmanager is down" is the
+  ##    external deadman WatchdogMdapi (healthchecks.io), which is correct by design
+  ##    — a local rule cannot report the process that delivers it. Nothing covers
+  ##    Alertmanager being UP but broken, which is what this group is for.
+  ##  * everything in the delivery path downstream of evaluation: config reload,
+  ##    and per-integration notification failures.
+  ##
+  ## statuspage: exclude on both — Alertmanager is internal plumbing. While it is
+  ## broken the statuspage adapter receives nothing, so the adapter's own staleness
+  ## is the visitor-facing question, and that is StatuspageAdapterUnhealthy's to
+  ## answer. Same reasoning as SnmpTargetDown.
+  ## ⚠️ A Pushover failure self-masks on Pushover (it is the thing that would have
+  ## told you); the deliberate property of this estate is that such an alert still
+  ## reaches the other integrations — statuspage-adapter and the O2 shadow route —
+  ## so a Pushover outage is visible through them.
+  - name: meta-monitoring.alertmanager
+    rules:
+    - alert: AlertmanagerConfigReloadFailed
+      ## `alertmanager_config_last_reload_successful` is 0 from the first failed
+      ## reload until one succeeds — it does not flap. Verified 2026-10-05: never 0
+      ## in 30 days, so this is a genuinely new signal rather than a known-noisy one.
+      ##
+      ## critical, not warning: a rejected config is not a degraded Alertmanager,
+      ## it is an Alertmanager running a config nobody chose. Routes, receivers and
+      ## the inhibition rules silently stay at whatever they were, and the failure
+      ## is otherwise silent — the reload is attempted at runtime and logged, not
+      ## surfaced as a readiness failure.
+      ## `for: 5m` covers a reload during a config rollout where the new file is
+      ## momentarily half-written.
+      expr: alertmanager_config_last_reload_successful{job="vmalertmanager-mdapi"} == 0
+      for: 5m
+      labels:
+        service: vmalertmanager-mdapi
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect
+        statuspage: exclude
+      annotations:
+        summary: "Alertmanager config reload is failing"
+        description: |
+          vmalertmanager-mdapi rejected its last configuration reload and is
+          running the previous one. Routing, receivers and inhibition are frozen
+          at the last accepted config — every alert still evaluates and still
+          reaches Alertmanager, but it may be delivered by the wrong route.
+
+          Check the live config and the reason:
+            kubectl --context=mdapi-prod -n monitoring logs vmalertmanager-mdapi-0 -c config-reloader --tail=30
+            kubectl --context=mdapi-prod -n monitoring exec vmalertmanager-mdapi-0 -c alertmanager -- amtool check-config /etc/alertmanager/config_out/alertmanager.env.yaml
+          Then fix the source (the Fleet-managed VMRule/secret), not the pod: the
+          container's copy is regenerated on every reconcile.
+
+    - alert: AlertmanagerNotificationsFailing
+      ## The delivery path every other alert depends on, and until 2026-10-05
+      ## nothing measured it: an alert can evaluate, route correctly, and then be
+      ## dropped by the integration, with no signal anywhere.
+      ##
+      ## `sum by (integration)` so the alert names WHICH one — pushover, webhook,
+      ## email, and so on. Replay 2026-09-05..10-05: fired exactly once,
+      ## 2026-09-11 12:41-12:55, integration=webhook, reason=other, 3 failures —
+      ## against a 30d baseline of 10184 webhook and 2600 pushover notifications,
+      ## so the bar is high enough to be real signal, not noise.
+      ##
+      ## `for: 10m` on a 15m window: a single failed delivery (one 5xx from the
+      ## statuspage adapter, a Pushover hiccup) is not worth waking anyone; a
+      ## sustained rate is. Severity is warning for that reason — critical is
+      ## reserved for "alerts are not being delivered at all", which is the
+      ## deadman's job at the top of the chain.
+      ## ⚠️ This counter's `reason` label is available if a future version needs
+      ## to separate transient (clientError) from persistent (authError) failures;
+      ## today they are deliberately pooled.
+      expr: sum by (integration) (increase(alertmanager_notifications_failed_total{job="vmalertmanager-mdapi"}[15m])) > 0
+      for: 10m
+      labels:
+        service: vmalertmanager-mdapi
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## internal signal, no visitor-observable effect
+        statuspage: exclude
+      annotations:
+        summary: "Alertmanager {{ $labels.integration }} notifications are failing"
+        description: |
+          Alertmanager's `{{ $labels.integration }}` integration has failed to
+          deliver notifications recently. Alerts that route to it are being lost —
+          this is a delivery failure, not an evaluation or routing one, so nothing
+          else will report it.
+
+          Check which side is broken:
+            kubectl --context=mdapi-prod -n monitoring logs vmalertmanager-mdapi-0 -c alertmanager --tail=50 | grep -i 'notify\|failed'
+          For webhook, that is the statuspage adapter (StatuspageAdapterUnhealthy
+          covers it from the other end). For pushover, the vendor API.
+
+  - name: meta-monitoring.scrape-targets
+    rules:
+    - alert: SnmpTargetDown
+      ## A dead SNMP scrape target previously went unnoticed for 9 days:
+      ## the zyxel rez AP (192.168.1.199) power-cycled 2026-06-24 and came
+      ## back with SNMP disabled (the activation had never been written to
+      ## startup config), and nothing alerted on up==0 for the snmp jobs.
+      ## Covers every job scraped through snmp-exporter (aruba-snmp,
+      ## host_snmp, ilo_snmp, msm_snmp, zyxel_snmp + future additions).
+      ## `for: 30m` rides out device reboots and firmware flashes.
+      expr: up{job=~".*snmp.*"} == 0
+      for: 30m
+      labels:
+        service: 'snmp-exporter'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}monitoring{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        ## internal signal, no visitor-observable effect: keep it off the public page (2026-09-28, ledger ext:statuspage-internal-alert-mapping)
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "SNMP target {{ $labels.instance }} ({{ $labels.job }}) unreachable"
+        description: |
+          The SNMP scrape target {{ $labels.instance }} of job {{ $labels.job }}
+          has been down for 30 minutes. If the device is reachable (ping/ssh)
+          but SNMP is off, check whether its SNMP config survived the last
+          reboot — on the Zyxel AP, CLI changes are lost unless saved with
+          `write`. Probe manually:
+            kubectl --context=mdapi-prod get --raw "/api/v1/namespaces/monitoring/services/snmp-exporter:9116/proxy/snmp?target={{ $labels.instance }}&auth=public_v2c&module=ifmib"
+
+  - name: meta-monitoring.alert-state
+    rules:
+    ## Detects vmalert RE-BASING an alert's `for:` timer: `activeAt` jumps
+    ## forward without the expression having gone false. The alert silently
+    ## restarts its countdown, so a condition that has been continuously true
+    ## for longer than `for:` still never fires.
+    ##
+    ## WHY THIS EXISTS (infra-acd0 / infra-1ps8). Up to v1.152.0 vmalert wrote
+    ## a fresh pending ALERTS_FOR_STATE *before* restoring state, so on every
+    ## restart with replicaCount: 2 the reset timer won and every later replica
+    ## inherited it. Measured on RgwOffsiteBackupFailing (for: 30h): rolled at
+    ## 2026-10-04T20:48:27Z, the alert was demoted firing->pending mid-countdown
+    ## and its timer restarted — while rgw_offsite_backup_success stayed 0 and
+    ## pairs_failed stayed 1 until the real recovery push at 22:27:48Z. The
+    ## 10-04 20:47/21:16/21:26Z resets and the 10-05T15:34:30Z poisoned value
+    ## that ImagePolicyWarn still carries are all this bug.
+    ## Fixed upstream (VictoriaMetrics#11401) and in the estate by pinning
+    ## vmalert to v1.153.0 (fleet !733). VERIFIED: the stored activeAt for
+    ## ImagePolicyWarn settled at 2026-10-05T15:34:30Z and did not move once
+    ## through the 10-06 09:45:27Z/09:45:57Z rollout of the two new pods.
+    ##
+    ## This rule is the REGRESSION TEST for that pin. The pin is temporary —
+    ## it can be dropped once the vmalert-operator default is >= v1.153.0
+    ## (operator v0.75.0 still ships v1.152.0). Do not drop it while this
+    ## alert is still capable of firing.
+    ##
+    ## WHY THE GATE IS ON ALERTS{alertstate="pending"}, NOT ON FOR_STATE.
+    ## Gating on ALERTS_FOR_STATE continuity looks equivalent and is not:
+    ## ALERTS_FOR_STATE PERSISTS AFTER AN ALERT GOES INACTIVE, so it leaves no
+    ## gap and does not filter legitimate re-pends — the exact thing the gate
+    ## was supposed to exclude. Measured over the 20h post-fix window:
+    ##   slope>1 AND count_over_time(FOR_STATE[15m:30s]) >= 29 -> 3 episodes
+    ##       (all BatteryLowPredictive; 10-06 11:33, 10-06 18:33, 10-07 01:36)
+    ##   slope>1 AND count_over_time(ALERTS{pending}[15m:30s]) >= 29 -> 0
+    ## A re-base CONTINUES the same pending series; a legitimate re-pend starts
+    ## a FRESH one. Continuity is only meaningful on the pending series.
+    ##
+    ## VALIDATION of the expression below. 0 series now, and 0 at every quiet
+    ## instant sampled (09-30 08:22Z, 10-01 05:16Z, 10-04 12:00Z, 10-06 18:45Z,
+    ## 10-07 01:40Z). At the 2026-10-05T14:36Z re-base it returned exactly the
+    ## 4 victims, slopes 1.49-95.55 (ContainerCpuThrottling, FleetBundlesNotReady,
+    ## ImagePolicyWarn, PVMissingBackupStrategy). It fires 14:31Z->14:44Z and is
+    ## silent by 14:46Z — the deriv() window, so ~15m of signal per event.
+    ##
+    ## `>= 29` of 31 slots (15m/30s) is deliberate, not slack: a vmalert
+    ## restart itself punches a hole in the ALERTS series, so demanding 30 or 31
+    ## could mask the very events being hunted.
+    ##
+    ## SELF-DETECTION IS IMPOSSIBLE while this rule keeps `for: 5m`: the gate
+    ## needs 15m of unbroken pending and this rule is pending for at most 5.
+    ## Raising `for:` above 15m would make the canary eligible to report on
+    ## itself; add an alertname!="VmalertForStateRebased" selector on both sides
+    ## if that ever changes.
+    ##
+    ## WHEN THIS FIRES: vmalert re-based a timer. Nothing about the underlying
+    ## condition is necessarily wrong — the TIMER is. Find the named alert in
+    ## the group, work out how long its condition has actually been true
+    ## (query the raw expr over range, don't read activeAt), and if it should
+    ## already have fired, treat the timer as wrong. Do NOT restart vmalert to
+    ## "fix" it: a restart re-bases EVERY alert in the group, which is how the
+    ## 10-05 poisoned value was minted. Report it instead.
+    ##
+    ## KNOWN BLIND SPOT: this rule rides vmalert, so it cannot fire during a
+    ## full vmalert outage. That is true of this whole file; the out-of-band
+    ## deadman is WatchdogMdapi (healthchecks.io), not anything here.
+    - alert: VmalertForStateRebased
+      ## Left side: the timer jumped. Right side: the alert really has been
+      ## pending long enough that a jump cannot be a fresh onset. `and` keeps
+      ## the left labels, so the victim's severity/component/alertgroup ride
+      ## through; label_replace preserves the victim's name, which the rule's
+      ## own alertname would otherwise overwrite.
+      expr: |
+        label_replace(
+          (deriv(ALERTS_FOR_STATE[15m]) > 1) and ignoring(alertstate)
+          (count_over_time(ALERTS{alertstate="pending"}[15m:30s]) >= 29),
+          "rebased_alert", "$1", "alertname", "(.+)"
+        )
+      for: 5m
+      labels:
+        severity: warning
+        component: Platform
+        team: mdapi
+        service: vmalert
+        namespace: monitoring
+        statuspage: exclude
+      annotations:
+        summary: "vmalert re-based the `for:` timer of {{ $labels.rebased_alert }}"
+        description: |
+          The `for:` countdown of {{ $labels.rebased_alert }} (rule group
+          {{ $labels.alertgroup }}) was reset while its condition was still
+          true, so it is now counting from later than it should be.
+
+          This is the infra-acd0 bug class (vmalert writing pending state
+          before restoring it on restart). The estate pins vmalert to v1.153.0
+          to prevent it — this alert firing means the pin is gone, wrong, or
+          upstream has regressed. Check what version is actually running first:
+
+            kubectl --context=mdapi-prod -n monitoring get pods \
+              -l app.kubernetes.io/name=vmalert \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].image}{"\n"}{end}'
+
+          Then find how long the condition has REALLY been true, rather than
+          trusting the stored timestamp:
+
+            kubectl --context=mdapi-prod get --raw "/api/v1/namespaces/monitoring/services/vmsingle-mdapi:8429/proxy/api/v1/query_range?query=<the alert's raw expr>&start=<12h ago>&end=<now>&step=5m"
+
+          If it should already have fired, the timer is wrong and the alert is
+          late by the difference. Related: infra-acd0, infra-1ps8.

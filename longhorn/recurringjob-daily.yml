@@ -1,0 +1,78 @@
+# RecurringJob "daily" — the LOCAL point-in-time tier for Longhorn PVCs, which
+# f/config_backup/ceph_pvc_snapshot cannot serve (it skips any PVC whose driver
+# is not rook-ceph). Bead infra-j45a.1, 2026-10-21.
+#
+# It is a daily BACKUP to the backup target (the in-cluster Ceph RGW, see
+# backup-target.yml), NOT a `snapshot` job. The bead proposed a snapshot job.
+# Measurement says a Longhorn snapshot cannot hold a restore point on this
+# cluster:
+#
+#   ⛔ Every filesystem-trim ERASES the volume's whole snapshot chain. With the
+#   global setting remove-snapshots-during-filesystem-trim=true, the engine's
+#   UnmapAt marks every snapshot behind volume-head as removed, user-created or
+#   not, and the purge that each trim job runs afterwards coalesces them away
+#   (longhorn-engine v1.11.1 pkg/replica/replica.go, the unmap loop). The
+#   `default` group (trim at 15:27) and `nobackup` (15:47) trim DAILY. Proven on
+#   2026-09-22: VolumeSnapshot openobserve/o2-pre-v1-upgrade-20260922 (class
+#   longhorn-snapshot) was taken at 13:43. The 15:47 trim marked it removed and
+#   it was coalesced at 15:47:27, so it lived 2h04m. Its VolumeSnapshot STILL
+#   reads readyToUse=true.
+#
+#   ⛔ Opting one volume out (Volume spec.unmapMarkSnapChainRemoved: disabled)
+#   keeps the snapshots but walks into an upstream bug in that same loop. It
+#   skips live snapshots yet keeps collecting the removed ones behind them,
+#   while diffDisk.UnmapAt punches holes in the N files nearest the head BY
+#   POSITION. A removed snapshot buried behind a live one is enough. VolSync's
+#   transient snapshot becomes exactly that every day, the moment the next
+#   snapshot lands on top of it. The next trim then punches holes in the LIVE
+#   snapshot, silently losing the deleted files that a restore point exists for.
+#
+#   ⚠️ A snapshot also takes one of the volume's snapshot-max-count (6) slots,
+#   which it shares with VolSync's transient snapshot. When the budget is full,
+#   the VolSync run fails, and that run is the OFFSITE tier.
+#
+# A backup has none of these problems. Its data lives in the backupstore, not in
+# the chain, so trim cannot touch it. It holds at most one snapshot slot,
+# because auto-cleanup-recurring-job-backup-snapshot keeps only the latest snapshot
+# per job. Restore = Longhorn restore-from-backup into a new volume.
+#
+# Cost, measured on openwebui-data (1.1 GiB used, ~0 sustained writes): its
+# weekly backups uploaded 26 MiB (10-09) and 14 MiB (10-16) of new blocks, and
+# the monthly one uploaded 64 MiB. That holds even when trim has already erased
+# the previous backup snapshot, because the backupstore dedupes blocks. 5 dailies
+# stay well under 0.5 GiB of RGW.
+#
+# Membership is a PVC label, `recurring-job-group.longhorn.io/daily: enabled`,
+# and Longhorn copies it to the Volume. It is orthogonal to
+# mdapi.ch/backup-class, like `nosnapshots`. f/heal/backup_label_enforcer manages
+# only source/default/weekly/nobackup/nosnapshots and leaves this label alone.
+#   - openwebui/openwebui-data: member.
+#   - openobserve/data-openobserve-0: deliberately NOT a member. VolSync every 6h
+#     is its only tier (see openobserve/o2-volsync-backup.yml). It writes
+#     ~43 GiB/day onto a 5-10 GiB filesystem, mostly WAL and query cache. Its
+#     parquet already lives in RGW, and a day-old meta DB rolled back against the
+#     live bucket would not be a clean restore.
+#
+# 03:40 sits clear of `weekly` (Fri 01:00), `default` (1st of month, 05:00),
+# openwebui's VolSync (04:10) and both trims. Retain 5 is the ceiling here: the
+# Longhorn setting recurring-job-max-retention is 5, and the webhook rejects 7.
+# That gives five dailies before the weekly (retain 2) and monthly (retain 2)
+# points take over.
+#
+# ⚠️ Daily runs are not yet watched: f/probe/longhorn_backup_run_completeness
+# judges only BACKUP_JOBS = ("default", "weekly"). Until it learns `daily`, a
+# failing daily run silently falls back to the weekly tier, which IS watched.
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: daily
+  namespace: longhorn-system
+spec:
+  cron: "40 3 * * *"
+  task: backup
+  groups:
+    - daily
+  retain: 5
+  concurrency: 1
+  labels:
+    backupjob.mdapi.ch: daily

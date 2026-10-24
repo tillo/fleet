@@ -1,0 +1,24 @@
+# Pull credential for registry.mdapi.ch (the pre-baked jump-bastion image).
+# Same Akeyless entry the split-horizon bundle uses — one registry credential,
+# rendered per-namespace because imagePullSecrets can't cross namespaces.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mdapi-registry
+  namespace: jump
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mdapi-registry
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: '{{ .encodedUserPass | toString }}'
+  data:
+    - remoteRef:
+        key: /mdapi/split-horizon/mdapi-registry
+      secretKey: encodedUserPass

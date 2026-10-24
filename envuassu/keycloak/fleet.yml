@@ -1,0 +1,31 @@
+defaultNamespace: envuassu
+namespace: envuassu
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+# Sources of expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running
+#      pods after start.
+#   2. A stale keel.sh/update-time, written live by Keel before it was
+#      retired for this workload (2026-10-02). Fleet does not own that
+#      field, so an apply cannot remove it; the pointer stays until the
+#      pod template recycles.
+#   3. Manual `kubectl rollout restart` writes kubectl.kubernetes.io/
+#      restartedAt onto the pod template.
+# All paths are listed as jsonPointers, which also tolerate absent paths.
+# NB an entry carrying BOTH `operations` and `jsonPointers` honours only the
+# jsonPointers -- Fleet silently drops the operations.
+# The image pointer was removed on 2026-10-02: git carries the resolved digest
+# (Renovate Lane A), so an image difference is a real change that must roll.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: postgres
+    namespace: envuassu
+    jsonPointers:
+    - "/spec/template/spec/containers/0/resources"
+    - "/spec/template/metadata/annotations/keel.sh~1update-time"
+    - "/spec/template/metadata/annotations/kubectl.kubernetes.io~1restartedAt"

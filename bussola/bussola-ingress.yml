@@ -1,0 +1,48 @@
+## bussola.mdapi.ch — dietro un'istanza oauth2-proxy dedicata.
+##
+## PERCHÉ UN'ISTANZA PROPRIA E NON quella del portale. oauth2-proxy-portal
+## ammette QUALUNQUE account valido del realm, che sono decine di persone: va
+## bene per la chat di famiglia, non per questa applicazione. Qui la porta
+## richiede il ruolo mdapi-bussola, e l'applicazione stessa ammette solo gli
+## indirizzi che trova nel proprio elenco (bussola-people, da Akeyless): due
+## controlli indipendenti, nessuno dei due sufficiente da solo.
+##
+## Nessun whitelist-source-range: deve funzionare dal telefono fuori casa,
+## perché è lì che si spende. Il cancello è Keycloak, non l'indirizzo IP —
+## stessa scelta fatta per chat.mdapi.ch.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bussola
+  namespace: bussola
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-bussola.oauth2-proxy.svc.cluster.local/bussola/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/bussola/oauth2/start?rd=https://$host$escaped_request_uri
+    ## L'identità che l'applicazione legge. Senza queste tre intestazioni
+    ## nessuno entra: BUSSOLA_TRUST_PROXY_HEADERS=true rifiuta il resto.
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-Email,X-Auth-Request-Preferred-Username,X-Auth-Request-Groups
+    ## Gli estratti conto arrivano come file; il limite di default rifiuta con
+    ## un 413 qualunque CAMT.053 di un anno.
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    ## La frase del narratore può prendersi qualche decina di secondi su CPU.
+    ## La pagina è già a schermo nel frattempo: questo timeout copre solo
+    ## quella richiesta secondaria.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: bussola.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: bussola
+            port:
+              number: 8080
+  tls:
+  - hosts:
+    - bussola.mdapi.ch
+    secretName: bussola-cert

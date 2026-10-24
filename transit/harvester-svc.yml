@@ -1,0 +1,28 @@
+## Transit Service for harvester.mdapi.ch -> in-cluster Harvester UI.
+##
+## Pointed at the harvester-system/harvester Service's ClusterIP (which
+## fronts the Rancher-derived Harvester UI on TCP/8443). nginx-ingress
+## cannot resolve ExternalName Services, so we keep the hand-maintained
+## Endpoint pattern (mirroring santillo/rancher).
+##
+## ⛔ That pattern has a sharp edge, and pfsense is why it is called out here:
+## a hand-written Endpoints has NO health check and no owner. When the pfSense
+## VM was retired its Endpoints kept pointing at 192.168.1.1 — an address that
+## had since been reassigned to the in-cluster split-horizon Unbound VIP — so
+## the ingress served a 502 against an unrelated service rather than failing
+## closed or disappearing. Retire the Endpoints WITH the backend it names.
+##
+## ClusterIPs are stable for the lifetime of the Service; if the
+## harvester-system/harvester Service ever gets re-created, refresh the
+## Endpoint with: `kubectl -n harvester-system get svc harvester
+## -o jsonpath='{.spec.clusterIP}'`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: harvester
+  namespace: transit
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8443
+      targetPort: 8443

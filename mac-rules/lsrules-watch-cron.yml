@@ -1,0 +1,99 @@
+## Out-of-band content watch for the Little Snitch rule group (see README).
+##
+## Little Snitch pins NOTHING about what it subscribes to: no signature, no hash,
+## and no certificate expectation beyond "publicly trusted". A zone owner who
+## repoints rules.mdapi.ch can obtain a certificate from the same CA we use, so on
+## the Mac our file and an attacker's are indistinguishable — the Mac cannot be
+## made to tell them apart. The only detector is off the Mac: fetch the
+## subscription through each resolver that decides where a client lands, and
+## compare the bytes with the ConfigMap the cluster is actually serving.
+##
+## ⛔ This watches cluster -> wire. It deliberately does NOT compare against git:
+## Fleet owns git -> cluster and its bundle status is the signal for that hop.
+##
+## Why a CronJob here and not a Windmill f/probe script: the expected bytes are a
+## ConfigMap in THIS namespace, so mounting it is the whole of the cluster-side
+## access — no RBAC, no kubectl in the image, no token in Windmill — and the probe
+## deploys and rolls with the thing it watches. The script is
+## `lsrules-watch-cm.yml`; pushed series are `lsrules_watch_*`, alerts are
+## `monitoring-rules/65-mac-rules.yml`, and the idle ceiling is declared in
+## `monitoring-rules/12-batch-jobs.yml`.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lsrules-watch
+  namespace: mac-rules
+  labels:
+    app.kubernetes.io/name: lsrules-watch
+    app.kubernetes.io/part-of: mac-rules
+spec:
+  # Two runs an hour, on minutes no other scheduled job on this estate claims.
+  # The Mac re-reads the group on its own update interval (minutes to hours), so
+  # the watch only has to notice a change before the next fetch acts on it.
+  schedule: "13,43 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: lsrules-watch
+        spec:
+          restartPolicy: Never
+          # The probe reads two mounted files and opens sockets. It never calls
+          # the API server, so it carries no token to steal.
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: watch
+              ## Same digest the zot mirror serves as library/python:3-alpine
+              ## (sha256:037610a1…, verified on Docker Hub 2026-10-22), pulled from
+              ## the primary rather than the mirror on purpose: this namespace has
+              ## no `zot-pull` secret, and a watcher whose whole job is to notice a
+              ## broken chain should not need ESO + Akeyless to reach a running
+              ## state. The bundle already pulls nginx from Docker Hub the same way.
+              image: docker.io/library/python:3-alpine@sha256:d44b1254cb92329418d164b22b20d86bbd3869d48e80e09e476531a409a728bb
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/opt/watch/lsrules_watch.py"]
+              env:
+                - {name: PUSHGATEWAY, value: "http://pushgateway.monitoring.svc.cluster.local:9091"}
+                - {name: PYTHONDONTWRITEBYTECODE, value: "1"}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: ["ALL"]}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {cpu: 200m, memory: 64Mi}
+              volumeMounts:
+                - {name: script, mountPath: /opt/watch, readOnly: true}
+                - {name: rules, mountPath: /etc/lsrules-src, readOnly: true}
+                - {name: token, mountPath: /etc/lsrules-token, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: script
+              configMap: {name: lsrules-watch-script, defaultMode: 0444}
+            # The expected bytes: the same ConfigMap the Deployment renders, so a
+            # match proves the serving chain end to end (nginx, ingress, TLS)
+            # rather than re-asserting git.
+            - name: rules
+              configMap:
+                name: lsrules
+                defaultMode: 0444
+                items: [{key: household.lsrules, path: household.lsrules}]
+            - name: token
+              secret:
+                secretName: lsrules-path
+                defaultMode: 0444
+                items: [{key: token, path: token}]
+            - name: tmp
+              emptyDir: {sizeLimit: 8Mi}

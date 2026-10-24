@@ -1,0 +1,32 @@
+{{- if and .Values.global.appConfig.smartcard.enabled .Values.global.gatewayApi.enabled (eq "true" (include "gitlab.gatewayApi.configureEnvoy" .)) (eq "true" (include "gitlab.gatewayApi.gateway.sameNamespace" .)) }}
+{{/*
+ClientTrafficPolicy to handle smartcard traffic with Envoy Gateway by handling mutual
+TLS and passing the client certificate to the backend.
+Also keeps paths with escaped slashes unchanged for GitLab API calls.
+
+Only rendered when the Gateway is in the same namespace as this release: targetRefs below
+uses a LocalPolicyTargetReference, which has no namespace field.
+*/}}
+{{- $spec := deepCopy .Values.clientTrafficPolicy.smartcard.spec }}
+{{- if not $spec.targetRefs }}
+{{-   $ref := (include "webservice.gatewayApi.gatewayRef.smartcard" . | fromYamlArray) }}
+{{-   $_ := unset (first $ref) "namespace" }}
+{{-   $_ := set $spec "targetRefs" $ref }}
+{{- end }}
+{{- $clientValidation := dig "tls" "clientValidation" dict $spec }}
+{{- range $ref := ($clientValidation.caCertificateRefs | default list) }}
+{{-   if not $ref.name }}
+{{-     $_ := set $ref "name" $.Values.global.appConfig.smartcard.CASecret }}
+{{-   end }}
+{{- end }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: {{ template "fullname" . }}-ctp-smartcard
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+spec:
+  {{- $spec | toYaml | nindent 2 }}
+{{- end }}

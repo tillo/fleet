@@ -1,0 +1,156 @@
+# ENFORCING — this policy DENIES. Part of the isolation programme
+# (infra-az8.4); this workload is infra-az8.4.1.
+# Promoted from learn.bootstrap-ci-jobs 2026-10-07 after a 36h22m window
+# (2026-10-05T18:51:33Z -> 2026-10-07T07:13:15Z) with journald suppression 0 on
+# all three nodes. Evidence: ~/ci-job-pods-netpol-analysis-20261007.md
+#
+# ⭐ THE WHOLE INTERNAL SURFACE IS FOUR ALLOWS. 10,637 measured rows reduced to:
+#    DNS (unlogged) + ingress-nginx:443 (99.7% of it) + the S3 cache + nothing.
+#    Everything else on the four internal nets is denied and logged.
+#
+# ⛔ THE LEARN POLICY IS DELETED IN THE SAME COMMIT AS THIS FILE, AND THAT IS NOT
+#    TIDINESS. Its trailing bare `Allow` is a catch-all; leaving it in place would
+#    swallow every `Deny` below and this policy would enforce nothing while
+#    appearing to be deployed. Precedent: commit 9428320 (nameserver).
+#
+# ⛔ DO NOT add `netpol-onboarded=true` to this namespace while no Calico tier
+#    exists — `NetworkPolicyFloorMissing` fires immediately. Order when the floor
+#    lands: floor -> policy -> label LAST.
+#
+# ⚠️ SELECTOR: `has(project.runner.gitlab.com/id)` matches the JOB PODS and NOT ONE
+#    of the 22 GitLab stack pods (webservice, gitaly, registry, sidekiq, shell, kas,
+#    pages, pg, valkey) nor the runner manager — verified 2026-10-05. That
+#    separation is what keeps this `Deny` off GitLab's own serving path, which
+#    matters more here than usual: this cluster serves its own GitOps source
+#    (Fleet reconciles from gitlab.mdapi.ch, which runs in this namespace).
+#    Re-check with:
+#      kubectl -n bootstrap get pods -o custom-columns='NAME:.metadata.name,MATCH:.metadata.labels.project\.runner\.gitlab\.com/id'
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.bootstrap-ci-jobs
+  namespace: bootstrap
+spec:
+  order: 500
+  selector: has(project.runner.gitlab.com/id)
+  types:
+    - Ingress
+    - Egress
+
+  egress:
+    # ── 1-2. DNS, and NOT logged: an Allow terminates, so name resolution stays
+    #    out of the dataset. ⛔ Selector-based, NEVER an ipBlock on the 10.53.0.10
+    #    Service VIP — CoreDNS is reached by POD IP (10.52.1.100 / 10.52.0.30,
+    #    verified 2026-10-07) and a VIP rule looks correct while breaking all name
+    #    resolution in the namespace.
+    - action: Allow
+      protocol: UDP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+
+    # ── 3. ⭐ THE RULE THAT CARRIES THIS WORKLOAD: 10,604 of 10,637 internal rows
+    #    (99.7%) went to the three rke2-ingress-nginx controller pods on :443.
+    #    Ports 80 and 443 are both allowed because the controllers serve a redirect
+    #    on 80; the window only ever exercised 443.
+    #
+    #    ⛔ NEVER allow-list the VIP 192.168.1.191. gitlab.mdapi.ch resolves to it,
+    #       and it is DNAT'd BEFORE Calico evaluates this policy, so the far end is
+    #       the controller POD IP. An ipBlock on .191 would look correct and match
+    #       nothing. Independently confirmed: ZERO 10.53.x rows in the entire
+    #       36h window, i.e. Service VIPs never appear in this data at all.
+    #    Verified 2026-10-07 that the three observed destination IPs are exactly
+    #    the three controller pods: 10.52.0.27, 10.52.2.16, 10.52.1.202.
+    #
+    #    This ONE rule covers every hostname CI uses — gitlab., registry. and
+    #    zot.mdapi.ch — and therefore also the entire credentialed surface
+    #    (AKEYLESS_ACCESS_*, FLEET_PUSH_TOKEN, WINDMILL_TOKEN, ZOT_TOKEN,
+    #    RENOVATE_TOKEN, GITHUB_COM_TOKEN, MIRROR_SSH_KEY all terminate at HTTPS
+    #    443 on the ingress). No CI config declares any internal address.
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name == "rke2-ingress-nginx"
+        ports: [80, 443]
+
+    # ── 4. The distributed CI cache: Ceph's S3 gateway. ONE row in 36h, from one
+    #    job pod on node quo, to the post-DNAT backend of the Service's port 80
+    #    (rook-ceph-rgw-ceph-objectstore, ClusterIP 10.53.40.154, port 80 ->
+    #    backend 8080). The cluster's largest S3-compatible store, and GitLab's
+    #    distributed cache is the only plausible client.
+    #    ⚠️ KNOWN OVER-BREADTH, carried knowingly: the connecting pod could not be
+    #       attributed to a namespace (the bootstrap runner is unpinned, so its
+    #       pods land on any node), and the only config in the window that
+    #       declares `cache:` belongs to a project that last ran 2026-07-10.
+    #       Allowed here because this runner's own config declares the RGW address;
+    #       NOT allowed in gitlab-runner-builder, whose config disclaims any
+    #       distributed cache. The Log below covers the residual risk.
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "rook-ceph"
+        selector: app == "rook-ceph-rgw"
+        ports: [8080]
+
+    # ── 5-6. ⭐ THE ENFORCEMENT, and the reason it is answerable.
+    #    `Log` is NON-TERMINATING — it records and falls through to the Deny, so
+    #    every future block shows up in `netpol_flows` as a row instead of as an
+    #    unexplained outage. Keep the Log immediately before the Deny, always.
+    #    Both CIDRs are listed even though only the pod IP is ever seen, so the
+    #    rule does not depend on where DNAT happens to land.
+    #    Why scoped to these four nets rather than logging everything: a job pod
+    #    runs arbitrary code chosen by any of 59 projects, so its egress set is
+    #    unbounded BY DESIGN. Logging it everywhere would produce an unreadable
+    #    dataset AND threaten the journald budget — Calico `Log` has no rate limit
+    #    and the 10000/30s burst budget is PER NODE and SHARED, so a lossy window
+    #    is worse than no window because it looks complete. Scoping bounds the
+    #    volume by construction.
+    - action: Log
+      destination:
+        nets:
+          - 10.52.0.0/16       # pod CIDR
+          - 10.53.0.0/16       # service CIDR
+          - 192.168.1.0/24     # LAN: nodes, router, NAS, switches, iLO
+          - 169.254.169.254/32 # link-local metadata
+    - action: Deny
+      destination:
+        nets:
+          - 10.52.0.0/16
+          - 10.53.0.0/16
+          - 192.168.1.0/24
+          - 169.254.169.254/32
+
+    # ── 7. The internet — a job's purpose, and deliberately NOT logged. NOT
+    #    port-pinned: a pipeline may legitimately reach new ports, and the boundary
+    #    being drawn here is "not inside", not "which port outside". The one SSH
+    #    path in all 46 readable configs is `git@github.com` (port 22, public
+    #    internet) — covered here.
+    - action: Allow
+
+  ingress:
+    # NOTHING is allowed in, and the window says nothing needs to be.
+    # ⚠️ In particular, do NOT add an allow for the runner manager on the theory
+    #    that it holds the pod's exec/log channel. Measured 2026-10-05 across a real
+    #    40-minute job with continuous log streaming: the job pod received ZERO
+    #    internal ingress rows. The manager drives the pod through the Kubernetes
+    #    API (manager -> kube-apiserver -> kubelet), which is not pod-to-pod
+    #    traffic; `kubectl exec`/`port-forward` likewise traverse kubelet locally.
+    #    The whole window produced ONE ingress row: the cluster's own metrics
+    #    scraper (monitoring/vmagent-mdapi) to a port a job happened to be
+    #    listening on. Not a GitLab channel.
+    #
+    # ⭐ WHY THIS Log IS BARE WHILE THE EGRESS ONE IS SCOPED — the one judgement
+    #    call in this file. An egress Log must be scoped because its DESTINATION
+    #    set is unbounded. The ingress SOURCE set is not: volume is provably tiny
+    #    (1 row / 36h), and a bare Log is the only way to keep a deny of
+    #    non-internal ingress answerable.
+    - action: Log
+    - action: Deny
