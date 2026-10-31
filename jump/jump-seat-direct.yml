@@ -1,0 +1,31 @@
+## The jump seat's own cluster identity, declared (ledger
+## alert:RbacClusterAdminGrowth, approved 2026-10-30).
+##
+## Created out-of-band on 2026-10-15 with a plain `kubectl apply` while the
+## kubeconfig was being rebuilt, so it existed in the cluster and nowhere in
+## git. A cluster-admin binding that no manifest owns is exactly the shape the
+## RBAC hygiene rule exists to catch: nobody can review it, and nothing notices
+## if it is widened.
+##
+## ⛔ NOT a candidate for deletion. `mdapi-prod-direct` in ~/.kube/config
+## authenticates AS this ServiceAccount (verified 2026-10-30:
+## `kubectl auth whoami` → system:serviceaccount:jump:jump-seat-direct), and it
+## is the habit CLAUDE.md requires — the path that keeps working when Rancher is
+## down. Deleting it locks the seat out of its own cluster.
+##
+## Not declared here: the token Secret `jump/jump-seat-direct-token`. It was
+## minted out of band too and carries no ownerReference, so Fleet would only
+## fight over it. It is the long-lived credential the kubeconfig holds; rotating
+## it is a seat operation, not a bundle reconcile.
+##
+## The ClusterRoleBinding is NOT in this bundle: jump/fleet.yaml sets
+## `namespace:`, which makes Fleet drop cluster-scoped objects silently while
+## still reporting the bundle Ready (caught by fleet-validate). It lives in
+## jump-rbac/, which sets only defaultNamespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jump-seat-direct
+  namespace: jump
+  labels:
+    app.mdapi.ch/component: seat

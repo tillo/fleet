@@ -1,0 +1,141 @@
+## mail-mcp — the read-only mail connector for chat.mdapi.ch.
+##
+## One person, their own mailbox: Open WebUI sends the caller's own Keycloak
+## access token (aud=mail-mcp, azp=openwebui-mail-mcp), this pod exchanges it
+## (RFC 8693 V2) for a token minted for Dovecot alone (aud=dovecot, scope
+## dovecot-mail, claim `mailbox`) and logs in to IMAPS with AUTHENTICATE XOAUTH2.
+## No IMAP password, no master password, no shared credential; only LIST, STATUS,
+## EXAMINE, SEARCH and FETCH BODY.PEEK — nothing writes, nothing sends.
+##
+## LOGIN_MODE=master is the mailbox picker (infra-47nq.2.1): the login name is
+## `<mailbox>*<username>`, Dovecot's master-user form, where the "master user"
+## is the caller, proved by their own exchanged token. Dovecot opens <mailbox>
+## only if it is a mailbox entry under the caller's own LDAP entry (the passdb
+## chain behind MAIL_PICKER in mail/, fleet !1538). The menu is the `mailboxes`
+## claim of the Chat token (Keycloak mapper `mailboxes-list` on the client
+## openwebui-mail-mcp); it is a menu, never the authority. Roll back with
+## LOGIN_MODE=claim FIRST, before anything on the Dovecot side.
+##
+## Code and CI: gitlab.mdapi.ch/mdapi/mail-mcp. The proposals and the gates:
+## ~/mail-dovecot-oauth2-proposal-20261027.md (bead infra-47nq.2) and
+## ~/mail-picker-v2-proposal-20261028.md (bead infra-47nq.2.1).
+##
+## ⚠️ ALLOWED_GROUPS is the per-person switch, not a nicety. It names the LDAP
+## groupOfNames `cn=ChatMail` (bare name: the realm's `groups` scope maps with
+## full.path=false). Granting mail-in-Chat = `member:` in that LDAP group; the
+## Keycloak gate role mdapi-chatmail follows from the same group. An EMPTY value
+## refuses everybody — that is the code's default, so a lost env var fails shut.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mail-mcp
+  namespace: mail-mcp
+  labels:
+    app: mail-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mail-mcp
+  template:
+    metadata:
+      labels:
+        app: mail-mcp
+    spec:
+      ## A per-user convenience, not a service anything depends on: it yields
+      ## first under memory pressure (infra-8ux0, same class as the openwebui
+      ## side pods since !1491).
+      priorityClassName: mdapi-low
+      ## The process never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: mail-mcp
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mail-mcp
+          ## Lane A: floating tag + resolved digest (Renovate owns the bump) +
+          ## IfNotPresent, so a node that already has the layer does not re-pull
+          ## and a registry outage does not stop a restart.
+          image: zot.mdapi.ch/mdapi/mail-mcp:latest@sha256:00f67e074405316d829fb586595abba5bfba80a74f77dcb239585aa4812853f3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: KEYCLOAK_ISSUER
+              value: https://idp.mdapi.ch/realms/tilloch
+            ## What this pod insists on in the token Open WebUI hands it.
+            - name: EXPECTED_AUDIENCE
+              value: mail-mcp
+            - name: EXPECTED_AZP
+              value: openwebui-mail-mcp
+            ## What it exchanges for, and what it insists on in the result.
+            ## Dovecot introspects the token and requires both again.
+            - name: TARGET_AUDIENCE
+              value: dovecot
+            - name: REQUIRED_SCOPE
+              value: dovecot-mail
+            - name: MCP_CLIENT_ID
+              value: mail-mcp
+            ## The in-cluster Service on 993 (NOT 10993, the PROXY-protocol
+            ## port). TLS is verified against the certificate's real name.
+            - name: IMAP_HOST
+              value: docker-mailserver.mail.svc.cluster.local
+            - name: IMAP_PORT
+              value: "993"
+            - name: IMAP_TLS_NAME
+              value: mail.mdapi.ch
+            ## RFC 9728 `resource` — must be the URL Open WebUI actually calls.
+            - name: RESOURCE_URL
+              value: http://mail-mcp.mail-mcp.svc.cluster.local:8080/mcp
+            - name: ALLOWED_GROUPS
+              value: ChatMail
+            ## The picker (see the header). claim = the first address only.
+            - name: LOGIN_MODE
+              value: master
+            - name: PORT
+              value: "8080"
+            - name: MCP_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: mail-mcp-env
+                  key: MCP_CLIENT_SECRET
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ## Baseline is a thin proxy (a few tens of MiB). mail_read fetches at
+          ## most 8 MB of one message and the MIME parse holds a few copies of
+          ## it, so the limit is wider than nextcloud-mcp's 256Mi.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 96Mi
+            limits:
+              memory: 384Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+      imagePullSecrets:
+        - name: zot-pull

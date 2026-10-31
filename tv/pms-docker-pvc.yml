@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pms-docker-config
+spec:
+  storageClassName: harvester-longhorn-2replicas
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # 10Gi hit 100% on 2026-10-08 and stayed there; Plex began returning 500s
+      # and the Home Assistant integration dropped out (alert:MediaPVCNearlyFull,
+      # approved 2026-10-18). The StorageClass allows expansion; the live volume
+      # was grown first and this declaration follows.
+      #
+      # 2026-10-30: 20Gi reached 94% (19G used, 1.2G free) — the same defect one
+      # size up, because metadata grew with the library. Measured breakdown at
+      # that point: 16G of it was `Media/localhost/*.bundle`, Plex's own
+      # regenerable chapter/video-preview thumbnails, against 1.9G of real
+      # Metadata and 140M of Cache. So: pruned the 1285 bundles (→ 2.6G total
+      # used) AND grew to 40Gi. Growth alone would have re-filled in weeks;
+      # pruning alone would leave no headroom for the next library import.
+      storage: 40Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pms-docker-transcode-ceph
+  labels:
+    app.mdapi.ch/phase2: migrated
+spec:
+  storageClassName: ceph-block
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

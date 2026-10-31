@@ -1,0 +1,120 @@
+## HOST-path arm: hostNetwork, so peer calls go node IP to node IP over the same
+## NICs, bond and switch as the pod path, minus the overlay. Same probes as
+## goldpinger-pod-ds.yml; keep the two in step.
+##
+## ⚠️ PORTS. In hostNetwork the listeners sit in each node's own netns:
+##   * 18780/tcp (HTTP API + /metrics), bound to the node IP only (HOST below);
+##   * 18781/udp (echo listener), which goldpinger binds on all addresses.
+## Chosen outside the NodePort range (30000-32767) and the ephemeral range
+## (32768-60999), and clear of every hostNetwork pod port on 2026-10-28 (etcd
+## 2379-2381, apiserver 6443, metallb 7475/7946/9140/9141/19443, etcd-metrics
+## 9381, node-exporter 9796, kube-proxy and control plane 10256-10259). Both are
+## reachable from the LAN, like node-exporter's 9796: the API is unauthenticated
+## and shows the pod and node IPs, nothing else.
+##
+## USE_HOST_IP makes each arm call peers on their host IP; without it the
+## hostNetwork pods would still be reached on podIP, which here IS the host IP,
+## so it is set for clarity rather than for effect.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: goldpinger-host
+  namespace: goldpinger
+  labels:
+    app.kubernetes.io/name: goldpinger
+    app.kubernetes.io/component: host-path
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: goldpinger
+      app.kubernetes.io/component: host-path
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: goldpinger
+        app.kubernetes.io/component: host-path
+    spec:
+      serviceAccountName: goldpinger
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: goldpinger
+          image: bloomberg/goldpinger:3.11.5@sha256:f7c60d31915048283bd91c41531388dde1956bc4ed7d99bbd28995871fab9a6e
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: PORT
+              value: "18780"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: USE_HOST_IP
+              value: "true"
+            - name: LABEL_SELECTOR
+              value: "app.kubernetes.io/name=goldpinger,app.kubernetes.io/component=host-path"
+            - name: DISPLAY_NODENAME
+              value: "true"
+            - name: REFRESH_INTERVAL
+              value: "5"
+            - name: PING_TIMEOUT
+              value: "300ms"
+            - name: UDP_ENABLED
+              value: "true"
+            - name: UDP_PORT
+              value: "18781"
+            - name: UDP_PACKET_COUNT
+              value: "20"
+            - name: UDP_TIMEOUT
+              value: "1s"
+          ports:
+            - name: http
+              containerPort: 18780
+              protocol: TCP
+            - name: udp-probe
+              containerPort: 18781
+              protocol: UDP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 5m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

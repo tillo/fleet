@@ -1,0 +1,57 @@
+# Kubelet memory reservation + memory eviction thresholds (infra-y6ac).
+#
+# Without these the kubelet hands all node memory to pods (allocatable == capacity) and has no
+# memory.available threshold, so a node never reports MemoryPressure. Under load only the kernel
+# reclaims, and on these nodes that starves rke2/etcd (2026-10-26 qua stall). Alert:
+# NodeKubeletMemoryReservationMissing (monitoring-rules/68-node-boot-baseline.yml).
+#
+# The values are the ones approved 2026-07-28. They were then written by hand as
+# 99-kubelet-reserve.yaml on qua/qui/quo, and they never took effect: rke2 merges
+# config.yaml.d/*.yaml in lexical order and a plain `kubelet-arg:` REPLACES the list, so
+# Harvester's own 99-max-pods.yaml (rewritten at every upgrade) wiped it. This file:
+#   - sorts after every Harvester drop-in (99-max-pods, 99-z00, 99-z01) and APPENDS (`kubelet-arg+:`);
+#   - leaves cpu out on purpose. Repeated --system-reserved/--kube-reserved flags merge key by
+#     key (component-base MapStringString), so the per-node cpu values from Harvester's
+#     99-z00-harvester-reserved-resources.yaml stay in force. The static cpu manager needs them.
+#   - restates nodefs/imagefs in eviction-hard: a user eviction-hard replaces rke2's default one.
+#
+# Effect per node: allocatable memory -5 GiB (2 + 2 reserved, plus the 1 GiB hard threshold).
+#
+# ROLLOUT — staged by node label, because a broken drop-in stops rke2 at boot:
+#   kubectl label node <n> mdapi.ch/kubelet-memory-reserve=true    # then reboot <n>, attended
+#   kubectl get --raw /api/v1/nodes/<n>/proxy/configz  # systemReserved has cpu AND memory
+# Activate only at a REBOOT. /oem/91_cleanup_kubelet.yaml clears cpu_manager_state at boot; a
+# live rke2 restart after a reservation change does not, and the kubelet refuses to start.
+# Once every node has proven it, switch matchSelector to harvesterhci.io/managed: "true" so a
+# new node is born with it.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-kubelet-memory-reserve
+spec:
+  matchSelector:
+    mdapi.ch/kubelet-memory-reserve: "true"
+  # Keep the .yaml: the node-manager webhook appends it to a bare name, and Fleet would then see
+  # the object as permanently Modified.
+  filename: 99_mdapi_kubelet_memory_reserve.yaml
+  contents: |
+    name: "mdapi kubelet memory reservation (fleet harvester-node-config, infra-y6ac)"
+    stages:
+      initramfs:
+        - name: "rke2 drop-in 99-zz-mdapi-kubelet-reserve.yaml"
+          files:
+            - path: /etc/rancher/rke2/config.yaml.d/99-zz-mdapi-kubelet-reserve.yaml
+              permissions: 384
+              owner: 0
+              group: 0
+              content: |
+                # Written at every boot from /oem/99_mdapi_kubelet_memory_reserve.yaml
+                # (CloudInit mdapi-kubelet-memory-reserve, fleet harvester-node-config).
+                # Local edits are lost at the next boot.
+                kubelet-arg+:
+                  - system-reserved=memory=2Gi,ephemeral-storage=10Gi
+                  - kube-reserved=memory=2Gi,ephemeral-storage=10Gi
+                  - eviction-hard=memory.available<1Gi,nodefs.available<5%,imagefs.available<5%
+                  - eviction-soft=memory.available<2Gi,nodefs.available<10%,imagefs.available<10%
+                  - eviction-soft-grace-period=memory.available=2m,nodefs.available=5m,imagefs.available=5m
+                  - eviction-max-pod-grace-period=60

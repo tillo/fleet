@@ -1,0 +1,30 @@
+## ingress-catchall: a plain 404 for every *.mdapi.ch name that has no Ingress
+## (infra-az8.19.5, pentest-2026-10-22 F16/F26).
+##
+## Why it exists. cattle-system/rancher-expose is a hostless Ingress, so it
+## becomes ingress-nginx's default server: any Host that matches no Ingress gets
+## Rancher. Over 7 days (measured 2026-10-28) 336 *.mdapi.ch names that exist
+## only through the DNS wildcard drew ~220k requests that way, nearly all of them
+## scanners, and the Rancher SPA answered 200 for any path.
+##
+## Why a wildcard Ingress and not a host on rancher-expose. Every Harvester node
+## GETs https://192.168.1.191/v1/harvester/cluster/local by IP literal through
+## that hostless Ingress, and the Harvester UI is opened by node IP. An Ingress
+## host cannot be an IP, so rancher-expose has to stay hostless. In nginx an
+## exact host and a longer wildcard (*.pages.mdapi.ch) still beat *.mdapi.ch, so
+## no existing site changes. IP literals and foreign names still route to
+## Rancher; our public WAN IP literals are denied in the WAF instead (rule 1899
+## in modsec-global-cm.yml).
+## Memory: harvester_nodes_curl_vip_through_hostless_rancher_expose_2026_10_28.
+##
+## Its own bundle under rke2-ingress-nginx-config/ (Fleet picks the subdirectory
+## up through the parent's GitRepo path, and the parent's raw-manifest bundle
+## does not deploy a nested fleet.yaml's files). Alerts and the canary probe:
+## monitoring-rules/73-ingress-catchall.yml.
+defaultNamespace: ingress-catchall
+namespace: ingress-catchall
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25

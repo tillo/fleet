@@ -1,0 +1,132 @@
+## Time Machine target — Samba/vfs_fruit for mbp-mda (ns `timemachine`, infra-hnbe.4).
+##
+## Household backup, nothing visitor-facing: warning tier and the INTERNAL
+## component `Storage` (never mapped to mdapi.statuspage.io).
+##
+## What covers what:
+##   * workload arms below — the Deployment is short of replicas;
+##   * TimeMachineUnreachable — the outside view: TCP 445 on the LAN address
+##     192.168.1.65, i.e. MetalLB, the Service and the NetworkPolicy, which
+##     replica counts cannot see;
+##   * TimeMachineVolumeFilling — Time Machine prunes itself at
+##     VOLUME_SIZE_LIMIT (1300G of 1536Gi), so a volume going past ~90% means
+##     the cap or the daily trim (nobackup group) stopped working;
+##   * whether the Mac actually BACKS UP is not visible from here: that is
+##     `tmutil latestbackup` on mbp-mda.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check — without them a namespace-only
+## selector claims coverage of a kind it can never fire on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-timemachine
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-timemachine.rules
+      rules:
+        - alert: TimeMachineWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="timemachine", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="timemachine", deployment=~".+"}
+            ) > 0
+          ## Recreate strategy plus a Longhorn re-attach: 15m rides it out.
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "timemachine" }}'
+            severity: warning
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "timemachine/{{ $labels.deployment }} unavailable"
+            description: |
+              The Time Machine SMB server has no available replica. mbp-mda's
+              backups to it fail until it is back (the local SanDisk copy keeps
+              running). Check:
+                kubectl --context mdapi-prod-direct -n timemachine describe pod -l app=timemachine
+                kubectl --context mdapi-prod-direct -n timemachine logs deploy/timemachine --tail=50
+                kubectl --context mdapi-prod-direct -n longhorn-system get volumes.longhorn.io \
+                  "$(kubectl --context mdapi-prod-direct -n timemachine get pvc timemachine-data -o jsonpath='{.spec.volumeName}')"
+
+        ## ⚠️ Keep this arm even though it matches nothing today: the coverage
+        ## probe treats a namespace-only selector as covering both kinds.
+        - alert: TimeMachineStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="timemachine", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="timemachine", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "timemachine" }}'
+            severity: warning
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "timemachine/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in ns timemachine has fewer available replicas than desired.
+
+        - alert: TimeMachineUnreachable
+          ## avg_over_time gives hysteresis on both edges (as RackKioskUnreachable).
+          expr: avg_over_time(probe_success{probe="timemachine"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: timemachine
+            severity: warning
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "Time Machine SMB 192.168.1.65:445 unreachable"
+            description: |
+              The blackbox tcp_connect probe of 192.168.1.65:445 has been mostly
+              failing for >15m. With the workload Available this points at the
+              MetalLB announcement, the Service or timemachine-netpol.yml rather
+              than smbd. Check:
+                kubectl --context mdapi-prod-direct -n timemachine get pod,svc,netpol -o wide
+
+        - alert: TimeMachineVolumeFilling
+          expr: |
+            kubelet_volume_stats_used_bytes{namespace="timemachine", persistentvolumeclaim="timemachine-data"}
+              / kubelet_volume_stats_capacity_bytes{namespace="timemachine", persistentvolumeclaim="timemachine-data"}
+              > 0.90
+          for: 6h
+          labels:
+            service: timemachine
+            severity: warning
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "Time Machine volume {{ $value | humanizePercentage }} full"
+            description: |
+              Time Machine should stop at VOLUME_SIZE_LIMIT (1300G) and prune old
+              backups, which leaves ~15% of the 1536Gi volume free. Past 90% the
+              cap is not being honoured (check `fruit:time machine max size` in
+              the pod's /etc/samba/smb.conf) or a second sparsebundle appeared.
+              Expanding is allowed (allowVolumeExpansion) but needs room on the
+              `large`-tagged fio disks: see iomemory-storageclass/iomemory-large-sc.yml.
+---
+## No `component`/`team` on the target, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled. TimeMachineUnreachable
+## above selects on `probe` and carries its own warning-tier labels. Plain TCP,
+## so there is no certificate to watch.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: timemachine
+  namespace: monitoring
+spec:
+  jobName: timemachine
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: tcp_connect
+  targets:
+    staticConfig:
+      static:
+        - 192.168.1.65:445
+      labels:
+        probe: timemachine

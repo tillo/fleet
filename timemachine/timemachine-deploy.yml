@@ -1,0 +1,86 @@
+## Samba + vfs_fruit as a macOS Time Machine destination (infra-hnbe.4).
+##
+## The image's own CMD is s6 supervising smbd, nmbd, avahi and dbus. In a pod
+## avahi's mDNS cannot reach the LAN anyway, and nmbd is NetBIOS, so `args`
+## runs smbd alone in the foreground. The entrypoint still writes smb.conf,
+## creates the user and tests xattrs on the volume before it execs the args.
+##
+## Stateless apart from the volume: the Samba user database is rebuilt from
+## PASSWORD_FILE on every start, so rotating the password = change it in
+## Akeyless, wait for the ExternalSecret refresh, restart the pod, then enter
+## the new password on the Mac.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: timemachine
+  namespace: timemachine
+  labels:
+    app: timemachine
+spec:
+  replicas: 1
+  ## RWO volume: the old pod must let go of it before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: timemachine
+  template:
+    metadata:
+      labels:
+        app: timemachine
+    spec:
+      ## The NetBIOS name smbd announces; otherwise it is the pod name.
+      hostname: timemachine
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: smbd
+          image: mbentley/timemachine:smb@sha256:7af90ea0a7e934a3510152baddadd868adf4d9408dfaac9cdfe83abf2089ceae
+          imagePullPolicy: IfNotPresent
+          args: ["smbd", "--foreground", "--no-process-group", "--debug-stdout"]
+          env:
+            - { name: TM_USERNAME, value: timemachine }
+            - { name: TM_UID, value: "1000" }
+            - { name: TM_GID, value: "1000" }
+            ## The share the Mac mounts: smb://timemachine@192.168.1.65/mbp-mda
+            - { name: SHARE_NAME, value: mbp-mda }
+            - { name: PASSWORD_FILE, value: /run/secrets/tm/password }
+            ## Time Machine prunes its oldest backups at this size instead of
+            ## filling the 1536Gi volume (ext4 overhead + trim headroom).
+            - { name: VOLUME_SIZE_LIMIT, value: "1300G" }
+            ## macOS speaks SMB3; nothing on the LAN needs SMB2 here.
+            - { name: CUSTOM_SMB_PROTO, value: SMB3 }
+            ## chown/chmod the share ROOT only (not recursive), so restarts stay fast.
+            - { name: SET_PERMISSIONS, value: "true" }
+            - { name: HIDE_SHARES, value: "yes" }
+          ports:
+            - { name: smb, containerPort: 445, protocol: TCP }
+          readinessProbe:
+            tcpSocket: { port: 445 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 445 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - { name: data, mountPath: /opt/timemachine }
+            - { name: smb-password, mountPath: /run/secrets/tm, readOnly: true }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: timemachine-data
+        - name: smb-password
+          secret:
+            secretName: timemachine-smb
+            defaultMode: 0400

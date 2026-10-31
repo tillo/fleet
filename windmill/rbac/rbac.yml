@@ -1,0 +1,904 @@
+# Direct kube-API path for the automation plane (infra-health hardening,
+# approved 2026-08-09): f/lib/mdapi k8s() talks to kubernetes.default.svc with
+# the worker pods' own ServiceAccount token instead of the Rancher proxy.
+#
+# The `windmill` SA (the `default` worker group) was cluster-admin from then
+# until 2026-10-30. infra-az8.19.2 option A replaced that binding with
+# windmill-worker-reader (below): read-only, no exec. Every script that writes
+# or execs now carries worker tag `heal` and runs as windmill-worker-heal.
+# The SA keeps its NAME on purpose: OpenBao's kubernetes-auth roles
+# windmill-archive / windmill-snapshot bind bound_service_account_names=windmill
+# (fleet openbao-bootstrap), used by f/secrets/get_secret,
+# openbao_secrets_archive and openbao_raft_snapshot, all on `default`.
+#
+# ⛔ Do not bring a cluster-admin binding back to fix a 403 on `default`: give
+# the script tag `heal` and add the verb to windmill-worker-heal.
+---
+# The API server's own account (infra-az8.19, pentest-2026-10-22 F16/F26).
+# windmill-app is the internet-facing component and never calls the kube-API:
+# it serves the UI/API and queues jobs in Postgres, the workers run them. Until
+# 2026-10-28 it shared the `windmill` SA above, so an RCE in the API server was a
+# cluster-admin token on disk. It now runs as this account with NO token mounted
+# and no binding anywhere. windmill/values.yml points windmill.app.serviceAccountName
+# here; the chart has no automount knob for the app, so the SA carries it.
+#
+# Ordering is safe either way: if the Deployment rolls before this SA exists,
+# the new ReplicaSet just fails to create pods (FailedCreate) and the old pods
+# keep serving until it does.
+#
+# ⚠️ If a future Windmill feature in the server needs the API (EE worker
+# autoscaling, the operator), give THIS account a namespaced Role for exactly
+# that, never a cluster-wide binding.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: windmill-app
+  namespace: windmill
+automountServiceAccountToken: false
+---
+# Per-group worker accounts (infra-az8.19.2). values.yml sets
+# windmill.workerGroupsRequireServiceAccount, so every worker group names one of
+# these (or `windmill` above, which only the default group uses).
+#
+# Inventory 2026-10-29: 30 d of Windmill job history (v2_job by tag), the
+# workspace scripts' kube-API calls, and the 2026-10-25..29 kube-apiserver audit
+# log on qua/qui/quo. That log records only create/delete/patch, but every
+# windmill-SA write in it came from the default group.
+#   native, gpu, long -> no kube-API use at all -> no token
+#   certs             -> one Secret read          -> the Role below
+#
+# ⚠️ This narrows what a job's RUNTIME holds on these pods (a compromised
+# dependency, a pod exec). It does NOT narrow what a script AUTHOR can do: the
+# author picks the tag, and `heal` is still effectively admin-equivalent.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: windmill-worker-nokube
+  namespace: windmill
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: windmill-worker-certs
+  namespace: windmill
+---
+# f/infra_certs/aruba_aos6_cert_sync: GET secrets/aruba-apin0325-cert in
+# monitoring (tls.crt + tls.key, staged for the AOS-6 IAP to download).
+# f/infra_certs/aruba_cert_sync: the two AOS-8 APs' certs (infra-az8.19.12 moved
+# it from `default` to `certs`, so private keys stay off the default group). A
+# new certs-tagged script that needs another Secret adds its name here.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-certs
+  namespace: monitoring
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["aruba-apin0325-cert", "aruba-apin0505-cert", "aruba-apin0315-cert"]  # gitleaks:allow (Secret names, not values)
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-certs
+  namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-certs
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-certs
+    namespace: windmill
+---
+# f/infra_certs/santillo_cert_sync: the NAS cert pushed over SSH (infra-az8.19.12,
+# moved from `default` to `certs` with aruba_cert_sync).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-certs
+  namespace: transit
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["santillo-cert"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-certs
+  namespace: transit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-certs
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-certs
+    namespace: windmill
+---
+# Option A of infra-az8.19.2 (user decision 2026-10-30): split the default
+# group's power into a READER and a HEALER.
+#
+# windmill-worker-reader: get/list/watch on every built-in resource by name and
+# on every CRD group, NOTHING else. No write verb anywhere, no escalate/bind/
+# impersonate, no subresources except pods/log. Bound to `windmill` (the default
+# group) and to windmill-worker-heal.
+#
+# Left out on purpose:
+#   - management.cattle.io (Rancher users/tokens; the two scripts that read it go
+#     through their own mgmt kubeconfig, not this SA)
+#   - aggregated API groups that are really proxies or actions:
+#     ext.cattle.io, subresources.kubevirt.io (VNC/console),
+#     upload.cdi.kubevirt.io, acme.infomaniak.com
+#   - pods/exec|attach|portforward|proxy, nodes/proxy, services/proxy: a GET on
+#     any of these is code execution, which is why built-in groups are listed
+#     resource by resource instead of "*" (RBAC "*" matches subresources too).
+#
+#   - secrets (infra-az8.19.12): RBAC cannot narrow a list by selector, so a
+#     `secrets` list here would read every ServiceAccount token and app
+#     credential in the cluster. The four probes that listed them now use
+#     cert-manager Certificates/CertificateRequests, Rancher catalog Apps and
+#     the workloads' imagePullSecrets names instead. Named reads are granted
+#     below (windmill-worker-secrets, windmill-worker-pull-secrets); `heal`
+#     gets any Secret by name through windmill-worker-heal-secrets.
+#
+# Generated by ~/windmill-worker-sa-20261029/gen_reader_role.py on the jump seat
+# from `kubectl api-resources` (2026-10-30). A new CRD group is covered
+# automatically; a new BUILT-IN resource needs a re-run.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: windmill-worker-reader
+rules:
+  - apiGroups: [""]
+    resources: [componentstatuses, configmaps, endpoints, events, limitranges, namespaces, nodes, persistentvolumeclaims, persistentvolumes, pods, pods/log, podtemplates, replicationcontrollers, resourcequotas, serviceaccounts, services]
+    verbs: [get, list, watch]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: [mutatingwebhookconfigurations, validatingadmissionpolicies, validatingadmissionpolicybindings, validatingwebhookconfigurations]
+    verbs: [get, list, watch]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: [apiservices]
+    verbs: [get, list, watch]
+  - apiGroups: ["apps"]
+    resources: [controllerrevisions, daemonsets, deployments, replicasets, statefulsets]
+    verbs: [get, list, watch]
+  - apiGroups: ["autoscaling"]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: ["batch"]
+    resources: [cronjobs, jobs]
+    verbs: [get, list, watch]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: [certificatesigningrequests]
+    verbs: [get, list, watch]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, list, watch]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: ["events.k8s.io"]
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: ["flowcontrol.apiserver.k8s.io"]
+    resources: [flowschemas, prioritylevelconfigurations]
+    verbs: [get, list, watch]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: [nodes, pods]
+    verbs: [get, list, watch]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [ingressclasses, ingresses, ipaddresses, networkpolicies, servicecidrs]
+    verbs: [get, list, watch]
+  - apiGroups: ["node.k8s.io"]
+    resources: [runtimeclasses]
+    verbs: [get, list, watch]
+  - apiGroups: ["policy"]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: [clusterrolebindings, clusterroles, rolebindings, roles]
+    verbs: [get, list, watch]
+  - apiGroups: ["resource.k8s.io"]
+    resources: [deviceclasses, resourceclaims, resourceclaimtemplates, resourceslices]
+    verbs: [get, list, watch]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: [priorityclasses]
+    verbs: [get, list, watch]
+  - apiGroups: ["storage.k8s.io"]
+    resources: [csidrivers, csinodes, csistoragecapacities, storageclasses, volumeattachments, volumeattributesclasses]
+    verbs: [get, list, watch]
+  - apiGroups:
+      - acme.cert-manager.io
+      - addons.cluster.x-k8s.io
+      - auditlog.cattle.io
+      - autoscaling.k8s.io
+      - barmancloud.cnpg.io
+      - bmc.tinkerbell.org
+      - catalog.cattle.io
+      - cdi.kubevirt.io
+      - ceph.rook.io
+      - cert-manager.io
+      - clone.kubevirt.io
+      - cluster.x-k8s.io
+      - core.haproxy.org
+      - crd.projectcalico.org
+      - csi.ceph.io
+      - devices.harvesterhci.io
+      - export.kubevirt.io
+      - external-secrets.io
+      - externaldns.k8s.io
+      - fleet.cattle.io
+      - forklift.cdi.kubevirt.io
+      - frrk8s.metallb.io
+      - gateway.networking.k8s.io
+      - generators.external-secrets.io
+      - harvesterhci.io
+      - helm.cattle.io
+      - horizon.evertrust.io
+      - hub.traefik.io
+      - instancetype.kubevirt.io
+      - ipam.cluster.x-k8s.io
+      - k3s.cattle.io
+      - k8s.cni.cncf.io
+      - kubeovn.io
+      - kubevirt.io
+      - loadbalancer.harvesterhci.io
+      - logging-extensions.banzaicloud.io
+      - logging.banzaicloud.io
+      - longhorn.io
+      - metal.harvesterhci.io
+      - metallb.io
+      - migrations.kubevirt.io
+      - monitoring.coreos.com
+      - network.harvesterhci.io
+      - node.harvesterhci.io
+      - objectbucket.io
+      - operator.victoriametrics.com
+      - policy.networking.k8s.io
+      - pool.kubevirt.io
+      - postgresql.cnpg.io
+      - provisioning.cattle.io
+      - rke.cattle.io
+      - runtime.cluster.x-k8s.io
+      - snapshot.kubevirt.io
+      - snapshot.storage.k8s.io
+      - telemetry.cattle.io
+      - tinkerbell.org
+      - traefik.containo.us
+      - traefik.io
+      - trust.cert-manager.io
+      - turtles-capi.cattle.io
+      - ui.cattle.io
+      - upgrade.cattle.io
+      - volsync.backube
+      - whereabouts.cni.cncf.io
+    resources: ["*"]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: windmill-worker-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: windmill-worker-reader
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# Secrets for the `default` group BY NAME (infra-az8.19.12). The reader above
+# has no `secrets` at all, so a default job can no longer list Secrets or read
+# a ServiceAccount token or another app's credentials. Each Role names the
+# scripts that read it. A new default script that needs a Secret adds its name
+# here; a script that must read a COMPUTED Secret name gets tag `heal`
+# (windmill-worker-heal-secrets below).
+# litellm_contract, litellm_guardrail_coverage, mbp_mda_services_health
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: litellm
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [litellm-env-secret, litellm-pg-app]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: litellm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# horizon_cert_metrics, horizon_license_usage, stream_license_usage
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: evertrust-mcp
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [horizon-mcp-secrets, stream-mcp-secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: evertrust-mcp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# k8s_cert_discovery, horizon_cert_metrics
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: horizon-discovery
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [horizon-discovery-creds]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: horizon-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# gitlab_backup_health, config_backup/gitlab_backup_retention
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: bootstrap
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [gitlab-s3cfg-secret]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: bootstrap
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# zot_orphan_images
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: zot
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [zot-s3-config]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: zot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# trapeye_decoy_health_check
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: honeypot
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [trapeye-uuid-secret]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: honeypot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# stream_license_usage
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: stream
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [stream-license]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: stream
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# zha_mesh_health
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: appdaemon
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [appdaemon-env-secret]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: appdaemon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# desk/memsearch_ingest
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: memsearch
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [memsearch-env]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: memsearch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# heal/ha_stream_unwedge (tag default: it only calls the HA API)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-secrets
+  namespace: home-assistant
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [home-assistant-env-secret]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-secrets
+  namespace: home-assistant
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# pinned_image_reachability: the image pull Secrets that live workloads name in
+# imagePullSecrets, in whatever namespace they sit (copies of the same four
+# credentials, measured 2026-10-30: registry.mdapi.ch x2, zot, evertrust). get
+# by name only, never list. A new pull-secret name adds itself here; until then
+# its images report `unknown`, not `dead`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: windmill-worker-pull-secrets
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [evertrust-registry, gitlab-registry, mdapi-registry, zot-pull]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: windmill-worker-pull-secrets
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: windmill-worker-pull-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill
+    namespace: windmill
+---
+# `heal` reads Secrets whose names it computes: restic_snapshot_freshness (each
+# VolSync ReplicationSource's repository Secret), rgw_backup_bucket_grant (each
+# CNPG bucket's OBC owner keys), k8s_orphan_audit (VM cloud-init secretRefs),
+# plus horizon_lic001_heal, ha_upgrade_rollback and openbao_failover_check by
+# name. get only, no list/watch: a heal job still cannot enumerate Secrets. Not
+# a new power for this SA: exec into any pod already reaches every mounted one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: windmill-worker-heal-secrets
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: windmill-worker-heal-secrets
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: windmill-worker-heal-secrets
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# The `heal` worker group (tag `heal`): the ~40 scripts that change PROD objects
+# or exec into pods. Each grant below names the script that needs it; a new
+# heal script that needs more adds a line here, it does not go back to default.
+#
+# ⚠️ Still effectively admin-equivalent: exec into any pod, delete any pod or
+# Node, create Jobs in kube-system. What the split buys is that the ~70 read-only
+# probes on `default` no longer carry these verbs, and a heal job cannot touch
+# RBAC, webhooks, CRDs or Rancher objects.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: windmill-worker-heal
+  namespace: windmill
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: windmill-worker-heal
+rules:
+  # longhorn_eio_autoheal, longhorn_rwx_split_heal (any ns), frigate_nest_camera_bounce,
+  # horizon_lic001_heal, ingress_worker_flush, wan_speedtest (its own pod)
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
+  # 17 exec-only scripts + longhorn_eio_autoheal (ns computed). The websocket
+  # upgrade is a GET, newer apiservers authorize it as create: grant both.
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create, get]
+  # pvc_grow (size), backup_label_enforcer (labels)
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [patch]
+  # resource_waste: removes Node objects of hosts gone for good
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [delete]
+  # k8s_job_janitor (any ns), node_opt_image_prune (kube-system)
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [delete]
+  # k8s_job_janitor
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [delete]
+  # ceph_pvc_snapshot (ns of each VolSync ReplicationSource)
+  - apiGroups: [snapshot.storage.k8s.io]
+    resources: [volumesnapshots]
+    verbs: [create, delete]
+  # kubevirt_stuck_vmi_finalizer
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [patch]
+  # volsync_restic_stale_lock
+  - apiGroups: [volsync.backube]
+    resources: [replicationsources]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: windmill-worker-heal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# wan_speedtest: one speedtest pod per run (deleted by the ClusterRole grant)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# node_opt_image_prune: one hostPath Job per node (kube-system on purpose: it is not baseline-labelled)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: kube-system
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# ha_upgrade_rollback: patches the HA Deployment image back
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: home-assistant
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: home-assistant
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# joplin_ldap_socket_heal: restart annotation on the joplin Deployment
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: joplin
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [joplin]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: joplin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# msm430_cert_renew: a temporary Service + Endpoints pointing at the worker for the ACME HTTP-01 answer
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: windmill
+rules:
+  - apiGroups: [""]
+    resources: [services, endpoints]
+    verbs: [create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: windmill
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# rspamd_forwarding_alias_map: writes the alias-map ConfigMap
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: mail
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: mail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# longhorn_backup_retry (snapshot + backup CRs), longhorn_degraded_stuck / longhorn_rebuild_stuck (stuck replicas)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: longhorn-system
+rules:
+  - apiGroups: [longhorn.io]
+    resources: [snapshots, backups]
+    verbs: [create]
+  - apiGroups: [longhorn.io]
+    resources: [replicas]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: longhorn-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill
+---
+# openbao_failover_check: the quarterly drill creates and purges ExternalSecret + Secret openbao-drill-check
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: windmill-worker-heal
+  namespace: openbao
+rules:
+  - apiGroups: [external-secrets.io]
+    resources: [externalsecrets]
+    verbs: [create]
+  - apiGroups: [external-secrets.io]
+    resources: [externalsecrets]
+    resourceNames: [openbao-drill-check]
+    verbs: [delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [openbao-drill-check]
+    verbs: [delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: windmill-worker-heal
+  namespace: openbao
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: windmill-worker-heal
+subjects:
+  - kind: ServiceAccount
+    name: windmill-worker-heal
+    namespace: windmill

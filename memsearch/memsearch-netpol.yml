@@ -1,0 +1,96 @@
+## Who may talk to memsearch, and what it may reach. ENFORCING from birth.
+##
+## WHY. This pod holds the whole operational brain in one file — every memory,
+## skill, runbook and incident report — plus two bearers and a LiteLLM key. The
+## bearers are the gate on /mcp and /ingest; this policy keeps everyone else from
+## even trying, and keeps the pod from sending the corpus anywhere but LiteLLM.
+##
+## ⚠️ A wrongly-blocked caller shows up as a TCP timeout on the CALLER's side,
+## not as an error here — nothing logs a packet that never arrived.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: memsearch-restricted
+  namespace: memsearch
+spec:
+  podSelector:
+    matchLabels:
+      app: memsearch
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    ## 1. The callers: the jump seat (MCP queries) and Windmill (the ingest job).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jump
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: windmill
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 1b. LiteLLM's MCP gateway (litellm-cm.yml `mcp_servers`), which re-exposes
+    ## /mcp at llm.mdapi.ch for the off-cluster seats. It presents the same
+    ## bearer, so this admits the path, not a second credential. The pods, not
+    ## the namespace: the claude-shim and Postgres there have no business here.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: litellm
+          podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 2. The blackbox exporter, for the /readyz Probe in
+    ## monitoring-rules/69-memsearch.yml (an open path; no bearer involved).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 3. The kubelet's probes, which arrive from the NODE IP (same line as
+    ## paperless-mcp-netpol.yml).
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    ## 1. DNS, by SELECTOR: CoreDNS is reached at its pod IP, never the
+    ## 10.53.0.10 service VIP (an ipBlock on the VIP would block all resolution).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    ## 2. LiteLLM, the only place text is sent (to be embedded). The far end is
+    ## evaluated post-DNAT, so this selects the litellm PODS, not the Service.
+    ## The reverse direction is litellm/litellm-netpol.yml, which lists this
+    ## namespace among its callers.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: litellm
+          podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - protocol: TCP
+          port: 4000

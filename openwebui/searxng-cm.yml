@@ -1,0 +1,64 @@
+## SearXNG settings for the chat.mdapi.ch web-search backend.
+##
+## Deliberately tiny: `use_default_settings: true` inherits everything from the
+## image's own searx/settings.yml, and this file overrides only what must change.
+## Everything else that matters is already correct upstream and is set through
+## env in searxng-deploy.yml (secret_key via SEARXNG_SECRET, etc.) so no secret
+## ever lands in a ConfigMap.
+##
+## ⚠ `${...}` below are NOT SearXNG syntax. SearXNG does no env interpolation at
+## all (settings_loader.py is a bare yaml.safe_load), so they are rendered into an
+## emptyDir by the initContainer in searxng-deploy.yml before the server reads the
+## file. That indirection exists only so the provider keys can stay in a Secret.
+##
+## ⚠ THE `json` FORMAT IS THE WHOLE POINT OF THIS FILE.
+## Upstream ships `search.formats: [html]` — JSON output is OFF by default.
+## Open WebUI's client calls the instance with `format=json`
+## (retrieval/web/searxng.py), so without this override every search returns a
+## 403 and the feature looks broken for no visible reason. This is the single
+## most common way the Open WebUI ↔ SearXNG integration fails.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-config
+  namespace: openwebui
+data:
+  settings.yml: |
+    use_default_settings: true
+
+    search:
+      formats:
+        - html
+        - json
+      # Language is passed per-request by Open WebUI (SEARXNG_LANGUAGE, default
+      # "all"); safe_search 1 = moderate, applied instance-wide because this
+      # instance is family-facing.
+      safe_search: 1
+
+    server:
+      # secret_key intentionally absent — SEARXNG_SECRET (Akeyless) overrides it.
+      # limiter stays false (upstream default): the limiter needs a Valkey and
+      # exists to fend off public abuse. This instance is ClusterIP with exactly
+      # one consumer, so it would only add a dependency and a way to rate-limit
+      # ourselves.
+      image_proxy: false
+
+    engines:
+      # Upstream's general/web set is brave/duckduckgo/google cse/startpage. The
+      # first three are CAPTCHA- or rate-limit-blocked from the cluster egress,
+      # so every default query was single-sourced on google cse — itself a scrape
+      # of a third-party CSE. bing is independent of Google (Jaccard 0.20) and
+      # held up 8/8 probes at ~0.2s. Merged by name, so only the flag is needed.
+      - name: bing
+        disabled: false
+      # Both ship `inactive: true` and the loader skips inactive engines BEFORE
+      # it ever reads api_key, so the flag is as load-bearing as the key itself.
+      # Measured 2026-10-01: exa 1.5s median / jina 1.1s, both inside the 3.0s
+      # engine timeout. search_type stays at exa's default `auto` — `instant` was
+      # barely quicker and returned as few as 4 results where auto returns 10.
+      - name: exaapi
+        api_key: "${EXA_API_KEY}"
+        inactive: false
+      - name: jina
+        api_key: "${JINA_API_KEY}"
+        inactive: false

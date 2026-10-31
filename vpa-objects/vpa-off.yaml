@@ -1,0 +1,64 @@
+# VPA Off mode — recommendations only, no eviction, no pod mutation.
+# Used for workloads that REALLY shouldn't be evicted (recorder DB
+# writes, GPU passthrough, authoritative DNS). Everything else lives
+# in vpa-auto.yaml so VPA right-sizes without manual intervention.
+# Check the Off recommendations after 7+ days:
+#   kubectl describe vpa -n <ns> <name>
+---
+# home-assistant uses 4+ GiB actual memory with zero requests/limits set.
+# Recorder writes Postgres continuously; eviction mid-day flushes the
+# in-memory queue and loses recent state transitions.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: home-assistant
+  namespace: home-assistant
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: home-assistant
+  updatePolicy:
+    updateMode: "Off"
+---
+# frigate: 4.7 cores + 2.9 GiB actual, no limits — node pressure risk.
+# Stay Off because the Coral USB + GPU passthroughs re-init on pod
+# restart and miss frames during the bring-up window.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: frigate
+  namespace: frigate
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frigate
+  updatePolicy:
+    updateMode: "Off"
+---
+# nameserver: BIND9 + Webmin. Pinned manually at req 200m/512Mi, lim 1000m/768Mi
+# after CPU throttling at 250m caused liveness probe (dig SOA) to time out.
+# Stay Off — authoritative DNS pod restart causes NXDOMAIN flicker for
+# downstream resolvers caching short TTLs (10s window of failed queries).
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: nameserver
+  namespace: nameserver
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nameserver
+  updatePolicy:
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      minAllowed:
+        cpu: 10m
+        memory: 64Mi
+      maxAllowed:
+        cpu: 1000m
+        memory: 768Mi

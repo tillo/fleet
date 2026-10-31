@@ -1,0 +1,98 @@
+## Who may talk to joplin-mcp-user, and what it may reach. ENFORCING from birth:
+## nothing but the Chat pods (and the guard probe, 1b) has a reason to call a
+## per-user notes connector, and the pod needs exactly three destinations.
+##
+## WHY INGRESS IS THIS NARROW. The pod holds every connected person's Joplin
+## application credential (encrypted at rest, decrypted in memory). A request
+## only ever reaches the credential of the person whose Keycloak token it
+## carries, but the boundary is still "the Chat pods and the probe that checks
+## them", not "the cluster".
+##
+## ⚠️ A wrongly-blocked caller shows up as a TCP timeout in the openwebui pod,
+## not as an error in this one. Debug from the caller's side first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: joplin-mcp-user-restricted
+  namespace: joplin-mcp-user
+spec:
+  podSelector:
+    matchLabels:
+      app: joplin-mcp-user
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    ## 1. Open WebUI, the only intended caller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 1b. Windmill, for f/probe/joplin_user_mcp_guard (hourly, decision D5): it
+    ## signs in as the synthetic canary and asserts that the door still refuses
+    ## no token, a wrong audience and a non-member, and that the canary sees only
+    ## its own marker. Same accepted cost as the LAN rule below: without a token
+    ## this endpoint answers 401 and holds nothing.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: windmill
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 2. The kubelet's probes, which arrive from the NODE IP, not from a pod.
+    ## ⚠️ Leave this out and readiness fails and the pod restarts forever. The
+    ## same allowance means the LAN can reach 8080; accepted, as for mail-mcp and
+    ## nextcloud-mcp, because the endpoint is useless without a token it validates.
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    ## 1. DNS, by SELECTOR: CoreDNS is reached at its pod IP, never the
+    ## 10.53.0.10 service VIP (an ipBlock on the VIP would block all resolution).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    ## 2. Keycloak's JWKS (idp.mdapi.ch), behind the estate ingress. ⭐ Calico
+    ## evaluates the POST-DNAT far end, so the destination is an
+    ## rke2-ingress-nginx CONTROLLER POD on 443, not the LB VIP. Same rule and
+    ## same accepted cost as mail-mcp-netpol.yml: L4 cannot scope by Host name.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 443
+    ## 3. Joplin Server, in-cluster (Service joplin.joplin:22300 → the joplin
+    ## pod). Deliberately NOT notes.mdapi.ch through the ingress: the API calls,
+    ## the application-credential poll and the self-revoke all go here. Only the
+    ## Connect link the person opens points at the public host.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: joplin
+          podSelector:
+            matchLabels:
+              app: joplin
+      ports:
+        - protocol: TCP
+          port: 22300

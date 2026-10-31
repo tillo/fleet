@@ -1,0 +1,28 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: paperless-mcp-env
+  namespace: paperless-mcp
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: paperless-mcp-env
+    creationPolicy: Owner
+
+  ## The API token of the Paperless user `paperless-mcp` — a read-only viewer,
+  ## not an administrator, not the household's personal account. It is the only
+  ## credential this pod holds; it is never sent anywhere except as an
+  ## Authorization header to the Paperless service.
+  ##
+  ## Rotating it: revoke the token in Paperless (Users → paperless-mcp), mint a
+  ## new one, write it to Akeyless, then restart the Deployment — the pod reads
+  ## the Secret once at start, so an ExternalSecret refresh alone changes nothing.
+  data:
+    - remoteRef:
+        key: /mdapi/paperless-mcp/paperless-mcp-env/PAPERLESS_TOKEN
+      secretKey: PAPERLESS_TOKEN

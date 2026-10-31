@@ -1,0 +1,38 @@
+# Windmill's DATABASE_URL, read by the app and every worker group through the
+# chart's windmill.databaseUrlSecretName (windmill/values.yml). infra-az8.19.1.
+#
+# Until 2026-10-28 the URL sat INLINE in the pod-spec env and carried the
+# windmill-labs chart's PUBLIC default superuser password (anyone with
+# `get deployments -n windmill` read it; until fleet !1513 any pod could reach
+# 5432). The password now lives only in Akeyless; the URL is assembled here so
+# there is one value to rotate.
+#
+# ⛔ The Postgres side does NOT follow this Secret: the role password is set
+# once with ALTER ROLE inside windmill-postgresql-0 (local socket = trust).
+# Rotating means: new Akeyless version -> ESO syncs (1m) -> ALTER ROLE
+# postgres -> roll the app + worker Deployments (pods read the env at start).
+# The StatefulSet's inline POSTGRES_PASSWORD is the chart default and is
+# init-only: it is NOT the live password (see values.yml postgresql.auth).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: windmill-database-url
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: windmill-database-url
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        url: "postgres://postgres:{{ .password }}@windmill-postgresql/windmill?sslmode=disable"
+
+  data:
+    - remoteRef:
+        key: /mdapi/windmill/windmill-postgresql/postgres-password
+      secretKey: password

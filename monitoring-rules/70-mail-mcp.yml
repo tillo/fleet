@@ -1,0 +1,63 @@
+## mail-mcp — the read-only mail connector for chat.mdapi.ch.
+##
+## Nothing here is visitor-facing: the connector is reached only from the Chat
+## pods, and its failure degrades one chat tool, never mail itself (IMAP, SMTP
+## and webmail do not go through it). Hence warning + `statuspage: exclude` —
+## component Mail is PUBLIC, and an internal connector must not degrade it on
+## mdapi.statuspage.io (66-nextcloud-mcp does the same with Files & Documents).
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract): every
+## workload later added to ns mail-mcp is then born covered. `deployment=~".+"`
+## / `statefulset=~".+"` are no-ops in PromQL and load-bearing for
+## f/probe/alert_coverage_check: without them a namespace-only selector claims
+## coverage of a kind it can never fire on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-mail-mcp
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-mail-mcp.rules
+      rules:
+        - alert: MailMcpWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="mail-mcp", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="mail-mcp", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "mail-mcp" }}'
+            severity: warning
+            component: Mail
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "mail-mcp/{{ $labels.deployment }} has {{ $value }} unavailable replica(s)"
+            description: |
+              The mail connector of chat.mdapi.ch is down for every user. Chat
+              and mail itself keep working; asking Chat about mail returns a
+              tool error instead.
+                kubectl --context mdapi-prod-direct -n mail-mcp get pods
+                kubectl --context mdapi-prod-direct -n mail-mcp logs deploy/{{ $labels.deployment }}
+              A pod stuck in CreateContainerConfigError usually means the
+              ExternalSecret `mail-mcp-env` has not materialised (Akeyless
+              path /mdapi/mail-mcp/mail-mcp-env/MCP_CLIENT_SECRET).
+
+        - alert: MailMcpStatefulSetUnavailable
+          ## Empty today — the arm exists so the namespace-wide claim above stays
+          ## true if a StatefulSet is ever added here.
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="mail-mcp", statefulset=~".+"}
+              < kube_statefulset_status_replicas{namespace="mail-mcp", statefulset=~".+"}
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "mail-mcp" }}'
+            severity: warning
+            component: Mail
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "mail-mcp/{{ $labels.statefulset }} has unavailable replicas"

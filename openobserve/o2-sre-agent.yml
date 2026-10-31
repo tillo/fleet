@@ -1,0 +1,444 @@
+# OpenObserve AI assistant — the "o2-sre-agent" service (added 2026-09-01).
+#
+# WHY A SEPARATE DEPLOYMENT: setting O2_AI_ENABLED on OpenObserve is NOT enough.
+# The chat endpoint (/api/<org>/ai/chat) only proxies; it answers
+#   400 "AI agent URL is not set"  /  "Agent service not configured"
+# until O2_AGENT_URL points at this service. The agent is what actually runs the
+# model loop — it embeds `opencode` and bootstraps its own agents, skills and
+# tools at startup ("Bootstrapped 4 opencode agent file(s)", 8 skills, 6 tools).
+#
+# MODEL ROUTING: the agent talks to the estate's litellm gateway as a generic
+# OpenAI-compatible endpoint — verified from its own startup log:
+#   "Configured OpenCode provider o2-ai-gateway -> http://litellm...:4000/v1
+#    (model=ds-flash)"
+# It appends /v1 itself, so O2_AI_GATEWAY_URL must NOT include it. This settles
+# the long-open question of whether O2_AI_GATEWAY_URL accepts a generic
+# OpenAI-compatible endpoint rather than only OpenObserve's own gateway: it does.
+#
+# ⚠️ PORT IS 8000, NOT 8080. O2_SRE_PORT is documented but did NOT take effect —
+# the process listened on 8000 regardless, which cost a debugging round when
+# OpenObserve reported a connection error to :8080. Checked with a port scan
+# rather than trusted from the variable. If you change the port, VERIFY it.
+#
+# ⚠️ NOT FAST. A one-line answer takes ~30 s, while the model itself answers in
+# ~1.5 s direct through litellm. Essentially all of it is the agent's own
+# reasoning/tool loop — this is an agentic assistant, not a chat completion, so
+# treat the latency as inherent rather than as a fault to chase. Swapping the
+# model will NOT fix it: the model is a few percent of the wall clock.
+#
+# The litellm credential lives ONLY here, never on the OpenObserve StatefulSet:
+# verified that ai_enabled flips true and chat works with O2_AI_ENABLED +
+# O2_AGENT_URL alone on OpenObserve, so the log store never holds an LLM key.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: o2-sre-agent
+  namespace: openobserve
+  labels:
+    app: o2-sre-agent
+  # Restart when a referenced Secret/ConfigMap changes (openobserve-sre-rca token
+  # rotation, openobserve-ai key, the health-probe ConfigMap). The env vars below
+  # are read once at start, so without this a rotated token leaves the RCA path
+  # failing with 401s until someone restarts the pod by hand.
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: o2-sre-agent
+  template:
+    metadata:
+      labels:
+        app: o2-sre-agent
+    spec:
+      containers:
+      - name: agent
+        # ⚠️ Resolve the amd64 digest from the multi-arch INDEX, not by hashing
+        # the manifest response: a hand-computed hash was rejected by containerd
+        # as a blob reference ("401 Unauthorized" on a /blobs/ HEAD).
+        #
+        # ⛔ "matching the OpenObserve EE version" no longer holds, and never
+        # really did. The agent has its OWN release train: it happened to ship a
+        # v0.92.0 alongside o2 v0.92.0, but as of 2026-09-22 the agent is at
+        # v1.1.6 while o2 is at v1.0.3. There is no shared version line to keep
+        # in step, so do not "fix" the skew by matching numbers.
+        #
+        # ⭐ Tag added 2026-09-22 (digest unchanged - verified that
+        # v0.92.0-linux-amd64 resolves to exactly this digest). The version is
+        # DELIBERATELY not bumped in the same change as the o2 v1.0.3 upgrade:
+        # one variable at a time. Bump the agent only after confirming the AI
+        # assistant still answers against o2 v1.0.3, since the agent calls back
+        # into o2's API via O2_TOOL_API_URL and a v1.0 API change would look
+        # like an agent fault.
+        image: public.ecr.aws/zinclabs/o2-sre-agent:v1.1.6-linux-amd64@sha256:5357db49f434851ea321bd2a323826776a40b10b342933f536834a5f675e1627
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+        env:
+        - name: O2_SRE_HOST
+          value: "0.0.0.0"
+        - name: O2_SRE_LOG_LEVEL
+          value: "info"
+        # Generic OpenAI-compatible provider pointed at litellm. The model is a
+        # litellm ROUTE name, not a vendor model id — change it here to re-point
+        # (the key below is scoped to auto-heuristic-local-cn and its two pre-rename
+        # spellings, cn-deepseek-pro / cn-deepseek-flash, local-closed-best and
+        # local-closed-tiel-large, so those need no new credential; anything else
+        # requires updating the litellm key's model list too). 2026-10-20: the
+        # pro-tail names this list used to carry were retired with their groups.
+        # 2026-10-26: us-claude-opus and local-tail-cn-flash-best-nothink removed —
+        # ⛔ O2 is exempt from Claude (subscription AND the claude-api-sonnet credit
+        # tier): do not re-point it at a group whose chain reaches either. See
+        # o2-es.yml for the live scope.
+        #
+        # `auto-local-tiel-cn-pro` = a litellm complexity-router group (2026-10-01,
+        # fleet !631; renamed from auto-local-gemma-cn-pro on 2026-10-10, fleet !838,
+        # when the local brain became tiel-coder-35b-a3b-mtp). Routine
+        # investigations land on the SAME local brain this
+        # agent already used, so nothing moves for them; investigations the
+        # classifier scores as complex go to DeepSeek pro on purpose rather than
+        # only when the laptop is unreachable. Chosen over a Claude tier because
+        # the shim is text-only and the login-backed groups need a caller
+        # credential this pod has not got. Rationale: ~/auto-router-proposal-20261001.md.
+        #
+        # ⚠️ VERIFY THIS AT THE WIRE, NEVER FROM THE MODEL NAME. CLAUDE.md
+        # records that `auto`/`infra` once 400'd deterministically on its local
+        # hop because a tool schema contained `\d`, which llama.cpp's
+        # JSON-schema→GBNF converter rejects — every call then fell through to
+        # Anthropic, turning the door into `opus` with extra steps. That is a
+        # fail-OPEN privacy change and it is SILENT. Checked 2026-09-01 with a
+        # real tool-carrying request; response headers said:
+        #     x-litellm-model-api-base: http://mbp-mda.home.tillo.ch:1234/v1
+        #     x-litellm-attempted-fallbacks: 0
+        #     finish_reason: tool_calls
+        # i.e. served locally WITH working tool calls. Re-check those headers
+        # after any change to the agent's tools or the local model.
+        #
+        # ⚠️ BUT "local-first" is not "local-only", and the gap is COLD START,
+        # not the `\d` bug. Measured 2026-09-01: the FIRST request after this
+        # agent rolled onto `infra` took 43 s and DID register cloud spend
+        # (+$0.00176 on the key); every request afterwards was 2-3 s at exactly
+        # zero cost, and the identical prompt did not reproduce it. Mechanism is
+        # in litellm's own config: the `infra` group sets NO request_timeout, so
+        # it inherits the 20 s global fail-fast, while that same file records a
+        # cold GGUF prefill at ~400 s. So whenever the local model has gone cold,
+        # the first query — CONTENT AND ALL — is answered by Anthropic.
+        #   * cost is negligible; the PRIVACY exposure is the point
+        #   * verified that local calls cost exactly 0, so key spend is a
+        #     trustworthy cloud-leak detector: watch it, don't infer from latency
+        #   * NOT changed here: adding request_timeout to `infra` would alter a
+        #     door shared with ccx/dsx, which is the user's call, not a
+        #     side effect of wiring up OpenObserve. `local-only` is the
+        #     fail-closed alternative (900 s timeout, no cloud tail) if the
+        #     assistant should never reach cloud.
+        - name: O2_AI_PROVIDER
+          value: "openai"
+        # The router's local tier is local-closed-best-nothink since 2026-10-26
+        # (local-tail-cn-flash-best-nothink 10-20..10-26, whose row gained the
+        # claude-api-sonnet hop; local-tail-cn-pro-best-nothink before that, under
+        # its earlier -tiel-large / -gemma-large / infra-sre names): the same local
+        # model, thinking OFF, but with NO fallback row of its own, so a dropped
+        # local call raises to the router's own row, which is flash-only. Every hop
+        # of the route therefore still tails to cn-deepseek-flash. The reason dates from
+        # the earlier brain -- in thinking mode gemma intermittently hid its tool
+        # calls inside reasoning_content and RCAs came back empty (2026-09-24,
+        # litellm-cm.yml).
+        # ⭐ RE-VERIFIED 2026-10-10 against tiel-coder: the hazard does NOT
+        # reproduce. On a forced `read_file` call BOTH local-tail-cn-pro-tiel-large
+        # and this -nothink tier return a `tool_use` block with
+        # stop_reason=tool_use. The door is kept -- it is harmless, marginally
+        # cheaper, and n=1 does not refute the original rationale -- but the
+        # gemma-era justification is no longer a claim about the current brain.
+        # ⭐ 2026-10-19 — the route was renamed and its classifier moved from the
+        # default keyword scorer to the local brain (session affinity ON). Both old
+        # spellings remain as `model_group_alias` rows, so this is a rename, not a
+        # cutover; the OpenObserve provider row (out of git, PUT 422s) keeps the old
+        # spelling and resolves through the same alias.
+        - name: O2_AI_MODEL
+          value: "auto-heuristic-local-cn"
+        - name: O2_AI_GATEWAY_ENABLED
+          value: "true"
+        - name: O2_AI_GATEWAY_URL
+          value: "http://litellm.litellm.svc.cluster.local:4000"
+        # Where the agent calls BACK into OpenObserve for tool use (running
+        # queries, reading streams). Must be the Service, not a pod IP — a stale
+        # pod IP here leaves the agent retrying a dead endpoint on every request.
+        # ⛔ This is the FULL MCP endpoint, path included, not the O2 API root.
+        # v1.1.6 sets `mcp_server_url = tool_api_url` verbatim and hands it to
+        # StreamableHTTPConnectionParams (src/config/settings.py:160,
+        # src/agent/sre_agent.py:308) — nothing appends `/api/<org>/mcp`, so the
+        # root was being POSTed and answering 405, measured 2026-10-22:
+        #   POST /                           -> 405 (no body)
+        #   POST /api/default/mcp  (basic)   -> 200, serverInfo openobserve-mcp 1.0.0
+        # That 405 surfaced as `ConnectionError: Failed to create MCP session:
+        # unhandled errors in a TaskGroup` on every RCA, and O2 logged
+        # `[INCIDENTS::RCA] RCA failed ... o2-sre-agent` with no tools available.
+        - name: O2_TOOL_API_URL
+          value: "http://openobserve.openobserve.svc.cluster.local:5080/api/default/mcp"
+        # The MCP endpoint is NOT anonymous: an unauthenticated POST answers 401
+        # whatever the path. The shared toolset (get_mcp_toolset, used by the RCA
+        # path rather than the per-user chat path) only sends Authorization when
+        # BOTH of these are set, so without them the 405 above would just become
+        # a 401.
+        # ⛔ NOT ROOT (changed 2026-10-31). Upstream documents root creds for this
+        # path, and we ran it that way from 10-22. Since then every autonomous RCA
+        # searched as tillo@tillo.ch and shared root's per-user work-group quota
+        # with every human and agent. Measured 10-31 04:46–05:01Z: 97 SearchSQL
+        # calls, 34 h windows, str_match over pod_logs, 156.8 GB of pod_logs scanned,
+        # and a DUPLICATE RCA launch for one incident at 04:58:05. Its two identical
+        # traces aggregations (04:59:38, 05:00:08) OOMKilled openobserve-0 at
+        # 05:00:17. It also left an admin credential in a pod that talks to an LLM.
+        # Now: service account o2-sre-rca@mdapi.ch holds role sre_rca, a copy of the
+        # 24 grants of O2's system role o2-sre-readonly (read logs/traces/metrics/
+        # streams/alerts, incidents Get/List/Put/Post, mcp List+Put). It can't
+        # manage users, roles, streams or settings. The RCA gets its OWN per-user
+        # quota (O2_WORK_GROUP_USER_*, fleet !1628). Basic auth = email + SA token.
+        # Created by ~/agent-runs/o2-20261031/o2-sre-rca-sa-create.py, which also
+        # proves 200 on MCP/search and 403 on role-list/SA-create BEFORE this merges.
+        # Why not O2's own system SA (o2-sre-agent.org-default@openobserve.internal,
+        # already holding o2-sre-readonly)? Its token can't be read back (list is
+        # masked, no GET), and rotating a system account's token was off the table.
+        - name: O2_MCP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: openobserve-sre-rca
+              key: O2_MCP_USERNAME
+        - name: O2_MCP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: openobserve-sre-rca
+              key: O2_MCP_PASSWORD
+        # ⚠ REQUIRED since the image move to v1.1.6 (Renovate, "Update … Docker tag
+        # to v1"). In 1.1.6 these three are `Field(...)` with NO default
+        # (/app/src/config/settings.py), and pydantic-settings refuses to start the
+        # app without them:
+        #   Missing required setting: O2_MCP_CONTENT_VALIDATION_ENABLED
+        #   Missing required setting: O2_MCP_CONTENT_VALIDATION_MODE
+        #   Missing required setting: O2_MCP_RESPONSE_VALIDATION_ENABLED
+        # → CrashLoopBackOff, RS never becomes available, and the whole bundle parks
+        #   on `Progress deadline exceeded` (2026-10-22). The old pod kept serving
+        #   (maxUnavailable allows it), so this failed silently as a stuck rollout.
+        # Both features are new in this line and neither is needed here: content
+        # validation (VRL/SQL/PromQL pre-checks on code-generating tools) and
+        # response validation (the validate_and_use_code tool) are OFF, which is
+        # parity with v0.92 behaviour. Flip deliberately after testing, not as a
+        # side effect of an image bump. Mode is inert while content validation is
+        # off; 'detect' (auto-detect) is the sane value if it is ever turned on.
+        - name: O2_MCP_CONTENT_VALIDATION_ENABLED
+          value: "false"
+        - name: O2_MCP_CONTENT_VALIDATION_MODE
+          value: "detect"
+        - name: O2_MCP_RESPONSE_VALIDATION_ENABLED
+          value: "false"
+        - name: O2_AI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openobserve-ai
+              key: O2_AI_API_KEY
+        # ⭐ ENTRYPOINT SHIM (infra-7yba). `python -m src.main` replaced by a shim
+        # that installs a corrected MCP health probe and then runs that SAME entry
+        # point — the app itself (tools, models, routes, auth) is untouched. Source
+        # and rationale: the `o2-sre-agent-health-probe` ConfigMap at the end of
+        # this file. Delete `command`, `volumeMounts` and `volumes` together with
+        # the ConfigMap once the image is bumped (upstream `latest` no longer
+        # probes MCP from /health at all).
+        command: ["python", "/opt/o2-health-probe/entrypoint.py"]
+        volumeMounts:
+        - name: health-probe
+          mountPath: /opt/o2-health-probe
+          readOnly: true
+        # Measured 865Mi resident after a handful of chats (opencode is a node
+        # subprocess). Requested at 1Gi deliberately: OpenObserve's own 512Mi
+        # request against ~1.2Gi actual already distorts scheduling on these
+        # nodes, and repeating that mistake here is not worth the paper saving.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+        # /health re-probes MCP on EVERY call via check_mcp_server(). Unpatched it
+        # is a GET whose response body never ends (the MCP endpoint is an SSE
+        # stream), so each call burns the app's hard-coded 10s timeout: measured
+        # 10.17s per call and two ERROR lines every 10s, for a check that should
+        # cost milliseconds. The shim above makes it a POST `initialize` (~15ms);
+        # the new live value is in the ConfigMap.
+        #
+        # ⛔ KEEP the 20s probe timeouts even though /health is now cheap. They are
+        # the safety margin for the shim's DESIGNED fallback: if a future image
+        # renames check_mcp_server the shim logs and runs the stock app, which is
+        # 10s/health again — and 5s/10s timeouts made that pod un-Ready and got it
+        # killed on 2026-10-22.
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 20
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 20
+          failureThreshold: 3
+      volumes:
+      - name: health-probe
+        configMap:
+          name: o2-sre-agent-health-probe
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: o2-sre-agent
+  namespace: openobserve
+  labels:
+    app: o2-sre-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: o2-sre-agent
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+---
+# Entrypoint shim for the Deployment above (infra-7yba, 2026-10-22).
+#
+# v1.1.6's /health calls check_mcp_server(): an httpx GET on the MCP URL that
+# awaits the WHOLE response, hard 10s timeout. Against /api/default/mcp an
+# authenticated GET is a Streamable-HTTP listen stream — headers in ~13ms, body
+# (`: connected` + events) never ends — so the check burned its full 10s and
+# reported the healthy server as `degraded` / `timeout`: 10.17s per call,
+# measured on the pod, plus two ERROR lines every 10s from the probes.
+#
+# The shim swaps in a POST `initialize` (the MCP handshake, which terminates;
+# 13ms measured) and then runs the stock app unchanged. Upstream's `latest`
+# build (2026-10-09, a rewrite) no longer probes MCP from /health at all, so
+# ⛔ this whole ConfigMap + `command`/`volumes` is DELETE-WITH-THE-IMAGE-BUMP.
+#
+# ⚠️ It patches a module attribute BY NAME. If a later v1.1.x renames it the
+# shim logs one line and runs the stock app — slow /health, never a crashloop.
+# That fallback is the reason the probes keep timeoutSeconds: 20.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: o2-sre-agent-health-probe
+  namespace: openobserve
+  labels:
+    app: o2-sre-agent
+data:
+  entrypoint.py: |
+    """Entrypoint shim for o2-sre-agent v1.1.6: probe MCP the way MCP is spoken.
+
+    WHY (infra-7yba, measured 2026-10-22 on the live pod)
+      /health -> check_mcp_server() -> httpx GET on O2_TOOL_API_URL, awaiting the
+      WHOLE response, hard 10 s timeout. O2_TOOL_API_URL is now the real MCP
+      endpoint (/api/default/mcp), where an authenticated GET is a Streamable-HTTP
+      listen stream: headers land in ~13 ms, the body (`: connected` + events)
+      never ends. So every call blocked the full 10 s and answered 200 with
+      {"status":"degraded","mcp_connected":false,"mcp_error":"timeout"} while the
+      toolset was fine: 10.17 s per call, two ERROR lines per 10 s.
+
+    WHAT
+      Replaces ONLY check_mcp_server with a POST `initialize` (the MCP handshake,
+      which terminates) keeping the stock status-code mapping and log lines, then
+      runs the stock entry point (`src.main:main`, i.e. `python -m src.main`) —
+      tools, models, routes and auth are untouched.
+
+    STALE-SHIM SAFETY
+      The patch is applied by name. If a future image renames check_mcp_server or
+      changes the import shape, this logs one line and runs the stock app (old
+      10 s /health), never a crashloop. That is why the probes keep 20 s timeouts.
+    """
+    import logging
+    import sys
+
+    APP_DIR = "/app"  # image WORKDIR; `python <script>` does NOT put cwd on sys.path
+    if APP_DIR not in sys.path:
+        sys.path.insert(0, APP_DIR)
+
+    logger = logging.getLogger("o2-health-probe")
+
+    _INITIALIZE = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "o2-sre-agent-health", "version": "1"},
+        },
+    }
+    _HEADERS = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+
+
+    async def check_mcp_server(settings):
+        """MCP `initialize` probe. Same (ok, error) contract as the stock check."""
+        import httpx
+
+        auth = None
+        if settings.mcp_username and settings.mcp_password:
+            auth = httpx.BasicAuth(settings.mcp_username, settings.mcp_password)
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    settings.mcp_server_url, json=_INITIALIZE, headers=_HEADERS, auth=auth
+                )
+        except httpx.ConnectError:
+            logger.error(f"Cannot connect to MCP server at {settings.mcp_server_url}")
+            return False, "connection_failed"
+        except httpx.TimeoutException:
+            logger.error(f"Timeout probing MCP server at {settings.mcp_server_url}")
+            return False, "timeout"
+        except Exception as e:
+            logger.error(f"Error checking MCP server: {e}")
+            return False, str(e)
+
+        if response.status_code == 401:
+            logger.error("MCP server authentication failed: invalid credentials")
+            return False, "authentication_failed"
+        if response.status_code == 403:
+            logger.error("MCP server authentication failed: access forbidden")
+            return False, "access_forbidden"
+        if response.status_code >= 500:
+            logger.error(f"MCP server error: {response.status_code}")
+            return False, "server_error"
+        return True, ""
+
+
+    def install():
+        import src.server.app as app_module
+
+        if not callable(getattr(app_module, "check_mcp_server", None)):
+            raise AttributeError("src.server.app.check_mcp_server is gone")
+        app_module.check_mcp_server = check_mcp_server
+        print("o2-health-probe: MCP health probe = POST initialize (infra-7yba)", flush=True)
+
+
+    def main():
+        try:
+            install()
+        except Exception as exc:
+            print(
+                f"o2-health-probe: NOT applied ({exc!r}) - running the stock app",
+                file=sys.stderr,
+                flush=True,
+            )
+        from src.main import main as run_app
+
+        run_app()
+
+
+    if __name__ == "__main__":
+        main()

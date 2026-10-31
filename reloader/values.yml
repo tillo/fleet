@@ -1,0 +1,144 @@
+## stakater/Reloader — watches ConfigMaps/Secrets and rolls the workloads
+## that reference them when their content changes.
+##
+## ⭐ 2026-09-20: switched from opt-in to WATCH EVERYTHING (autoReloadAll), and
+## the repeated OOMKills were root-caused and fixed properly rather than by
+## raising the ceiling again.
+##
+## NB: when Reloader triggers a rollout it patches the live workload, so
+## Fleet will briefly show that bundle as "Modified". Fleet correctDrift is
+## off, so it only reports — it does not fight Reloader.
+
+reloader:
+  ## ⭐ Every workload that consumes a ConfigMap/Secret now reloads on change,
+  ## not only those carrying `reloader.stakater.com/auto: "true"`.
+  ## Measured 2026-09-20: of 159 secret-consuming Deployments/StatefulSets only
+  ## 38 had the annotation, so 121 would silently keep running with a stale
+  ## credential after a rotation — and `envFrom: secretRef` snapshots at pod
+  ## start, so that failure is invisible until the old credential is revoked.
+  ## Opt-in coverage that is 24% complete is worse than no policy, because it
+  ## reads as covered. See beads infra-ikig.
+  autoReloadAll: true
+
+  ## ⛔⛔ THE ACTUAL FIX for the OOMKills — exclude Helm's own release history.
+  ##
+  ## Measured 2026-09-20: Reloader cached 4,187 objects / 243.8 MiB cluster-wide
+  ## against a 256 MiB limit. It could not fit by construction: it sat at 246 MiB
+  ## steady (96% of the limit) with 5 restarts, last OOMKilled 09-19 19:51Z.
+  ## 3,082 of those objects are `owner=helm` release secrets = 210.6 MiB = **99%**
+  ## of the payload, and Reloader has no use for any of them — they are Helm's
+  ## revision store, never mounted by a workload.
+  ##
+  ## ⚠️ The 128→256 MiB bump on 2026-05-28 treated the same symptom without
+  ## finding this, which is why it came back. Raising the ceiling a third time
+  ## would have failed again the moment Helm history grew.
+  ##
+  ## `owner!=helm` also matches objects that have NO owner label — verified, all
+  ## 487 ConfigMaps are still selected — so nothing real is dropped:
+  ##     4,187 objects / 243.8 MiB  ->  1,103 objects / ~33 MiB
+  ##
+  ## ⭐ 2026-10-26: `managed-by!=vm-operator` — config the VictoriaMetrics
+  ## operator renders for its OWN pods. Every one of those pods (vmagent,
+  ## vmalert, vmalertmanager) ships a `config-reloader` sidecar that hot-reloads
+  ## exactly these objects, so a Reloader roll on top only restarts the process:
+  ## a scrape gap for vmagent, an evaluation gap for vmalert. Measured: the
+  ## operator regenerates `vm-mdapi-rulefiles-0` on every VMRule/PrometheusRule
+  ## change and Reloader rolled vmalert-mdapi 7× between 09:20Z and 12:48Z
+  ## (generation 139, vs 30 for vmalertmanager and 18 for vmsingle).
+  ## The label covers 7 objects, all in ns monitoring, none consumed by a
+  ## workload of ours (checked by mapping every STAKATER_* env var back to its
+  ## object). ⚠️ The selector filters Reloader's informer, so an excluded object
+  ## is invisible to it and NO workload annotation can opt back in. If an app of
+  ## ours ever consumes operator output (e.g. a VMUser password Secret, should
+  ## we add VMUsers), drop this term and opt vmagent/vmalert out per workload
+  ## with `reloader.stakater.com/auto: "false"` via the CR's managedMetadata.
+  ## ⛔ Do NOT add `app.kubernetes.io/managed-by!=cloudnative-pg` by analogy:
+  ## CNPG's `<cluster>-app` credential Secrets carry it and OUR apps consume them.
+  ## Terms are AND-ed (Reloader joins them and runs labels.Parse); a `!=` term
+  ## keeps every object that lacks the label.
+  resourceLabelSelector: "owner!=helm,managed-by!=vm-operator"
+
+  ## ⛔⛔ 2026-10-05: autoReloadAll is a CLUSTER-KILLER in a namespace whose
+  ## operator rewrites its own ConfigMaps. Exclude those namespaces.
+  ##
+  ## Reloader and a CRD operator form a positive-feedback loop: the operator
+  ## writes a ConfigMap → Reloader rolls its consumers → the consumers ARE the
+  ## operator's own daemons → restarting them makes the operator write the
+  ## ConfigMap again. Neither side is buggy — both do exactly what they were
+  ## told, which is why it repeats without anyone touching anything.
+  ##
+  ## PROVEN 2026-10-03 05:49:36Z, and it took the whole cluster down. A write to
+  ## ConfigMap `rook-ceph-mon-endpoints` made Reloader roll EVERY Deployment in ns
+  ## rook-ceph — 21 OSDs, 3 mons, 2 mgrs, 2 MDS, both CSI controller plugins — in
+  ## ~3 s. All 21 OSDs on all three hosts took SIGTERM inside 11 s, in
+  ## lexicographic OSD-id order (patch → SIGTERM lag 188-362 ms; that ordered
+  ## sweep across three hosts is what proves a single actor, not three faults).
+  ## Rook then rewrote the ConfigMap and it fired AGAIN: five bursts in five
+  ## minutes (05:49:36, 05:50:24, 05:50:36, 05:53:29, 05:54:14), so Ceph never
+  ## stabilised. Every Ceph-backed rbd device pinned at 100% util from ~05:55Z,
+  ## ioPSI 0.5 → 25/s and load15 12 → 23 on all three nodes, all three hosts
+  ## I/O-starved → iLO ASR reset each chassis → ~10 h mgmt-plane outage.
+  ## Also fired 2026-09-28T11:49:54Z. Loaded by 64464f2, the commit above.
+  ##
+  ## ⚠️ Reloader has no business restarting a mon, an OSD or an MDS because an
+  ## operator touched its own bookkeeping. Rook owns those daemons' lifecycle and
+  ## rolls them safely — one at a time, honouring PDBs; Reloader does not, and a
+  ## whole-namespace sweep is precisely the unsynchronised restart Ceph cannot
+  ## survive. Evidence: Reloader's own log on qua, cross-checked against the RKE2
+  ## audit log. Beads infra-8f4.18.
+  ##
+  ## ⛔ Do NOT "fix" this by dropping autoReloadAll — that is the 24%-coverage
+  ## problem above. Scope it instead. If another operator-owned namespace is later
+  ## found rewriting a ConfigMap its own daemons mount, add it here on the same
+  ## evidence (its namespace in Reloader's log as the updater), never by guessing
+  ## from the namespace's name.
+  ##
+  ## ⭐ 2026-10-26: harvester-system, on that evidence. Reloader's log names it as
+  ## the updater on every cert rotation — 08:05:45Z CDI (cdi-apiserver,
+  ## cdi-uploadproxy ×2), 08:39:52-55Z KubeVirt (virt-controller ×2, virt-api ×2,
+  ## virt-handler DaemonSet ×3, virt-operator). Here it is a FIGHT, not a loop:
+  ## the CDI CR and virt-operator reconcile their workloads back to their own
+  ## spec and strip the STAKATER_* env again (0 left on all of them), so each
+  ## rotation costs TWO rollouts — and for virt-handler that is a rolling restart
+  ## of the KubeVirt agent on every node, aborting any live migration in flight.
+  ## Generations show the toll: cdi-apiserver 265, virt-handler 246, virt-api
+  ## 220, cdi-uploadproxy 219, against 6-20 for every other Harvester component.
+  ## Both operators hot-reload these certs themselves, so nothing is lost.
+  ## The namespace holds nothing of ours: 0 ExternalSecrets, and every workload
+  ## is owned by Harvester's managed chart, the CDI CR, virt-operator or a
+  ## Harvester add-on release.
+  ignoreNamespaces: "rook-ceph,harvester-system"
+
+  ## ⛔ 2026-10-27: never reload Jobs or CronJobs. For these kinds a "reload" RE-RUNS
+  ## one-shot work: Reloader creates a Job from a CronJob on the spot, and deletes
+  ## and recreates a Job. Neither gains anything. Every new Job pod mounts the
+  ## current ConfigMap/Secret anyway, so the next scheduled run picks up a change
+  ## without help.
+  ## Measured: each descheduler policy change (fleet !1462, 17:52:03Z; !1476,
+  ## 20:23:42Z) started FOUR descheduler runs in the same second. Reloader also
+  ## tried to recreate the three retained cron Jobs. Each attempt failed ("object
+  ## is being deleted ... already exists"), the event was requeued, and every retry
+  ## repeated the CronJob step. Each run has its own maxNoOfPodsToEvictTotal: 10,
+  ## so the cap became 40 per change, and concurrencyPolicy: Forbid never saw these
+  ## runs. The three logs still kept show 17 distinct pods evicted.
+  ## Also within reach: the rke2 helm-install Jobs (kube-system), Rancher's
+  ## HelmChart Jobs and tenants' completed one-shot Jobs. 0 Jobs/CronJobs carried a
+  ## reloader annotation, so nothing had opted in. With both set, the chart also
+  ## drops Reloader's RBAC for the two kinds.
+  ignoreJobs: true
+  ignoreCronJobs: true
+
+  deployment:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 96Mi
+      limits:
+        ## Unchanged at 256 MiB, and now genuinely ample rather than marginal:
+        ## with Helm history excluded the working set is ~33 MiB, so this is ~8×
+        ## headroom instead of 104% of the limit. autoReloadAll adds only the
+        ## workload list (275 Deployments/StatefulSets), which is negligible
+        ## beside the ConfigMap/Secret cache.
+        ## ⛔ If this OOMs again, do NOT just raise it — re-measure what is being
+        ## cached first (`kubectl get secrets,configmaps -A -o json | wc -c`).
+        memory: 256Mi

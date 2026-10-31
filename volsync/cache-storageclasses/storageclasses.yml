@@ -1,0 +1,67 @@
+## Restic cache volumes whose filesystem ROOT is owned by the mover's uid.
+##
+## WHY: VolSync creates each source's cache PVC itself, and a fresh ext4 root is
+## root:root 0755. A mover pinned to a non-root uid (moverSecurityContext.
+## runAsUser) with no fsGroup can never write it:
+##     unable to open cache: open /cache/CACHEDIR.TAG: permission denied
+## restic <= 0.18 only warned and ran CACHELESS — nextcloud's and envuassu's
+## caches were measured EMPTY (0 files) on 2026-10-27, so every nightly run had
+## re-read the repository index from B2 since 2026-08-15. restic 0.19.1
+## (VolSync 0.17.0) makes it FATAL: both sources failed from 2026-10-27 03:00Z.
+##
+## WHY NOT fsGroup: it is pod-wide, and both data drivers apply it (Ceph RBD
+## fsGroupPolicy File, Longhorn ReadWriteOnceWithFSType). The mover mounts the
+## snapshot clone read-write, so kubelet would chgrp + chmod g+rw EVERY file of
+## the clone on every run — the backup then records the wrong group and modes,
+## and the ctime change makes restic re-read the whole volume. OnRootMismatch
+## does not help: the data roots do not carry gid=fsGroup + setgid.
+## WHY NOT a read-only (ROX) clone, which kubelet would skip: ceph-csi maps it
+## --read-only and mounts ext4 without noload, and a crash-consistent snapshot
+## needs its journal replayed. The read-write clone mount is what replays it.
+##
+## THE FIX: mke2fs `-E root_owner=<uid>:<gid>` — the cache is BORN owned by the
+## mover, with no fsGroup, no privileged mover and no hand-repaired state, and a
+## re-created cache is correct too. Tested 2026-10-27: root 33:33 0755, a
+## uid-33 pod with ALL capabilities dropped wrote CACHEDIR.TAG.
+##
+## RULES:
+##   * Add a class per uid; name it longhorn-volsync-cache-uid<uid>.
+##   * lint.py VOLSYNC-CACHE-OWNER fails any non-root mover without fsGroup whose
+##     cacheStorageClassName is not a class here with root_owner=<runAsUser>:.
+##   * VolSync never re-creates an EXISTING cache PVC when this field changes.
+##     Switching an RS to a class here only takes effect once the cache PVC is
+##     deleted while no mover runs — and a populated cache costs a full index
+##     re-download from B2, so do that only when the cache is unusable anyway.
+##   * Parameters otherwise match harvester-longhorn-1replica (Harvester-made,
+##     not in git): a cache is disposable, so one replica.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-volsync-cache-uid33
+  annotations:
+    storageclass.mdapi.ch/purpose: "VolSync restic cache, root owned by uid 33 (www-data: nextcloud, envuassu)"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "1"
+  staleReplicaTimeout: "2880"
+  fsType: "ext4"
+  mkfsParams: "-E root_owner=33:33"
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-volsync-cache-uid1000
+  annotations:
+    storageclass.mdapi.ch/purpose: "VolSync restic cache, root owned by uid 1000 (paperless)"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "1"
+  staleReplicaTimeout: "2880"
+  fsType: "ext4"
+  mkfsParams: "-E root_owner=1000:1000"

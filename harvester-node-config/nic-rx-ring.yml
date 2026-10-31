@@ -1,0 +1,42 @@
+# NIC RX rings -> each NIC's own maximum, every boot (infra-nqfj).
+#
+# A short RX ring overflows under burst (rx_missed_errors). On qua that starved Longhorn replica
+# rebuilds into an endless rebuild/restart loop (longhorn #9051, 2026-06-17).
+#
+# ADOPTED from the hand-placed /oem/94_nic_rxring.yaml, taking quarto's generic script
+# (sha256 fdcc37ca...) over the Gen8 one (b095bccc...). The Gen8 copy hard-codes
+# `ethtool -G eno1 rx 8192`, which was right for its single 10G uplink. Since the move to 2x10G
+# LACP, eno2 is the second bond member, and it was still at the 512 default. Measured
+# 2026-10-27: eno2 = 512/8192 on qua, qui and quo, and quo's eno2 had 92 rx_missed_errors in
+# 13.5 h while eno1 had none. The generic script reads each NIC's "Pre-set maximums" and asks
+# for that: 8192 on ixgbe, 2047 on quarto's tg3.
+#
+# Effect at each node's next boot: Gen8 eno2 512 -> 8192; eno1 and quarto stay as they are.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-nic-rx-ring
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 94_nic_rxring.yaml
+  contents: |
+    # Managed by CloudInit mdapi-nic-rx-ring (fleet harvester-node-config/nic-rx-ring.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "net tuning: eno1-eno4 RX ring -> each NIC's own maximum, every boot. A short ring overflowed under load (rx_missed_errors), starving Longhorn replica rebuilds into the node -> infinite rebuild/restart loop (longhorn #9051, 2026-06-17). Reads the NIC's own 'Pre-set maximums' instead of hard-coding one, so it is right on ixgbe (8192) and tg3 (2047) alike and covers every bond member."
+    stages:
+      boot:
+        - name: "enlarge eno1-eno4 RX ring buffer to each NIC's own maximum"
+          commands:
+            - |
+              ET=""
+              for c in ethtool /usr/sbin/ethtool /sbin/ethtool /usr/bin/ethtool; do
+                if command -v "$c" >/dev/null 2>&1; then ET="$c"; break; fi
+              done
+              [ -n "$ET" ] || exit 0
+              for n in eno1 eno2 eno3 eno4; do
+                [ -d "/sys/class/net/$n" ] || continue
+                max=$("$ET" -g "$n" 2>/dev/null | awk '/Pre-set maximums/{f=1} f&&/^RX:/{print $2; exit}')
+                [ -n "$max" ] || continue
+                "$ET" -G "$n" rx "$max" 2>/dev/null || true
+              done

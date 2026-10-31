@@ -1,0 +1,170 @@
+## Second external-dns instance: drives the estate's internal split-horizon by
+## writing unbound local-data via the custom webhook provider
+## (mdapi/external-dns-unbound-webhook). Distinct from the home.tillo.ch
+## external-dns (RFC2136 -> Technitium) in the external-dns namespace.
+##
+## Live: the provider writes `unbound-generated`, which the unbound config
+## `include:`s (fleet/split-horizon/unbound-cm.yml). Put the host on an Ingress
+## and the record follows; Stakater Reloader then rolls unbound.
+##
+## Source of truth: k8s Ingress (host -> 192.168.1.191 ingress VIP). A
+## multi-host Ingress emits BOTH its apex and www, so a site that hardcodes
+## https://www.<zone>/ as its base URL does not send a LAN browser across from
+## the public origin into 192.168.1.191 -- that cross-space hop is what raises
+## Chrome's Local Network Access prompt.
+##
+## --domain-filter and the webhook's DOMAIN_FILTER env are the same zone list;
+## keep them in sync. A zone NOT listed stays hand-maintained in
+## fleet/split-horizon/unbound-cm.yml (autoconfig/webmail have no Ingress).
+##
+## Exceptions (must resolve somewhere other than the .191 VIP on-LAN) are kept
+## out via --exclude-domains and remain static in fleet/split-horizon/unbound-cm.yml:
+##   mirror.mdapi.ch (.49), plex.mdapi.ch (.46), ftth.mdapi.ch (.254),
+##   santillo.tillo.ch (.5).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: external-dns-mdapi
+  namespace: split-horizon
+---
+# Cluster-scoped read of Ingress/Service (they live in every namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: external-dns-mdapi
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: external-dns-mdapi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-dns-mdapi
+subjects:
+  - kind: ServiceAccount
+    name: external-dns-mdapi
+    namespace: split-horizon
+---
+# Namespaced: the webhook sidecar patches the generated ConfigMap in-ns only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: external-dns-mdapi-unbound-cm
+  namespace: split-horizon
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: external-dns-mdapi-unbound-cm
+  namespace: split-horizon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: external-dns-mdapi-unbound-cm
+subjects:
+  - kind: ServiceAccount
+    name: external-dns-mdapi
+    namespace: split-horizon
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns-mdapi
+  namespace: split-horizon
+  labels:
+    app: external-dns-mdapi
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # single writer to the configmap; avoid 2 reconcilers
+  selector:
+    matchLabels:
+      app: external-dns-mdapi
+  template:
+    metadata:
+      labels:
+        app: external-dns-mdapi
+    spec:
+      serviceAccountName: external-dns-mdapi
+      imagePullSecrets:
+        - name: mdapi-registry      # reused from the split-horizon ns
+      containers:
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.24.0@sha256:a80a146d2540fa138565e404f0625157271071a06093021f27ae19d8316d10f9
+          args:
+            - --source=ingress
+            - --domain-filter=mdapi.ch
+            - --domain-filter=tillo.ch
+            - --domain-filter=dellambrogio.ch
+            - --domain-filter=dellambrogio.com
+            - --domain-filter=dellambrogio.net
+            - --domain-filter=dellambrogio.org
+            - --domain-filter=coiffuredreams.ch
+            - --domain-filter=ivodellambrogio.ch
+            - --domain-filter=spider3.ch
+            - --domain-filter=envuassu.ch
+            - --exclude-domains=mirror.mdapi.ch
+            - --exclude-domains=plex.mdapi.ch
+            - --exclude-domains=ftth.mdapi.ch
+            - --exclude-domains=santillo.tillo.ch
+            - --provider=webhook
+            - --webhook-provider-url=http://localhost:8888
+            - --registry=noop
+            - --policy=sync
+            - --interval=5m
+            - --default-targets=192.168.1.191
+            - --force-default-targets
+            - --log-level=info
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {memory: 128Mi}
+        - name: webhook
+          # PINNED BY DIGEST — do not go back to :latest.
+          # Under the Keel policy this Deployment used to carry, Keel
+          # force-replaced this pod every night at ~02:2x-02:35Z whenever CI
+          # re-pushed the tag. Because this Deployment is replicas=1 with
+          # strategy=Recreate, that briefly takes down the only writer of the
+          # unbound-generated ConfigMap that split-horizon Unbound (192.168.1.1)
+          # serves from — and cluster CoreDNS forwards to it by default. The
+          # result was a recurring short in-cluster/external resolution blip
+          # (08-23, 08-28, 08-29, and still rolling 09-02T02:35:06Z).
+          # Bump deliberately: read the new digest from the registry, put it
+          # here, and let Fleet roll it once at a time you are watching.
+          image: registry.mdapi.ch/mdapi/external-dns-unbound-webhook@sha256:96938734fe610522856a6b9e1076c031e8b58357fe7039dd1f012f9984b365b2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DOMAIN_FILTER
+              value: "mdapi.ch,tillo.ch,dellambrogio.ch,dellambrogio.com,dellambrogio.net,dellambrogio.org,coiffuredreams.ch,ivodellambrogio.ch,spider3.ch,envuassu.ch"
+            - name: UNBOUND_CM_NAMESPACE
+              value: "split-horizon"
+            - name: UNBOUND_CM_NAME
+              value: "unbound-generated"
+            - name: UNBOUND_CM_KEY
+              value: "generated.conf"
+          ports:
+            - name: http-webhook
+              containerPort: 8888
+          livenessProbe:
+            httpGet: {path: /healthz, port: http-webhook}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /healthz, port: http-webhook}
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 64Mi}

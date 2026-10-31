@@ -1,0 +1,78 @@
+# Identity of the MCP server: an in-cluster ServiceAccount of mdapi-prod, scoped
+# to what the server's clients were measured doing with it (2026-10-28, every
+# recorded tool call: pods_exec 75, resources_list 11, pods_list* 12,
+# resources_get 3, contexts_list 4, namespaces_list 2, pods_get 1 — nothing
+# that creates, deletes, scales or runs anything).
+#
+# Until then the pod held a Rancher mgmt-proxy kubeconfig with an ADMIN token
+# for two clusters (mdapi-prod AND the Rancher local cluster), i.e. one leaked
+# MCP credential was cluster-admin twice over, and configuration_view handed the
+# kubeconfig itself back to the caller.
+#
+# What is granted, and why not more:
+#   - view (built-in, aggregated): read of every namespaced workload object,
+#     pods/log, events, namespaces. No Secrets — view excludes them by design.
+#   - k8s-mcp-cluster-read: the cluster-scoped kinds view lacks (nodes, PVs,
+#     storage classes, CRDs) plus metrics for pods_top/nodes_top.
+#     ⛔ No nodes/proxy: a GET on it reaches the kubelet's exec endpoint, so it
+#     is exec on every pod of the node. That is why nodes_log and
+#     nodes_stats_summary are not enabled in k8s-mcp-config.yml.
+#   - pods/exec: ONLY in openwebui (openwebui/k8s-mcp-exec-rbac.yml), where 55
+#     of the 75 exec calls went and every pod runs as a ServiceAccount with no
+#     API rights. Never cluster-wide: exec into any pod whose token is mounted
+#     is that pod's identity, and several (operators, controllers, Fleet,
+#     Windmill workers) are far stronger than this SA. Not in monitoring
+#     either, for the same reason: its vm-operator SA can read every Secret and
+#     create pods cluster-wide, and vmagent's SA holds nodes/proxy.
+#
+# The token is a projected, auto-rotating one, mounted into the
+# kube-mcp-server container only (see k8s-mcp-deploy.yml).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-mcp
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-mcp-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: k8s-mcp
+    namespace: k8s-mcp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-mcp-cluster-read
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-mcp-cluster-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-mcp-cluster-read
+subjects:
+  - kind: ServiceAccount
+    name: k8s-mcp
+    namespace: k8s-mcp

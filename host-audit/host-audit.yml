@@ -1,0 +1,252 @@
+## Interim host auditd collector — see fleet.yaml for why this bundle exists
+## and when to delete it.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: host-audit-collector
+  namespace: cattle-logging-system
+## This pod talks to the kernel's filesystem and to Cribl over HTTP. It never
+## talks to the Kubernetes API, so it must not carry a token that could.
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: host-audit-collector
+  namespace: cattle-logging-system
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush              5
+        Daemon             Off
+        Log_Level          info
+        ## Health endpoint for the probes below. A tailer that is running but
+        ## has lost its input is the exact failure mode this bundle exists to
+        ## fix, so "the process is up" is not enough of a readiness signal —
+        ## /api/v1/health also fails once errors cross hc_errors_count.
+        HTTP_Server        On
+        HTTP_Listen        0.0.0.0
+        HTTP_Port          2020
+        Health_Check       On
+        hc_errors_count    5
+        hc_retry_failure_count 5
+        hc_period          60
+        hc_log_level       error
+        ## Filesystem buffering so a Cribl outage is a DELAY, not a loss. The
+        ## 2026-08 incident (see monitoring-logging-flows/output-cribl.yml)
+        ## was exactly this: a wedged Cribl source plus a memory-only buffer
+        ## lost a week of records. This path is low-volume, so a small limit
+        ## is enough.
+        ##
+        ## ⚠️ storage.path alone buffers NOTHING: an input only writes chunks
+        ## here when it sets `storage.type filesystem` itself (see [INPUT]).
+        ## Until 2026-10-26 it did not, the startup log said
+        ## `[input:tail:tail.0] storage_strategy='memory' (memory only)`, and
+        ## every Cribl outage piled retry chunks in RAM (Retry_Limit False
+        ## never drops one) until the 128Mi limit OOMKilled the pod: qua on
+        ## 10-25 21:30Z, quarto on 10-26 12:14Z (24 restarts over 4 pods in 24h).
+        storage.path              /fluent-bit/buffers
+        storage.sync              normal
+        storage.checksum          off
+        storage.backlog.mem_limit 16M
+        ## Chunks held in memory at once; the rest stay on disk until the
+        ## output drains. The default (128 chunks of up to ~2 MB) is larger
+        ## than the container's memory limit on its own.
+        storage.max_chunks_up     16
+
+    [INPUT]
+        Name              tail
+        ## DIRECTORY glob, not a single file: this is the whole fix. With a DB,
+        ## fluent-bit follows auditd's rotation (8 MB x 5, ROTATE) across
+        ## inodes instead of pinning one and re-reading a dead file.
+        Path              /var/log/audit/audit.log*
+        DB                /var/lib/fluent-bit/audit.db
+        DB.locking        true
+        ## Without this the input ignores storage.path — see [SERVICE].
+        storage.type      filesystem
+        Tag               host.audit
+        ## Start at the tail of files it has never seen. On first deploy this
+        ## means "from now", not 40 MB of history — and the Cribl pipeline
+        ## would drop anything older than 24h anyway.
+        Read_from_Head    Off
+        Rotate_Wait       5
+        Refresh_Interval  10
+        Buffer_Max_Size   128k
+        Skip_Long_Lines   On
+        ## auditd writes one record per line, including the multi-part
+        ## `msg='...'` USER_* records; do NOT enable multiline here.
+        Multiline         Off
+
+    [FILTER]
+        Name    record_modifier
+        Match   host.audit
+        ## The chart's envelope had no node name, so an audit event could not
+        ## be attributed to a host. This is that gap, closed.
+        Record  host_node ${NODE_NAME}
+
+    [OUTPUT]
+        Name    http
+        Match   host.audit
+        ## Cribl http_raw source (same endpoint as monitoring-logging-flows'
+        ## ClusterOutput). The route host_audit_to_oo does the parsing and the
+        ## OpenObserve write — there is deliberately no second parser here.
+        Host    logstream-leader-internal.cribl.svc.cluster.local
+        Port    8080
+        URI     /
+        ## `json_lines`, and the record goes out BARE. Neither `json` nor
+        ## `json_stream` fits this source, and both were tried first:
+        ##   json         packs the flush into a JSON ARRAY, each element
+        ##                {date, log, …} — the Cribl http_raw source splits the
+        ##                pretty-printed array across events, so every row
+        ##                died with "Unexpected non-whitespace character after
+        ##                JSON" and no host_node.
+        ##   json_stream  wraps each record {date, log, …} and the source took
+        ##                a whole flush as ONE event with the objects
+        ##                concatenated and no delimiter: many audit records in
+        ##                one _raw, audit_parse_error, no host_node.
+        ## `json_lines` writes one bare record per line — the exact shape the
+        ## source splits on and the pipeline parses (verified against Cribl +
+        ## OpenObserve 2026-10-23 with two probe records: two events, both
+        ## with host_node, audit_type, audit_serial and audit_acct).
+        ## json_date_key off: the date wrapper is what pushed the other two
+        ## formats out of shape, and the audit record carries its own epoch
+        ## in `msg=audit(<epoch>:<serial>)` — the pipeline's audit_epoch.
+        Format        json_lines
+        json_date_key false
+        ## Never give up on a chunk: with filesystem buffering below this
+        ## turns a Cribl outage into backlog instead of data loss.
+        Retry_Limit                 False
+        storage.total_limit_size    1G
+        ## Bound the connect/flush like the ClusterOutput does, so a wedged
+        ## Cribl source errors out and retries instead of hanging a thread.
+        net.connect_timeout         5
+        net.io_timeout              30
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: host-audit-collector
+  namespace: cattle-logging-system
+  labels:
+    app.kubernetes.io/name: host-audit-collector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: host-audit-collector
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: host-audit-collector
+      annotations:
+        ## Fleet applies this ConfigMap as a plain resource, so a config change
+        ## alone would NOT restart the pods — the old config would keep running
+        ## until the next unrelated rollout. Recompute in the SAME commit that
+        ## touches the config:
+        ##   sed -n '/  fluent-bit.conf: |/,/^---/p' host-audit/host-audit.yml \
+        ##     | sed '1d;$d;s/^    //' | sha256sum | cut -c1-12
+        checksum/config: "76087a91541e"
+    spec:
+      serviceAccountName: host-audit-collector
+      automountServiceAccountToken: false
+      ## Same class Falco inherits (the cluster's global default). This is a
+      ## log shipper, not a detector: being preempted is acceptable, and it
+      ## must not compete with the workloads whose audit records it carries.
+      priorityClassName: mdapi-default
+      ## No taints on any node today (same measurement as falco/values.yml),
+      ## so no tolerations are needed. Deliberately no nodeSelector either:
+      ## coverage must follow the host, and a selector that matches fewer
+      ## nodes fails silently rather than loudly.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: fluent-bit
+          ## Lane A pin: tag keeps tracking upstream, Renovate pins the digest
+          ## this deployment actually resolved. The digest is the INDEX digest
+          ## the tag resolved to on 2026-10-23; the first attempt pinned
+          ## 6d03db… which is the index digest of an EARLIER, now-orphaned push
+          ## of this same tag — quarto still had those layers cached and ran,
+          ## the other three nodes 404'd forever (`ErrImagePull`). Do not take
+          ## a digest from a running pod's imageID after an unrelated rollout:
+          ## it can be a stale local resolve.
+          image: rancher/mirrored-fluent-fluent-bit:3.1.8@sha256:2113721429a144d504a148a0b14ec082ad28782b99ba55d5df0dde276ae22bc3
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: health
+              containerPort: 2020
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            ## Live auditd on these nodes is tens of MB/day — the old 2M rows/h
+            ## was the REPLAY, not the traffic. Deliberately small.
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            ## audit.log is root-owned and not world-readable, which is why the
+            ## chart's own tailer runs as root too. Everything else is dropped:
+            ## no capabilities are needed to read a file.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: audit-log
+              mountPath: /var/log/audit
+              readOnly: true
+            - name: tail-db
+              mountPath: /var/lib/fluent-bit
+            - name: buffers
+              mountPath: /fluent-bit/buffers
+            - name: config
+              mountPath: /fluent-bit/etc
+              readOnly: true
+      volumes:
+        - name: audit-log
+          hostPath:
+            path: /var/log/audit
+            ## `Directory`, not the default: if a node ever stops running
+            ## auditd, the pod must fail instead of quietly tailing an empty
+            ## directory that the kubelet helpfully created.
+            type: Directory
+        - name: tail-db
+          hostPath:
+            ## The DB is what makes rotation work, so it must survive a pod
+            ## restart. emptyDir would forget everything the pod had read.
+            path: /var/lib/mdapi-host-audit
+            type: DirectoryOrCreate
+        - name: buffers
+          hostPath:
+            ## Same reason as tail-db, and the two must agree: the DB advances
+            ## its offset as soon as a record is in a chunk, so a backlog kept
+            ## in an emptyDir dies with the pod (a rollout, an eviction) while
+            ## the DB says it was read — a silent gap no retry can refill.
+            path: /var/lib/mdapi-host-audit/buffers
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: host-audit-collector

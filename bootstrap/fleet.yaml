@@ -1,0 +1,23 @@
+defaultNamespace: bootstrap
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA: warn+audit at baseline, deliberately WITHOUT enforce. Fleet stamps
+  # namespaceLabels only at namespace creation, so this is the desired state
+  # for a recreated namespace — the LIVE namespace was patched explicitly on
+  # 2026-10-19 (ledger alert:PsaLabelDrift, approved 2026-10-19).
+  # enforce=baseline was tried and reverted the same hour: the GitLab runner
+  # creates job pods with container.apparmor...=unconfined (its
+  # pod_annotations config), which the API server denies under baseline
+  # enforce — the first CI job after the label failed "violates PodSecurity
+  # baseline:latest: forbidden AppArmor profiles" (pipeline 43935). warn+audit
+  # still satisfies the coverage probe and keeps the promise audible.
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+- name: mdapi-prod-cloudnative-pg
+- name: mdapi-prod-external-secrets
+helm:
+  maxHistory: 25

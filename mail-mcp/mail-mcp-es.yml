@@ -1,0 +1,26 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mail-mcp-env
+  namespace: mail-mcp
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: mail-mcp-env
+    creationPolicy: Owner
+
+  ## The secret of Keycloak client `mail-mcp` (realm tilloch). It is the ONLY
+  ## credential this pod holds, and all it can do is exchange a token the caller
+  ## already owns for one Dovecot accepts for that caller's own mailbox. There is
+  ## no IMAP password and no master user anywhere in this namespace. Rotating it:
+  ## change the value in Akeyless and restart the Deployment — the pod reads it
+  ## once at start.
+  data:
+    - remoteRef:
+        key: /mdapi/mail-mcp/mail-mcp-env/MCP_CLIENT_SECRET
+      secretKey: MCP_CLIENT_SECRET

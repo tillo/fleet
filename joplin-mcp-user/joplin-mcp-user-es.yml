@@ -1,0 +1,27 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: joplin-mcp-user-env
+  namespace: joplin-mcp-user
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: joplin-mcp-user-env
+    creationPolicy: Owner
+
+  ## The Fernet key that encrypts the credential store on the PVC. It is the
+  ## ONLY secret this pod holds: there is no Joplin password and no shared or
+  ## admin Joplin account in this namespace, and the Keycloak tokens it checks
+  ## need only the realm's public JWKS.
+  ## ⚠️ Rotating it makes every stored credential unreadable: each person then
+  ## presses Connect + Authorise again, and the old credentials stay on their
+  ## Joplin Applications page until deleted there. The pod reads it once at start.
+  data:
+    - remoteRef:
+        key: /mdapi/joplin-mcp-user/joplin-mcp-user-env/STORE_KEY
+      secretKey: STORE_KEY

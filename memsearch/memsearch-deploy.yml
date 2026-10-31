@@ -1,0 +1,113 @@
+## memsearch — hybrid (BM25 + embedding) search MCP over the estate's memory
+## brain, skills, ~/docs runbooks, incident reports and the seat's root
+## instructions file. Seats query it before grepping ~/.
+##
+## The corpus arrives by PUSH: Windmill f/desk/memsearch_ingest tars the files on
+## the jump seat and POSTs them to /ingest. The seat's home is an RWO PVC, so
+## nothing here could mount it, and the server — not the job — decides what is
+## indexable.
+##
+## Embeddings: LiteLLM group local-closed-gemma-embed only (fail-closed, no
+## cloud deployment behind it). When mbp-mda sleeps, queries degrade to lexical
+## and the next ingest back-fills the missing vectors.
+##
+## Code and CI: gitlab.mdapi.ch/mdapi/memsearch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memsearch
+  namespace: memsearch
+  labels:
+    app: memsearch
+  annotations:
+    ## Restart on a token rotation: the env is read once at start.
+    reloader.stakater.com/auto: "true"
+spec:
+  ## One writer on one SQLite file on an RWO volume: never two pods.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: memsearch
+  template:
+    metadata:
+      labels:
+        app: memsearch
+    spec:
+      ## The process never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: memsearch
+          ## Lane A: floating tag + resolved digest (Renovate owns the bump) +
+          ## IfNotPresent, so a registry outage does not stop a restart.
+          image: zot.mdapi.ch/mdapi/memsearch:latest@sha256:74176c316ad74993812d94427b648ddcf810326fed4e88b5f51cc5b9bf0f6ae6
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: LITELLM_BASE
+              value: http://litellm.litellm.svc.cluster.local:4000
+            - name: EMBED_MODEL
+              value: local-closed-gemma-embed
+            ## The Host the MCP SDK's DNS-rebinding guard admits is derived from
+            ## this — it must be the URL the seats actually call.
+            - name: RESOURCE_URL
+              value: http://memsearch.memsearch.svc.cluster.local:8080/mcp
+            - name: PORT
+              value: "8080"
+            ## SQLite spills large sorts here; the root filesystem is read-only.
+            - name: SQLITE_TMPDIR
+              value: /tmp
+          envFrom:
+            - secretRef:
+                name: memsearch-env
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ## Measured 2026-10-27: peak RSS 238 MiB for a FIRST ingest of the whole
+          ## corpus (1,645 docs → 11,311 chunks), 183 MiB serving searches with all
+          ## vectors loaded. The limit leaves room for a 64 MiB upload in flight.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 768Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: memsearch-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+      imagePullSecrets:
+        - name: zot-pull

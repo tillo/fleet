@@ -1,0 +1,138 @@
+## joplin-mcp-user — the per-user notes connector for chat.mdapi.ch.
+##
+## One person, their own Joplin account: Open WebUI sends the caller's own
+## Keycloak access token (aud=azp=openwebui-joplin-mcp), and this pod reaches
+## that person's account through a Joplin "applications" credential they
+## authorised themselves on notes.mdapi.ch (Connect → Authorise). No shared or
+## admin Joplin account, no Joplin password anywhere in this namespace; the
+## tools are joplin_server_mcp's, minus the two deletes and ping.
+## Fail closed: on every new Joplin session the account's email must equal the
+## token's email, and an E2EE account is refused; a refused credential is
+## removed in Joplin at once.
+##
+## Same image as the bearer joplin-mcp (ns joplin), second entry point:
+## `python /app/joplin_user_mcp.py`. Code and CI: gitlab.mdapi.ch/mdapi/joplin-mcp.
+## Proposal and decisions D1–D9: ~/joplin-per-user-proposal-20261028.md, bead
+## infra-47nq.10.
+##
+## ⚠️ ALLOWED_GROUPS is the per-person switch, not a nicety. It names the LDAP
+## groupOfNames `cn=ChatNotes` (bare name: the realm's `groups` scope maps with
+## full.path=false). Granting notes-in-Chat = `member:` in that LDAP group; the
+## Keycloak gate role mdapi-chatnotes follows from the same group. An EMPTY value
+## refuses everybody — that is the code's default, so a lost env var fails shut.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: joplin-mcp-user
+  namespace: joplin-mcp-user
+  labels:
+    app: joplin-mcp-user
+spec:
+  ## ONE replica, Recreate: the credential store is a SQLite file on an RWO
+  ## volume, and the per-person session cache and locks live in the process.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: joplin-mcp-user
+  template:
+    metadata:
+      labels:
+        app: joplin-mcp-user
+    spec:
+      ## A per-user convenience, not a service anything depends on: it yields
+      ## first under memory pressure (infra-8ux0, same class as mail-mcp).
+      priorityClassName: mdapi-low
+      ## The process never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        ## The store's volume is written as this group.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: joplin-mcp-user
+          ## Lane A: floating tag + resolved digest (Renovate owns the bump, the
+          ## same digest as joplin-mcp in ns joplin) + IfNotPresent.
+          image: zot.mdapi.ch/mdapi/joplin-mcp:latest@sha256:c09ea3612817eed49153f84ab1511b14b5fb9abc853cc299fcd53ebde1626522
+          imagePullPolicy: IfNotPresent
+          ## Not the image's ENTRYPOINT (start.sh = nginx + supergateway, the
+          ## bearer mode). Not `python -I`: it imports joplin_server_mcp from /app.
+          command: ["python", "/app/joplin_user_mcp.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: KEYCLOAK_ISSUER
+              value: https://idp.mdapi.ch/realms/tilloch
+            ## What this pod insists on in the token Open WebUI hands it.
+            - name: EXPECTED_AUDIENCE
+              value: openwebui-joplin-mcp
+            - name: EXPECTED_AZP
+              value: openwebui-joplin-mcp
+            - name: ALLOWED_GROUPS
+              value: ChatNotes
+            ## API calls, the credential poll and the self-revoke: in-cluster.
+            - name: JOPLIN_URL
+              value: http://joplin.joplin.svc.cluster.local:22300
+            ## The host of the Connect link the person opens in their browser.
+            - name: JOPLIN_PUBLIC_URL
+              value: https://notes.mdapi.ch
+            ## RFC 9728 `resource` — must be the URL Open WebUI actually calls.
+            - name: RESOURCE_URL
+              value: http://joplin-mcp-user.joplin-mcp-user.svc.cluster.local:8080/mcp
+            - name: STORE_PATH
+              value: /data/store.sqlite3
+            - name: PORT
+              value: "8080"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: STORE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: joplin-mcp-user-env
+                  key: STORE_KEY
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          ## Baseline is a thin Python proxy. The bearer joplin-mcp's 3Gi limit
+          ## is for supergateway buffering big apply_patch bodies, which this
+          ## entry point does not run; a whole note body is still held a few
+          ## times over during a patch, hence the headroom.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 128Mi
+            limits:
+              memory: 768Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: joplin-mcp-user-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      imagePullSecrets:
+        - name: zot-pull

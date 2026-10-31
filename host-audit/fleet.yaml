@@ -1,0 +1,33 @@
+## host-audit — an ESTATE-SIDE collector for /var/log/audit/audit.log.
+##
+## WHY THIS EXISTS (beads infra-4uch). Harvester's patched rancher-logging
+## chart (108.0.2+up4.10.0-rancher.18) ships the rke2-journald-aggregator with
+## `/var/log/audit/audit.log` mounted as a hostPath FILE and no fluent-bit DB.
+## auditd rotates the file every 1-2 days (8 MB x 5); the mount stays pinned to
+## the original inode, which is then unlinked, and fluent-bit either re-reads
+## the dead inode from the head forever or logs
+## `inode=N cannot register file /var/log/audit/audit.log` every two minutes.
+## Result: live HOST AUDIT COVERAGE HAS BEEN ZERO since ~2026-09-15.
+##
+## There is no values/HelmChart knob for this — the mount is baked into the
+## chart template. The durable fix is a chart patch: upstream PR
+## harvester/harvester#11759 (master only) plus a v1.8 backport to
+## harvester/addons, both waiting on maintainers. This bundle is the interim
+## collector, and it is DELIBERATELY THROWAWAY: when the chart patch reaches
+## this release, delete this directory (and its fleet-paths.txt line) rather
+## than keeping a second tail alive.
+##
+## It tails the SAME file through a DIRECTORY mount with a DB, so rotation is
+## handled the way fluent-bit is designed to handle it, and it ships to the
+## same place the broken path did: the Cribl http_raw source. The Cribl route
+## `host_audit_to_oo` and its pipeline are unchanged — our events match the
+## same filter (`http_raw` input, `_raw` containing `msg=audit(`) and land in
+## the same OpenObserve stream, so there is one parser, not two.
+##
+## It also fixes a gap the old path had: the chart's envelope carried NO node
+## name (only `{"log": ...}`), so an audit record could not be attributed to a
+## host. Every event here also carries `host_node`.
+defaultNamespace: cattle-logging-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod

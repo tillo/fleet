@@ -1,0 +1,290 @@
+## CIS Kubernetes Benchmark posture, published by the weekly `kube-bench`
+## CronJob (ns `kube-bench`, bundle ../kube-bench/).
+##
+## ⚠️ These are NOT Windmill-pushed metrics, so the generic `BatchJobStale` in
+## `12-batch-jobs.yml` does NOT cover them and a scoped staleness rule below is
+## not the duplicate it looks like. That rule joins `job` against
+## `windmill_schedule_interval_seconds{script!=""}`, which the Windmill probe
+## `f/probe/schedule_cadence_map` publishes per *Windmill script*. A Kubernetes
+## CronJob publishes no cadence entry, so the join has no right-hand side and
+## the alert can never fire for `job="kube_bench"` — silently, which is the
+## failure mode that rule's own comment history is about.
+##
+## The job POSTs rather than PUTs: busybox wget in the kube-bench image has no
+## PUT. Safe here because the group is per-node and exclusively owned. The
+## per-check `kube_bench_check_fail{check}` set does change with the tool
+## version, but a POST replaces EVERY series of a metric name it carries in
+## that group, so a check the new version dropped disappears with the next run
+## instead of lingering.
+##
+## `component: Security` is INTERNAL on purpose. A benchmark regression is a
+## posture finding, not a service outage — routing it to a public statuspage
+## component would degrade mdapi.statuspage.io in front of strangers for
+## something no user can observe.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cis-benchmark
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: cis-benchmark.posture
+    rules:
+    ## Baseline RE-DERIVED 2026-09-22 (rke2-cis-1.24, kube-bench v0.16.0):
+    ## 9 FAIL per node, identical on qui / quo / qua.
+    ##
+    ## ⭐ The previous baseline was 8 under kube-bench v0.13.0. The count moved
+    ## because Renovate bumped the MEASURING TOOL, not because the estate
+    ## changed. Proven by running both versions at the same moment against the
+    ## same nodes: v0.13.0 reported 8, v0.16.0 reported 9, same hosts, same
+    ## second.
+    ##
+    ## ⛔ Do not read the net +1 as "one check was added" — it hides a 5-item
+    ## churn in the kubelet section:
+    ##     dropped: 1.1.7, 4.1.10          (no longer reported at all)
+    ##     added:   4.2.6, 4.2.7, 4.2.11   (never tested by v0.13.0)
+    ## A threshold on an aggregate count looked almost stable while 5 of the 8
+    ## underlying items changed. Re-derive the SET; never inherit the NUMBER.
+    ##
+    ## The 9, verified 2026-09-22 against the live effective kubelet config
+    ## (/api/v1/nodes/<node>/proxy/configz), not against the on-disk file:
+    ##   * 1.1.3 / 1.1.5: manifest mode 0644 against a literal 0600/0644 check,
+    ##     inside a parent directory that is 0700 root:root, so the files are
+    ##     unreachable by any non-root principal and carry no credentials.
+    ##     Accepted deviation; the fix would be RKE2's `profile: cis`, which
+    ##     Harvester owns and we must not hand-edit.
+    ##   * 4.1.9 / 4.2.1 / 4.2.2 / 4.2.3 / 4.2.7: artefacts. The profile looks
+    ##     for the retired `--config` kubelet path; this cluster uses
+    ##     `--config-dir` (0600 root:root). configz confirms the settings are
+    ##     in fact correct — anonymous.enabled false, authorization.mode
+    ##     Webhook, an x509 clientCAFile, makeIPTablesUtilChains true.
+    ##   * 4.2.6 protectKernelDefaults / 4.2.11 rotateCertificates: ⚠️ NOT
+    ##     artefacts. Both are genuinely unset in the effective config on all
+    ##     three nodes. They sit in the baseline as ACCEPTED, not as clean: the
+    ##     kubelet configuration is owned by RKE2 / Harvester, so setting them
+    ##     is a distribution-level decision rather than a hand-edit.
+    ##     ⚠️ Do not credit the tool bump with finding both. v0.13.0 tested
+    ##     neither, but 4.2.6 was ALREADY on record as a known gap on
+    ##     2026-09-11 (risk R-12, LLD § annexe A, "observation hors échec"),
+    ##     found by reading configz rather than by any scanner. v0.16.0 only
+    ##     caught up with it. 4.2.11 is the one genuinely new finding.
+    ##     ⭐ Reading the effective configuration had a nine-day head start on
+    ##     the benchmark — which is the whole argument for doing it.
+    ##
+    ## The alert therefore fires on REGRESSION from the accepted baseline, not
+    ## on the existence of failures — and since 2026-10-30 it compares the SET
+    ## of failing checks, not their count. A count hides churn: one accepted
+    ## item fixed plus one new failure leaves every total at 9, and the
+    ## v0.13→v0.16 bump above already showed a 5-item churn behind a +1.
+    ##
+    ## ⭐ THE ACCEPTED SET lives in the four `check` regexes below and nowhere
+    ## else (two per role: unaccepted-fail and accepted-now-passes — keep each
+    ## pair identical). Remediating an item = delete it from both regexes of
+    ## its role; CisBenchmarkAcceptedCheckNowPasses says when that is due, so
+    ## the baseline can no longer sit silently above the real state.
+    ##   control-plane (qua, qui, quo): 1.1.3 1.1.5 4.1.9 4.2.1 4.2.2 4.2.3
+    ##                                  4.2.6 4.2.7 4.2.11
+    ##   any other node (quarto):       4.1.9 4.2.1 4.2.2 4.2.3 4.2.6 4.2.7
+    ##                                  4.2.11, sections 3|4|5 only
+    ## Re-verified 2026-10-30 on all four nodes: these were exactly the failing
+    ## checks, the worker's section-4 set identical to the control plane's.
+    ##
+    ## ROLE-AWARE since 2026-10-18 (ledger alert:CisBenchmarkRegression,
+    ## approved). The CronJob runs --targets master,etcd,controlplane,node,
+    ## policies on EVERY node, so a worker is measured against sections it
+    ## cannot satisfy: quarto (worker-only, joined 2026-10-10) reads 50 =
+    ## section 1 (41, control-plane config) + section 2 (2, etcd) + section 4
+    ## (7). Those 43 are apiserver/scheduler/controller-manager/etcd checks on
+    ## a node that runs none of them. They are deliberately NOT suppressed in
+    ## the job (`--targets node,policies` on workers): on 2026-10-25 quo ran as
+    ## an rke2 agent beside its server and section 1 jumped 2 → 30. That was
+    ## real, and a job that chose targets from what the host looks like would
+    ## have measured it as a healthy worker.
+    ## ⚠️ Role comes from kube-state-metrics' kube_node_role. Without it every
+    ## node falls into the "other" branch: sections 3|4|5 are still checked,
+    ## control-plane section 1/2 regressions are not.
+    ##
+    ## ⚠️ Keep the baseline pinned to the TOOL VERSION. CisBenchmarkToolChanged
+    ## names the version the set was derived with, and the fleet test
+    ## tests/test_cis_baseline_matches_kube_bench_pin.py fails any MR (i.e. the
+    ## Renovate bump) that moves the image without moving that version — the
+    ## re-derivation happens in the bump MR, not after the alert.
+    - record: kube_bench:check_fail_unaccepted
+      expr: |-
+        (
+          max by (node, section, check) (kube_bench_check_fail{check!~"1\\.1\\.3|1\\.1\\.5|4\\.1\\.9|4\\.2\\.1|4\\.2\\.2|4\\.2\\.3|4\\.2\\.6|4\\.2\\.7|4\\.2\\.11"}) == 1
+            and on(node) kube_node_role{role="control-plane"}
+        )
+        or
+        (
+          max by (node, section, check) (kube_bench_check_fail{section=~"3|4|5", check!~"4\\.1\\.9|4\\.2\\.1|4\\.2\\.2|4\\.2\\.3|4\\.2\\.6|4\\.2\\.7|4\\.2\\.11"}) == 1
+            unless on(node) kube_node_role{role="control-plane"}
+        )
+
+    - alert: CisBenchmarkRegression
+      expr: kube_bench:check_fail_unaccepted
+      for: 30m
+      labels:
+        service: 'kube-bench'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS check {{ $labels.check }} fails on node {{ $labels.node }} and is not in the accepted baseline (kube-bench v0.16.0)"
+        description: |
+          Check {{ $labels.check }} (section {{ $labels.section }}) FAILS on
+          {{ $labels.node }} and is not one of the accepted deviations for that
+          node's role.
+          ⚠️ FIRST: is CisBenchmarkToolChanged firing too? Then the measuring
+          tool moved, not the estate — re-derive the failing SET before
+          touching anything.
+          Otherwise node or control-plane configuration has changed.
+          Read the run: kubectl -n kube-bench logs job/<newest job> --all-containers
+          Everything outside the baseline: kube_bench:check_fail_unaccepted
+          Triage and the accepted-deviation rationale: docs.mdapi.ch → CIS Benchmark.
+
+    ## The other half of keeping the baseline honest: an accepted item that now
+    ## PASSES means the baseline is above the real state, and a later relapse
+    ## of that item would not alert. Info: nothing is wrong, the rule is due an
+    ## edit (remove the check from both regexes of its role).
+    - alert: CisBenchmarkAcceptedCheckNowPasses
+      expr: |-
+        (
+          max by (node, section, check) (kube_bench_check_fail{check=~"1\\.1\\.3|1\\.1\\.5|4\\.1\\.9|4\\.2\\.1|4\\.2\\.2|4\\.2\\.3|4\\.2\\.6|4\\.2\\.7|4\\.2\\.11"}) == 0
+            and on(node) kube_node_role{role="control-plane"}
+        )
+        or
+        (
+          max by (node, section, check) (kube_bench_check_fail{section=~"3|4|5", check=~"4\\.1\\.9|4\\.2\\.1|4\\.2\\.2|4\\.2\\.3|4\\.2\\.6|4\\.2\\.7|4\\.2\\.11"}) == 0
+            unless on(node) kube_node_role{role="control-plane"}
+        )
+      for: 1h
+      labels:
+        service: 'kube-bench'
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "Accepted CIS deviation {{ $labels.check }} now passes on node {{ $labels.node }}: remove it from the baseline"
+        description: |
+          {{ $labels.check }} is in the accepted baseline but PASSES on
+          {{ $labels.node }}. Remove it from both `check` regexes of that role in
+          monitoring-rules/51-cis-benchmark.yml, so a relapse fires
+          CisBenchmarkRegression instead of passing silently.
+
+    ## A regression baseline is only valid for the tool that measured it.
+    ## The version here IS the baseline's version: tests/test_cis_baseline_
+    ## matches_kube_bench_pin.py holds it equal to the image tag in
+    ## kube-bench/cronjob.yml, so it moves only in an MR that re-derives the set.
+    - alert: CisBenchmarkToolChanged
+      expr: max by (node, version, benchmark) (kube_bench_info{version!="v0.16.0"} or kube_bench_info{benchmark!="rke2-cis-1.24"})
+      for: 30m
+      labels:
+        service: 'kube-bench'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "kube-bench on node {{ $labels.node }} ran {{ $labels.version }} / {{ $labels.benchmark }}, but the accepted baseline was derived with v0.16.0 / rke2-cis-1.24"
+        description: |
+          The measuring tool or profile is not the one the accepted set was
+          derived with, so CisBenchmarkRegression and
+          CisBenchmarkAcceptedCheckNowPasses may be reporting the tool rather
+          than the estate. Re-derive the failing SET with the new version on
+          every node, verify each new item against the effective configuration,
+          then update the regexes and the version in 51-cis-benchmark.yml.
+
+    ## See the header: the generic BatchJobStale cannot reach a k8s CronJob.
+    ## Weekly schedule, so two missed cycles is where silence stops being
+    ## plausible — the same 2x grace the generic rule applies.
+    ##
+    ## ⭐ Driven by the NODE INVENTORY (kube_node_info), not by the pushed
+    ## series, since 2026-10-30. Keyed on the pushed series alone it could not
+    ## see a node that was never measured — and a node that joins is exactly
+    ## that: with completions: 3 and four nodes, a different node went
+    ## unmeasured each week. A node younger than the window is not yet due.
+    ## Retired nodes drop out with their kube_node_info, so their leftover
+    ## pushgroups no longer alert forever.
+    - alert: CisBenchmarkStale
+      expr: |-
+        (
+          max by (node) (kube_node_info)
+            unless on(node) ((time() - max by (node) (kube_bench_last_run_timestamp_seconds)) < 1209600)
+        )
+        and on(node) ((time() - max by (node) (kube_node_created)) > 1209600)
+      for: 1h
+      labels:
+        service: 'kube-bench'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark has not measured node {{ $labels.node }} for over 14 days (or never)"
+        description: |
+          The weekly kube-bench CronJob has published no run for this node in
+          two cycles. FIRST compare the node count with `completions` in
+          kube-bench/cronjob.yml: a node that joined without that number moving
+          is skipped on some weeks or all of them. Then check the CronJob is not
+          suspended (kubectl -n kube-bench get cronjob), that the anti-affinity
+          can still place one pod per node, and that the namespace
+          NetworkPolicy still permits egress to Pushgateway.
+
+    ## Separates "the audit ran and found problems" from "the audit broke".
+    ## Without it, a job that dies before parsing looks identical to a clean run
+    ## that simply has not happened yet.
+    ##
+    ## Second branch: the set-based CisBenchmarkRegression is only as good as
+    ## the per-check series. A run publishes one kube_bench_check_fail per
+    ## scored check, so their count must equal pass+fail; if it does not, the
+    ## set comparison is reading a partial (or stale) set. Scoped to nodes
+    ## that have published kube_bench_info, i.e. ran a job new enough to
+    ## publish per-check series at all.
+    - alert: CisBenchmarkRunFailed
+      expr: |-
+        max by (node) (kube_bench_last_run_success) == 0
+        or
+        (
+          (
+            max by (node) (kube_bench_checks_pass + kube_bench_checks_fail)
+              unless on(node) (count by (node) (kube_bench_check_fail) == max by (node) (kube_bench_checks_pass + kube_bench_checks_fail))
+          )
+          and on(node) kube_bench_info
+        )
+      for: 15m
+      labels:
+        service: 'kube-bench'
+        severity: warning
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark run failed on node {{ $labels.node }}"
+        description: |
+          kube-bench produced no parseable report, or published fewer per-check
+          series than its own pass+fail total (the set comparison would then be
+          reading a partial set). Most likely the pinned
+          BENCHMARK env no longer matches the running RKE2 version after an
+          upgrade, or a hostPath mount moved. The pod logs carry kube-bench's
+          own stderr.
+
+    ## Backstop for "the bundle deployed but nothing ever ran" — a state the
+    ## staleness rule cannot see, because an absent series yields no sample to
+    ## compare against. `for: 10d` and not 48h: the schedule is weekly, so a
+    ## freshly merged bundle legitimately has no data for up to 7 days, and an
+    ## alert that fires on every deployment is an alert people learn to ignore.
+    - alert: CisBenchmarkNeverRan
+      expr: absent(kube_bench_last_run_timestamp_seconds)
+      for: 10d
+      labels:
+        service: 'kube-bench'
+        severity: info
+        component: Security
+        team: mdapi
+      annotations:
+        summary: "CIS benchmark has never published a result"
+        description: |
+          No kube_bench_* series exists at all: either the bundle is not
+          deployed on this cluster, or the first run has never succeeded.
+          Trigger one by hand to find out:
+          kubectl -n kube-bench create job kb-once --from=cronjob/kube-bench

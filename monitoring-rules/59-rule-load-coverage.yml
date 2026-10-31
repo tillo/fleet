@@ -1,0 +1,205 @@
+## Is every rule OBJECT in this cluster actually LOADED by the one rule evaluator?
+##
+## Fed by Windmill f/probe/rule_load_coverage (daily 07:20 Zurich), which derives
+## all four sides at runtime: the selector from the LIVE VMAlert CR, the VMRule
+## objects from the cluster, the (group, rule) pairs vmalert actually serves from
+## its own /api/v1/rules, and ownership from the Fleet bundle id. Nothing here
+## maintains a list.
+##
+## WHY THIS EXISTS. vmalert-mdapi is the only rule evaluator on mdapi-prod — no
+## Prometheus, no ThanosRuler, no second vmalert — and it selects rules with
+## `ruleSelector: {matchLabels: {monitoring-stack: mdapi}}`. Any VMRule object
+## without that label is inert: it renders, it reads as coverage in every UI, and
+## nothing evaluates it. Measured 2026-10-05: 96 VMRule objects, 62 selected, 34
+## unselected carrying 368 rules — including KubeAPIDown, KubeTargetDown,
+## CephHealthError and every apiserver burn-rate rule. The sibling
+## f/probe/alert_coverage_check cannot see this: it only inspects the loaded set.
+##
+## ⛔ THE CLAIM IS ABOUT THE RULES, NEVER ABOUT THE CONCERNS. "368 rules are
+## inert" is true and provable. "368 alerts are missing" is false — the
+## 2026-10-05 per-concern diff found most of those concerns covered anyway by our
+## own set and by deliberate backstops. The residue needing a decision was six
+## items, not 245, and it is tracked in the ledger
+## (alert:RancherMonitoringRulesNeverEvaluated), not here.
+##
+## ⛔ WHY NOT `selectAllByDefault: true`: enabling everything would load the
+## chart's `prometheus_*` rules that watch a server we retired, NVMe-oF and
+## RBD-mirror rules for hardware that is not here, and node-exporter rules for
+## collector names this estate does not use. That is the same class of lie in the
+## other direction, at ten times the volume. The honest fix is to stop RENDERING
+## what nothing evaluates and to widen the selector deliberately, one reviewed
+## file at a time.
+##
+## ⛔ THE ALERTS DO NOT FIRE ON THE STANDING POPULATION. 34 inert objects is a
+## gauge to look at; a permanent 34-series page would camouflage its neighbours
+## and would be indistinguishable from the day a 35th appeared. What fires is a
+## CHANGE: an inert object that was not inert a week ago. That shape also catches
+## the cross-directory case the same-bundle test cannot see — a rules file in
+## ANOTHER fleet directory that rendered without the label — without inventing a
+## maintained list of foreign bundles.
+##
+## ⚠️ The probe pushes with PUT to /metrics/job/{job}, so each run REPLACES the
+## job group: an object that stops being inert loses its series rather than
+## freezing at its old value. The change rule reads absence correctly because of
+## that, not by accident.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: rule-load-coverage
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-monitoring.rule-load
+    rules:
+    - alert: FleetRuleObjectNeverEvaluated
+      ## The precise detector, and the one that would have caught the original
+      ## defect on the day it landed: a rules object rendered by the SAME Helm
+      ## release as objects we DO load, yet carrying no `monitoring-stack: mdapi`.
+      ## Same bundle means same rules files, so this is not a heuristic — someone
+      ## dropped the label from a file, or added a file without it.
+      ##
+      ## Unlike the change rule below this one may legitimately sit at 0 forever,
+      ## and that is the point: it is a config assertion, not a population count.
+      ## It is silent today (measured 2026-10-05: 0) and any non-zero value is a
+      ## defect to fix, never a backlog to tolerate.
+      expr: rule_load_ours_unselected_objects > 0
+      for: 30m
+      labels:
+        service: 'rule-load-coverage'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.object }} carries {{ $labels.bundle }}'s rules and is loaded by nothing"
+        description: |
+          This VMRule object came out of the same Fleet bundle as objects the
+          evaluator DOES load, so it is one of ours — and it holds {{ $labels.rules }}
+          rule(s) that nothing will ever evaluate, because it is missing the
+          `monitoring-stack: mdapi` label that vmalert-mdapi selects on. Its siblings
+          in the same release carry it.
+
+          It renders, it reads as coverage in every UI, and it is inert. Check the
+          source file's `metadata.labels` in fleet/monitoring-rules/. This is a
+          one-word fix, and leaving it is what made the 2026-10-05 finding possible.
+
+    - alert: NewUnevaluatedRuleObject
+      ## THE actionable change rule for the population the bundle test cannot see:
+      ## an inert object that was not inert a week ago — the rook-ceph class, whose
+      ## rules file lives in another fleet directory and rendered without the label.
+      ##
+      ## ⚠️ The lookback is load-bearing, not defensive habit. It is the same guard
+      ## WorkloadLostAlertCoverage carries and for the same reason: if the probe stops
+      ## pushing, the offset window empties and EVERY inert object reads as newly inert
+      ## at once. The liveness gate below is the second half of that — pushgateway
+      ## FREEZES the current side when the probe dies rather than emptying it, so a
+      ## dead probe would keep answering "nothing new" forever. The gate turns that
+      ## into silence from this rule and an explicit page from RuleLoadCoverageCheckStale.
+      ##
+      ## ⚠️ TWO gates, and both are load-bearing — measured, not assumed. The probe
+      ## was 40 minutes old when this file was written, so `max_over_time(... offset
+      ## 12h)` had no history at all and the bare `unless` returned ALL 34 inert
+      ## objects as "newly inert". That is the exact storm the sibling's gap guard
+      ## prevents, and it is why this rule refuses to evaluate until the lookback
+      ## window actually contains probe data.
+      ##
+      ## Gate 1 — history exists: count_over_time of the probe's own success marker
+      ## over the same window the lookback uses. Deliberately NOT `count(<the
+      ## population>) > N` as the sibling file does: after the honesty fix the whole
+      ## inert population is 4 objects, so any floor large enough to mean "history"
+      ## would suppress this rule forever. The marker is pushed every run whatever
+      ## the population, so it answers the question being asked without that trap.
+      ##
+      ## Gate 2 — the probe is still alive: pushgateway FREEZES the current side when
+      ## a probe dies rather than emptying it, so a dead probe would keep answering
+      ## "nothing new" indefinitely. A frozen board is not a healthy fleet.
+      expr: |
+        (
+          (
+            rule_load_unevaluated_rules
+            unless
+            max_over_time(rule_load_unevaluated_rules[7d:1h] offset 12h)
+          )
+          and on() (count_over_time(rule_load_coverage_last_run_success[7d:1h] offset 12h) > 0)
+          and on() (time() - rule_load_coverage_last_run_timestamp_seconds < 172800)
+        )
+      for: 30m
+      labels:
+        service: 'rule-load-coverage'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.object }} became inert ({{ $value | humanize }} rule(s))"
+        description: |
+          This object holds {{ $value | humanize }} rule(s) that no evaluator loads, and it
+          was not in that state at any point in the previous 7 days. Something changed:
+          a rules file lost its `monitoring-stack: mdapi` label, a new one arrived
+          without it, or the Helm release it belongs to was re-rendered by a chart
+          that does not set it.
+
+          ⛔ Do not read this as "{{ $value | humanize }} alerts are missing" — the concern
+          may well be covered by our own rules or by a deliberate backstop. Check what
+          the object actually watches, then either fix the label or extend the residue
+          in fleet/monitoring-rules/ deliberately.
+
+          Inventory of everything inert right now: rule_load_unevaluated_rules.
+          How many of these rule names are alive anyway under our own copy:
+          rule_load_unselected_names_served.
+
+    - alert: RuleObjectSelectedButNotEvaluated
+      ## The cross-check, and the only test that catches the failure the ownership
+      ## test is blind to: the selector DID match, and the evaluator still serves none
+      ## of the object's (group, rule) pairs — a half-landed selector edit, or a
+      ## vmalert up but serving a config that predates the object.
+      ##
+      ## Measured 2026-10-05: all 62 selected objects fully loaded, and the sum of
+      ## this metric's series equals rule_load_loaded_rules_total exactly (615), so
+      ## zero is the correct resting value. An object with no rules at all emits no
+      ## series and so cannot fire this — absence is not failure here.
+      expr: rule_load_object_rules_matched == 0
+      for: 30m
+      labels:
+        service: 'rule-load-coverage'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.object }} is selected but vmalert serves none of it"
+        description: |
+          The live selector matches this object, so it was handed to the operator —
+          and none of its (group, rule) names appear in vmalert's /api/v1/rules. The
+          selector change did not take, the operator did not reconcile, or vmalert is
+          serving a stale config.
+
+          Check: kubectl --context mdapi-prod-direct -n monitoring get vmalert mdapi -o yaml
+                 (ruleSelector, selectAllByDefault)
+                 kubectl --context mdapi-prod-direct -n monitoring logs deploy/vmalert-mdapi
+          Then compare against the object's own groups and rules. Two objects declaring
+          identical group+rule names both score positive, so this rule cannot be fooled
+          into silence by a shadowing twin — only the reverse.
+
+    - alert: RuleLoadCoverageCheckStale
+      ## Monitor-the-monitor. Without this the guard dies quietly and its silence reads
+      ## as "every rule object is loaded", which is the exact failure mode it exists to
+      ## prevent — and pushgateway would keep the last frozen value on the board while
+      ## it happened.
+      expr: time() - rule_load_coverage_last_run_timestamp_seconds > 172800
+      for: 1h
+      labels:
+        service: 'rule-load-coverage'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}windmill{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+      annotations:
+        summary: "Rule-load coverage check stale ({{ $value | humanizeDuration }})"
+        description: |
+          f/probe/rule_load_coverage has not pushed in over two days (it runs daily).
+          NewUnevaluatedRuleObject and FleetRuleObjectNeverEvaluated are blind until
+          this resolves, and NewUnevaluatedRuleObject's lookback will suppress it for
+          a further 7 days after the probe returns.

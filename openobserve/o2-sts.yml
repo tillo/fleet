@@ -1,0 +1,236 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: openobserve
+  namespace: openobserve
+  annotations:
+    reloader.stakater.com/auto: "true"
+    # Keel annotations removed with the digest pin (approved 2026-08-12,
+    # ext:o2-search-topk-blind): a 24h force-poll on latest-amd64 was a silent
+    # upgrade path — o2 version changes are now deliberate git edits here.
+spec:
+  serviceName: openobserve
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openobserve
+  template:
+    metadata:
+      labels:
+        app: openobserve
+    spec:
+      securityContext:
+        fsGroup: 10001
+        ## Skip kubelet's recursive chown when the volume root already matches.
+        ## Under the default (Always), every NEW pod walked all 241,573 inodes
+        ## before the container could start: on 2026-10-27 the volume attached at
+        ## 20:47:40Z and the walk ran until 20:52:16Z (4 min 36 s). With this
+        ## policy the next roll started the container 3 s after scheduling. The
+        ## 36 s boot that had followed the chown was a page cache warmed by the
+        ## walk, not the normal boot: O2 walks the cache tree itself, see
+        ## ZO_DISK_CACHE_MAX_SIZE and cache-dir-gc below. A container restart
+        ## (OOM) does not remount, so the chown hit only rolls, evictions and
+        ## node moves.
+        ## Safe here: the walk has already left the root gid 10001 + g+rwx + setgid
+        ## (read live afterwards: 2775 0:10001), which is exactly what kubelet's
+        ## requiresPermissionChange() tests. New
+        ## directories inherit setgid, so the group stays 10001. If the root ever
+        ## drifts, the full walk runs once more. The VolSync mover
+        ## (o2-volsync-backup.yml) relies on the same root state.
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+      - name: openobserve
+        # ⚠️ ALWAYS the non-SIMD amd64 variant; the SIMD build SIGILLs on Xeon
+        # nodes without AVX2. None of qui/quo/qua have it. Upstream's tag
+        # convention is NOT consistent across releases - v1.0.1 publishes no
+        # amd64 build at all, v1.0.2 only a multi-arch index, v1.0.3 an explicit
+        # `-amd64`. So resolve the platform from the MANIFEST, never from the
+        # tag name, and boot-test on a prod node before merging.
+        #
+        # Pinned by digest (approved 2026-08-12, infra-health
+        # ext:o2-search-topk-blind): unpinned latest-amd64 + pullPolicy Always
+        # meant any pod recreation could silently change the o2 version.
+        # ⭐ The ref now carries the TAG as well as the digest. Digest-only is
+        # what made this image invisible to BOTH lanes for six weeks - see the
+        # Renovate note below.
+        #
+        # ENTERPRISE EDITION since 2026-09-01 (user decision). EE is free for
+        # self-hosted use up to 50 GB/day ingestion - no licence key, no
+        # registration, nothing to renew. Measured 2026-09-22: ~12-17 GB/day,
+        # `ingestion_quota_used` 19.1. That margin only exists because the
+        # pod_logs re-parse (infra-l8x9) took the estate from ~46.9 GB/day. The
+        # ceiling is per 24-hour UTC day, so hourly peaks do not breach it - but
+        # traces/RUM/LLM spans are ADDITIVE, so watch it as those land and
+        # filter in Cribl rather than let the licence lapse.
+        #
+        # ── 2026-09-22: v0.92.0 -> v1.0.3 ───────────────────────────────────
+        # First real version bump since the EE build-flag swap. Why v1.0.3:
+        #   * meets this repo's own Lane-B soak policy (minimumReleaseAge 3d);
+        #   * its ONLY delta over v1.0.2 is two backported fixes, one of them
+        #     "OTLP series identity" - load-bearing for the trace ingestion
+        #     being wired up now, so taking v1.0.2 to buy one more soak day
+        #     would mean knowingly shipping the OTLP bug;
+        #   * v1.0.1 publishes no amd64 build, so it was never a candidate.
+        # v1.0.0 brings SLOs, composite alerts, synthetics (now OSS), DBM,
+        # AI-Observability v1.0 and a hardened service graph; the storage layer
+        # split into separate ORM read/write clients, retiring the sqlite write
+        # lock - which is why the meta DB was snapshotted first.
+        #
+        # ⭐ BOOT-TESTED before merge, on prod node qua, with this exact digest:
+        # it ran tantivy, built the 247-tool MCP index, initialised the
+        # enterprise AI components and the ingesters. Exit was code 1 (a config
+        # complaint), NOT 132/SIGILL - which is the evidence that matters for
+        # the non-SIMD question.
+        #
+        # ⛔⛔ LANDMINE found by that boot test, deliberately NOT fixed here.
+        # v1.0.x validates ZO_ROOT_USER_PASSWORD strength (needs lower+upper+
+        # digit+SPECIAL) and PANICS if it fails. Our stored root password has no
+        # special character. It is harmless today because the check sits inside
+        # `if !db::user::root_user_exists()` (src/jobs/src/job/mod.rs) - it runs
+        # ONLY on first init, and our root user already exists in the meta DB.
+        # But if this PVC is ever lost or recreated, the pod will panic on first
+        # boot and the message will not mention the upgrade. Rotate the Akeyless
+        # secret /mdapi/openobserve/o2/root-password to add a special character
+        # before that can bite.
+        #
+        # ⛔ The pre-upgrade VolumeSnapshot openobserve/o2-pre-v1-upgrade-20260922
+        # is EMPTY, although it still reads readyToUse=true. The 15:47 `nobackup`
+        # trim erased the Longhorn snapshot 2h04m after it was taken. On this
+        # cluster a longhorn-snapshot never outlives the next trim (see
+        # longhorn/recurringjob-daily.yml). Take the next pre-upgrade restore
+        # point as a BACKUP instead: volumeSnapshotClassName `longhorn`, which is
+        # type bak and goes to the RGW target. Or trigger the VolSync source manually.
+        #
+        # Rollback: restore the previous digest
+        #   @sha256:0e9abced022fb004103acc38ae2cb9b5fa041bcb3d96b5f9a054de04d6b2d3d5
+        # (EE v0.92.0, commit 30af70fdfc8c42fa672b28cbba78a1a8930745b6).
+        image: public.ecr.aws/zinclabs/openobserve-enterprise:v1.1.2-amd64@sha256:c34b2aab0c1728194521bbf48665a46f5d789765d457b55afa1a448cc3978ec1
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: openobserve-config
+        - secretRef:
+            name: openobserve-admin
+        ## RUM client token, kept out of git because the fleet repo is publicly
+        ## mirrored. Note this credential is public ONCE SERVED: with
+        ## ZO_RUM_ENABLED=true, logs.mdapi.ch/config hands it to any anonymous
+        ## caller by design. It is in Akeyless so the repo does not publish it,
+        ## not because the token is a secret in the usual sense. The thing that
+        ## actually bounds abuse is the rate limit in o2-rum-ing.yml.
+        - secretRef:
+            name: openobserve-rum
+        env:
+        - name: ZO_S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rgw-openobserve-s3-creds
+              key: access_key
+        - name: ZO_S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rgw-openobserve-s3-creds
+              key: secret_key
+        ## Fixed disk-cache budget, in MiB. Left at 0, v1.1.2's
+        ## check_disk_cache_config() sizes the cache as (free + current cache) / 2
+        ## and measures the current cache with get_dir_size(): a synchronous stat
+        ## of the whole cache tree inside the first get_config(), BEFORE logging
+        ## is set up. With 239k entries that was ~4 silent minutes on every boot:
+        ## on 2026-10-27 the container started at 21:04:05Z and logged its first
+        ## line ("Starting OpenObserve") at 21:08:11Z. A set value skips the walk.
+        ## 9216 MiB (9 GiB) is just under the 9.28 GiB the walk computed. It is
+        ## tied to the 20Gi PVC below: the result and aggregation caches still
+        ## take max/10 each, so the worst case is ~10.8 GiB of cache plus ~1 GiB
+        ## of WAL and meta DB. Resize this together with the PVC.
+        - name: ZO_DISK_CACHE_MAX_SIZE
+          value: "9216"
+        ports:
+        - { name: http, containerPort: 5080 }
+        - { name: grpc, containerPort: 5081 }
+        ## Boot is ~160-180 s here (the search API answers last). The liveness
+        ## budget is initialDelay 30 + 5x30 s = EXACTLY 180 s, so a container
+        ## restarted after an OOM was being killed IN THE MIDDLE OF BOOT: on
+        ## 2026-10-23 the 20:23:58 replacement died at 20:27:01 with reason
+        ## Error / exit 137, and the pod's last_terminated_reason flipped from
+        ## OOMKilled to Error — which also silences the PodOOMKilled rules,
+        ## whose `and` clause requires reason="OOMKilled". Every OOM therefore
+        ## cost TWO restarts and ~3 extra minutes of pod_logs down, exactly
+        ## when forensics needs the record. A startupProbe holds readiness and
+        ## liveness off until boot finishes; liveness then runs at its normal
+        ## cadence. 60 x 10 s = a 600 s budget.
+        ## Boot grows with the data: on 2026-10-27 the post-OOM container started
+        ## 14:14:27 and went Ready 14:18:16 (229 s), 11 s inside the old 24 x 10 s
+        ## budget. The restart before it (14:13:56) was killed by that probe.
+        startupProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          periodSeconds: 10
+          failureThreshold: 60
+        readinessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /healthz, port: 5080 }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /data }
+        ## Sized for INGEST BURSTS, not for the steady state (2026-10-23).
+        ## Hourly-max working set sits at 1.2-3.4 GiB, but O2 dies on a spike
+        ## between samples: the 4Gi limit produced 11-12 OOMKills/hour through
+        ## 2026-10-22 00:00-07:00Z and has flapped ever since (13 restarts, ~40
+        ## min up then exit 137). The request is raised to 2Gi because that is
+        ## what it actually uses; the limit has the headroom the burst needs.
+        ## Node quo has ~19 GiB of unrequested allocatable, and limits are not
+        ## reserved, so this reserves nothing extra at scheduling time.
+        resources:
+          requests: { cpu: 200m, memory: 2Gi }
+          limits:   { cpu: "2",  memory: 8Gi }
+      ## Prunes empty directories from the disk cache, which O2 never does.
+      ## When the cache evicts a file, DiskCache::remove() moves it to trash and
+      ## leaves its hourly directory behind, and the hourly clean_empty_dirs job
+      ## covers only the WAL tree ({data_wal_dir}files/). On 2026-10-27 the
+      ## cache held 183,344 directories for 55,736 files, 153,880 of them empty,
+      ## and the volume's inodes had grown 60k -> 240k in 30 days. Every boot
+      ## walks them all: the cache load does, and so does get_dir_size() when
+      ## the budget above is unset.
+      ## Same rule as upstream's WAL job: a directory empty for over 1 h goes.
+      ## Removing a child bumps its parent's mtime, so each run removes one more
+      ## level. -mindepth 3 keeps the cache/<type>/<org> skeleton. O2 recreates
+      ## directories on write (create_dir_all in disk.rs), so a write that lands
+      ## in a directory at the instant it is removed fails once, and that file
+      ## is served from S3. The first run waits 10 min, until the boot-time
+      ## cache load has finished. TERM is trapped so a roll is not held for the
+      ## 30 s grace period.
+      ## uid 0 because the tree is root-owned and 18 directories lack g+w, so
+      ## the fsGroup group cannot remove inside them. With every capability
+      ## dropped, only plain owner permissions apply.
+      - name: cache-dir-gc
+        image: busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
+        command:
+        - sh
+        - -c
+        - |
+          trap 'exit 0' TERM
+          sleep 600 & wait $!
+          while true; do
+            find /data/cache -xdev -mindepth 3 -type d -empty -mmin +60 -delete
+            sleep 3600 & wait $!
+          done
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: [ALL] }
+        resources:
+          requests: { cpu: 1m, memory: 8Mi }
+          limits:   { memory: 32Mi }
+        volumeMounts:
+        - { name: data, mountPath: /data }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 20Gi } }

@@ -1,0 +1,46 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: showcase
+  namespace: showcase
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Inject the RUM bootstrap. See rum-assets/ for the self-hosted bundle.
+      # Accept-Encoding is cleared because sub_filter cannot match gzipped HTML;
+      # it costs upstream compression on HTML only, not on assets.
+      proxy_set_header Accept-Encoding $rum_accept_encoding;
+      sub_filter_types text/html;
+      sub_filter_once on;
+      sub_filter '</head>' '<script defer src="https://rum.mdapi.ch/rum.js"></script></head>';
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: www.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: showcase
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+    - host: mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: showcase
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - www.mdapi.ch
+      secretName: showcase-cert
+    - hosts:
+      - mdapi.ch
+      secretName: mdapi-cert

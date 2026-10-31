@@ -1,0 +1,39 @@
+# replica-auto-balance-disk-pressure-percentage = 0 — switches off the scheduler
+# path that puts a second and third replica of one volume on quo. Bead
+# infra-r14w, 2026-10-28.
+#
+# ⛔ While this is > 0, replica-soft-anti-affinity=false does NOT keep replicas
+# apart on quo. Measured on Longhorn v1.11.2, scheduler/replica_scheduler.go
+# L424-451 (the fix for longhorn/longhorn#11189). With replica-auto-balance=
+# best-effort and this setting > 0, a node that ALREADY holds a replica of the
+# volume goes back into the candidate list when ANY of its disks is "under
+# pressure": (storageAvailable - storageReserved) * 100 / storageMaximum
+# < 100 - this value. The code comment says the reuse is for moving a replica
+# between disks of one node, but nothing checks that the request is such a move,
+# so every replenish and auto-balance request gets it. quo/fio-hot carries a
+# deliberate 1875 GiB storageReserved (the worn FusionIO card, capped
+# 2026-09-30), which leaves it ~9 % unused. quo is therefore under pressure all
+# the time, at 60 and at the default 90 alike. Only 0 turns the path off.
+# Longhorn v1.12.1 (Harvester v1.9) and master carry the same code, so the
+# upgrade does not fix it.
+#
+# What it did. Every replica clump since then was on quo, never on qua: 64
+# volume/node clumps at 2026-10-26 21:00Z (qua's stall; the rebuild-slot
+# deadlock of infra-r14w), 52 at 2026-10-27 14:00Z (qui's reboot). All 29
+# replicas on quo/fio-hot on 2026-10-28 were created on 10-26 or 10-27, so the
+# card the reserve was meant to spare took the overflow because of the reserve.
+#
+# ⚠️ What 0 costs. It also disables disk-pressure rebalancing, which moves a
+# replica off a disk past the threshold onto another disk of the same node. Only
+# quo/fio-hot ever crosses it here, and quo's manager logged no such move in the
+# 3 h checked on 10-28. During a node outage while quarto is unschedulable, a
+# 3-replica volume now stays degraded on 2 nodes until the node returns,
+# instead of rebuilding a third copy on quo. That is what
+# replica-soft-anti-affinity=false asks for, and it keeps the 2-per-node
+# rebuild slots free.
+apiVersion: longhorn.io/v1beta2
+kind: Setting
+metadata:
+  name: replica-auto-balance-disk-pressure-percentage
+  namespace: longhorn-system
+value: "0"

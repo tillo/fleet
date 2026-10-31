@@ -1,0 +1,22 @@
+# Longhorn fast tier backed by FusionIO ioMemory disks.
+# INERT until at least one Longhorn disk is tagged `iomemory` (see README runbook):
+# a PVC on this class stays Pending (no schedulable disk) until then — harmless.
+#
+# The existing SATA SSD extra-disks are already tagged `fast,ssd`, so this tier
+# deliberately uses a DISTINCT tag (`iomemory`) to keep the flash tier separable.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-iomemory
+  annotations:
+    storageclass.mdapi.ch/purpose: "FusionIO ioMemory low-latency tier (mail DB, recorder, etc.)"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "2"          # HA across two ioMemory nodes; raise to 3 once all 3 cards are in
+  staleReplicaTimeout: "30"
+  diskSelector: "iomemory"       # pin replicas to disks tagged `iomemory`
+  dataLocality: "best-effort"    # keep a replica local to the pod's node -> lowest fsync latency
+  fsType: "ext4"

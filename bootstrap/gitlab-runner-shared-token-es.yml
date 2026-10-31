@@ -1,0 +1,44 @@
+## Authentication token for the SHARED instance runner (deploy/gitlab-gitlab-runner,
+## infra-lhjo). Until 2026-10-27 that runner held only the chart-generated LEGACY
+## registration token, so every runner process start (pod roll, container restart,
+## OOM) ran `register`, which minted a NEW instance runner row: 245 orphans, and an
+## id that changed on every roll. A glrt- token belongs to ONE admin-created runner
+## (description bootstrap/gitlab-gitlab-runner), so `register` only verifies it and
+## writes config.toml; the id is fixed and the per-pod manager rows are pruned by
+## GitLab after 7 days of silence.
+##
+## runner-registration-token is EMPTY on purpose: given both, `register` takes the
+## legacy path again.
+##
+## Consumed through global.runner.registrationToken.secret in gitlab/values.yaml,
+## which the gitlab chart uses as the runner subchart's token secret. That switch
+## lands in a LATER commit, after this Secret exists: the chart's shared-secrets job
+## creates the named Secret itself when it is missing, which would leave ESO and the
+## job holding the same object.
+##
+## Akeyless /mdapi/gitlab/runner-shared-token is the runner's auth token, not a PAT.
+## Re-mint: gitlab-rails, Ci::Runners::CreateRunnerService (the instance runner),
+## or reset the existing runner's token; update the item, ESO refreshes in 5m and
+## the runner needs a roll to re-read it.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gitlab-runner-shared-token
+  namespace: bootstrap
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: gitlab-runner-shared-token
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        runner-registration-token: ''
+        runner-token: '{{ .token }}'
+  data:
+  - remoteRef:
+      key: /mdapi/gitlab/runner-shared-token
+    secretKey: token

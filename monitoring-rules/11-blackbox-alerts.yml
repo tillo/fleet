@@ -1,0 +1,272 @@
+## PrometheusRule fed by blackbox probes.
+##
+## probe_success is 1 (probe ok) or 0 (probe failing). We alert when it's
+## been 0 for several minutes — short enough to catch real outages, long
+## enough to ride out single-poll transient failures (15s scrape interval
+## by default).
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-blackbox
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-blackbox.synthetic
+    rules:
+    - alert: SyntheticProbeFailing
+      ## 2026-07-13 flap fix: was `probe_success == 0 for: 5m`. During
+      ## recovery a SINGLE successful 15s scrape resolved the alert, the
+      ## next failure window re-fired it — 140 firing episodes in 13 days,
+      ## each = 2 priority-1 Pushover messages. avg_over_time gives
+      ## hysteresis on BOTH edges: fires after ~1m hard failure + for:,
+      ## resolves only once the success rate over the last 5m is back
+      ## above 80%.
+      ## dns_external_google is a REFERENCE probe (is the internet broken,
+      ## not us) — split into the info-tier rule below.
+      ##
+      ## 2026-07-23 blip fix (infra-health, user-approved 06:14Z): for:
+      ## 4m -> 8m on everything EXCEPT Mail. Three unattributable sub-6-min
+      ## self-resolved blips in a week (07-16, 07-19, 07-21) each fired
+      ## critical for 1-2min; ≈9m detection rides those out. Known trade:
+      ## a real-but-short outage (07-23 pushgateway OOM, ~5min) no longer
+      ## pages. Mail is priority 1 and keeps the 4m rule below.
+      expr: avg_over_time(probe_success{component!="", component!="Mail", team="mdapi", probe!="dns_external_google"}[5m]) < 0.8
+      for: 8m
+      labels:
+        service: '{{ or $labels.instance "synthetic-probes" }}'
+        severity: critical
+        team: mdapi
+        # component label is inherited from the Probe target, no need to set
+      annotations:
+        summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} failing"
+        description: |
+          Blackbox probe `{{ $labels.instance }}` (module: {{ $labels.module }})
+          has had <80% success over the last 5m for >8m.
+          Component {{ $labels.component }} on statuspage will go to major_outage.
+          Investigate from a workstation:
+            curl -v {{ $labels.instance }}    (for HTTP probes)
+            dig @{{ reReplaceAll ":53" "" $labels.instance }} mdapi.ch  (for DNS)
+
+    - alert: SyntheticProbeFailing
+      ## Mail split (2026-07-23): mail is priority 1 — keeps the original
+      ## 4m (≈5m detection). Same alertname on purpose: routing, statuspage
+      ## mapping and the SlowResponse inhibition all key on alertname, and
+      ## each probe_success series matches exactly one of the two rules.
+      expr: avg_over_time(probe_success{component="Mail", team="mdapi"}[5m]) < 0.8
+      for: 4m
+      labels:
+        service: '{{ or $labels.instance "synthetic-probes" }}'
+        severity: critical
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} failing"
+        description: |
+          Blackbox probe `{{ $labels.instance }}` (module: {{ $labels.module }})
+          has had <80% success over the last 5m for >4m.
+          Component {{ $labels.component }} on statuspage will go to major_outage.
+          Investigate from a workstation:
+            curl -v {{ $labels.instance }}    (for HTTP probes)
+            dig @{{ reReplaceAll ":53" "" $labels.instance }} mdapi.ch  (for DNS)
+
+    - alert: SyntheticReferenceProbeFailing
+      ## External reference targets (currently Google public DNS). Failure
+      ## means the upstream internet path is unhealthy — nothing of ours to
+      ## fix, so info tier (badge only), never a priority-1 page. 6 critical
+      ## episodes in the 13d window before 2026-07-13 were pure noise.
+      expr: avg_over_time(probe_success{probe="dns_external_google"}[10m]) < 0.2
+      for: 5m
+      labels:
+        service: '{{ or $labels.instance "synthetic-probes" }}'
+        severity: info
+        team: mdapi
+        ## Overrides the probe target's inherited DNS component: a failing
+        ## external reference means the internet path is sick, not our DNS.
+        component: Internet
+      annotations:
+        summary: "{{ $labels.component }}: external reference probe {{ $labels.probe }} failing (upstream, not ours)"
+        description: |
+          Reference probe `{{ $labels.instance }}` is failing — the upstream
+          internet path is degraded. Cross-check BpiR4/WAN alerts before
+          suspecting any mdapi component.
+
+    - alert: SyntheticProbeSlowResponse
+      expr: probe_duration_seconds{component!="", team="mdapi"} > 5
+      for: 10m
+      labels:
+        service: '{{ or $labels.instance "synthetic-probes" }}'
+        severity: warning
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }}: probe {{ if $labels.probe }}{{ $labels.probe }}{{ else }}{{ $labels.instance }}{{ end }} slow ({{ $value }}s)"
+        description: |
+          Probe is succeeding but response time >5s for >10m. Performance degradation
+          incoming. Statuspage component {{ $labels.component }} → degraded_performance.
+
+    - alert: SyntheticProbeTLSExpiringSoon
+      expr: |
+        probe_ssl_earliest_cert_expiry{component!="", team="mdapi"} - time() < 14 * 24 * 3600
+      for: 30m
+      labels:
+        service: '{{ or $labels.instance "synthetic-probes" }}'
+        severity: warning
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.component }}: TLS cert for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+        description: |
+          cert-manager renews before 30d remaining; if this fires, automation has stalled.
+          Check: kubectl get certificate -A | grep -v True
+
+    - alert: RancherMgmtMemberUnreachable
+      ## One mgmt node's ingress down while the VIP keeps serving: N-1, not an
+      ## outage — but silent N-1 is how a member stayed gone 18h (2026-09-15).
+      expr: avg_over_time(probe_success{probe="rancher-mgmt-member"}[10m]) < 0.5
+      for: 15m
+      labels:
+        service: 'rancher'
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      annotations:
+        summary: "rancher-mgmt member {{ $labels.instance }} unreachable — management plane at N-1"
+        description: |
+          This node's ingress has failed /ping for >15m while rancher-mgmt.home.tillo.ch
+          (kube-vip VIP 192.168.1.30) is served by the others. One more loss breaks etcd quorum.
+          Check: kubectl --context mdapi-rancher get nodes -o wide
+                 kubectl --context mdapi-prod-direct -n rancher-mgmt get vmi   # guest IP vs Node InternalIP
+          Memory: rancher_mgmt_rr_dns_and_windmill_proxy_hop_2026_09_15.
+
+    - alert: RackKioskUnreachable
+      ## The Carnotzet rack display (bone, Pi 3B+). Until 2026-09-01 nothing
+      ## observed it at all, so a dark screen was invisible until someone walked
+      ## into the cellar.
+      ##
+      ## ⛔ An earlier version of this comment claimed bone sits on "the
+      ## un-scraped PoE switch". It does not, and that was an inference from a
+      ## switch that could not be scraped rather than an observation: bone has
+      ## NO cable at all (eth0 down, 0 bytes ever) and reaches the LAN over wifi.
+      ## Host telemetry now comes from f/probe/bone_health, which publishes
+      ## bone_eth_carrier so this stops being a claim anyone has to maintain.
+      ##
+      ## Deliberately NOT the SyntheticProbe* family: those inherit `component`
+      ## from the Probe target and are critical + statuspage-coupled. A status
+      ## display is neither public nor urgent — losing it costs visibility, not
+      ## service. So: severity warning (Pushover priority -1, in-app, 7d repeat)
+      ## and an INTERNAL component so mdapi.statuspage.io never sees it.
+      ##
+      ## avg_over_time gives hysteresis on both edges, same reasoning as the
+      ## 2026-07-13 flap fix above. 10m window + for:15m ≈ 25m to notify, which
+      ## rides out a reboot of the Pi (~2.5 min power-on to dashboard) and any
+      ## lightdm restart without crying wolf.
+      expr: avg_over_time(probe_success{probe="rack-kiosk"}[10m]) < 0.5
+      for: 15m
+      labels:
+        service: 'bone'
+        severity: warning
+        team: mdapi
+        component: Automation
+      annotations:
+        summary: "Rack kiosk (bone) unreachable — the Carnotzet screen is probably dark"
+        description: |
+          ICMP to bone (192.168.1.185) has been mostly failing for >15m, so the
+          rack status display is almost certainly not showing anything.
+          Nothing else depends on bone — this is a visibility loss, not an outage.
+          Check:
+            ssh bone 'journalctl -t rack-kiosk --no-pager | tail'
+            ssh bone 'vcgencmd get_throttled'   # 0x...8 = under-voltage history
+          The screen plays a Grafana playlist; the launcher self-relaunches up to
+          4x on the dropped-navigation fault. Memory:
+          rack_status_screen_kiosk_bone_reflash_2026_08_28.
+
+  - name: app-blackbox.waf
+    ## WAF enforcement canary (infra-dg5l, 2026-10-27). Probes `waf-canary`
+    ## (CRS payload, expects 403) and `waf-canary-control` (same host, harmless
+    ## query, expects 200) live in 10-blackbox-probes.yml and run every 5m, so
+    ## each window below covers 2–3 samples.
+    ## ⚠️ Every expression aggregates `by (probe)`. A target edit starts a new
+    ## series (`instance` is the URL) while the old one stays in the lookback
+    ## windows; judged per series, the retired 400 series fired WafCanaryBlind
+    ## for ~1h after fleet !1470 (2026-10-27 19:06Z) although the new one got 403.
+    rules:
+    - alert: WafNotEnforcing
+      ## Every canary sample in 12m got through (a 2xx/3xx answer) while every
+      ## control sample succeeded: the edge serves www.mdapi.ch but no longer
+      ## blocks an attack payload. Notifies ~15–20 min after enforcement stops.
+      ## The control gate keeps a site outage from reading as a WAF fault.
+      ## ⚠️ Keyed on the status code, not on probe_success == 0: any other
+      ## failure (a 400, a 5xx, a timeout) proves nothing about the WAF, and
+      ## the first version fired on exactly that — an nginx 400 for a malformed
+      ## canary URL (2026-10-27). Those go to WafCanaryBlind.
+      expr: |
+        max by (probe) (max_over_time(probe_http_status_code{probe="waf-canary"}[12m])) < 400
+          and min by (probe) (min_over_time(probe_http_status_code{probe="waf-canary"}[12m])) >= 200
+          and on() min(min_over_time(probe_success{probe="waf-canary-control"}[12m])) == 1
+      for: 5m
+      labels:
+        service: 'rke2-ingress-nginx-controller'
+        namespace: kube-system
+        severity: warning
+        component: Platform
+        subsystem: waf
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "WAF is not enforcing: a CRS attack payload to www.mdapi.ch got HTTP {{ $value }} instead of 403"
+        description: |
+          The waf-canary probe sends a command-injection payload (CRS anomaly score
+          20, threshold 10) and for >15m it has been answered 2xx/3xx instead of 403,
+          while the control request to the same host succeeds. ModSecurity still logs,
+          so nothing else notices: likely SecRuleEngine DetectionOnly, a removed CRS
+          include, a HelmChartConfig regression, or ingress-nginx replaced by another edge.
+          Check:
+            curl -sk -o /dev/null -w '%{http_code}\n' 'https://www.mdapi.ch/?mdapi_waf_canary=$(cat/etc/passwd)'   # want 403
+            kubectl --context mdapi-prod-direct -n kube-system get cm ingress-modsec-global -o yaml | grep -n SecRuleEngine
+            kubectl --context mdapi-prod-direct -n kube-system get helmchartconfig rke2-ingress-nginx -o yaml | grep -n -i modsecurity
+            ~/pre-reboot-guard.sh   # check 6: the 99-traefik.yaml ingress pin on every node
+          Source: fleet rke2-ingress-nginx-config/. Memory:
+          harvester_19_ingress_nginx_to_traefik_switch_2026_10_24.
+
+    - alert: WafCanaryBlind
+      ## WafNotEnforcing cannot fire when its inputs are missing: a Probe that
+      ## never became a VMProbe, a renamed `probe` label, a control that keeps
+      ## failing, or a canary that keeps failing for a reason other than a
+      ## pass-through (a 400 for a malformed URL, a 5xx, a timeout). Each of those
+      ## would leave the WAF unwatched without a sound.
+      ## absent_over_time keeps the `probe` label, so the alert names the series.
+      ## for: 10m because at rollout the rule can load before the first 5m scrape.
+      expr: |
+        absent_over_time(probe_success{probe="waf-canary"}[30m])
+          or absent_over_time(probe_success{probe="waf-canary-control"}[30m])
+          or max by (probe) (max_over_time(probe_success{probe="waf-canary-control"}[1h])) == 0
+          or (
+            max by (probe) (max_over_time(probe_success{probe="waf-canary"}[1h])) == 0
+              unless on() (
+                max(max_over_time(probe_http_status_code{probe="waf-canary"}[1h])) < 400
+                  and min(min_over_time(probe_http_status_code{probe="waf-canary"}[1h])) >= 200
+              )
+          )
+      for: 10m
+      labels:
+        service: 'rke2-ingress-nginx-controller'
+        namespace: kube-system
+        severity: warning
+        component: Platform
+        subsystem: waf
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "WAF canary is blind ({{ $labels.probe }}): WAF enforcement is not being checked"
+        description: |
+          One of: a canary series has had no samples for 30m; the control request to
+          https://www.mdapi.ch/?mdapi_waf_canary=control has failed for 1h; or the
+          canary has failed for 1h with neither a 403 nor a pass-through. Nothing
+          else probes www.mdapi.ch, so a failing control is also the site being down.
+          Check:
+            kubectl --context mdapi-prod-direct -n monitoring get probe,vmprobe | grep waf-canary
+            curl -sk -o /dev/null -w '%{http_code}\n' 'https://www.mdapi.ch/?mdapi_waf_canary=control'   # want 200
+            # canary status: probe_http_status_code{probe="waf-canary"}. A 400 with an empty
+            # request_uri in the nginx log means the target URL is malformed (keep it free of % and &)
+          Probes: fleet monitoring-rules/10-blackbox-probes.yml (waf-canary*).

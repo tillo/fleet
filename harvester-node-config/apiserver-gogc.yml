@@ -1,0 +1,47 @@
+# kube-apiserver GOGC=50, control-plane nodes only (infra-nqfj).
+#
+# kube-apiserver was the largest tunable memory consumer on the estate (14.3 GiB over three
+# nodes, 2026-09-15). That is Go GC headroom, not object count: next_gc ~4 GiB against a ~2 GiB
+# live set is GOGC=100. GOGC=50 targets ~1.5x, about 1-1.5 GiB back per apiserver, for some
+# more apiserver CPU. Do not go lower without measuring apiserver latency.
+#
+# Moves the hand-placed config.yaml.d/45-apiserver-gogc.yaml (qua/qui/quo, sha256 ed7984d6...)
+# into fleet. quarto lacking it is correct: it is an agent and runs no apiserver. Selecting on
+# the control-plane role means a promoted node gets it without anyone remembering.
+#
+# `kube-apiserver-extra-env+:` appends (a plain key REPLACES the list, memory
+# rke2_dropin_plain_list_key_replaces_use_plus_2026_10_27), and 99-zz-* sorts after every
+# Harvester drop-in. Until the hand copy is retired both files set GOGC=50, which is harmless.
+#
+# ROLLOUT — per control-plane node, at its next planned reboot:
+#   kubectl get cloudinit mdapi-apiserver-gogc -o jsonpath='{.status.rollouts.<n>}'   # Present
+#   mv /etc/rancher/rke2/config.yaml.d/45-apiserver-gogc.yaml{,.retired-<date>}
+#   reboot, then on the node:
+#   grep -A1 GOGC /var/lib/rancher/rke2/agent/pod-manifests/kube-apiserver.yaml        # "50"
+# Takes effect only when rke2-server restarts.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-apiserver-gogc
+spec:
+  matchSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  filename: 99_mdapi_apiserver_gogc.yaml
+  contents: |
+    # Managed by CloudInit mdapi-apiserver-gogc (fleet harvester-node-config/apiserver-gogc.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "mdapi kube-apiserver GOGC=50 (fleet harvester-node-config, infra-nqfj)"
+    stages:
+      initramfs:
+        - name: "rke2 drop-in 99-zz-mdapi-apiserver-gogc.yaml"
+          files:
+            - path: /etc/rancher/rke2/config.yaml.d/99-zz-mdapi-apiserver-gogc.yaml
+              permissions: 384
+              owner: 0
+              group: 0
+              content: |
+                # Written at every boot from /oem/99_mdapi_apiserver_gogc.yaml
+                # (CloudInit mdapi-apiserver-gogc, fleet harvester-node-config).
+                # Local edits are lost at the next boot.
+                kube-apiserver-extra-env+:
+                  - "GOGC=50"

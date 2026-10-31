@@ -1,0 +1,83 @@
+## Who may talk to nextcloud-mcp, and what it may reach. ENFORCING from birth:
+## nothing else in the cluster has a reason to call a per-user file connector,
+## and the pod needs exactly two destinations.
+##
+## WHY INGRESS IS THIS NARROW. The pod holds the Keycloak client secret that
+## performs the token exchange, so anyone who can reach it can ask it to exchange
+## *their* token — that is the feature. What must not happen is another workload
+## using it as a stepping stone: the boundary is "the Chat pods and nothing
+## else", not "the cluster".
+##
+## ⚠️ A wrongly-blocked caller shows up as a TCP timeout in the openwebui pod,
+## not as an error in this one — there is nothing to log for a packet that never
+## arrived. Debug from the caller's side first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nextcloud-mcp-restricted
+  namespace: nextcloud-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app: nextcloud-mcp
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    ## 1. Open WebUI, the only intended caller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 2. The kubelet's probes, which arrive from the NODE IP, not from a pod.
+    ## ⚠️ Leave this out and readiness fails, the pod never becomes Ready and it
+    ## restarts forever — the most common way to break yourself with a
+    ## NetworkPolicy. The same allowance means the LAN can reach 8080; that is
+    ## accepted because the endpoint is useless without a token this pod will
+    ## validate, and tightening it (a separate probe port) would be a change to
+    ## the image, not to this file.
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    ## 1. DNS, by SELECTOR: CoreDNS is reached at its pod IP, never the
+    ## 10.53.0.10 service VIP (an ipBlock on the VIP would look right and block
+    ## all name resolution).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    ## 2. Keycloak and Nextcloud, both published behind the estate ingress.
+    ## ⭐ Calico evaluates the POST-DNAT far end: cloud.mdapi.ch and idp.mdapi.ch
+    ## resolve to the ingress LB VIP 192.168.1.191, but from inside a pod the
+    ## destination is an rke2-ingress-nginx CONTROLLER POD on 443. An ipBlock on
+    ## .191 matches nothing and would silently break both legs — measured
+    ## 2026-10-05, 55/55 internal rows were ingress-nginx pods :443.
+    ##
+    ## ⚠️ The cost of allowing ingress by selector: this also permits every
+    ## OTHER ingress-exposed host. L3/L4 cannot scope by Host name, and the two
+    ## names this pod needs are the two it is written against.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 443

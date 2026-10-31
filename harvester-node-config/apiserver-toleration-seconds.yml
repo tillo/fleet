@@ -1,0 +1,48 @@
+# DefaultTolerationSeconds 300 -> 1800, control-plane nodes only (infra-nqfj).
+#
+# HP Gen8 POST alone is ~10 min, so any reboot outlasts the 300 s default and starts a full
+# taint-eviction cycle. N-1 does not fit on this cluster, so evicted pods mostly go Pending: pure
+# churn. It also spares the Longhorn instance-manager, whose eviction with volumes still mounted
+# caused the 2026-07-17 quo iSCSI/ext4 deadlock. Trade-off: a really dead node keeps its pods
+# ~30 min. Applies to pods created after the apiserver restart; existing pods keep 300 s.
+#
+# Moves the hand-placed config.yaml.d/99-toleration-defaults.yaml (qua/qui/quo, sha256
+# 24bfaca4...) into fleet. quarto lacking it is correct: these are kube-apiserver flags and
+# quarto runs no apiserver.
+#
+# `kube-apiserver-arg+:` appends; nothing else on these nodes sets kube-apiserver-arg today.
+# Until the hand copy is retired both files pass the same two flags; the last one wins and both
+# say 1800.
+#
+# ROLLOUT — per control-plane node, at its next planned reboot:
+#   kubectl get cloudinit mdapi-apiserver-toleration-seconds -o jsonpath='{.status.rollouts.<n>}'
+#   mv /etc/rancher/rke2/config.yaml.d/99-toleration-defaults.yaml{,.retired-<date>}
+#   reboot, then on the node:
+#   grep toleration-seconds /var/lib/rancher/rke2/agent/pod-manifests/kube-apiserver.yaml
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-apiserver-toleration-seconds
+spec:
+  matchSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  filename: 99_mdapi_apiserver_toleration_seconds.yaml
+  contents: |
+    # Managed by CloudInit mdapi-apiserver-toleration-seconds (fleet harvester-node-config/apiserver-toleration-seconds.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "mdapi kube-apiserver default toleration seconds 1800 (fleet harvester-node-config, infra-nqfj)"
+    stages:
+      initramfs:
+        - name: "rke2 drop-in 99-zz-mdapi-apiserver-toleration-seconds.yaml"
+          files:
+            - path: /etc/rancher/rke2/config.yaml.d/99-zz-mdapi-apiserver-toleration-seconds.yaml
+              permissions: 384
+              owner: 0
+              group: 0
+              content: |
+                # Written at every boot from /oem/99_mdapi_apiserver_toleration_seconds.yaml
+                # (CloudInit mdapi-apiserver-toleration-seconds, fleet harvester-node-config).
+                # Local edits are lost at the next boot.
+                kube-apiserver-arg+:
+                  - default-not-ready-toleration-seconds=1800
+                  - default-unreachable-toleration-seconds=1800

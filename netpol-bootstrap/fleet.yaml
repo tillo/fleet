@@ -1,0 +1,38 @@
+## NetworkPolicy ENFORCING policy for the GitLab CI job pods in ns `bootstrap`.
+## Isolation programme infra-az8.4; this workload is infra-az8.4.1.
+## ⭐ ENFORCING since 2026-10-07 — this DENIES. Promoted from a learn window of
+##    36h22m (2026-10-05T18:51:33Z -> 2026-10-07T07:13:15Z) with journald
+##    suppression 0 on all three nodes.
+##    Evidence: ~/ci-job-pods-netpol-analysis-20261007.md (supersedes
+##    ~/bootstrap-netpol-readiness-20261005.md, which sized the learn window).
+##
+## ⚠️ ON THE WORD "RAW", because it is easy to get backwards: Fleet deploys EVERY
+##    bundle as a Helm release named `mdapi-prod-<dir>`, with or without a `helm:`
+##    block — this bundle becomes release `mdapi-prod-netpol-bootstrap` like any
+##    other. Checked 2026-10-05: `kube-bench/` ships no `helm:` block at all and
+##    still has a live release whose objects carry Helm ownership annotations.
+##    So `helm:` is omitted here only because there are no options to set — NOT
+##    to opt out of Helm, and a green bundle is still NOT proof a resource landed.
+##
+##    What a `helm:` block WOULD change is a remote `chart:`: with a chart source
+##    the directory's own manifests are not rendered (the documented estate trap).
+##    That, plus the `dependsOn` chain below, is the reason this policy is a
+##    separate bundle rather than a file dropped into a chart-installing one.
+##
+## ⛔ NO `dependsOn`, on purpose, and it is a design requirement rather than an
+##    oversight: the cluster must be able to come up FROM SCRATCH without this
+##    bundle, and a security observation layer must never sit in the dependency
+##    path of the stack it observes. Nothing depends on this bundle either —
+##    verified, no fleet.yaml in this repo references mdapi-prod-bootstrap.
+##
+##    This is why the policy is not simply added to `bootstrap/`: that bundle
+##    carries `dependsOn: [cloudnative-pg, external-secrets]` and is where the
+##    GitLab stack's own manifests live, so a bad manifest here could hold up the
+##    reconcile of the very services needed for recovery. Coupling the two buys
+##    nothing and costs exactly the property we want to keep.
+##
+## ⛔ NO `namespace:` — that field makes Fleet CREATE and own the namespace, and
+##    `bootstrap` is already owned by the `bootstrap/` bundle. Two bundles owning
+##    one namespace is a conflict, not a convenience. `defaultNamespace` below
+##    only names the target; the existing namespace keeps its labels.
+defaultNamespace: bootstrap

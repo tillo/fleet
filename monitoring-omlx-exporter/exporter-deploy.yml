@@ -1,0 +1,109 @@
+## oMLX exporter: ~200 lines of stdlib Python from the ConfigMap next door, the
+## same base image and pattern as statuspage-adapter. reloader restarts the pod
+## when the script or the key changes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omlx-exporter
+  namespace: monitoring
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: omlx-exporter
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: omlx-exporter
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 10
+      imagePullSecrets:
+      - name: zot-pull
+      containers:
+      - name: exporter
+        ## Same digest as statuspage-adapter; Renovate proposes bumps (MR-only).
+        image: zot.mdapi.ch/library/python:3-alpine@sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "-I", "/etc/omlx-exporter/exporter.py"]
+        env:
+        ## Both from the ExternalSecret next door, never literal here: this repo
+        ## is public and the address is the Mac's internal one.
+        - name: OMLX_URL
+          valueFrom:
+            secretKeyRef:
+              name: omlx-exporter
+              key: OMLX_URL
+        - name: OMLX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: omlx-exporter
+              key: OMLX_API_KEY
+        ports:
+        - containerPort: 9877
+          name: metrics
+          protocol: TCP
+        ## /healthz never touches oMLX: the Mac being unreachable (asleep, off,
+        ## tunnel down) is what omlx_up reports, and must not restart the exporter.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9877
+          initialDelaySeconds: 5
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 4
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 9877
+          initialDelaySeconds: 3
+          periodSeconds: 30
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+          limits:
+            memory: 96Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+          runAsGroup: 65534
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - mountPath: /etc/omlx-exporter
+          name: exporter-files
+          readOnly: true
+      volumes:
+      - name: exporter-files
+        configMap:
+          name: omlx-exporter
+          defaultMode: 420
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: omlx-exporter
+  namespace: monitoring
+  labels:
+    app: omlx-exporter
+spec:
+  selector:
+    app: omlx-exporter
+  ports:
+  - port: 9877
+    targetPort: 9877
+    name: metrics
+    protocol: TCP

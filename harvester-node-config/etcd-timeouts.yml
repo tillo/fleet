@@ -1,0 +1,48 @@
+# etcd heartbeat-interval=1000 / election-timeout=10000, control-plane nodes only (infra-nqfj).
+#
+# On 2026-06-30 a 7.5 s fsync stall on qua lost it the raft election; it stayed up as a zombie
+# member and rke2-server, kubelet and the workloads fell after it. Raised from 500/5000 ms that
+# day (memory etcd_member_election_loss_io_stall_qua_cascade_2026_06_30). etcd requires
+# election-timeout >= 10x heartbeat.
+#
+# Moves the `etcd-arg:` half of the hand-placed config.yaml.d/99-rejoin-server.yaml into fleet.
+# The other half, `server: https://192.168.1.191:9345` on qui and quo, is join plumbing for one
+# node and stays where it is. quarto lacking these is correct: it runs no etcd. The timeouts
+# have to match on every member, which is what the control-plane selector gives a promoted node.
+#
+# `etcd-arg+:` appends. rke2 folds etcd-arg into the etcd config file as keys, so the hand copy
+# and this drop-in setting the same values at once is harmless.
+#
+# ROLLOUT — per control-plane node, at its next planned reboot:
+#   kubectl get cloudinit mdapi-etcd-timeouts -o jsonpath='{.status.rollouts.<n>}'   # Present
+#   qua:     mv /etc/rancher/rke2/config.yaml.d/99-rejoin-server.yaml{,.retired-<date>}
+#   qui/quo: drop the etcd-arg lines from 99-rejoin-server.yaml, keep the server: line
+#   reboot, then on the node:
+#   grep -E 'heartbeat|election' /var/lib/rancher/rke2/server/db/etcd/config       # 1000 / 10000
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-etcd-timeouts
+spec:
+  matchSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  filename: 99_mdapi_etcd_timeouts.yaml
+  contents: |
+    # Managed by CloudInit mdapi-etcd-timeouts (fleet harvester-node-config/etcd-timeouts.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "mdapi etcd heartbeat/election timeouts (fleet harvester-node-config, infra-nqfj)"
+    stages:
+      initramfs:
+        - name: "rke2 drop-in 99-zz-mdapi-etcd-timeouts.yaml"
+          files:
+            - path: /etc/rancher/rke2/config.yaml.d/99-zz-mdapi-etcd-timeouts.yaml
+              permissions: 384
+              owner: 0
+              group: 0
+              content: |
+                # Written at every boot from /oem/99_mdapi_etcd_timeouts.yaml
+                # (CloudInit mdapi-etcd-timeouts, fleet harvester-node-config).
+                # Local edits are lost at the next boot.
+                etcd-arg+:
+                  - heartbeat-interval=1000
+                  - election-timeout=10000

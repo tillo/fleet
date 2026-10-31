@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sftpgo
+  namespace: spider3
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: spider3.files.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sftpgo-web
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - spider3.files.mdapi.ch
+      secretName: sftpgo-spider3-cert

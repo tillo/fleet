@@ -1,0 +1,33 @@
+# systemd drives the hardware watchdog (infra-nqfj).
+#
+# RuntimeWatchdogSec=120: a hung kernel is hardware-reset within ~2 min instead of sitting frozen
+# (the panic-on-ERST hang that froze qua 2026-06-07). On a node without /dev/watchdog0 systemd
+# logs and carries on. 95b_lockup_panic.yaml (lockup-panic.yml) turns soft hangs into panics so
+# this watchdog actually fires.
+#
+# ADOPTED, not new: byte-identical to the hand-placed /oem/95_watchdog.yaml found on all four
+# nodes on 2026-10-27 (sha256 86d81b82...), plus the two "Managed by" lines.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-watchdog
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 95_watchdog.yaml
+  contents: |
+    # Managed by CloudInit mdapi-watchdog (fleet harvester-node-config/watchdog.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "hardware watchdog: systemd drives hpwdt /dev/watchdog0 so a hung kernel (e.g. the panic-on-ERST hang that froze qua 2026-06-07) is hardware-reset within ~2min instead of frozen indefinitely. RuntimeWatchdogSec=120."
+    stages:
+      boot:
+        - name: "enable systemd runtime watchdog (hpwdt)"
+          files:
+            - path: /etc/systemd/system.conf.d/10-watchdog.conf
+              permissions: 0644
+              content: |
+                [Manager]
+                RuntimeWatchdogSec=120
+                RebootWatchdogSec=10min
+          commands:
+            - systemctl daemon-reexec || true

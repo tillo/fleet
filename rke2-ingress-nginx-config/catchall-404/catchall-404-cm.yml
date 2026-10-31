@@ -1,0 +1,21 @@
+# The whole site: /healthz for the kubelet, 404 for everything else. No body
+# beyond nginx's stock 404 page, no version, no access log (the ingress
+# controller already logs every request to ingress_access).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catchall-404
+  namespace: ingress-catchall
+data:
+  default.conf: |
+    server_tokens off;
+    server {
+      listen 8080;
+      server_name _;
+      access_log off;
+      location = /healthz {
+        default_type text/plain;
+        return 200 "ok\n";
+      }
+      location / { return 404; }
+    }

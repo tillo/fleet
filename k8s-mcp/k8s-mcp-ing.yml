@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: k8s-mcp
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # SSE requires no buffering and long timeouts
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # ModSecurity off — MCP JSON traffic triggers false positives
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    # Every ingress client is on the LAN: mbp-mda at home or on its WireGuard
+    # address, LAN IPv6 clients via NAT64 (192.168.164.3; .2 is the WAN IPv6
+    # pool, so never the /24). In-cluster callers (the jump seat) use the
+    # Service directly, http://k8s-mcp.k8s-mcp.svc.cluster.local:8080/mcp, so
+    # there is deliberately NO pod range here: at the shared ingress a pod
+    # address is also what any in-cluster relay presents.
+    # ⚠️ Defense in depth ONLY, not access control. The Bearer header in
+    # k8s-mcp-caddy-cm.yml is the gate.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24,192.168.164.3/32,10.8.0.5/32"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: k8s-mcp.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: k8s-mcp
+            port:
+              number: 8080
+  tls:
+  - hosts:
+    - k8s-mcp.mdapi.ch
+    secretName: k8s-mcp-cert

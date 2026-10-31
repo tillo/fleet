@@ -1,0 +1,55 @@
+# RecurringJob "snapshotcleanup" — the scheduled purge that replaces the one
+# rebuilds no longer run (setting-auto-cleanup-system-generated-snapshot.yml,
+# bead infra-jks8). It was created by hand for group `nosnapshots` alone, every
+# 4 h. It is adopted here in place (fleet.yaml takeOwnership) and widened.
+#
+# A snapshot-cleanup task deletes no snapshot CR itself. It calls SnapshotPurge,
+# and the engine's purge marks every system-generated (not user-created) snapshot
+# removed, then coalesces it away (longhorn-engine v1.11.2 pkg/sync/rpc/server.go
+# purgeSnapshots). User, backup and VolSync snapshots are not touched.
+#
+# Groups: `default` + `nobackup` cover every volume. Longhorn puts any volume
+# without a group into `default`, and `nobackup` is the exclusion group
+# (recurringjob-nobackup.yml). Measured 2026-10-27: 86 + 24 = 110 of 110 volumes.
+# `default` alone, as the bead first proposed, would have missed the 24.
+# `nosnapshots` stays listed so its two members keep their cleanup even if they
+# ever leave `default`. A volume that is in several groups is purged once per run
+# (filterVolumesForJob skips duplicates).
+#
+# ⚠️ The daily filesystem-trim jobs also purge, but only after a trim that
+# succeeds. That needs an attached Filesystem PVC. A Block PVC (a VM disk) fails
+# trim every day, so nothing else ever purges it.
+#
+# Why hourly: a system snapshot holds one of the volume's 6 snapshot slots until a
+# purge runs. A rebuild that keeps failing adds one per attempt, and a volume with
+# no free slot can neither rebuild nor back up. The interval is the longest that
+# lockout can last. An empty purge costs almost no disk I/O. Each purge does ask
+# the heavy-task limiter, though, which polls every engine. Expect ~10 min per run
+# for ~93 attached volumes, the same shape as the daily `trim` run (11 min).
+#
+# Purge vs rebuild: the engine refuses to purge a volume while any of its replicas
+# is rebuilding ("cannot purge snapshots because … is rebuilding"). So a run
+# during a drain is a no-op for those volumes, not a stall. A rebuild that starts
+# in the second a purge is running fails PrepareRebuild ("replica is purging
+# snapshots") and is retried after the engine backoff. That costs one more slot,
+# not a jam.
+#
+# concurrency 1: one volume at a time, cluster-wide. The coalesce is the I/O, and
+# these disks are why the rebuild limit is 2. Minute :30 is clear of the other job
+# starts (:00 weekly/monthly, 03:40 daily, 15:27/15:47 trims). Detached volumes
+# are skipped (allow-recurring-job-while-volume-detached=false). With
+# offline-replica-rebuilding=false they cannot rebuild while detached anyway.
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: snapshotcleanup
+  namespace: longhorn-system
+spec:
+  cron: "30 * * * *"
+  task: snapshot-cleanup
+  groups:
+    - default
+    - nobackup
+    - nosnapshots
+  retain: 0
+  concurrency: 1

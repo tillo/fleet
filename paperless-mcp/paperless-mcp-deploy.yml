@@ -1,0 +1,111 @@
+## paperless-mcp — the household Paperless archive, read-only, for chat.mdapi.ch.
+##
+## WHY THIS IS NOT PER-USER (and nextcloud-mcp is). The Paperless archive is one
+## collection the two household people curate together (decision 2026-10-22), so
+## there is a single reader identity on the Paperless side and this service's job
+## is to decide WHO MAY ASK. That gate is the Keycloak group `DMS` on the
+## caller's own token — enforced in code, before any Paperless call — and Chat's
+## `access_grants` narrows the same connection to the same two accounts.
+##
+## The token this pod holds (PAPERLESS_TOKEN) belongs to the Paperless user
+## `paperless-mcp`: unusable password, NOT a superuser, only `view_*`
+## permissions. Every upstream call is a GET; there is no write path to disable.
+##
+## Code and CI: gitlab.mdapi.ch/mdapi/paperless-mcp.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperless-mcp
+  namespace: paperless-mcp
+  labels:
+    app: paperless-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: paperless-mcp
+  template:
+    metadata:
+      labels:
+        app: paperless-mcp
+    spec:
+      ## The process never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: paperless-mcp
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: paperless-mcp
+          ## Lane A: floating tag + resolved digest (Renovate owns the bump) +
+          ## IfNotPresent, so a node that already has the layer does not re-pull
+          ## and a registry outage does not stop a restart.
+          image: zot.mdapi.ch/mdapi/paperless-mcp:latest@sha256:0e44e0c984b23b5db10a5404def06a735a565a1659fc3c26186b5de24bd97451
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PAPERLESS_BASE
+              value: http://paperless.paperless.svc.cluster.local:8000
+            - name: KEYCLOAK_ISSUER
+              value: https://idp.mdapi.ch/realms/tilloch
+            ## Audience this pod insists on in the token Open WebUI hands it.
+            ## Chat's Paperless connection has its own Keycloak client,
+            ## openwebui-paperless-mcp (kc-gate: mdapi-paperless, i.e. /DMS), whose
+            ## tokens carry aud=paperless-mcp. Tokens of the Files client
+            ## (openwebui-mcp, aud nextcloud-mcp/openwebui-mcp) are refused here.
+            ## infra-47nq.8
+            - name: EXPECTED_AUDIENCE
+              value: paperless-mcp
+            ## The realm group whose members are exactly the two who share the
+            ## archive. Empty would decode to "no gate" — never do that here.
+            - name: ALLOWED_GROUPS
+              value: DMS
+            ## RFC 9728 `resource` — must be the URL Open WebUI actually calls.
+            - name: RESOURCE_URL
+              value: http://paperless-mcp.paperless-mcp.svc.cluster.local:8080/mcp
+            - name: PORT
+              value: "8080"
+            - name: PAPERLESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: paperless-mcp-env
+                  key: PAPERLESS_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ## A thin proxy over JSON; the biggest thing it holds is one document's
+          ## OCR text (capped at 20k chars), so 256Mi is generous.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 96Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+      imagePullSecrets:
+        - name: zot-pull

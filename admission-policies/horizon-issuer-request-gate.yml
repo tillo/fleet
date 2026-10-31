@@ -1,0 +1,137 @@
+## Who may ask horizon-issuer for a certificate (infra-az8.17, pentest 2026-10-22 F28).
+##
+## horizon-issuer enrols every CertificateRequest that names it with its OWN
+## Horizon credential, and Horizon auto-completes that identity's requests. It
+## never waits for the Approved condition (2.0.0 included: there is no
+## CertificateRequestIsApproved call outside its tests), so approval — ours is
+## cert-manager's built-in approver, which approves every horizon signer since
+## !1413 — gates nothing. Before this policy, `create certificaterequests`
+## alone (stock `edit`) minted a client+server-auth certificate for any CN/SAN
+## from MDAPI Issuing CA 01 in ~3 s.
+##
+## The gate therefore sits at admission, before any controller sees the object:
+##  - a horizon CertificateRequest may only be CREATED by the cert-manager
+##    controller (it creates them from Certificates) — or by a principal that
+##    may reference the signer;
+##  - a horizon Certificate may only be created, or have its spec changed, by a
+##    principal that may reference the signer, i.e. holds the cluster-scoped
+##    permission  cert-manager.io / signers / reference  on
+##    `clusterissuers.horizon.evertrust.io/<name>` (or `.../*`, or
+##    `issuers.horizon.evertrust.io/<ns>.<name>`) — cert-manager's own naming for
+##    signers. Today that is cluster-admin and fleet-agent (both hold `*`); no
+##    namespace RoleBinding can grant it, because the check is cluster-scoped.
+##    cert-manager's controller does NOT hold it, which is what stops the
+##    ingress-shim route (an `edit` user annotating an Ingress with the horizon
+##    issuer would otherwise get cert-manager to create the Certificate for them);
+##  - nobody else rewrites the annotations that bind a request to an identity:
+##    `horizon.evertrust.io/*` on Certificates (last-certificate-id selects the
+##    Horizon certificate a RENEW reissues — with the requester's CSR) and
+##    `horizon.evertrust.io/*` + `cert-manager.io/*` on CertificateRequests
+##    (certificate-name picks the parent whose last-certificate-id is used).
+##    horizon-issuer itself writes those, so it is exempt — for metadata only.
+##
+## Not the Horizon-side control (issuer credential gets the request permission
+## instead of Enroll, so everything lands PENDING for a human): that makes every
+## renewal manual. This keeps renewals automatic and refuses the forged ones.
+##
+## Deny + Audit, failurePolicy Fail: this is a security control. The
+## matchConditions confine it to objects that name the horizon.evertrust.io
+## group, so an error can only ever refuse a horizon request, never another
+## issuer's. Verified with server-side dry-runs (MR description).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: horizon-issuer-request-gate
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["cert-manager.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["certificaterequests", "certificates"]
+        scope: Namespaced
+  matchConditions:
+    - name: names-the-horizon-issuer
+      expression: >-
+        (has(object.spec) && has(object.spec.issuerRef) && has(object.spec.issuerRef.group) &&
+         object.spec.issuerRef.group == 'horizon.evertrust.io') ||
+        (oldObject != null && has(oldObject.spec) && has(oldObject.spec.issuerRef) &&
+         has(oldObject.spec.issuerRef.group) && oldObject.spec.issuerRef.group == 'horizon.evertrust.io')
+  variables:
+    - name: ref
+      expression: >-
+        has(object.spec.issuerRef.group) && object.spec.issuerRef.group == 'horizon.evertrust.io'
+          ? object.spec.issuerRef : oldObject.spec.issuerRef
+    - name: cluster
+      expression: "has(variables.ref.kind) && variables.ref.kind == 'ClusterIssuer'"
+    - name: signerPrefix
+      expression: "variables.cluster ? 'clusterissuers.horizon.evertrust.io/' : 'issuers.horizon.evertrust.io/'"
+    - name: signer
+      expression: >-
+        variables.signerPrefix +
+        (variables.cluster ? variables.ref.name : request.namespace + '.' + variables.ref.name)
+    - name: mayReference
+      expression: >-
+        authorizer.group('cert-manager.io').resource('signers').name(variables.signer).check('reference').allowed() ||
+        authorizer.group('cert-manager.io').resource('signers').name(variables.signerPrefix + '*').check('reference').allowed()
+    - name: isCertManager
+      expression: "request.userInfo.username == 'system:serviceaccount:cert-manager:cert-manager'"
+    - name: isHorizonIssuer
+      expression: "request.userInfo.username == 'system:serviceaccount:horizon-issuer:horizon-issuer-controller-manager'"
+    - name: isRequest
+      expression: "request.resource.resource == 'certificaterequests'"
+    ## Annotation keys that bind a request to an identity (see header). Only read on UPDATE.
+    - name: guardedNew
+      expression: >-
+        has(object.metadata.annotations) ? object.metadata.annotations.filter(k,
+          k.startsWith('horizon.evertrust.io/') || (variables.isRequest && k.startsWith('cert-manager.io/'))) : []
+    - name: guardedOld
+      expression: >-
+        has(oldObject.metadata.annotations) ? oldObject.metadata.annotations.filter(k,
+          k.startsWith('horizon.evertrust.io/') || (variables.isRequest && k.startsWith('cert-manager.io/'))) : []
+    - name: guardedUnchanged
+      expression: >-
+        size(variables.guardedNew) == size(variables.guardedOld) &&
+        variables.guardedNew.all(k, k in variables.guardedOld &&
+          object.metadata.annotations[k] == oldObject.metadata.annotations[k])
+  validations:
+    - expression: >-
+        !variables.isRequest || request.operation != 'CREATE' ||
+        variables.isCertManager || variables.mayReference
+      message: >-
+        horizon.evertrust.io CertificateRequests may only be created by the
+        cert-manager controller, from a Certificate (infra-az8.17).
+      messageExpression: >-
+        'horizon.evertrust.io CertificateRequests may only be created by the cert-manager controller,
+        from a Certificate; ' + request.userInfo.username + ' may not reference signer ' +
+        variables.signer + ' (infra-az8.17)'
+      reason: Forbidden
+    - expression: >-
+        variables.isRequest || variables.mayReference ||
+        (request.operation == 'UPDATE' && object.spec == oldObject.spec &&
+         (variables.guardedUnchanged || variables.isHorizonIssuer))
+      message: >-
+        Creating a horizon.evertrust.io Certificate, changing its spec or its
+        horizon.evertrust.io/* annotations needs 'reference' on the signer (infra-az8.17).
+      messageExpression: >-
+        'Creating a horizon.evertrust.io Certificate, changing its spec or its horizon.evertrust.io/*
+        annotations needs cluster-scoped reference on cert-manager.io/signers ' + variables.signer +
+        ', which ' + request.userInfo.username + ' lacks (infra-az8.17)'
+      reason: Forbidden
+    - expression: >-
+        !variables.isRequest || request.operation != 'UPDATE' ||
+        variables.isCertManager || variables.isHorizonIssuer || variables.mayReference ||
+        variables.guardedUnchanged
+      message: >-
+        The horizon.evertrust.io/* and cert-manager.io/* annotations of a
+        horizon.evertrust.io CertificateRequest belong to its controllers (infra-az8.17).
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: horizon-issuer-request-gate
+spec:
+  policyName: horizon-issuer-request-gate
+  validationActions: ["Deny", "Audit"]

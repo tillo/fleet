@@ -1,0 +1,73 @@
+## OpenFGA, the authorisation store behind OpenObserve RBAC (ns `openfga`, 2026-09-24).
+##
+## Selectors are NAMESPACE-WIDE (see 50-findmy.yml): a name-pinned selector is how
+## the second workload in a namespace is born uncovered.
+##
+## Why warning, not critical: with OpenFGA down, root and every ingestion token keep
+## working (tested). Only non-root O2 READS fail closed with 403: the Windmill O2
+## probes and any future SSO user. Nothing is lost; visibility degrades.
+## The Postgres datastore (openfga-pg) is covered by the generic CNPG rules in
+## 52-cnpg-backups.yml.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-openfga
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-openfga.workload
+    rules:
+    - alert: OpenfgaDeploymentUnavailable
+      expr: |
+        max by (namespace, deployment) (
+          ( kube_deployment_spec_replicas{
+              namespace="openfga", deployment=~".+"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="openfga", deployment=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "openfga" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}openfga{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "openfga/{{ $labels.deployment }} has unavailable replicas"
+        description: |
+          OpenFGA answers OpenObserve's authorisation checks. With no replica
+          available, non-root O2 reads (Windmill probes, SSO users) fail with 403.
+          Root and ingestion are unaffected. Check `kubectl -n openfga get pods`
+          and the openfga-pg cluster.
+
+    ## ⚠️ Keep this arm even though it matches nothing today: the coverage probe
+    ## treats a namespace-only selector as covering both kinds.
+    - alert: OpenfgaStatefulSetUnavailable
+      expr: |
+        max by (namespace, statefulset) (
+          ( kube_statefulset_replicas{
+              namespace="openfga", statefulset=~".+"
+            }
+            - kube_statefulset_status_replicas_available{
+              namespace="openfga", statefulset=~".+"
+            }
+          ) > 0
+        )
+      for: 15m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "openfga" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}openfga{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "openfga/{{ $labels.statefulset }} has unavailable replicas"
+        description: |
+          A StatefulSet in the openfga namespace has no available replica.

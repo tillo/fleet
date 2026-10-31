@@ -1,0 +1,152 @@
+## Container creation wedged — the containerd name-reservation leak.
+##
+## Gap found 2026-08-29 while root-causing ledger restart:nameserver/nameserver.
+## Nothing in monitoring-rules matched CreateContainerError or a pod stuck in
+## Waiting (verified by grep, 0 hits), so this failure mode was visible only
+## through whatever service-level alert happened to notice the app was gone —
+## i.e. after the outage had already started.
+##
+## THE MECHANISM (see the ledger entry for the full evidence):
+##  1. Node IO saturates. /dev/sda5 on qui/quo/qua carries containerd's
+##     snapshotter (/var/lib/rancher), kubelet (/var/lib/kubelet, including CI
+##     build workspaces) AND /var/lib/longhorn on one device, so GitLab CI
+##     runner IO drives node_pressure_io_stalled to 20-28%.
+##  2. A container restarts, and kubelet's CreateContainer RPC to containerd
+##     exceeds its deadline: "CreateContainerError: context deadline exceeded".
+##  3. containerd has ALREADY reserved the container name when that RPC fails,
+##     so the name leaks. Every retry then returns
+##     'failed to reserve container name "..._<n>": name "..._<n>" is reserved
+##     for "<containerid>"'.
+##  4. The kubelet retries every ~13s with the SAME restart ordinal, so it can
+##     never succeed. This is a permanent wedge, not backoff — it clears only
+##     when IO pressure decays.
+##
+## NOT app-specific, deliberately: any pod that restarts on a saturated node can
+## hit this. It was found on the public authoritative nameserver only because
+## that is where it hurt enough to investigate.
+##
+## VERIFIED AS A DETECTOR, not just written: replayed against the real incident,
+## kube_pod_container_status_waiting_reason{namespace="nameserver",
+## reason="CreateContainerError"} == 1 from 2026-08-27T13:04Z to 13:14Z, so this
+## rule would have fired at 13:06 — about 8 minutes before it self-cleared.
+## It is also rare enough not to be noisy: 2 series carried that reason in 14d.
+##
+## for: 2m rides out the ordinary transient (a normal CreateContainer completes
+## in well under a second); 2 minutes in this state is always the leak.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: container-create-wedge
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-k8s.container-create-wedge
+    rules:
+    - alert: ContainerCreateWedged
+      expr: |
+        kube_pod_container_status_waiting_reason{reason="CreateContainerError"} == 1
+      for: 2m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "containerd" }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Internal plane — the affected app's own alert owns the public status.
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} stuck in CreateContainerError >2m"
+        description: |
+          Container creation is wedged, most likely the containerd
+          container-name reservation leak following a CreateContainer timeout
+          under node IO pressure. The kubelet will retry forever with the same
+          restart ordinal and cannot recover on its own until IO pressure drops.
+
+          Confirm the shape (the first error is the tell — 'context deadline
+          exceeded', THEN repeating 'failed to reserve container name'):
+            kubectl -n {{ $labels.namespace }} describe pod {{ $labels.pod }}
+            ssh rancher@<node> 'zcat /var/lib/rancher/rke2/agent/logs/kubelet-*.log.gz \
+              | grep -F {{ $labels.pod }}'
+          (/var/lib/rancher/rke2/agent/containerd/containerd.log is root-only —
+          not readable as rancher.)
+
+          Find what is saturating the node:
+            topk(8, rate(container_pressure_io_stalled_seconds_total{node="<n>",container!=""}[3m]))
+            rate(node_disk_io_time_seconds_total{device="sda"}[5m])
+          Node-exporter instance labels are IP:9796 — qui .190, quo .192, qua .193.
+
+          To break the wedge now, delete the pod so it gets a new UID and a fresh
+          container name; the leaked reservation is tied to the old one.
+
+          Precedent: nameserver/nameserver 2026-08-26 and 08-27, ~12 min wedged
+          on 08-27 13:03-13:15Z. Public resolution survived via the two external
+          secondaries, but cert-manager DNS-01 (rfc2136 -> ns.mdapi.ch) did not.
+          Full analysis in the infra-health ledger under
+          restart:nameserver/nameserver.
+
+    - alert: ImagePullFailureNoReadyReplicas
+      ## Added 2026-10-18 (ledger alert:ClusterPendingPodsTooLong, approved).
+      ## That alert is a cluster-wide COUNT of Pending pods with a 1h `for:` and
+      ## no pod/namespace label, which is how three workloads sat dead for FOUR
+      ## DAYS (tv/plex-webhook-receiver since 10-10, joplin/postgres-events-cleanup
+      ## since 10-11, openbao/openbao-mirror since 10-14) before anyone could
+      ## attribute the number — and it only ever fired at warning.
+      ##
+      ## This rule is the specific, fast half: a container whose image CANNOT BE
+      ## PULLED on a workload that has no ready replica at all. Zero ready is the
+      ## gate that keeps it quiet for a single failing pod of a healthy multi-
+      ## replica Deployment, while still covering the CronJob/Job case (whose
+      ## completed pods are never "ready", so a failed new pod leaves the owner
+      ## with none). 10m rides out a normal registry blip and the backoff cycle;
+      ## a pull failure that lasts 10 minutes is a rollout that will not happen.
+      ##
+      ## Distinct from ContainerCreateWedged above: that is a CREATED container
+      ## failing to start (containerd name reservation); this is never getting an
+      ## image at all (dead digest pin, auth, or upstream GC).
+      expr: |
+        (
+          kube_pod_container_status_waiting_reason{reason=~"ImagePullBackOff|ErrImagePull|InvalidImageName"} == 1
+        )
+        * on (namespace, pod) group_left(owner_name)
+          kube_pod_owner{owner_is_controller="true"}
+        unless on (namespace, owner_name)
+        (
+          kube_pod_status_ready{condition="true"} == 1
+          * on (namespace, pod) group_left()
+            kube_pod_owner{owner_is_controller="true"}
+        )
+      for: 10m
+      labels:
+        service: '{{ or $labels.owner_name $labels.pod "kubernetes" }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.owner_name }} has no ready replica: {{ $labels.pod }} cannot pull its image ({{ $labels.reason }})"
+        description: |
+          Container `{{ $labels.container }}` of pod `{{ $labels.pod }}` has been
+          in {{ $labels.reason }} for over 10 minutes, and its workload
+          `{{ $labels.namespace }}/{{ $labels.owner_name }}` has ZERO ready
+          replicas — so nothing has been serving this workload since it was
+          (re)scheduled. This is the failure that stayed invisible for four days
+          on 2026-10-10..14.
+
+          First check the pin, not the workload: a `@sha256:` digest on a MOVING
+          tag dies silently when the upstream registry GCs the superseded
+          manifest. Docker Hub rebuilt library/python on 2026-10-04 and removed
+          the pinned manifests; every pod pinning them crashlooped with
+          MANIFEST_UNKNOWN while the tag itself still resolved (ledger
+          ext:zot-digest-pin-dead-upstream).
+
+          Confirm before changing anything:
+            kubectl -n {{ $labels.namespace }} describe pod {{ $labels.pod }} | tail -30
+            # then, for the image named in the events, an anonymous HEAD by digest:
+            curl -sI https://registry-1.docker.io/v2/library/<repo>/manifests/<digest>
+
+          Fix forward by re-pinning to the digest the tag CURRENTLY resolves to,
+          or by using the estate's dependency-proxy path
+          (gitlab.mdapi.ch:443/mdapi/dependency_proxy/containers/<image>) —
+          which is what every other postgres/python consumer here uses.
+

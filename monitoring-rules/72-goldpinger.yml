@@ -1,0 +1,200 @@
+## goldpinger — node-pair mesh, POD path vs HOST path (ns `goldpinger`, beads infra-5lii).
+##
+## Background: 2026-10-27 12:01Z all 7 quo OSDs and mon.t lost their qua/qui peers
+## for ~100 s while the host network stayed healthy, and afterwards there was no
+## per-pair series to diagnose it from (infra-mzaj, memory
+## quo_pod_network_ceph_cut_2026_10_27). The bundle in goldpinger/ runs the same
+## probes on both paths; these rules turn the comparison into per-pair series
+## and alerts. goldpinger/fleet.yaml explains the two flow shapes.
+##
+## Severity is warning and component is Platform with `statuspage: exclude`: this
+## is an internal diagnosis signal; a visitor only notices if Ceph does, and the
+## Ceph alerts own that.
+##
+## Every pair alert needs the HOST path to be clean over 10 minutes, not just the
+## last 2. A node that reboots or drops off the LAN fails both paths. When it comes
+## back, the pod path can lag the host path by minutes (CNI starts after the host
+## network). The longer host window keeps that boot lag quiet, and a pod-path cut
+## on a host that has been stable for 10 minutes still fires.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `daemonset=~".+"` / `deployment=~".+"` / `statefulset=~".+"` are no-ops in
+## PromQL and load-bearing for f/probe/alert_coverage_check.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-goldpinger
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-goldpinger.records
+      interval: 15s
+      rules:
+        ## One series per (source node, peer host_ip, path): 4 nodes x 4 peers x 2
+        ## paths. `path` comes from goldpinger/vmpodscrape.yml.
+        ##
+        ## UDP loss from a fresh socket each cycle (the fresh-flow shape), averaged
+        ## over 2m. Two filters, because there are two ways a series outlives its peer:
+        ##   * `and` the live gauge drops a SOURCE pod's series once it stops being
+        ##     scraped (source pod restarted);
+        ##   * `and on (...) increase(ping count) > 0` drops a PEER that is no longer
+        ##     probed. goldpinger 3.11.5 does not always delete the loss gauge when a
+        ##     peer pod goes away: it keeps exporting the last value. Measured
+        ##     2026-10-28 in the infra-5lii synthetic test: after the 3 peer pods were
+        ##     recreated mid-cut, quo kept 2 of the 3 old pod_ip series at 100 %, so
+        ##     the max held PodNetworkPairUdpLoss firing long after the path healed.
+        ##     The ping histogram of a dropped peer stops counting (a live peer's
+        ##     counts, timeouts included, keep rising), so liveness is read from it.
+        - record: goldpinger:peer_udp_loss_pct:avg2m
+          expr: |
+            max by (goldpinger_instance, host_ip, path) (
+              avg_over_time(goldpinger_peers_loss_pct{namespace="goldpinger"}[2m])
+              and goldpinger_peers_loss_pct{namespace="goldpinger"}
+              and on (goldpinger_instance, host_ip, pod_ip, path)
+              increase(goldpinger_peers_response_time_s_count{namespace="goldpinger", call_type="ping"}[1m]) > 0
+            )
+        ## Share of HTTP pings over the keep-alive connection (the long-lived-flow
+        ## shape) that took longer than 250 ms. goldpinger observes the histogram on
+        ## failure too, and a timeout lands at ~PING_TIMEOUT (300 ms), so this is
+        ## the timeout ratio: healthy pings take a few ms. A refused connection
+        ## fails fast and is NOT counted; that is a restarting peer, not the network.
+        ## A dropped peer's frozen histogram has rate 0, so it falls out on its own.
+        - record: goldpinger:peer_ping_slow_ratio:rate2m
+          expr: |
+            1 - (
+              sum by (goldpinger_instance, host_ip, path) (
+                rate(goldpinger_peers_response_time_s_bucket{namespace="goldpinger", call_type="ping", le="0.25"}[2m])
+              )
+              /
+              sum by (goldpinger_instance, host_ip, path) (
+                rate(goldpinger_peers_response_time_s_count{namespace="goldpinger", call_type="ping"}[2m])
+              )
+            )
+
+    - name: app-goldpinger.rules
+      rules:
+        ## Fresh-flow loss: the pod path drops UDP from new sockets while the host
+        ## path is clean. The synthetic test (a NetworkPolicy denying one node's
+        ## goldpinger-pod IP to the pod arm) trips this one within ~3 min.
+        - alert: PodNetworkPairUdpLoss
+          expr: |
+            goldpinger:peer_udp_loss_pct:avg2m{path="pod"} > 20
+            and on (goldpinger_instance, host_ip)
+            avg_over_time(goldpinger:peer_udp_loss_pct:avg2m{path="host"}[10m]) < 5
+          for: 1m
+          labels:
+            service: '{{ $labels.goldpinger_instance }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            ## internal network signal; Ceph's own alerts own the visible effect
+            statuspage: exclude
+          annotations:
+            summary: "pod network {{ $labels.goldpinger_instance }} -> {{ $labels.host_ip }}: {{ $value | humanize }}% UDP loss, host path clean"
+            description: |
+              Over the last 2m the POD path (flannel VXLAN) from node
+              {{ $labels.goldpinger_instance }} to the node at {{ $labels.host_ip }}
+              lost {{ $value | humanize }}% of goldpinger's UDP probes, while the HOST
+              path between the same two nodes stayed under 5% for 10m. Same NICs and
+              switch, so look at the overlay: flannel/canal on both nodes, felix, and
+              conntrack. Ceph OSDs and mons use this path (2026-10-27, memory
+              quo_pod_network_ceph_cut_2026_10_27; beads infra-mzaj, infra-5lii).
+                kubectl --context mdapi-prod-direct -n goldpinger get pods -o wide
+                kubectl --context mdapi-prod-direct -n kube-system get pods -o wide -l k8s-app=canal
+              Per pair, both paths:
+                goldpinger:peer_udp_loss_pct:avg2m{goldpinger_instance="{{ $labels.goldpinger_instance }}"}
+
+        ## Long-lived-flow loss: pings over the kept-alive connection time out on
+        ## the pod path while the host path is clean. This is the 10-27 shape:
+        ## established flows lost heartbeats while fresh connections got through,
+        ## so it can fire with PodNetworkPairUdpLoss silent.
+        ## ⚠️ Testing it: a NetworkPolicy alone does NOT trip this one. Calico
+        ## accepts ESTABLISHED conntrack flows before it evaluates policy, so the
+        ## kept-alive connection keeps working; recreate the PEER pod-arm pods
+        ## after applying the deny (new IPs, new flows). Measured 2026-10-28.
+        - alert: PodNetworkPairPingTimeouts
+          expr: |
+            goldpinger:peer_ping_slow_ratio:rate2m{path="pod"} > 0.1
+            and on (goldpinger_instance, host_ip)
+            avg_over_time(goldpinger:peer_ping_slow_ratio:rate2m{path="host"}[10m]) < 0.05
+          for: 1m
+          labels:
+            service: '{{ $labels.goldpinger_instance }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            ## internal network signal; Ceph's own alerts own the visible effect
+            statuspage: exclude
+          annotations:
+            summary: "pod network {{ $labels.goldpinger_instance }} -> {{ $labels.host_ip }}: {{ $value | humanizePercentage }} of pings timing out, host path clean"
+            description: |
+              Over the last 2m {{ $value | humanizePercentage }} of goldpinger's HTTP
+              pings from node {{ $labels.goldpinger_instance }} to the node at
+              {{ $labels.host_ip }} over the POD path took over 250 ms (timeout is
+              300 ms; healthy is a few ms). Over 10m the HOST path between the same
+              nodes stayed under 5%. These pings reuse one keep-alive connection, so
+              this is ESTABLISHED flows failing: the 2026-10-27 shape that cost quo
+              its Ceph peers (memory quo_pod_network_ceph_cut_2026_10_27; beads
+              infra-mzaj, infra-5lii). Capture before it clears:
+                kubectl --context mdapi-prod-direct -n goldpinger get pods -o wide
+                kubectl --context mdapi-prod-direct -n goldpinger logs ds/goldpinger-pod --tail=50
+              Per pair, both paths, both shapes:
+                {__name__=~"goldpinger:peer_.*", goldpinger_instance="{{ $labels.goldpinger_instance }}"}
+
+        - alert: GoldpingerDaemonSetUnavailable
+          expr: |
+            kube_daemonset_status_number_unavailable{namespace="goldpinger", daemonset=~".+"} > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.daemonset "goldpinger" }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            ## internal network probe; nothing a visitor can observe
+            statuspage: exclude
+          annotations:
+            summary: "goldpinger/{{ $labels.daemonset }}: {{ $value }} node(s) without a ready probe"
+            description: |
+              A goldpinger arm is missing on at least one node, so the pair alerts
+              above are blind for that node. A missing host arm also silences every
+              pair through that node, because those alerts require a clean host path.
+                kubectl --context mdapi-prod-direct -n goldpinger get pods -o wide
+                kubectl --context mdapi-prod-direct -n goldpinger describe ds/{{ $labels.daemonset }}
+
+        ## ⚠️ Keep these two arms even though they match nothing today: the coverage
+        ## probe treats a namespace-only selector as covering every kind.
+        - alert: GoldpingerWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="goldpinger", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="goldpinger", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "goldpinger" }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "goldpinger/{{ $labels.deployment }} unavailable"
+            description: |
+              A Deployment in ns goldpinger has fewer available replicas than desired.
+
+        - alert: GoldpingerStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="goldpinger", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="goldpinger", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "goldpinger" }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "goldpinger/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in ns goldpinger has fewer available replicas than desired.

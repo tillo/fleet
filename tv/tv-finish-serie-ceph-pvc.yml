@@ -1,0 +1,20 @@
+## tv-finish-serie-ceph — CephFS RWX target migrating the series download/library volume
+## off fio/Longhorn to the Ceph bulk tier. Consumers: radarr/sonarr/transmission-pia
+## (no Plex). Online pre-synced from tv-finish-serie-v2, then repoint at cutover.
+##
+## Size is a CephFS subvolume quota (bytes_quota), not a device: raising it is a
+## metadata write applied online, and it consumes no pool space until written.
+## Keep the SUM of ceph-filesystem quotas below what the pool can actually back —
+## a quota stopping one writer is recoverable, a full pool blocks writes clusterwide.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tv-finish-serie-ceph
+  namespace: tv
+spec:
+  storageClassName: ceph-filesystem
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1400Gi

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-notify-push
+  namespace: envuassu
+spec:
+  # See sibling -apache patch for rationale (Recreate avoids cross-node RWX
+  # window during rollouts; podAffinity below only enforces at schedule time).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: nextcloud-aio-notify-push
+          # A2 (infra-ka2): explicit request floors sized from the VPA
+          # recommender's targets — VPA Auto does NOT mutate envuassu pods
+          # (works in other namespaces; tracked separately). No limits.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 128Mi
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_PASSWORD
+              $patch: delete
+            - name: REDIS_HOST_PASSWORD
+              $patch: delete
+          envFrom:
+            - secretRef:
+                name: nextcloud-aio-env-secret
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: io.kompose.service
+                operator: In
+                values:
+                - nextcloud-aio-nextcloud
+            topologyKey: "kubernetes.io/hostname"

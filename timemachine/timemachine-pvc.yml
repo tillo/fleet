@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: timemachine-data
+  namespace: timemachine
+  ## Backup class `none`, declared at definition time: this volume IS a backup
+  ## (mbp-mda's Time Machine history), and its second copy is the Mac's local
+  ## SanDisk. A Longhorn backup would put 1+ TiB into the RGW `longhorn-backup`
+  ## bucket, which the nightly off-site sync then pushes to B2 and o2switch.
+  ## `none` is MEMBERSHIP of the `nobackup` group (filesystem-trim only, no
+  ## snapshots), the same set f/heal/backup_label_enforcer derives, so it patches
+  ## nothing. The daily trim is what hands pruned bands back to the thin volume.
+  labels:
+    mdapi.ch/backup-class: none
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/nobackup: enabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-iomemory-large
+  resources:
+    requests:
+      ## 1.5 TiB. Time Machine is capped below this (VOLUME_SIZE_LIMIT in the
+      ## Deployment) so it prunes old backups instead of filling ext4.
+      ## mbp-mda's santillo bundle was 685 GiB on 2026-10-28.
+      storage: 1536Gi

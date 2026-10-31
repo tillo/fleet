@@ -1,0 +1,37 @@
+# Node OS configuration as Harvester CloudInit CRs (node.harvesterhci.io/v1beta1).
+#
+# Each CR makes harvester-node-manager write /oem/<filename>.yaml on every node its
+# matchSelector matches, and put the file back immediately if someone edits it on the node.
+# Elemental applies /oem at BOOT, so a change here takes effect at each node's next reboot,
+# never live.
+#
+# Why a bundle: until 2026-10-27 every node setting was a hand-placed /oem or
+# /etc/rancher/rke2/config.yaml.d file, copied node by node. A node added later (quarto)
+# silently missed some of them, and nothing showed what a node was supposed to carry.
+# The per-file classification (ported / hardware-specific / Harvester-owned / obsolete) is in
+# README.md next to this file.
+#
+# node-manager v1.8.2 semantics, read from its source (pkg/controller/cloudinit) — they decide
+# how a CR here may be written:
+#   - A node the selector does NOT match gets /oem/<filename> DELETED. So a CR that adopts an
+#     existing hand-placed filename must match every node that carries that file today, and a
+#     per-hardware variant needs a filename of its own.
+#   - Identical bytes on disk are left alone; anything else is replaced (mode 0600).
+#   - Deleting a CR removes the file on only some nodes: one finalizer is shared by every
+#     node's controller, and the first to finish drops it for all. To retire a CR: first point
+#     its matchSelector at a label no node carries, wait until every status.rollouts entry
+#     shows the file absent, then delete it.
+#   - Only the /oem file is managed. Whatever that file writes at boot (the 99-zz-mdapi-*
+#     rke2 drop-ins) stays on persistent /etc/rancher after the CR is gone; retiring one of
+#     those means removing its drop-in on each node too.
+#   - A Node LABEL change is not watched. After labelling (or unlabelling) a node, its rollout
+#     stays Applicable=False ("MatchSelector does not match Node labels") until node-manager
+#     resyncs. To apply it now, delete that node's harvester-node-manager pod: Present followed
+#     within ~10 s (seen 2026-10-27 on quarto, infra-y6ac). A change to the CR itself is picked up
+#     on its own. Either way, check status.rollouts before relying on it.
+#   - Never write `paused: false`. The API drops a false bool (omitempty), so the live object
+#     never carries it and Fleet keeps the bundle Modified forever (seen 2026-10-27 on
+#     mdapi-kubelet-memory-reserve). Leave the field out; write `paused: true` only to pause.
+#
+# CloudInit is cluster-scoped; defaultNamespace only satisfies Fleet.
+defaultNamespace: harvester-system

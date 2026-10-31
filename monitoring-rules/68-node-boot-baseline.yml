@@ -1,0 +1,108 @@
+## Node boot-baseline drift (added 2026-10-26, bead infra-q6or).
+##
+## Every node boots with the estate baseline in /oem/grubenv `third_party_kernel_args`:
+##   multipath=off ifname=<each eno*>:<permanent MAC> psi=1 hpwdt.pretimeout=0 systemd.debug_shell=ttyS1
+## Harvester's upgrade_node.sh only ever APPENDS to that value (ifname pins, multipath=off);
+## nothing re-asserts the rest. During the 2026-10-24/25 1.8.2 hop the value was REPLACED by a
+## bare `console=ttyS1,115200n8` on qui, quo and quarto and never restored. All three tokens below
+## silently vanished at the next boot, with nothing firing:
+##   - multipath=off       — without it the initramfs multipathd wraps every SmartArray LD (the
+##                            boot LD too) and the leftover maps hold the Ceph OSD disks: OSD EBUSY
+##                            crashloop after every reboot.
+##   - psi=1               — the kernel ships CONFIG_PSI_DEFAULT_DISABLED=y; without it
+##                            /proc/pressure is absent and NodeMemoryStallPSI (33-) is blind.
+##   - hpwdt.pretimeout=0  — with the 9 s default the iLO watchdog raises an NMI panic that cannot
+##                            complete on a wedged node, instead of resetting it (25c-, 2026-09-04).
+## The ifname pins and systemd.debug_shell are not visible to node-exporter; check them by hand:
+##   ssh rancher@<node> 'cat /proc/cmdline; sudo grub2-editenv /oem/grubenv list'
+##
+## systemd.debug_shell=ttyS1 is KEPT on purpose (decided 2026-10-28, bead infra-9x4e). It is a root
+## shell with no login on the iLO virtual serial port (COM2), and the only shell when a boot lands
+## in emergency mode (root is locked, so sulogin refuses). It grants nothing new: GRUB has no
+## password and every iLO account holds Remote Console + Virtual Media + Power, so VSP access is
+## already root. Its security rests on iLO credentials and iLO reachability; revisit it if a
+## non-admin iLO account with Remote Console is ever created, or if GRUB gets a password.
+##
+## A drift is a boot-time setting, so the fix is two steps: restore /oem/grubenv (back it up first;
+## /oem/grubenv.bak-* hold earlier values), then the next reboot activates it. Until that reboot the
+## alert keeps firing even though the grubenv is already correct, which is deliberate: the node is
+## still running without the protection.
+##
+## Kubelet memory reservation (added 2026-10-27). /etc/rancher/rke2/config.yaml.d/99-kubelet-reserve.yaml
+## (2026-07-28: system-reserved + kube-reserved memory, eviction-hard/soft memory.available) never
+## took effect on any node: rke2 merges the drop-ins in lexical order and a plain `kubelet-arg:`
+## REPLACES the list, so Harvester's own 99-max-pods.yaml (rewritten by every upgrade) wiped it;
+## only the `kubelet-arg+:` files after it (99-z00 cpu reservations, 99-z01 cpu manager) survived.
+## capacity == allocatable memory on every node since July, and the explicit rke2 default
+## eviction-hard (nodefs/imagefs only) also drops the kubelet's memory.available threshold, so the
+## kubelet never reports MemoryPressure: only the kernel reclaims (the 2026-10-26 qua stall).
+## The rule reads what the kubelet RUNS (allocatable), never the files. Same two-step fix shape:
+## a drop-in that sorts last and appends (`kubelet-arg+:`), then the next rke2 restart or reboot.
+##
+## statuspage: exclude — an internal resilience posture; a missing boot arg has no
+## visitor-observable effect until the failure it guards against happens.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-boot-baseline
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: node-boot-baseline
+    rules:
+    - alert: NodeBootBaselineDrift
+      expr: |
+        (
+          label_replace(count by (instance) (node_disk_device_mapper_info{uuid=~"mpath-.*"}) > 0,
+                        "arg", "multipath=off", "", "")
+          or
+          label_replace(count by (instance) (node_uname_info)
+                          unless on(instance) count by (instance) (node_pressure_cpu_waiting_seconds_total),
+                        "arg", "psi=1", "", "")
+          or
+          label_replace(max by (instance) (node_watchdog_pretimeout_seconds) > 0,
+                        "arg", "hpwdt.pretimeout=0", "", "")
+        )
+        * on(instance) group_left(nodename) (max by (instance, nodename) (node_uname_info) * 0 + 1)
+      for: 30m
+      labels:
+        service: '{{ or $labels.node $labels.nodename $labels.instance "cluster-nodes" }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Node {{ $labels.nodename }} booted without {{ $labels.arg }}"
+        description: |
+          {{ $labels.nodename }} ({{ $labels.instance }}) is running without the `{{ $labels.arg }}`
+          kernel argument of the estate boot baseline (see the header of 68-node-boot-baseline.yml
+          for what each argument protects). Check /proc/cmdline and
+          `sudo grub2-editenv /oem/grubenv list`. If the grubenv lost the token, back it up and set
+          `third_party_kernel_args` back to the full baseline (APPEND, never replace the value).
+          The alert clears at the next reboot after the grubenv is restored.
+    - alert: NodeKubeletMemoryReservationMissing
+      expr: |
+        (
+          max by (node) (kube_node_status_capacity{resource="memory"})
+          - max by (node) (kube_node_status_allocatable{resource="memory"})
+        ) < 2^30
+      for: 30m
+      labels:
+        service: '{{ $labels.node }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "Node {{ $labels.node }} kubelet reserves no memory for the system"
+        description: |
+          {{ $labels.node }} has allocatable memory equal to capacity: the kubelet runs without
+          system-reserved/kube-reserved memory and without a memory.available eviction threshold,
+          so pods can take the memory rke2, containerd and journald need, and the node never
+          reports MemoryPressure before the kernel starts reclaiming. Check the effective config,
+          not the files: `kubectl get --raw /api/v1/nodes/{{ $labels.node }}/proxy/configz`. A
+          later drop-in with a plain `kubelet-arg:` replaces earlier lists (header of
+          68-node-boot-baseline.yml); the fix is a last-sorting `kubelet-arg+:` drop-in, active
+          after the next rke2 restart or reboot.
