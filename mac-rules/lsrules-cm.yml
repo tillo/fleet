@@ -1,0 +1,85 @@
+# Little Snitch rule-group subscriptions, served as a plain static file.
+#
+# WHY THIS EXISTS: mbp-mda's inbound gate is per-binary and cannot be managed
+# from the command line — the LS CLI has no add-rule command, and `export-model`
+# /`restore-model` (the only write paths) require root, which this seat does not
+# have. A REMOTE rule group is the one supported way to manage rules from
+# outside the Mac: subscribe once in the GUI, then every edit here reaches the
+# Mac on Little Snitch's own update interval, no click required.
+#
+# ⛔ Little Snitch only accepts https with a PUBLICLY-trusted certificate —
+# self-signed and private-CA certs are refused (letsencrypt-prod satisfies it).
+#
+# ⛔ Nothing secret belongs in this ConfigMap: it is git, and the decoded JSON
+# is what every subscriber sees. The subscription PATH is a credential and lives
+# in Akeyless (/mdapi/mac-rules/lsrules-path/token) — never here, and never in
+# the JSON's own `description`, which is served too.
+# Rules are policy, not credentials — do not add hostnames of customer systems.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lsrules
+  namespace: mac-rules
+data:
+  household.lsrules: |
+    {
+      "name": "mdapi household (mbp-mda)",
+      "description": "Managed from git: fleet/mac-rules. Edit the ConfigMap, merge, and Little Snitch picks it up on its update interval.",
+      "rules": [
+        {
+          "action": "allow",
+          "direction": "incoming",
+          "process": "any",
+          "protocol": "tcp",
+          "ports": "1240",
+          "remote": "local-net",
+          "priority": "high",
+          "notes": "mflux image shim (litellm model image-household). Port-keyed rather than path-keyed on purpose: the interpreter path changes on every Homebrew patch bump."
+        },
+        {
+          "action": "allow",
+          "direction": "incoming",
+          "process": "any",
+          "protocol": "tcp",
+          "ports": "1251",
+          "remote": "local-net",
+          "priority": "high",
+          "notes": "Probe port. Kept so the per-binary gate can be re-tested from the pod (`python3 -m http.server 1251`) without editing this file. Learned 2026-10-22: Homebrew python is gated inbound while /usr/bin/python3 answers."
+        }
+      ]
+    }
+  default.conf.template: |
+    server {
+      listen 8080;
+      server_name _;
+      root /etc/lsrules;
+      autoindex off;
+      server_tokens off;
+      access_log off;
+
+      location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+      }
+
+      # The ONLY rule-file URL. Little Snitch cannot authenticate the fetch, so
+      # the path IS the credential: 64 hex chars rendered from the lsrules-path
+      # Secret by the image's envsubst entrypoint (NGINX_ENVSUBST_FILTER limits
+      # substitution to that one variable). Rotating the token means re-adding
+      # the subscription in the GUI.
+      location = /s/${LS_TOKEN}/household.lsrules {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        add_header Referrer-Policy "no-referrer" always;
+        try_files /household.lsrules =404;
+      }
+
+      # Everything else is a plain 404 — including the old public path, so a
+      # scanner or a search engine learns nothing about what used to be here.
+      location / {
+        return 404;
+      }
+    }
+

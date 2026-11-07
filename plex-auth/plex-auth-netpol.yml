@@ -1,0 +1,70 @@
+## The bridge holds the Plex OWNER token, so it gets both directions fenced.
+##
+## In: the ingress controller (public traffic), the door's pods in dellambrogio
+## (server-side /token and JWKS calls) and the node network (kubelet probes).
+## Out: DNS, and HTTPS to the PUBLIC internet only (plex.tv, app.plex.tv) with every
+## private range carved out -- a compromised bridge can reach no cluster pod, no
+## Service and no LAN host. Same shape as tenant-1/netpol.yml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: plex-oidc-bridge-ingress
+  namespace: plex-auth
+spec:
+  podSelector:
+    matchLabels:
+      app: plex-oidc-bridge
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dellambrogio
+          podSelector:
+            matchLabels:
+              app: dellambrogio
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+## ⛔ DNS must be selector-based: pods reach CoreDNS by POD IP, never by the service
+## VIP, so an ipBlock on the VIP silently resolves nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: plex-oidc-bridge-egress
+  namespace: plex-auth
+spec:
+  podSelector:
+    matchLabels:
+      app: plex-oidc-bridge
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - { protocol: TCP, port: 443 }

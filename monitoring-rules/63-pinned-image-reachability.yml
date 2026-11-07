@@ -1,0 +1,98 @@
+## Pinned-image reachability — a digest pin that the registry no longer serves.
+##
+## WHY THIS EXISTS (ledger ext:zot-digest-pin-dead-upstream, approved 2026-10-18).
+## Docker Hub rebuilt `library/python:3.12-alpine` and `:3-alpine` on 2026-10-04 and
+## REMOVED the superseded manifest lists. Every fleet manifest that pinned those
+## digests was still syntactically valid, the TAGS still resolved, and the lint
+## that wrote the pins had nothing left to check — so nothing noticed. Three
+## workloads sat dead for four days, visible only as a cluster-wide Pending
+## COUNT (tv/plex-webhook-receiver, joplin/postgres-events-cleanup,
+## openbao/openbao-mirror). The pods crashlooped with MANIFEST_UNKNOWN on every
+## node that did not already hold the layers.
+##
+## Published daily (06:53 UTC) by f/probe/pinned_image_reachability, which walks
+## every digest-pinned image in the LIVE workload specs (Deployments,
+## StatefulSets, DaemonSets, CronJobs, Jobs, bare Pods) and HEADs the manifest by
+## digest at its registry, using the cluster's own pull credentials.
+##
+## ⚠️ severity: info, deliberately. A dead pin is a LATENT risk while the cached
+## layers survive — the workload is running right now. It becomes an outage only
+## on the next reschedule onto a node without those layers, and THAT is already
+## paged by ImagePullFailureNoReadyReplicas in 38-container-create-wedge.yml.
+## This rule is the early, upstream signal: the exact ref to re-pin, a day after
+## an upstream rotation instead of four days after it bites.
+##
+## statuspage: exclude — an internal supply-chain condition; no visitor-observable
+## effect while the layers are cached.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-pinned-image-reachability
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-batch-jobs.pinned-image-reachability
+    rules:
+    - alert: PinnedImageDigestDead
+      ## One series per dead ref, labelled with its host and the live workloads
+      ## running it, so the alert names exactly what to re-pin.
+      expr: pinned_image_dead_total{job="pinned_image_reachability"} > 0
+      ## The probe re-measures daily; the series persists in Pushgateway between
+      ## runs, so this only rides out one blip in the push itself.
+      for: 1h
+      labels:
+        service: 'registry'
+        namespace: 'monitoring'
+        severity: info
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "{{ $value }} digest-pinned image(s) no longer exist at their registry"
+        description: |
+          A live workload runs an image pinned by `@sha256:` that the registry
+          no longer serves. The tag may still resolve — Docker Hub rebuilt
+          library/python on 2026-10-04 and deleted the superseded manifests
+          while `:3.12-alpine` kept answering — so a tag probe calls this healthy.
+
+          The workload keeps running only because some node still has the layers.
+          The next reschedule onto a node without them is an immediate
+          ErrImagePull/MANIFEST_UNKNOWN crashloop.
+
+          The per-ref series `pinned_image_dead{ref,host,workload}` names the
+          exact references. To confirm and fix:
+            # the digest the tag currently resolves to:
+            curl -sI -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              https://registry-1.docker.io/v2/library/<repo>/manifests/<tag>
+            # then re-pin that digest in the fleet manifest
+          Prefer the estate's dependency-proxy path
+          (gitlab.mdapi.ch:443/mdapi/dependency_proxy/containers/<image>) for
+          library/** images, which is what every other postgres/python consumer
+          here uses. This is a RESTORATION, not a fix — the same trap returns on
+          the next upstream rotation, which is what this alert exists to surface.
+
+    - alert: PinnedImageProbeStale
+      ## Pushgateway keeps a dead pusher's last sample forever, and "last run
+      ## found 0 dead pins" reads identically to "last run was a month ago".
+      ## 26h = one missed daily run plus slack.
+      expr: (time() - pinned_image_reachability_last_run_timestamp_seconds) > 26 * 3600
+      for: 1h
+      labels:
+        service: 'registry'
+        namespace: 'monitoring'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "pinned_image_reachability has not run in over 26h — its silence means nothing"
+        description: |
+          The digest-pin probe has not pushed a result for more than a day, so
+          every value it owns is frozen at its last sample. An all-clear from a
+          dead probe is not an all-clear.
+
+          Check the Windmill schedule f/probe/pinned_image_reachability and the
+          last run's job log.

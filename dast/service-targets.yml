@@ -1,0 +1,24 @@
+# Opt-in list for the ACTIVE in-cluster scan (service-cronjob.yml, infra-7rog.31.5).
+# ⛔ Starts EMPTY on purpose: ZAP's full scan sends attack payloads and POSTs, so a
+# target is something its owner agreed to have attacked (e.g. a form that sends mail
+# or writes rows gets real traffic). Nothing is scanned until a line is added here.
+#
+# One target per line:  <name> <base-url> [<openapi-url>]
+#   name       short id, becomes the DefectDojo test title (`zap-full <name>`)
+#   base-url   the Service, NEVER the ingress: http://<svc>.<ns>.svc.cluster.local:<port>
+#              (behind the WAF on purpose - an in-cluster CRS block raises
+#              ModSecBlockLikelyFalsePositive and a flood of those OOM-killed O2)
+#   openapi    optional: an OpenAPI URL -> zap-api-scan.py instead of zap-full-scan.py
+#
+# ENROLLING an app = THREE edits in one MR: the line here, an egress rule for that
+# Service in netpol.yml (service-dast-egress, rule 2 is the template), and an ingress
+# allowance in the target namespace if it is default-deny. ⛔ This repo is public:
+# a hosted tenant's Service never goes in here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dast-service-targets
+  namespace: dast
+data:
+  targets: |
+    # (no app enrolled yet)

@@ -1,0 +1,238 @@
+## DefectDojo — findings store and risk-acceptance record (ns `defectdojo`,
+## epic infra-7rog.4).
+##
+## Internal tooling: warning tier, INTERNAL component `Security` (never
+## mapped to mdapi.statuspage.io). An outage here delays an import or a
+## risk-acceptance review; it never exposes anything.
+##
+## What covers what:
+##   * workload arms — django (uwsgi+nginx), celery beat/worker, valkey and
+##     the CNPG defectdojo-pg instances (Pods of a CNPG Cluster are neither a
+##     Deployment nor a StatefulSet: DefectDojoDatabaseUnready covers them);
+##   * DefectDojoUnreachable — the in-cluster django Service, the path the
+##     Windmill importers use;
+##   * DefectDojoTlsExpiring — defectdojo.mdapi.ch's certificate (the oauth2
+##     gate answers 302; TLS is still measured).
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-defectdojo
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-defectdojo.rules
+      rules:
+        - alert: DefectDojoWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="defectdojo", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="defectdojo", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "defectdojo" }}'
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "defectdojo/{{ $labels.deployment }} unavailable"
+            description: |
+              A DefectDojo Deployment (django, celery beat or worker) is short of
+              replicas. Imports from Windmill fail or queue until it is back. Check:
+                kubectl --context mdapi-prod-direct -n defectdojo get pod,job
+                kubectl --context mdapi-prod-direct -n defectdojo logs deploy/defectdojo-django -c uwsgi --tail=50
+
+        - alert: DefectDojoStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="defectdojo", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="defectdojo", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "defectdojo" }}'
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "defectdojo/{{ $labels.statefulset }} unavailable"
+            description: |
+              The Celery broker (valkey) is down: DefectDojo accepts imports but
+              deduplication and every async task stall.
+                kubectl --context mdapi-prod-direct -n defectdojo get pod -l app.kubernetes.io/name=valkey
+
+        - alert: DefectDojoDatabaseUnready
+          expr: |
+            count by (namespace) (kube_pod_status_ready{namespace="defectdojo", condition="true", pod=~"defectdojo-pg-[0-9]+"} == 1) < 2
+          for: 30m
+          labels:
+            service: defectdojo-pg
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "defectdojo-pg has fewer than 2 ready instances"
+            description: |
+              The CNPG cluster holding every risk acceptance runs degraded. Check:
+                kubectl --context mdapi-prod-direct -n defectdojo get cluster.postgresql.cnpg.io,pod -l cnpg.io/cluster=defectdojo-pg
+
+        - alert: DefectDojoUnreachable
+          expr: avg_over_time(probe_success{probe="defectdojo-django"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: defectdojo
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "DefectDojo does not answer in-cluster"
+            description: |
+              The probe of http://defectdojo-django.defectdojo.svc.cluster.local/login failed
+              for >15m: the django pod, its Service, DD_ALLOWED_HOSTS (a 400) or
+              defectdojo-mdapi/defectdojo-netpol.yml.
+                kubectl --context mdapi-prod-direct -n defectdojo get pod,svc,networkpolicy
+
+        - alert: DefectDojoTlsExpiring
+          ## Re-provided because the target carries no `component` (see Probe below),
+          ## so SyntheticProbeTLSExpiringSoon does not cover it.
+          expr: (probe_ssl_earliest_cert_expiry{probe="defectdojo-tls"} - time()) < 14 * 86400
+          for: 1h
+          labels:
+            service: defectdojo
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "defectdojo.mdapi.ch certificate expires in {{ $value | humanizeDuration }}"
+            description: |
+              cert-manager should have renewed at 30 days. Check:
+                kubectl --context mdapi-prod-direct -n defectdojo describe certificate defectdojo-tls
+
+    ## The RECORD's integrity, from f/security/defectdojo_metrics (hourly, epic
+    ## infra-7rog.30). These say "the record stopped being true", never "a CVE
+    ## exists": CVE news stays with the grype curator's Pushover digest
+    ## (user decision 2026-07-10). The exporter's own staleness is the generic
+    ## BatchJobStale (12-batch-jobs.yml).
+    - name: app-defectdojo.record
+      rules:
+        - alert: DefectDojoMetricsUnreadable
+          expr: defectdojo_metrics_probe_success == 0
+          for: 2h
+          labels:
+            service: defectdojo
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "DefectDojo's findings record could not be read for 2 h"
+            description: |
+              f/security/defectdojo_metrics failed twice in a row: the DefectDojo
+              numbers on Grafana Security/supply-chain are gone, not stale. Its job
+              log names the failing GET. Check:
+                kubectl --context mdapi-prod-direct -n defectdojo get pod
+              and the Windmill run of f/security/defectdojo_metrics.
+
+        - alert: DefectDojoFeedStale
+          ## Every feed is reimported daily by f/security/defectdojo_grype_sync
+          ## (07:30), which bumps each test's `updated` even for an unchanged
+          ## report — kube-bench too, though its CronJob is weekly. 50 h = one
+          ## missed run plus slack. The sync pushes no metrics of its own: this
+          ## is the only alert that notices it stopped.
+          expr: |
+            time() - max by (engagement) (defectdojo_engagement_last_import_timestamp_seconds) > 50 * 3600
+          for: 1h
+          labels:
+            service: defectdojo
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "DefectDojo feed {{ $labels.engagement }} last imported {{ $value | humanizeDuration }} ago"
+            description: |
+              No product's {{ $labels.engagement }} engagement got a new import in over
+              two days: DefectDojo is describing an estate that no longer exists.
+              Check the latest run of f/security/defectdojo_grype_sync (schedule
+              f/security/defectdojo_grype_sync_schedule) and, for ci-*, that the
+              mdapi/* `scan`/`secret-scan` CI jobs still publish their reports.
+
+        - alert: DefectDojoAutoRiskAcceptanceNotRenewed
+          ## grype_sync re-sets each auto acceptance's expiry to now+30 d on every
+          ## daily run. Under 25 d left = five runs without a renewal; at 0 the
+          ## won't-fix findings reopen as open work.
+          expr: |
+            defectdojo_risk_acceptance_expiry_timestamp_seconds{origin="auto"} - time() < 25 * 86400
+          for: 1h
+          labels:
+            service: defectdojo
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "Auto risk acceptance '{{ $labels.risk_acceptance }}' is no longer renewed ({{ $value | humanizeDuration }} left)"
+            description: |
+              f/security/defectdojo_grype_sync owns this acceptance and should push its
+              expiry to 30 days out every day. Either the sync is failing, or it no
+              longer produces this name (product {{ $labels.product }} renamed or gone).
+              At expiry its findings reactivate.
+
+        - alert: DefectDojoRiskAcceptanceDecisionDue
+          ## A HUMAN acceptance (made in the DefectDojo UI) is a decision with an
+          ## owner and an end date: a week before the end, someone renews it with
+          ## a reason or lets the findings come back as work.
+          expr: |
+            defectdojo_risk_acceptance_expiry_timestamp_seconds{origin="human"} - time() < 7 * 86400
+          for: 1h
+          labels:
+            service: defectdojo
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "Risk acceptance '{{ $labels.risk_acceptance }}' ({{ $labels.product }}) expires in {{ $value | humanizeDuration }}"
+            description: |
+              Decide before it expires: renew it in DefectDojo with the reason it still
+              holds, or let its findings reopen and fix them. The product's accepted
+              findings, each linking its acceptance:
+                https://defectdojo.mdapi.ch/product/{{ $labels.product_id }}/finding/accepted
+---
+## No `component`/`team` on the targets, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: defectdojo-django
+  namespace: monitoring
+spec:
+  jobName: defectdojo-django
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - http://defectdojo-django.defectdojo.svc.cluster.local/login
+      labels:
+        probe: defectdojo-django
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: defectdojo-tls
+  namespace: monitoring
+spec:
+  jobName: defectdojo-tls
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://defectdojo.mdapi.ch/
+      labels:
+        probe: defectdojo-tls

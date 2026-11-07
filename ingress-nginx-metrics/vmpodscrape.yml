@@ -1,0 +1,50 @@
+# Scrape the rke2-ingress-nginx controller metrics (:10254, port "metrics") into
+# VictoriaMetrics. Metrics were enabled 2026-07-28 via the HelmChartConfig manifest on
+# the server nodes (controller.metrics.enabled) as part of the storage-stall T2 work:
+# the reload timestamps + worker-process RSS are the observables for the
+# "ModSec reload allocation burst -> reclaim stall -> D-state avalanche" hypothesis
+# (see ~/storage-stall-isolation-design.md v2 and memory
+# quo_iscsi_kernel_deadlock_umount_dead_lun_2026_07_18).
+#
+# keep-list only: the per-request HISTOGRAMS (path/host labels) are cardinality bombs
+# and are deliberately dropped. Kept: config_* (reload timestamps/hash), success
+# (reload counter), nginx_process_* (worker count + RSS = the burst observable),
+# build_info, and since 2026-09-22 the plain `requests` COUNTER.
+#
+# ⭐ WHY `requests` WAS ADDED, and why it does not violate the rule above. Two
+# separate issues were blocked on it and neither could tell it was the same cause:
+#   * beads infra-go9h (measure Bussola release downtime) — its stated method is
+#     "5xx on the ingress during the rollout window", impossible without this.
+#   * beads infra-cst7 (idp.mdapi.ch view-users 403 storm) — the obvious re-check
+#     is a 403 count for that host. Querying it returned EMPTY, which reads exactly
+#     like "the storm stopped". It was not evidence of anything: the series simply
+#     was not collected.
+# An absent metric does not fail loudly; it fails as a reassuring zero.
+#
+# ⛔ The histograms stay dropped, and the numbers say why. Measured on one live
+# controller pod, 2026-09-22:
+#     nginx_ingress_controller_requests                      95 series
+#     nginx_ingress_controller_request_duration_seconds_*   1140
+#     nginx_ingress_controller_response_size_*              1045
+#     nginx_ingress_controller_bytes_sent_*                  760
+# So the counter is ~1/12th of one histogram — roughly 285 series across the three
+# controllers, against ~8,800 if the buckets came with it. The counter carries the
+# labels that answer both questions above (host, status, method, ingress, service,
+# namespace, path) and none of the bucket explosion. If per-path latency is ever
+# wanted, add it deliberately and re-measure; do not widen this regex to `.*`.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: ingress-nginx-controller
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rke2-ingress-nginx
+      app.kubernetes.io/component: controller
+  podMetricsEndpoints:
+    - port: metrics
+      metricRelabelConfigs:
+        - action: keep
+          sourceLabels: [__name__]
+          regex: "nginx_ingress_controller_(config_.*|success|nginx_process_.*|build_info|requests)"

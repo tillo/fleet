@@ -1,0 +1,72 @@
+# Dolt SQL server — canonical store for the beads (bd) issue tracker.
+# Deployed 2026-08-13 (beads trial, kata successor candidate): bd on mbptillo
+# and the in-pod bd serve/bdui all connect here in --server mode; the DB is
+# the single source of truth (the JSONL in ~/backlog is an export, not sync).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dolt
+  namespace: backlog
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  serviceName: dolt
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dolt
+  template:
+    metadata:
+      labels:
+        app: dolt
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: dolt
+        # Pinned by digest; Renovate keeps it current (tag 2.5.0 on 2026-10-17).
+        image: dolthub/dolt-sql-server@sha256:46a89ff378ceaf81df78ff2025a4262f4c6f572973024eb3624ddf2e1dbe9159
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DOLT_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: backlog-dolt
+              key: DOLT_ROOT_PASSWORD
+        # Root must be reachable from beyond the pod (beads-app pod, mbptillo
+        # via the LAN LB). Access control = password + LAN-only exposure.
+        - name: DOLT_ROOT_HOST
+          value: "%"
+        ports:
+        - { name: mysql, containerPort: 3306 }
+        readinessProbe:
+          tcpSocket: { port: 3306 }
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          tcpSocket: { port: 3306 }
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+        volumeMounts:
+        - { name: data, mountPath: /var/lib/dolt }
+        # cpu limit 1 -> 2 (2026-11-04, ContainerCpuThrottling on dolt, infra-c5hwd):
+        # dolt averages ~0.016 cores (p50) and 0.18 cores (5m max over 7d), yet ~5% of
+        # CFS periods were throttled (7d ratio 4.8%; cpu.stat 17652/360368). The
+        # throttled periods overshoot the 100 ms quota by only ~9.4 ms on average
+        # (throttled_usec / nr_throttled), i.e. short multi-thread bursts (GC,
+        # connection storms) on a 32-core node. A 200 ms quota absorbs them; the
+        # request (what placement reserves) is unchanged.
+        resources:
+          requests: { cpu: 100m, memory: 256Mi }
+          limits:   { cpu: "2",  memory: 1Gi }
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        recurring-job.longhorn.io/source: enabled
+        recurring-job-group.longhorn.io/default: enabled
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: harvester-longhorn-2replicas
+      resources: { requests: { storage: 5Gi } }

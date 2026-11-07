@@ -1,0 +1,80 @@
+## Who may reach the standalone agentgateway pod.
+##
+##  :4001  the Admin UI + /api — ingress-nginx ONLY. agentgateway does not
+##         authenticate the UI; oauth2-proxy at the Ingress does. Any other
+##         caller would be an unauthenticated config admin.
+##  :4000  the LLM listener — the jump seat only (evaluation copies of
+##         LiteLLM groups; widen per consumer).
+##  :8080  the MCP front door (mcp.mdapi.ch, Service `mcp`). The client API
+##         key is the real gate; this keeps every other namespace from trying.
+##  :15020 metrics (monitoring), :15021 readiness (kubelet, from the NODE IP).
+## :15000 (admin) binds loopback and needs no rule.
+## ⚠️ A wrongly-blocked caller sees a TCP timeout, nothing logs here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentgateway-known-callers
+  namespace: agentgateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agentgateway-standalone
+      app.kubernetes.io/instance: agentgateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 4001
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jump
+      ports:
+        - protocol: TCP
+          port: 4000
+    - from:
+        ## mcp.mdapi.ch
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        ## the jump seat (and the off-LAN seats' tunnels through it)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jump
+        ## kagent's agents (RemoteMCPServers)
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kagent
+        ## the blackbox Probe in monitoring-rules/76-agentgateway.yml
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 15020
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 15021

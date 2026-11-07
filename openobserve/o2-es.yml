@@ -1,0 +1,158 @@
+# OpenObserve admin credentials. Pushed to Akeyless before first deploy.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-admin
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-admin
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/o2/root-email }
+    secretKey: ZO_ROOT_USER_EMAIL
+  - remoteRef: { key: /mdapi/openobserve/o2/root-password }
+    secretKey: ZO_ROOT_USER_PASSWORD
+---
+# litellm virtual key for the OpenObserve AI assistant (o2-sre-agent), 2026-09-01.
+# Scoped at the litellm side (not a master key). The live list, read back from
+# litellm 2026-09-27, is the local-first gemma chains (local-tail-cn-pro-gemma-large
+# [-nothink] and -wg hops), cn-deepseek-pro / cn-deepseek-flash, us-claude-opus and
+# the local-closed-gemma-large chain, plus the pre-rename names of the same groups
+# (infra, infra-sre, local-wg, local-wg-sre, opus, ds-pro, ds-flash, local-only),
+# which litellm keeps as aliases for the transition.
+# WIDENED 2026-10-10: each gemma-large name above gained its tiel-large twin
+# (GET /key/list then reads 11 entries), because the local brain was promoted to
+# tiel-coder (!838); `models` REPLACES the array, so this was done additively and
+# the gemma-large names were KEPT — they now spell litellm aliases of the same
+# groups, so they grant nothing the tiel names do not.
+# NARROWED 2026-10-20: the pro-tail groups (local-tail-cn-pro-best[-nothink], their
+# -tiel-large spellings and infra-sre) were RETIRED in litellm-cm.yml. The scope now
+# carries local-tail-cn-flash-best-nothink, the auto router's three spellings, and the
+# cloud/local names the route can still reach. Read it back with GET /key/list.
+# NARROWED 2026-10-26 (6 entries): us-claude-opus and local-tail-cn-flash-best-nothink
+# removed — O2 is exempt from the Max subscription and from the claude-api-sonnet
+# tier, and both groups reach one of them. Neither was used (0 calls in 30 days).
+# Created via litellm /key/generate with alias "openobserve-ai".
+# ⛔ The key carries DB-side metadata that git cannot see (set 2026-10-27 via
+# /key/update, read back with GET /key/list?key_alias=openobserve-ai):
+#   metadata.logging = [{callback_name: otel, callback_type: success_and_failure,
+#                        callback_vars: {turn_off_message_logging: "true"}}]
+# It redacts THIS key's prompts and completions from the litellm spans; every
+# other key keeps content logging (litellm-cm.yml, option a). Why: litellm exports
+# each RCA call's full prompt into the `default` traces stream, and the agent's
+# GetLatestTraces tool reads that stream back, so every RCA re-read its earlier
+# transcripts. Measured 10-27: 1,588 MB of prompt content in 24 h (89% of all LLM
+# content bytes in O2), one GetLatestTraces(size 10) result of 6.27 MB, a 3.56 M
+# token request that failed 400. That ingest + search load is what OOMed
+# openobserve-0 at 14:10Z. A regenerated key MUST get this metadata again.
+# Consumed ONLY by the o2-sre-agent Deployment; the OpenObserve StatefulSet does
+# not get it (verified: O2_AI_ENABLED + O2_AGENT_URL alone are sufficient there).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-ai
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-ai
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/ai/litellm-key }
+    secretKey: O2_AI_API_KEY
+---
+# O2 credential for o2-sre-agent's autonomous RCA (MCP basic auth), 2026-10-31.
+# Replaces root (openobserve-admin) on that path; why and the measured OOM chain:
+# o2-sre-agent.yml, at O2_MCP_USERNAME. Service account o2-sre-rca@mdapi.ch, role
+# sre_rca (a copy of the system role o2-sre-readonly). The token is shown ONCE
+# at creation and has no GET: to rotate, run PUT /api/default/service_accounts/
+# o2-sre-rca@mdapi.ch?rotateToken=true and write the new token to Akeyless. ESO
+# refreshes within 5 min, then Reloader restarts the agent.
+# ⛔ Merge only AFTER the Akeyless items exist. Without them ESO cannot build the
+# Secret, the new pod sits in CreateContainerConfigError, and the old one keeps
+# serving, so the bundle parks on a stuck rollout (the 10-22 failure shape).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-sre-rca
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-sre-rca
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/o2-sre-rca/email }
+    secretKey: O2_MCP_USERNAME
+  - remoteRef: { key: /mdapi/openobserve/o2-sre-rca/token }
+    secretKey: O2_MCP_PASSWORD
+---
+# Credential the OTel Collector attaches on behalf of emitters that cannot carry
+# one themselves (ingress-nginx has no Authorization option at all).
+#
+# ⚠️ TWO SHAPES OF THE SAME CREDENTIAL, deliberately, because the two consumers
+# want different strings and neither will accept the other's:
+#
+#   /mdapi/openobserve/otel/ingest-header         "Authorization=Basic <b64>"
+#       -> OTEL_EXPORTER_OTLP_HEADERS, the OTel SDK env var (litellm). The SDK
+#          parses "key=value" pairs, so the header NAME is part of the value.
+#   /mdapi/openobserve/otel/ingest-authorization  "Basic <b64>"
+#       -> the collector's exporters.headers.Authorization, where the name is
+#          already the YAML key and only the VALUE belongs here.
+#
+# Both encode the SAME OpenObserve service account, otel-ingest@mdapi.ch (role
+# service_account) — NOT the root credential. Rotating the account means
+# rewriting both, and a mismatch fails CLOSED and silently: spans simply stop.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: otel-collector-auth
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: otel-collector-auth
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/otel/ingest-authorization }
+    secretKey: O2_OTLP_AUTHORIZATION
+---
+# RUM client token for OpenObserve's own web UI (ZO_RUM_ENABLED), 2026-09-23.
+# Minted with GET /api/default/rumtoken — a dedicated write-only ingest
+# credential, NOT the root passcode and NOT the org passcode.
+#
+# ⛔ This token is PUBLIC the moment RUM is enabled: logs.mdapi.ch/config answers
+# 200 without authentication and serves the whole rum block, client_token
+# included. That is inherent to RUM — a browser SDK cannot hold a secret. It
+# lives in Akeyless so the publicly-mirrored fleet repo does not carry it, and
+# the abuse bound is the rate limit in o2-rum-ing.yml, not the token's secrecy.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openobserve-rum
+  namespace: openobserve
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openobserve-rum
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/rum/client-token }
+    secretKey: ZO_RUM_CLIENT_TOKEN

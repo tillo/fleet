@@ -1,0 +1,43 @@
+## LoadBalancer for the split-horizon resolver. Holds the LAN DNS VIP
+## 192.168.1.1 via the dedicated single-address MetalLB pool in
+## metallb-pools/split-horizon.yml. LAN clients are handed this address
+## directly by DHCP; DMZ / ad-LAN clients reach it through the BPI-R4
+## dnsmasq forwarder.
+##
+## externalTrafficPolicy: Local (was Cluster until 2026-08-23) -- under Cluster
+## the MetalLB L2 announcer is INDEPENDENT of pod placement, so this VIP could be
+## announced from a node running no unbound pod at all. Powering that node off
+## blackholes LAN DNS until client ARP caches expire: that is the mechanism
+## behind the 2026-08-22 "Disney+ freezing" report, and it forced a manual
+## `node.kubernetes.io/exclude-from-external-load-balancers` label on every node
+## maintenance window (bouncing the speaker is NOT durable -- the restarted
+## speaker reclaims the VIP within ~30s).
+##
+## Local makes the announcement follow the READY endpoints, which is what we
+## actually want, and removes that manual step from every future window. It is
+## safe because unbound runs 3 replicas spread over at least two nodes, so a
+## candidate announcer always exists; keep it that way. Trade-off accepted: a
+## rollout can now move the VIP (brief ARP churn) instead of never moving it.
+## Bonus: Local preserves the real client IP, so query logs show actual clients
+## rather than the kube-proxy SNAT source.
+apiVersion: v1
+kind: Service
+metadata:
+  name: unbound
+  namespace: split-horizon
+spec:
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.1
+  externalTrafficPolicy: Local
+  selector:
+    app: unbound
+  ports:
+  - name: dns-udp
+    port: 53
+    targetPort: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    targetPort: 53
+    protocol: TCP

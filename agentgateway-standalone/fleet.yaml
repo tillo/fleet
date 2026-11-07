@@ -1,0 +1,133 @@
+# agentgateway STANDALONE in database mode — the editable instance behind the
+# Admin UI at https://agentgateway.mdapi.ch/ui/ (oauth2-proxy-admin in front).
+#
+# The MCP front door (mcp.mdapi.ch, bead infra-7rog.32) and an LLM-routing
+# evaluation. It replaced a controller-mode install (CRDs over xDS, read-only
+# UI). The ConfigMap below is a read-only BASELINE and everything made in
+# the UI / config API / agctl is an overlay row in Postgres (storage mode
+# `hybrid`), shared by every replica. The overlay only ADDS resources — a UI
+# write that collides with a name defined here is refused with 409.
+#
+# ⭐ The UI cannot create a top-level section, only fill one: that is why llm and
+# mcp are declared here, empty.
+# ⚠️ Credentials typed into the UI are stored in Postgres AS ENTERED. Prefer an
+# env reference (`$VAR`, LLM provider `params.apiKey` only) backed by a Secret
+# via extraEnv, so the value stays in Akeyless and the row holds a name.
+#
+# Ports: 4000 LLM proxy (jump only), 4001 the UI and its /api (only
+# ingress-nginx may reach it: agentgateway-standalone-wiring netpol), 8080 the
+# MCP listener, 15000 admin (loopback only), 15020 metrics, 15021 readiness.
+# Postgres, Ingress and NetworkPolicy live in the raw sibling bundle
+# agentgateway-standalone-wiring (a helm bundle never applies loose manifests).
+defaultNamespace: agentgateway
+dependsOn:
+  ## Creates the namespace and the CNPG cluster whose app Secret and CA the pod mounts.
+  - name: mdapi-prod-agentgateway-standalone-wiring
+helm:
+  maxHistory: 25
+  ## Fleet renders helm values as a Go template with `${ }` delimiters, so the
+  ## ${POSTGRES_PASSWORD} below (agentgateway's own env expansion) became a call
+  ## to an undefined function and the bundle failed to target. Nothing here
+  ## uses Fleet's templating.
+  disablePreProcess: true
+  releaseName: agentgateway
+  chart: oci://cr.agentgateway.dev/charts/agentgateway-standalone
+  version: v1.7.0
+  values:
+    fullnameOverride: agentgateway
+    mode: database
+    ## Two, as the MCP front door had: config is in Postgres, so replicas share it.
+    replicaCount: 2
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 1
+    database:
+      postgres:
+        ## ${POSTGRES_PASSWORD} is expanded by agentgateway at startup, never
+        ## rendered into the ConfigMap. CNPG passwords are alphanumeric, so the
+        ## URL needs no escaping. verify-full against the CNPG CA.
+        url: postgres://agentgateway:${POSTGRES_PASSWORD}@agentgateway-pg-rw.agentgateway.svc.cluster.local:5432/agentgateway?sslmode=verify-full&sslrootcert=/pg-ca/ca.crt
+    extraEnv:
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: agentgateway-pg-app
+            key: password
+      ## LLM provider keys, referenced in database rows as `$NAME`
+      ## (agentgateway-standalone-wiring/llm-keys-es.yml).
+      - name: ANTHROPIC_API_KEY
+        valueFrom:
+          secretKeyRef: {name: agentgateway-llm-keys, key: ANTHROPIC_API_KEY}
+      - name: DEEPSEEK_API_KEY
+        valueFrom:
+          secretKeyRef: {name: agentgateway-llm-keys, key: DEEPSEEK_API_KEY}
+      - name: LMSTUDIO_API_KEY
+        valueFrom:
+          secretKeyRef: {name: agentgateway-llm-keys, key: LMSTUDIO_API_KEY}
+    extraVolumes:
+      - name: pg-ca
+        secret:
+          secretName: agentgateway-pg-ca
+          items:
+            - key: ca.crt
+              path: ca.crt
+      ## Upstream MCP bearers as files, /mcp-upstream/<server>: the database
+      ## routes reference them as backendAuth.key.value.file (watched, so a
+      ## rotation reloads in place). Never a bearer in Postgres.
+      - name: mcp-upstream
+        projected:
+          sources:
+            - secret:
+                name: mcp-upstream-memsearch
+                items: [{key: token, path: memsearch}]
+            - secret:
+                name: mcp-upstream-kubernetes
+                items: [{key: token, path: kubernetes}]
+            - secret:
+                name: mcp-upstream-backstage
+                items: [{key: token, path: backstage}]
+    extraVolumeMounts:
+      - name: pg-ca
+        mountPath: /pg-ca
+        readOnly: true
+      - name: mcp-upstream
+        mountPath: /mcp-upstream
+        readOnly: true
+    gateway:
+      service:
+        type: ClusterIP
+      extraServices:
+        - name: ui
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 4001
+              targetPort: 4001
+    podSecurityContext:
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests:
+        cpu: 20m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+    config:
+      gateways:
+        default:
+          port: 4000
+        ## The UI moves here and stops answering on 4000.
+        ui:
+          port: 4001
+        ## The MCP front door, mcp.mdapi.ch (Service `mcp` in the wiring bundle).
+        ## Its routes (/memsearch/, /kubernetes/, /backstage/) are database rows.
+        mcp:
+          port: 8080
+      ui:
+        gateways: [ui]
+      llm:
+        providers: []
+        models: []
+        virtualModels: []
+      mcp:
+        targets: []

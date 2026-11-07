@@ -1,0 +1,249 @@
+## Bridge sidecar config — Google Nest WebRTC → local RTSP.
+##
+## Why this exists: go2rtc's nest: driver (1.9.10 / 1.9.14) generates an SDP
+## offer that Google's SDM service rejects with HTTP 500 for some Nest cam
+## generations (proven on balconycam, while garagecam works fine on the same
+## OAuth / project / refresh_token). HA works because it uses aiortc, which
+## produces a more standard offer. This bridge runs the same aiortc path
+## inside a sidecar and republishes the received media as RTSP via MediaMTX,
+## which Frigate's go2rtc then consumes via plain rtsp://127.0.0.1:8555/...
+##
+## When upstream go2rtc fixes the SDP for Nest cams, rollback is two changes:
+##   1. /config/config.yaml on the frigate PVC: re-enable the nest: line for
+##      balconycam and remove the rtsp:// line.
+##   2. frigate-deploy.yml: delete the mediamtx + nest-bridge-balconycam
+##      containers and the nest-bridge-scripts volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frigate-nest-bridge
+  namespace: frigate
+data:
+  bridge.py: |
+    #!/usr/bin/env python3
+    """Bridge Google Nest SDM WebRTC stream to local RTSP via aiortc + PyAV."""
+    import asyncio, json, os, sys, time, logging, signal
+    import urllib.request, urllib.parse, urllib.error
+
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc.contrib.media import MediaRecorder, MediaBlackhole
+
+    # Set to 1 to test pure WebRTC reception (no RTSP push). If the connection
+    # stays alive >2 min in this mode the issue is in MediaRecorder/PyAV's
+    # RTSP path; if it still dies fast, the WebRTC layer itself has a problem.
+    DIAG_BLACKHOLE = os.environ.get('DIAG_BLACKHOLE', '0') == '1'
+
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    log = logging.getLogger('nest-bridge')
+
+    CID = os.environ['NEST_CLIENT_ID']
+    CSEC = os.environ['NEST_CLIENT_SECRET']
+    RTOK = os.environ['NEST_REFRESH_TOKEN']
+    PROJ = os.environ['NEST_PROJECT_ID']
+    DEV = os.environ['NEST_DEVICE_ID']
+    RTSP_URL = os.environ.get('RTSP_OUT_URL', 'rtsp://127.0.0.1:8555/balconycam')
+
+    def get_access_token():
+        req = urllib.request.Request(
+            'https://www.googleapis.com/oauth2/v4/token',
+            data=urllib.parse.urlencode({
+                'client_id': CID, 'client_secret': CSEC,
+                'refresh_token': RTOK, 'grant_type': 'refresh_token',
+            }).encode(),
+            method='POST',
+        )
+        return json.loads(urllib.request.urlopen(req, timeout=10).read())['access_token']
+
+    def sdm_execute(atok, command, params):
+        url = f'https://smartdevicemanagement.googleapis.com/v1/enterprises/{PROJ}/devices/{DEV}:executeCommand'
+        body = json.dumps({'command': command, 'params': params}).encode()
+        req = urllib.request.Request(url, data=body, method='POST')
+        req.add_header('Authorization', f'Bearer {atok}')
+        req.add_header('Content-Type', 'application/json')
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=30).read())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"SDM {command} HTTP {e.code}: {e.read().decode()[:200]}")
+
+    async def run_session():
+        atok = get_access_token()
+        log.info(f'OAuth token OK, device={DEV[:20]}...')
+
+        # SDM mandates the offer contain audio,video,application m-lines in
+        # that order. With default (BALANCED) policy aiortc emits them in the
+        # order we add them, which SDM accepts. MAX_BUNDLE reorders and
+        # gets the offer rejected with HTTP 400 — keep BALANCED.
+        pc = RTCPeerConnection()
+        pc.addTransceiver('audio', direction='recvonly')
+        pc.addTransceiver('video', direction='recvonly')
+        pc.createDataChannel('data')
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+
+        # Sanitize the offer the same way Scrypted's google-device-access
+        # plugin does before posting to SDM (plugins/google-device-access/
+        # src/main.ts L172-174). Two SDM-specific quirks:
+        #   - SDM doesn't support trickle ICE; strip a=ice-options:trickle
+        #     so Google doesn't get confused expecting incremental candidates.
+        #   - aiortc can emit `a=sendrecv` on a transceiver we set to recvonly
+        #     in some negotiations. SDM mirrors whatever direction we send
+        #     back as `sendrecv` in the answer, which breaks the connection
+        #     ~20 s in. Force all directions to recvonly defensively.
+        offer_sdp = pc.localDescription.sdp
+        offer_sdp = offer_sdp.replace('a=ice-options:trickle\r\n', '')
+        offer_sdp = offer_sdp.replace('a=ice-options:trickle\n', '')
+        offer_sdp = offer_sdp.replace('a=sendrecv', 'a=recvonly')
+
+        log.info('GenerateWebRtcStream...')
+        resp = sdm_execute(atok,
+                           'sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream',
+                           {'offerSdp': offer_sdp})
+        results = resp.get('results', {})
+        answer_sdp = results.get('answerSdp')
+        media_id = results.get('mediaSessionId')
+        expires_at = results.get('expiresAt')
+        log.info(f'Stream OK media_id={media_id[:10]}... expires_at={expires_at}')
+
+        # Apply both Google SDM SDP workarounds that python-google-nest-sdm
+        # carries (PR allenporter/python-google-nest-sdm#1116, merged 2024-09).
+        # aiortc has the same strict SDP validator as chromium>=143 / firefox,
+        # so both fixes are required:
+        #
+        # (1) Direction mismatch — Google returns `a=sendrecv` for audio/video
+        #     even when the offer is `a=recvonly`. RFC 3264 requires the
+        #     answer direction to be the converse of the offer. Without fix,
+        #     aiortc completes ICE/DTLS but the peer drops ~20-25 s later
+        #     because no media flows in the bogus reverse direction.
+        # (2) Missing foundation in ICE candidates — Google writes
+        #     `a=candidate: 1 udp ...` (note the leading space) instead of
+        #     `a=candidate:<foundation> 1 udp ...`. aiortc's parser raises
+        #     `ValueError: invalid literal for int(): 'udp'` on these.
+
+        # (1) Direction fix
+        def _direction_fix(sdp: str, kind: str) -> str:
+            in_section = False
+            out = []
+            for line in sdp.split('\r\n'):
+                if line.startswith('m='):
+                    in_section = line.startswith(f'm={kind}')
+                if in_section and line == 'a=sendrecv':
+                    out.append('a=sendonly')
+                    continue
+                out.append(line)
+            return '\r\n'.join(out)
+
+        # Our offer is recvonly for both audio + video. Always apply the fix.
+        clean_sdp = answer_sdp.replace('\n', '\r\n').replace('\r\r\n', '\r\n')
+        clean_sdp = _direction_fix(clean_sdp, 'video')
+        clean_sdp = _direction_fix(clean_sdp, 'audio')
+
+        # (2) Foundation fix — Google's candidate line:
+        #   a=candidate: 1 udp 2113932031 74.125.247.237 19305 typ host ...
+        # becomes:
+        #   a=candidate:N 1 udp 2113932031 74.125.247.237 19305 typ host ...
+        # (matches PR #1116 — assign incrementing index as foundation).
+        out_lines = []
+        index = 1
+        for line in clean_sdp.split('\r\n'):
+            if line.startswith('a=candidate: '):
+                out_lines.append(line.replace('a=candidate: ', f'a=candidate:{index} '))
+                index += 1
+                continue
+            out_lines.append(line)
+        clean_sdp = '\r\n'.join(out_lines)
+        log.info(f'Applied SDP fixes (direction recv->send for our recvonly offer, '
+                 f'foundation injection on {index-1} candidates)')
+
+        # Define recorder + register handlers BEFORE setRemoteDescription so
+        # we don't miss the initial track-added events.
+        if DIAG_BLACKHOLE:
+            log.info('DIAG mode: using MediaBlackhole (no RTSP push)')
+            recorder = MediaBlackhole()
+        else:
+            recorder = MediaRecorder(RTSP_URL, format='rtsp',
+                                     options={'rtsp_transport': 'tcp'})
+
+        @pc.on('connectionstatechange')
+        async def _state():
+            log.info(f'peer connectionState={pc.connectionState}')
+        @pc.on('iceconnectionstatechange')
+        async def _ice():
+            log.info(f'peer iceConnectionState={pc.iceConnectionState}')
+        @pc.on('signalingstatechange')
+        async def _sig():
+            log.info(f'peer signalingState={pc.signalingState}')
+
+        @pc.on('track')
+        def on_track(track):
+            log.info(f'Track received: kind={track.kind} id={track.id}')
+            recorder.addTrack(track)
+
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=clean_sdp, type='answer'))
+
+        # Wait for the connection to settle and tracks to be signalled.
+        for _ in range(20):
+            if pc.connectionState == 'connected':
+                break
+            await asyncio.sleep(0.5)
+        log.info(f'After-wait state: connection={pc.connectionState} ice={pc.iceConnectionState}')
+        await recorder.start()
+        log.info(f'Recorder started ({"blackhole" if DIAG_BLACKHOLE else RTSP_URL})')
+
+        # SDM WebRTC streams expire after 5 min. Extend every 4 min.
+        extend_at = time.time() + 240
+        try:
+            while True:
+                await asyncio.sleep(5)
+                if pc.connectionState in ('failed', 'closed', 'disconnected'):
+                    log.warning(f'Peer state {pc.connectionState}, restarting session')
+                    return
+                if time.time() >= extend_at:
+                    atok = get_access_token()
+                    ext = sdm_execute(atok,
+                                      'sdm.devices.commands.CameraLiveStream.ExtendWebRtcStream',
+                                      {'mediaSessionId': media_id})
+                    expires_at = ext.get('results', {}).get('expiresAt')
+                    log.info(f'Extended stream, expires_at={expires_at}')
+                    extend_at = time.time() + 240
+        finally:
+            try: await recorder.stop()
+            except Exception: pass
+            try: await pc.close()
+            except Exception: pass
+
+    async def main():
+        backoff = 5
+        while True:
+            try:
+                await run_session()
+                backoff = 5
+            except Exception as e:
+                log.exception(f'Session failed: {e}')
+                backoff = min(backoff * 2, 300)
+            log.info(f'Reconnecting in {backoff}s')
+            await asyncio.sleep(backoff)
+
+    def _shutdown(*a):
+        log.info('SIGTERM')
+        sys.exit(0)
+
+    if __name__ == '__main__':
+        signal.signal(signal.SIGTERM, _shutdown)
+        asyncio.run(main())
+
+  mediamtx.yml: |
+    # Single-purpose RTSP relay: accept RTSP PUSH from the nest-bridge
+    # sidecar on port 8555 and serve RTSP PULL on the same port for Frigate's
+    # go2rtc. No transcoding, no auth — pod-local loopback only.
+    logLevel: info
+    rtsp: yes
+    rtspAddress: :8555
+    rtmp: no
+    hls: no
+    webrtc: no
+    srt: no
+    api: no
+    metrics: no
+    paths:
+      all_others:

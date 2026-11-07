@@ -1,0 +1,69 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cnpg-wal
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: cnpg-wal.retention
+      rules:
+        ## infra-bs6r. 2026-10-26: a replica stranded on a cordoned node (its volume
+        ## detached, owned by quarto) stopped consuming WAL, its replication slot kept
+        ## every segment, and grafana-pg-2's 5Gi volume filled with 4.8G of pg_wal
+        ## until the primary crashlooped 133x. Nothing alerted on the way up.
+        ##
+        ## The ratio is pg_wal size over the capacity of the volume pg_wal lives on:
+        ## the `<pod>-wal` PVC where the cluster has walStorage (left side of `or`),
+        ## else the data PVC, which CNPG names after the pod. 30-day max on 2026-11-05
+        ## outside that incident: 0.41 (openfga-pg-2), so 0.6 leaves room for normal
+        ## checkpoint swings and 0.8 is still minutes-to-hours before full.
+        - record: cnpg:pg_wal_volume_ratio
+          expr: |
+            (
+              max by (namespace, pod) (cnpg_collector_pg_wal{value="size"})
+              / on (namespace, pod) group_left
+              max by (namespace, pod) (label_replace(kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~".+-wal"}, "pod", "$1", "persistentvolumeclaim", "(.+)-wal"))
+            )
+            or
+            (
+              max by (namespace, pod) (cnpg_collector_pg_wal{value="size"})
+              / on (namespace, pod) group_left
+              max by (namespace, pod) (label_replace(kubelet_volume_stats_capacity_bytes, "pod", "$1", "persistentvolumeclaim", "(.+)"))
+            )
+        - alert: CnpgWalFillingVolume
+          expr: cnpg:pg_wal_volume_ratio > 0.6
+          for: 10m
+          labels:
+            service: '{{ $labels.pod }}'
+            severity: warning
+            component: Storage
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}/{{ $labels.pod }}: pg_wal holds {{ $value | humanizePercentage }} of its volume"
+            description: |
+              pg_wal of {{ $labels.namespace }}/{{ $labels.pod }} holds {{ $value | humanizePercentage }} of the volume it lives on. WAL that
+              is neither archived nor consumed keeps growing until postgres stops with "no free
+              disk space for WALs". Usual cause: a replication slot whose replica is down or
+              stranded (cordoned node, detached volume), so check the slots first:
+                kubectl -n {{ $labels.namespace }} exec {{ $labels.pod }} -c postgres -- psql -c "select slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) from pg_replication_slots"
+              then the archiver (cnpg_collector_pg_wal_archive_status). Growing the PVC by
+              spec alone can deadlock: past "Not enough disk space" CNPG never reaches the PVC
+              reconcile, so patch each PVC to the new spec size by hand (infra-bs6r).
+        - alert: CnpgWalFillingVolumeCritical
+          expr: cnpg:pg_wal_volume_ratio > 0.8
+          for: 5m
+          labels:
+            service: '{{ $labels.pod }}'
+            severity: critical
+            component: Storage
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}/{{ $labels.pod }}: pg_wal holds {{ $value | humanizePercentage }} of its volume, postgres stops when it is full"
+            description: |
+              See CnpgWalFillingVolume. At this level the next burst of writes or a missed
+              archive cycle fills the volume and the primary goes down.

@@ -1,0 +1,33 @@
+defaultNamespace: keycloak
+namespace: keycloak
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25
+# Expected drift between fleet manifest and live state:
+#   1. VPA (mode=Auto) writes resources.requests/limits onto running
+#      pods after start.
+# The image is deliberately NOT stripped: git carries the resolved digest
+# (Renovate Lane A), so an image difference is a real change that must roll.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: postgres
+    namespace: keycloak
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: keycloak
+    namespace: keycloak
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}

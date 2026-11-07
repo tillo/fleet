@@ -1,0 +1,32 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: memsearch-env
+  namespace: memsearch
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: memsearch-env
+    creationPolicy: Owner
+
+  data:
+    ## LiteLLM virtual key `memsearch-embed`, scoped to the ONE fail-closed group
+    ## local-closed-gemma-embed (oMLX embeddinggemma on mbp-mda). It cannot reach
+    ## any cloud model: corpus text must never leave the estate.
+    - remoteRef:
+        key: /mdapi/memsearch/litellm-key
+      secretKey: LITELLM_KEY
+    ## Bearer for /mcp — held by the seats that query the index.
+    - remoteRef:
+        key: /mdapi/memsearch/mcp-token
+      secretKey: MCP_TOKEN
+    ## Bearer for POST /ingest — held only by the Windmill ingest job. Separate
+    ## from the MCP token so a seat's credential cannot rewrite the corpus.
+    - remoteRef:
+        key: /mdapi/memsearch/ingest-token
+      secretKey: INGEST_TOKEN

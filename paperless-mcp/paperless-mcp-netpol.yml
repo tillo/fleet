@@ -1,0 +1,83 @@
+## Who may talk to paperless-mcp, and what it may reach. ENFORCING from birth.
+##
+## WHY INGRESS IS THIS NARROW. This pod holds a token that can read the whole
+## household archive. Anyone who can reach it *and* present a Keycloak token from
+## group DMS can read documents — that is the feature — so the boundary is "the
+## Chat pods and nothing else", not "the cluster".
+##
+## ⚠️ A wrongly-blocked caller shows up as a TCP timeout in the openwebui pod,
+## not as an error in this one — nothing logs a packet that never arrived.
+## Debug from the caller's side first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: paperless-mcp-restricted
+  namespace: paperless-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app: paperless-mcp
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    ## 1. Open WebUI, the only intended caller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+      ports:
+        - protocol: TCP
+          port: 8080
+    ## 2. The kubelet's probes, which arrive from the NODE IP, not from a pod.
+    ## ⚠️ Leave this out and readiness fails, the pod never becomes Ready and
+    ## restarts forever — the classic way to break yourself with a NetworkPolicy.
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    ## 1. DNS, by SELECTOR: CoreDNS is reached at its pod IP, never the
+    ## 10.53.0.10 service VIP (an ipBlock on the VIP would look right and block
+    ## all name resolution).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    ## 2. The Paperless API, in-cluster and nowhere else: one namespace, one
+    ## workload, one port. This is the only place documents can come from.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: paperless
+          podSelector:
+            matchLabels:
+              app: paperless
+      ports:
+        - protocol: TCP
+          port: 8000
+    ## 3. Keycloak, for the JWKS that validates the caller's token. Published
+    ## behind the estate ingress, and ⭐ Calico evaluates the POST-DNAT far end:
+    ## idp.mdapi.ch resolves to the ingress VIP, but from a pod the destination is
+    ## an rke2-ingress-nginx CONTROLLER POD on 443. An ipBlock on the VIP would
+    ## match nothing and silently break every tool call.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 443

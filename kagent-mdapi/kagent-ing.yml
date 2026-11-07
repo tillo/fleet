@@ -1,0 +1,35 @@
+# kagent.mdapi.ch — the kagent UI. kagent has no login of its own (auth.mode
+# unsecure: every caller is admin@kagent.dev), so the admin oauth2-proxy gate
+# is the only access control; same treatment as vmalert.mdapi.ch. Streaming
+# chat ⇒ buffering off and a long read timeout (the UI's own nginx allows 1800s).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kagent
+  namespace: kagent
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-response-headers: Authorization
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/admin/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-admin.oauth2-proxy.svc.cluster.local/admin/oauth2/auth
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "1800"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: kagent.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: kagent-ui
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - kagent.mdapi.ch
+      secretName: kagent-cert

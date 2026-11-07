@@ -1,0 +1,28 @@
+## The kubelet's OWN eviction signal, recorded (infra-8f4.40).
+##
+## memory.available = node capacity - working set of the ROOT cgroup
+## (pkg/kubelet/stats/helper.go, v1.35.7). The root cgroup is the cadvisor series
+## container_memory_working_set_bytes{id="/",pod=""}, which the chart's kubelet
+## ServiceMonitor used to drop with every other pod-less series; since this change it
+## keeps exactly that one series per node (rancher-monitoring-helmchartconfig.yml,
+## kubelet.serviceMonitor.cAdvisorMetricRelabelings).
+##
+## Why: infra-7ku6 (the 14Gi/10m eviction tune, 2026-11-01) had to convert from
+## MemAvailable with a per-node bias that flips sign (+2.0 GiB qua ... -3.1 GiB qui),
+## measured live 12 samples at a time. This gives the next tune a history to query.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubelet-memory-available
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: platform.kubelet-memory-available
+    rules:
+    - record: node:kubelet_memory_available_bytes
+      expr: |
+        max by (node) (kube_node_status_capacity{resource="memory"})
+        - on (node)
+        max by (node) (container_memory_working_set_bytes{job="kubelet", metrics_path="/metrics/cadvisor", id="/"})

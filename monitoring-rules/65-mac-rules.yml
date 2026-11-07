@@ -1,0 +1,105 @@
+## Little Snitch remote rule group — is the endpoint serving the bytes the cluster
+## actually holds?
+##
+## Fed by the CronJob `mac-rules/lsrules-watch` (job label `lsrules_watch`, twice an
+## hour), which fetches https://rules.mdapi.ch/s/<token>/household.lsrules through
+## three resolvers — the in-cluster one, the bpi-r4 dnsmasq that mbp-mda asks first,
+## and 1.1.1.1 — each time pinning SNI to the hostname while connecting to the
+## address that resolver returned. Every body is hashed against the mounted
+## `lsrules` ConfigMap.
+##
+## WHY THIS EXISTS. Little Snitch subscribes with no signature, no hash and no
+## certificate expectation beyond "publicly trusted", so a repointed DNS record plus
+## a certificate for the same name is indistinguishable from the real thing ON THE
+## MAC. Once a client has accepted the group, the served bytes are firewall policy
+## applied without review: an injected `allow` is an open door, an injected `deny`
+## is blindness. Nothing inside the Mac can tell. This is the outside view.
+##
+## ⛔ What a match does NOT prove: that git -> cluster landed. Fleet owns that hop
+## and reports it through the bundle (`mdapi-prod-mac-rules`). This pair is
+## cluster -> wire, which Fleet cannot see. `fleet/lint.py` check G bounds what an
+## allow may say; that plus git merge rights is the control on the content itself.
+##
+## A per-leg fracture is reported per leg on purpose: "public" failing while
+## "cluster" passes is a DNS or edge problem, not a nginx one, and the label says
+## which question to ask first.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-mac-rules
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-mac-rules.subscription
+    rules:
+    - alert: MacRulesContentMismatch
+      ## fetch_ok is load-bearing: a leg that never answered also carries
+      ## content_matches 0, and "served different bytes" would be a false claim
+      ## about a path that served nothing. Unreachable legs are the next alert.
+      expr: |
+        max by (leg) (lsrules_watch_content_matches) == 0
+        and on (leg) max by (leg) (lsrules_watch_fetch_ok) == 1
+      ## 15m absorbs a rollout: the Deployment may still be serving the previous
+      ## render for a few seconds after the ConfigMap volume this Job mounts has
+      ## the new bytes. A real mismatch does not heal on its own.
+      for: 15m
+      labels:
+        service: mac-rules
+        namespace: mac-rules
+        severity: critical
+        team: mdapi
+        component: Platform
+        ## internal signal, no visitor-observable effect
+        statuspage: exclude
+      annotations:
+        summary: "Little Snitch rule group served with unpublished content (leg {{ $labels.leg }})"
+        description: |
+          The subscription URL answered — over the `{{ $labels.leg }}` resolver —
+          with a body whose sha256 is not the `lsrules` ConfigMap's
+          `household.lsrules`. Three things produce this, and they are told apart
+          by the other legs' values in `lsrules_watch_*`:
+
+            * a rotated path token (Akeyless) that the Mac still holds the old
+              copy of: the URL 404s, `http_status = 404`, every leg agrees;
+            * a serving-chain change (nginx template, ingress, a second backend):
+              usually one leg only, or cluster-only;
+            * a DNS repoint or a second server holding a valid certificate for the
+              name: the `public`/`lan` leg lands somewhere else and returns
+              somebody's file. THIS IS THE CASE THE WATCH EXISTS FOR.
+
+          Check in this order: `curl -sS -o /dev/null -w '%{http_code}\n'` the
+          subscription URL from the pod; compare `sha256sum` of the served body
+          with the ConfigMap (`jq -j '.data["household.lsrules"]'`, NOT `-r`); then
+          `dig @192.168.1.254 rules.mdapi.ch` against `dig @1.1.1.1` and see
+          whether the two views disagree. On the Mac, disabling the group
+          (`littlesnitch rulegroup -d "<name>"`) is the kill switch — a failed
+          fetch keeps the OLD rules, so breaking the endpoint stops nothing.
+
+    - alert: MacRulesWatchFetchFailing
+      ## A leg that cannot reach the endpoint at all. Not an emergency on its own
+      ## — Little Snitch keeps the previous rules when a fetch fails — but it means
+      ## new rules cannot land, and a leg that has quietly rotted still reads as
+      ## coverage unless something says otherwise.
+      expr: max by (leg) (lsrules_watch_fetch_ok) == 0
+      for: 3h
+      labels:
+        service: mac-rules
+        namespace: mac-rules
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      annotations:
+        summary: "Little Snitch rule group unreachable via the {{ $labels.leg }} resolver"
+        description: |
+          The watch could not resolve or connect for the `{{ $labels.leg }}` leg
+          for three hours. `cluster` failing points at the ingress path; `lan` at
+          the bpi-r4 dnsmasq record or the LAN route; `public` at the public DNS
+          record, the WAN address or the edge DNAT.
+
+          The Mac is NOT broken by this: a failed subscription fetch keeps the
+          previously imported rules (Little Snitch logs
+          `subscribedRuleGroupUpdateFail` and the group still looks healthy in the
+          UI). What is broken is the ability to change policy from git.

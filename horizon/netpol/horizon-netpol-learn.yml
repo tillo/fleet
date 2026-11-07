@@ -1,0 +1,31 @@
+# LEARN MODE: logs every new inbound flow to the Horizon server, blocks NOTHING
+# (infra-az8.20 F33, user decision 2026-11-05: learn, then enforce).
+#
+# WHY: Horizon trusts the client certificate it reads from the `ssl-client-cert`
+# header (HTTP_CERTIFICATE_HEADER). On the public path ingress-nginx overwrites that
+# header on every location, so it cannot be forged from outside. Inside the cluster
+# nothing stands in front of horizon.horizon.svc:9000, so any pod can send its own
+# header. The enforcing policy will admit only the real callers; this window
+# measures who they are (/netpol-learn-analyse horizon).
+#
+# ⛔ THIS POLICY MUST NOT BLOCK ANYTHING. Keep the shape `Log` then `Allow`: Calico's
+# Log does not terminate, the trailing Allow accepts everything. A policy that
+# selects an endpoint default-denies every direction in `types`, so deleting the
+# Allow cuts Horizon off. Ingress only: egress is not what F33 is about.
+#
+# SIZE (2026-11-05): ingress-nginx sends ~0.0006 req/s to ns horizon; the busiest
+# node's Calico log channel peaked at 27 lines/h over 24 h. Budget ~333 lines/s.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: learn.horizon
+  namespace: horizon
+spec:
+  order: 500
+  selector: app.kubernetes.io/name == "horizon"
+  types:
+    - Ingress
+  ingress:
+    # Log first, then allow unconditionally. Never reorder these two.
+    - action: Log
+    - action: Allow

@@ -1,0 +1,130 @@
+data:
+  configure: |
+    set -e
+    mkdir -p /init-secrets/gitaly /init-secrets/shell
+    cp -v -r -L /init-config/.gitlab_shell_secret  /init-secrets/shell/.gitlab_shell_secret
+    cp -v -r -L /init-config/gitaly_token  /init-secrets/gitaly/gitaly_token
+    {{- if $.Values.global.gitaly.tls.enabled }}
+    cp -v -L /init-config/gitaly.crt /init-secrets/gitaly/gitaly.crt
+    cp -v -L /init-config/gitaly.key /init-secrets/gitaly/gitaly.key
+    {{- end }}
+    {{- if .Values.gpgSigning.enabled }}
+    cp -v -L /init-config/signing_key.gpg  /init-secrets/gitaly/signing_key.gpg
+    {{- end }}
+  config.toml.tpl: |
+    {{- /*
+    TLS and metrics listen addresses are chart-managed (see
+    gitlab.gitaly.configuration.static) and hand-written here. As top-level TOML
+    keys they must precede any table, so they are emitted before the block below.
+    */}}
+    {{- if $.Values.global.gitaly.tls.enabled }}
+    tls_listen_addr = ":{{ coalesce .Values.service.tls.internalPort .Values.global.gitaly.service.tls.internalPort }}"
+    {{- end }}
+    {{- if .Values.metrics.enabled }}
+    prometheus_listen_addr = ":{{ default .Values.metrics.port .Values.metrics.metricsPort }}"
+    {{- end }}
+
+    {{- /*
+    Most of the configuration is assembled by merging the legacy Helm values
+    with the new .Values.configuration block, with the latter taking precedence.
+    A few sections below are appended manually. See
+    gitlab.gitaly.configuration.static helper for more details.
+    */}}
+    {{- include "gitlab.gitaly.tomlFromValues" (include "gitlab.gitaly.configuration.static" . | fromYaml) | nindent 4 }}
+
+    # Storage configuration
+    {{- if .storage }}
+
+    {{- /*
+    Passing in "skipStorages=true" below prevents changes in the Gitaly replica counts from modifying
+    the contents of the ConfigMap, which would cause existing pods to restart unnecessarily.
+    */}}
+    {{- if not .skipStorages }}
+    {% $storages := coll.Slice {{ include "gitlab.praefect.gitaly.storageNames" . }} %}
+    {{- end }}
+    {% $hostname := .Env.HOSTNAME | strings.TrimSpace %}
+    {% if coll.Has $storages $hostname %}
+    [[storage]]
+    name = "{% $hostname %}"
+    path = "/home/git/repositories"
+    {% else %}
+    {% printf "Storage for node %q is not present in the storageNames array. Did you use kubectl to scale up? You need to solely use helm for this purpose." $hostname | fail %}
+    {% end %}
+
+    {{- else }}
+
+    {{- /*
+    Passing in "skipStorages=true" below prevents changes in the Gitaly replica counts from modifying
+    the contents of the ConfigMap, which would cause existing pods to restart unnecessarily.
+    */}}
+    {{- if not .skipStorages }}
+    {% $storages := coll.Slice {{ include "gitlab.gitaly.storageNames" . }} %}
+    {{- end }}
+    {% $hostid := index (.Env.HOSTNAME | strings.Split "-" | coll.Reverse) 0 %}
+    {% $index := 0 %}
+    {% if regexp.Match "^[0-9]+$" $hostid %}
+      {% $index = conv.ToInt64 $hostid %}
+    {% end %}
+    {% if len $storages | lt $index %}
+    [[storage]]
+    name = "{% index $storages $index %}"
+    path = "/home/git/repositories"
+    {% else %}
+    {% printf "Storage for node %d is not present in the storageNames array. Did you use kubectl to scale up? You need to solely use helm for this purpose." $index | fail %}
+    {% end %}
+
+    {{- end }}
+
+    {{- if $.Values.global.gitaly.tls.enabled }}
+    [tls]
+    certificate_path = '/etc/gitlab-secrets/gitaly/gitaly.crt'
+    key_path = '/etc/gitlab-secrets/gitaly/gitaly.key'
+    {{- end }}
+
+    {{- if .Values.prometheus.grpcLatencyBuckets }}
+    [prometheus]
+    grpc_latency_buckets = {{ .Values.prometheus.grpcLatencyBuckets }}
+    {{- end }}
+
+    [auth]
+    token = {% file.Read "/etc/gitlab-secrets/gitaly/gitaly_token" | strings.TrimSpace | data.ToJSON %}
+
+    {{- if .Values.cgroups.enabled }}
+    {{-   with .Values.cgroups }}
+    [cgroups]
+    {{-     if .mountpoint }}
+    mountpoint = "{{ .mountpoint }}"
+    {{-     end }}
+    {{-     if .hierarchyRoot }}
+    hierarchy_root = {{ .hierarchyRoot | quote }}
+    {{-     end }}
+    {{-     if .memoryBytes }}
+    memory_bytes = {{ .memoryBytes | int64 }}
+    {{-     end }}
+    {{-     if .cpuShares }}
+    cpu_shares = {{ .cpuShares | int64 }}
+    {{-     end }}
+    {{-     if .cpuQuotaUs }}
+    cpu_quota_us = {{ .cpuQuotaUs | int64 }}
+    {{-     end }}
+    {{-  end }}
+
+    {{-   with .Values.cgroups.repositories }}
+    [cgroups.repositories]
+    {{-     if .count }}
+    count = {{ .count | int64 }}
+    {{-     end }}
+    {{-     if .memoryBytes }}
+    memory_bytes = {{ .memoryBytes | int64 }}
+    {{-     end }}
+    {{-     if .cpuShares }}
+    cpu_shares = {{ .cpuShares | int64 }}
+    {{-     end }}
+    {{-     if .cpuQuotaUs }}
+    cpu_quota_us = {{ .cpuQuotaUs | int64 }}
+    {{-     end }}
+    {{-     if .maxCgroupsPerRepo }}
+    max_cgroups_per_repo = {{ .maxCgroupsPerRepo | int64 }}
+    {{-     end }}
+    {{-   end }}
+    {{- end }}

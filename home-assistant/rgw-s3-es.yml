@@ -1,0 +1,51 @@
+---
+# ⭐ 2026-09-21: rgw-ha-backup-s3 replaces garage-ha-backup-s3. The rclone remote and
+# the Akeyless paths were already renamed garage -> rgw on 2026-09-19; the note there
+# said "only the secret's NAME still says garage; renaming it is a separate change."
+# This is that change.
+#
+# ⛔ STILL https, and that is not optional. Home Assistant's backup tarballs are NOT
+# encrypted by anything before they leave this pod -- which is why home-assistant-backups
+# sits in the offsite job's ENCRYPT_BUCKETS. RGW's :80 listener would undo that: pods on
+# qui/quo/qua reach an RGW pod on another node ACROSS THE PHYSICAL LAN over an
+# unencrypted VXLAN overlay. "In-cluster" is not a substitute for encrypted here.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: rgw-ha-backup-s3
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: rgw-ha-backup-s3
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        RCLONE_CONFIG_RGW_TYPE: "s3"
+        RCLONE_CONFIG_RGW_PROVIDER: "Ceph"
+        RCLONE_CONFIG_RGW_ENDPOINT: "https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443"
+        ## Same mounted bundle, same house chain (MDAPI Root + Issuing CA 01), which is
+        ## what a Horizon-issued RGW leaf chains to.
+        ## ⛔ This path and the volumeMount in home-assistant-deploy.yml must move
+        ## TOGETHER: this env var names that exact directory, so changing either one
+        ## alone points rclone at a path that is not mounted. Both were renamed
+        ## garage -> rgw on 2026-09-21, in the same commit, for that reason.
+        RCLONE_CA_CERT: "/etc/rgw-tls/ca.crt"
+        RCLONE_CONFIG_RGW_REGION: "us-east-1"
+        RCLONE_CONFIG_RGW_ACCESS_KEY_ID: "{{ .access_key }}"
+        RCLONE_CONFIG_RGW_SECRET_ACCESS_KEY: "{{ .secret_key }}"
+        BUCKET: "home-assistant-backups"
+
+  data:
+    ## Keys minted by the ha-backup CephObjectStoreUser (!373) and mirrored here.
+    - remoteRef:
+        key: /mdapi/home-assistant/rgw/access-key
+      secretKey: access_key
+    - remoteRef:
+        key: /mdapi/home-assistant/rgw/secret-key
+      secretKey: secret_key

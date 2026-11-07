@@ -1,0 +1,133 @@
+## oMLX — the MLX inference server on mbp-mda behind the local-brain doors.
+##
+## Series come from monitoring-omlx-exporter (ns monitoring), which reads oMLX's
+## JSON status directly at the Mac's WireGuard address. omlx_up is 0 whenever
+## that path fails: oMLX down, the Mac asleep/off, or its wg_iot tunnel down. The
+## exporter cannot tell those apart; server.log (O2 stream `omlx`) can.
+##
+## All warning tier, component Automation (INTERNAL — never published to
+## mdapi.statuspage.io; statuspage: exclude says it again). The local doors are
+## the cheap tier of the estate's automation and litellm falls back to cloud
+## doors when they fail, so nothing here is visitor-observable or pages.
+##
+## Thresholds come from six days of logs (2026-10-15..20), not from guesses:
+##  * reachability blips: 29, most healed within ~10 s; 5 lasted over 30 min (the
+##    longest ~10 h overnight, when the Mac's tunnel was still on-demand). `for: 1h`
+##    stays quiet on the first kind and still catches a whole lost evening.
+##  * memory pressure: ~3,700 ok<->soft flips (max 193 s), 167 hard episodes with
+##    p99 129 s and ONE over 15 min (42 min). Soft is the normal operating state of
+##    a 19B model on a 24 GB budget, so it gets no alert; hard for 15m does.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-omlx
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-omlx.rules
+    rules:
+    - alert: OmlxExporterWorkloadUnavailable
+      ## By NAME, deliberately: ns monitoring is shared, and its other Deployments
+      ## are covered (critical, component Platform) by MonitoringComponentDown in
+      ## 16-monitor-the-monitoring.yml. A namespace-wide arm here would re-alert all
+      ## of them at the wrong tier. `deployment=~` keeps the coverage probe reading
+      ## this as a Deployment rule.
+      expr: |
+        ( kube_deployment_spec_replicas{namespace="monitoring", deployment=~"omlx-exporter"}
+          - kube_deployment_status_replicas_available{namespace="monitoring", deployment=~"omlx-exporter"}
+        ) > 0
+      for: 15m
+      labels:
+        service: '{{ or $labels.deployment "omlx-exporter" }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "monitoring/omlx-exporter has {{ $value }} unavailable replica(s)"
+        description: |
+          The exporter is down, so every other alert in this file is blind (no
+          omlx_* series at all — OmlxMetricsAbsent fires alongside this one).
+            kubectl --context mdapi-prod-direct -n monitoring describe deploy omlx-exporter
+            kubectl --context mdapi-prod-direct -n monitoring logs deploy/omlx-exporter
+
+    - alert: OmlxMetricsAbsent
+      ## The series vanished: the exporter is gone, or vmagent stopped scraping it.
+      ## Without this an exporter outage reads as "oMLX fine" to the rules below.
+      expr: absent(omlx_up)
+      for: 30m
+      labels:
+        service: omlx
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}jump{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "no omlx_up series for 30m — oMLX is unmonitored"
+        description: |
+          monitoring-omlx-exporter is not being scraped. Check the Deployment and
+          its VMServiceScrape (ns monitoring), then vmagent targets.
+
+    - alert: OmlxUnreachable
+      expr: max(omlx_up) == 0
+      for: 1h
+      labels:
+        service: omlx
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}jump{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "oMLX unreachable at its WireGuard address for 1h — local-brain doors are falling back to cloud"
+        description: |
+          /api/status at the Mac's WireGuard address (the bpi-r4 wg_iot peer) has
+          not answered for an hour. Either oMLX is down on mbp-mda (the DMG app has
+          no launchd job, so nothing restarts it after a crash), the Mac is
+          asleep/off, or its WireGuard tunnel is down.
+            ssh mbp-mda 'tail ~/.omlx/logs/server.log'       # server side
+            curl -s -m5 http://127.0.0.1:1234/health         # ON the Mac: is oMLX up?
+          If oMLX answers locally, the failure is the tunnel or the peer address.
+          O2: stream `omlx`, service_name=omlx, for the server's own account.
+
+    - alert: OmlxHardMemoryPressure
+      expr: max(omlx_memory_pressure{level="hard"}) == 1
+      for: 15m
+      labels:
+        service: omlx
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}jump{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "oMLX at HARD memory pressure for 15m"
+        description: |
+          oMLX's process-memory enforcer has been at the hard threshold for 15
+          minutes (six days of logs: p99 hard episode 129 s, one in six days over
+          15 min). At hard, prefill-guard rejections and Metal "Insufficient Memory"
+          aborts follow. Usually one long-context request: check the prefill queue
+          (Grafana "oMLX" dashboard) and server.log for the request it is stuck on.
+
+    - alert: OmlxQueueStuck
+      ## A queued request that has waited 15 minutes is not slow, it is wedged:
+      ## litellm's timeouts have long since given up on it.
+      expr: max by (model) (omlx_model_queue_oldest_seconds) > 900
+      for: 5m
+      labels:
+        service: omlx
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}jump{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "oMLX request queued {{ $value | humanizeDuration }} on {{ $labels.model }}"
+        description: |
+          The oldest request waiting on this model has been queued for more than
+          15 minutes. Something ahead of it is not finishing (a huge prefill, or a
+          wedged engine). server.log names the active request id; a restart of
+          the oMLX app clears it.

@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opennic-tier2
+  namespace: opennic
+spec:
+  selector:
+    matchLabels:
+      app: opennic-tier2
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: opennic-tier2
+    spec:
+      containers:
+      - name: opennic-tier2
+        image: registry.mdapi.ch/mdapi/opennic-tier2:latest@sha256:b32159749fd11e18ad7000feb84c99535ab4d77e61c7fc858e52c293e81a3b8b
+        securityContext:
+          privileged: true
+        ports:
+        - name: nameserver-udp
+          containerPort: 53
+          protocol: UDP
+        - name: nameserver-tcp
+          containerPort: 53
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers:
+        - 127.0.0.1
+      imagePullSecrets:
+      - name: mdapi-registry

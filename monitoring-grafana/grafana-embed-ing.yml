@@ -1,0 +1,42 @@
+## grafana-embed.mdapi.ch — UNGATED (no oauth2-proxy) Grafana endpoint, LAN-only,
+## used solely so the Ceph dashboard (ceph.mdapi.ch) can iframe-embed Grafana
+## d-solo panels. grafana.mdapi.ch is SSO-gated and SSO cookies aren't sent in
+## cross-site iframes, so the embed needs this gate-free path. Grafana itself
+## serves anonymous Viewer (read-only) — see GF_AUTH_ANONYMOUS_* in grafana-deploy.yml.
+## ModSecurity in DetectionOnly so the d-solo JS / query params aren't blocked.
+## Set as ceph dashboard grafana-frontend-api-url (the BROWSER's URL; the mgr's
+## own grafana-api-url is the Service).
+##
+## Allowlist = the browsers that open the Ceph dashboard: the home LAN, LAN IPv6
+## clients via NAT64 (192.168.164.3; .2 is the WAN IPv6 pool, so never
+## 192.168.0.0/16) and mbp-mda on its WireGuard address. Deliberately NO pod
+## range: in-cluster callers (the jump seat's PromQL helpers, the ceph mgr) use
+## http://grafana.monitoring.svc.cluster.local directly, and at the shared
+## ingress a pod address is also what any in-cluster relay presents.
+## ⚠️ Defense in depth only: anonymous Viewer is the real exposure here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-embed
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24,192.168.164.3/32,10.8.0.5/32"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana-embed.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: grafana
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - grafana-embed.mdapi.ch
+      secretName: grafana-embed-cert

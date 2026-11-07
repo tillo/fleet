@@ -1,0 +1,254 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-gitlab
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-gitlab.workload
+    rules:
+    - alert: GitLabWebserviceUnavailable
+      ## 2026-11-04 (infra-r9mzd, mirror row infra-cn7yo): an HPA scale-up is
+      ## not an outage. The HPA (min 2, max 3) raises spec to 3, and the new
+      ## webservice pod needs ~6 min to come up, so `spec - available` stayed
+      ## > 0 past `for: 5m`. That caused 5 of the 6 firings in 7 d (10-29 02:37,
+      ## 11-03 13:00/13:35/15:40/20:46), each one critical and public while 2
+      ## pods were serving. Measured from kube-state-metrics, the scale-up pod
+      ## never became available before the HPA scaled back. So the rule stays
+      ## quiet while `available` is still at the HPA floor (minReplicas). With
+      ## no HPA the `unless` side is empty and the old behaviour applies. The
+      ## real outage (11-03 19:23Z, 0-1 of 2 available, qua NotReady) still
+      ## fires in the 7 d backtest.
+      expr: |
+        ( ( kube_deployment_spec_replicas{
+              namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+            }
+            - kube_deployment_status_replicas_available{
+              namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+            }
+          ) > 0
+        )
+        unless on(namespace, deployment)
+        ( kube_deployment_status_replicas_available{
+            namespace="bootstrap", deployment=~"gitlab-webservice-.*"
+          }
+          >= on(namespace, deployment) group_left()
+          label_replace(
+            kube_horizontalpodautoscaler_spec_min_replicas{
+              namespace="bootstrap", horizontalpodautoscaler=~"gitlab-webservice-.*"
+            },
+            "deployment", "$1", "horizontalpodautoscaler", "(.*)")
+        )
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        statuspage: include
+        team: mdapi
+      annotations:
+        summary: "GitLab webservice {{ $labels.deployment }}: {{ $value }} replicas unavailable"
+        description: "gitlab.mdapi.ch will be unreachable. Check: kubectl -n bootstrap logs deployment/{{ $labels.deployment }}"
+
+    - alert: GitLabGitalyDown
+      expr: |
+        kube_statefulset_status_replicas_ready{
+          namespace="bootstrap", statefulset=~"gitlab-gitaly.*"
+        } < kube_statefulset_status_replicas{
+          namespace="bootstrap", statefulset=~"gitlab-gitaly.*"
+        }
+      for: 5m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: critical
+        component: Platform
+        statuspage: include
+        team: mdapi
+      annotations:
+        summary: "Gitaly statefulset {{ $labels.statefulset }} degraded"
+        description: "Git operations will fail. Check: kubectl -n bootstrap logs sts/{{ $labels.statefulset }}"
+
+    - alert: GitLabSidekiqDown
+      ## 2026-09-23 (user-approved, ledger alert:GitLabSidekiqDown): was
+      ## `spec_replicas - status_replicas_available > 0`, which is HPA-blind —
+      ## spec is driven by hpa gitlab-sidekiq-all-in-1-v2 (min 3, max 6), so
+      ## every scale-up read as "down" until the new pod was Ready. Now keyed on
+      ## the Deployment's own Available=false condition, which the controller
+      ## computes against spec minus maxUnavailable (25%): a 3->4 scale-up keeps
+      ## Available=true, losing an existing pod does not.
+      ## Replayed 07-25..09-23 as a sustained-10m condition: the scale-up-only
+      ## episodes (07-29T01:58, 08-23T08:28, 08-25T05:12, 08-27T12:52 and the
+      ## 09-14T00:50-00:58 tail) drop out; the real outages (07-29 and 09-03,
+      ## available 0) and the node-event pod losses stay. Known limit: at
+      ## 25% of 3 the floor is 0, so ANY pod unavailable 10m+ fires, and a
+      ## scale-up jump of 2+ pods at once can still trip it.
+      ## max by() folds the `reason` label, which changes with the condition.
+      expr: |
+        max by (namespace, deployment) (
+          kube_deployment_status_condition{
+            namespace="bootstrap", deployment=~"gitlab-sidekiq-.*",
+            condition="Available", status="false"
+          }
+        ) == 1
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        statuspage: include
+        team: mdapi
+      annotations:
+        summary: "Sidekiq {{ $labels.deployment }}: Deployment not Available"
+        description: "The Deployment has reported Available=false for 10m (fewer available replicas than spec minus maxUnavailable) — not an HPA scale-up in progress. Background jobs (CI runners, emails, repository indexing) will queue up."
+
+    - alert: GitLabPodCrashLooping
+      expr: |
+        max by (namespace, pod, container) (
+          rate(kube_pod_container_status_restarts_total{
+            namespace="bootstrap", pod=~"gitlab-.*"
+          }[15m]) * 60
+        ) > 0.5
+      for: 10m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        statuspage: include
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.pod }}/{{ $labels.container }} restarting frequently"
+
+    - alert: GitLabBuilderRunnerUnavailable
+      ## The openwrt runners (fast lane + full-build lane) in their own namespace.
+      ## A runner manager that is down fails nothing: its tagged jobs just sit in
+      ## `pending` until someone wonders why the build never started.
+      ## Selected by NAMESPACE so a third runner there is born covered.
+      ## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL but keep the
+      ## coverage probe from crediting one arm with the other kind.
+      expr: |
+        ( kube_deployment_spec_replicas{namespace="gitlab-runner-builder", deployment=~".+"}
+          - kube_deployment_status_replicas_available{namespace="gitlab-runner-builder", deployment=~".+"}
+        ) > 0
+        or
+        ( kube_statefulset_replicas{namespace="gitlab-runner-builder", statefulset=~".+"}
+          - kube_statefulset_status_replicas_ready{namespace="gitlab-runner-builder", statefulset=~".+"}
+        ) > 0
+      for: 15m
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset "gitlab-runner-builder" }}'
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## CI capacity, not a service anyone outside sees.
+        statuspage: exclude
+      annotations:
+        summary: "gitlab-runner-builder/{{ or $labels.deployment $labels.statefulset }}: runner unavailable"
+        description: |
+          A runner manager for the openwrt builds is below its replica count, so jobs
+          tagged for it (builder-persistent / builder-full / builder-full-mr) wait in
+          `pending`. Check: kubectl -n gitlab-runner-builder get pods; the two full-build
+          runners are pinned to quarto and need their PVC (openwrt-full-workspace,
+          openwrt-mr-workspace) attached there.
+
+    - alert: GitLabBackupCronJobMissed
+      expr: |
+        time() - kube_cronjob_status_last_successful_time{
+          namespace="bootstrap", cronjob="gitlab-toolbox-backup"
+        } > 36 * 3600
+      labels:
+        service: '{{ or $labels.deployment $labels.statefulset $labels.daemonset $labels.cronjob "gitlab" }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}bootstrap{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "GitLab backup CronJob hasn't succeeded in {{ $value | humanizeDuration }}"
+        description: |
+          Schedule is daily at 02:00. >36h means at least one missed run.
+          Check: kubectl -n bootstrap get jobs | grep toolbox-backup
+
+  ## Sidekiq can be up and Ready, run jobs, and still have dead pollers (infra-os00t).
+  ## On 2026-11-03 bootstrap/valkey-0 was down ~240 s (19:18-19:22Z). Afterwards the
+  ## scheduled-set poller stopped (no scheduled pipeline from ~19:23Z) and the
+  ## sidekiq-cron poller stopped too (last_enqueue_time frozen at 19:48:08Z for all
+  ## ~240 cron jobs). GitLabSidekiqDown stayed green, because it watches the
+  ## Deployment. The stall was noticed 1h15m later, from missing pipelines.
+  ## Fix: delete ONE sidekiq pod; the replacement re-registers cron and drains the set.
+  ## Memory gitlab_sidekiq_pollers_stall_after_valkey_outage_2026_11_03.
+  ## Series come from gitlab-sidekiq-scrape/vmscrapes.yml.
+  - name: app-gitlab.pollers
+    rules:
+    - alert: GitLabSidekiqCronStalled
+      ## The scrape keeps only five every-minute cron workers, which run about
+      ## once a minute in total. All of them going 15 minutes without a single
+      ## execution means the cron poller is dead. `or on() vector(0)` makes a
+      ## blind scrape fire too, rather than go silent. A brand-new pod's series
+      ## does not false-fire: VictoriaMetrics' increase() counts a new series
+      ## from 0. 11-03 replay: the freeze at 19:48 fires at ~20:08.
+      expr: |
+        ( sum(increase(gitlab_sli_sidekiq_execution_total{namespace="bootstrap"}[15m]))
+          or on() vector(0)
+        ) < 1
+      for: 5m
+      labels:
+        service: gitlab-sidekiq-all-in-1-v2
+        namespace: bootstrap
+        severity: warning
+        component: Platform
+        team: mdapi
+        ## Scheduled pipelines and housekeeping are late, but GitLab itself still
+        ## serves. The user-facing outage is covered by GitLabSidekiqDown/Webservice.
+        statuspage: exclude
+      annotations:
+        summary: "GitLab sidekiq-cron enqueued nothing for 15m (cron poller dead, or the scrape is blind)"
+        description: |
+          None of the five every-minute cron workers (UpdateAllMirrorsWorker, ...) ran
+          in 15 minutes while Sidekiq is up, so no cron job runs: no scheduled
+          pipelines, no mirror updates, no cleanups. Usually after a valkey outage.
+          Check in valkey-0: HGET cron_job:default:pipeline_schedule_worker last_enqueue_time
+          (the `default:` namespace; un-namespaced cron_job:* keys are stale).
+          Fix: kubectl -n bootstrap delete pod <ONE gitlab-sidekiq-all-in-1-v2 pod>.
+          If `sum(gitlab_sli_sidekiq_execution_total{namespace="bootstrap"})` is empty,
+          the alert is firing because the VMPodScrape gitlab-sidekiq-cron is blind.
+          Memory gitlab_sidekiq_pollers_stall_after_valkey_outage_2026_11_03.
+
+    - alert: GitLabSidekiqScheduledSetBacklog
+      ## Size of Sidekiq's `schedule` ZSET (gitlab-exporter /sidekiq). This is
+      ## the WHOLE set, future jobs included, so a healthy set still bursts:
+      ## 1-2 at 07:2xZ but 30-58 at 08:00Z on 2026-11-04 with 0 overdue (12 of
+      ## 29 were Ci::DailyBuildGroupReportResultsWorker). When the poller dies,
+      ## overdue jobs pile up at about 2/min (174 overdue after ~80 min on
+      ## 11-03). >150 for 15m clears the healthy peak about 2.5x and fires
+      ## about 1h15m after onset, so this is a slow BACKSTOP.
+      ## GitLabSidekiqCronStalled is the fast signal (~20 min). The absent()
+      ## arm makes a blind exporter scrape fire instead of going silent.
+      expr: |
+        max(sidekiq_jobs_scheduled_size{namespace="bootstrap"}) > 150
+        or
+        absent(sidekiq_jobs_scheduled_size{namespace="bootstrap"})
+      for: 15m
+      labels:
+        service: gitlab-sidekiq-all-in-1-v2
+        namespace: bootstrap
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "GitLab Sidekiq scheduled set holds {{ $value }} jobs (scheduled-set poller dead, or 1 = exporter scrape blind)"
+        description: |
+          Jobs scheduled with perform_in (RunPipelineScheduleWorker, ArchiveTraceWorker,
+          FlushCounterIncrementsWorker ...) are not being moved to their queues, so
+          scheduled pipelines do not start. Check in valkey-0: ZCOUNT schedule -inf <now>
+          (should be ~0). Fix: kubectl -n bootstrap delete pod <ONE gitlab-sidekiq-all-in-1-v2 pod>,
+          then watch the count fall to ~0 within ~10 min.
+          A value of 1 with no `sidekiq_jobs_scheduled_size` series means the
+          VMServiceScrape gitlab-exporter-sidekiq is blind.
+          Memory gitlab_sidekiq_pollers_stall_after_valkey_outage_2026_11_03.

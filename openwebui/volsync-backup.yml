@@ -1,0 +1,112 @@
+## File-level offsite backup for openwebui-data.
+##
+## ⭐ WHY, precisely — the row that asked for this (beads infra-n647) said "no PVC
+## backup yet", and that is half right in a way worth writing down. Measured
+## 2026-09-22: the PVC DOES carry Longhorn recurring-job labels
+## (recurring-job-group.longhorn.io/{default,weekly}) and the estate's own coverage
+## probe agrees — longhorn_pvc_backup_intent{class="weekly"} = 1 and
+## longhorn_pvc_backup_effective{class="weekly"} = 1, so PvcBackupUncovered does not
+## fire and never would have. What was missing is the OTHER channel: no
+## ReplicationSource, therefore no per-file restore and no client-side-encrypted
+## offsite copy. Exactly the gap jump/volsync-backup.yml was written to close for
+## jump-home, and the same two-channel split recorded in
+## [[salt_garage_retirement_two_channel_architecture_2026_09_19]]:
+## local = block-level Longhorn → RGW, offsite = restic → B2, encrypted client-side.
+##
+## ⛔ So "it has a backup" and "it has THIS backup" were different claims, and only
+## the second was false. A block snapshot cannot answer "restore one conversation".
+##
+## ⚠️ WHAT IS ACTUALLY PRECIOUS HERE IS ~25 MB, NOT THE 1.1 GiB THE VOLUME REPORTS.
+## Measured inside the running pod, 147 files total:
+##     1.1G  /app/backend/data/cache        <- regenerable, and it is ALL of the size
+##      19M  /app/backend/data/vector_db    <- RAG embeddings
+##     3.1M  /app/backend/data/webui.db-wal
+##     1.9M  /app/backend/data/webui.db     <- the chats, users and settings
+##     564K  /app/backend/data/uploads
+## Everything is backed up anyway because VolSync's restic mover has no exclude
+## field, and restic deduplicates so only the first run pays for the cache
+## directory. If B2 storage or first-run time ever matters, excluding
+## `cache/` is the lever — it is 99.9% of the bytes and 0% of the value.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: openwebui
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## Same shared /mdapi/volsync/ceph-backup credentials and the same
+        ## per-PVC subpath convention as every other ReplicationSource on the
+        ## estate (esphome, findmy, spider3, jump, macos-vm, tenant-1, cribl).
+        ##
+        ## ⛔ B2's S3 endpoint is region us-west-001, read from b2_authorize_account's
+        ## `s3ApiUrl` — do NOT guess 002/003/004 or eu-central, they all fail and
+        ## read as "B2 is not S3 compatible" when it is only the wrong region.
+        ## The bucket is in the offsite job's NO_ENCRYPT set on purpose: restic
+        ## already encrypts client-side, so this is a REAL restic repo, not an
+        ## rclone-crypt wrapper.
+        RESTIC_REPOSITORY: "s3:https://s3.us-west-001.backblazeb2.com/saltminio/ceph-backup/openwebui-data"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .b2_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .b2_app_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: b2_key_id
+      remoteRef:
+        key: /mdapi/volsync/b2/account-id
+    - secretKey: b2_app_key
+      remoteRef:
+        key: /mdapi/volsync/b2/account-key
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: openwebui-data
+  namespace: openwebui
+spec:
+  sourcePVC: openwebui-data
+  trigger:
+    ## Daily. Deliberately at :10 past 04 — the existing sources cluster at
+    ## 02:45 (esphome), 03:20 (findmy) and 03:30 (spider3), and jump runs hourly
+    ## at :17. Chat data changes in bursts, not continuously; hourly would buy
+    ## nothing and would contend with the 02:00 offsite rclone sweep.
+    schedule: "10 4 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    ## ⛔ NOT ceph-block. Every other ReplicationSource on this estate snapshots a
+    ## Ceph PVC, but openwebui-data is `harvester-longhorn-2replicas` — a Longhorn
+    ## volume — so it needs a Longhorn VolumeSnapshotClass or the snapshot is
+    ## never created and the mover waits forever. `longhorn-snapshot` carries
+    ## parameters {"type":"snap"}; the bare `longhorn` class has no parameters.
+    volumeSnapshotClassName: longhorn-snapshot
+    ## ⛔ NO moverSecurityContext here, and that is deliberate — do not copy jump's.
+    ## jump pins the mover to uid/gid 1000 because its data is tillo-owned. Open
+    ## WebUI runs as ROOT: the pod has fsGroup 0, `id` inside the container is
+    ## uid=0(root), and /app/backend/data is root:root. A mover pinned to 1000
+    ## could not read it. Default (root) mover is correct for this PVC.
+    ## ⚠️ If the image ever moves to a non-root user, this must change WITH it.
+    ##
+    ## 2Gi cache: restic's cache holds the repo index plus every tree pack, so it
+    ## scales with FILE COUNT and snapshot churn, not with data size — the lesson
+    ## jump learned the hard way when 245k files wedged a 4Gi cache at 99.76% of
+    ## the scan. This PVC holds 147 files, so the index is tiny and 2Gi is far
+    ## more than 4x the expected high-water mark. Re-check after the first run
+    ## rather than assuming.
+    cacheCapacity: 2Gi
+    cacheStorageClassName: harvester-longhorn-1replica
+    pruneIntervalDays: 7
+    retain:
+      daily: 14
+      weekly: 8
+      monthly: 6

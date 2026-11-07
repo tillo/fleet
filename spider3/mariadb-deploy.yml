@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb
+  namespace: spider3
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      containers:
+      - env:
+        - name: MARIADB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: MARIADB_ROOT_PASSWORD
+              name: db-secret
+        - name: MARIADB_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              key: DB_NAME
+              name: db-config
+        - name: MARIADB_USER
+          valueFrom:
+            configMapKeyRef:
+              key: DB_USER
+              name: db-config
+        - name: MARIADB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: DB_PASSWORD
+              name: db-secret
+        # The image only runs mariadb-upgrade when this is set. This data dir
+        # still carries a legacy 10.11 `mysql_upgrade_info`, and 11.4+ look for
+        # `mariadb_upgrade_info` instead — so every start logs "upgrade
+        # information missing, assuming required" and skips it silently. Set
+        # before the 12.3 start so that start is the one that upgrades.
+        - name: MARIADB_AUTO_UPGRADE
+          value: "1"
+        # Upgrade 10.11 LTS -> 11.8 LTS was 2026-06-05 (canary on
+        # ivodellambrogio, Longhorn snapshot taken first). 11.8 LTS -> 12.3 LTS
+        # on 2026-10-22: 12.3 is the maintained LTS (to 2029) and the digest
+        # below is the one `mail` has been running since 2026-08-04. 13.0 was
+        # NOT taken on purpose — it is a rolling stable release, not an LTS.
+        image: mariadb:12.3@sha256:d46e102fa8b9b72bfcdeb56f9dd538742092119dc8b11f31fe662605cd234cd9
+        imagePullPolicy: IfNotPresent
+        name: mariadb
+        ports:
+        - containerPort: 3306
+        resources:
+          limits:
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        volumeMounts:
+        - mountPath: /var/lib/mysql
+          name: db-data
+      volumes:
+      - name: db-data
+        persistentVolumeClaim:
+          claimName: db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  namespace: spider3
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mariadb

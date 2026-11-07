@@ -1,0 +1,284 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openobserve-config
+  namespace: openobserve
+data:
+  # Single-node mode, writes Parquet to Ceph RGW S3 (migrated off the in-cluster
+  # Garage 2026-06-17 — RGW benchmarked ~3-7x faster). Metadata = local SQLite on
+  # PVC. WAL + cache also on PVC. ZO_S3_FORCE_PATH_STYLE is required (RGW user is
+  # addressed path-style here).
+  ZO_HTTP_PORT: "5080"
+  ZO_GRPC_PORT: "5081"
+  ZO_DATA_DIR: "/data/"
+  ZO_LOCAL_MODE: "true"
+  ZO_LOCAL_MODE_STORAGE: "s3"
+  ZO_S3_PROVIDER: "s3"
+  ZO_S3_SERVER_URL: "http://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:80"
+  ZO_S3_REGION_NAME: "us-east-1"
+  ZO_S3_BUCKET_NAME: "openobserve"
+  ZO_S3_FORCE_PATH_STYLE: "true"
+  ZO_TELEMETRY: "false"
+  # Default retention in days for streams carrying no per-stream override
+  # (minimum 3). Overrides go via PUT /api/<org>/streams/<stream>/settings and
+  # take precedence over this.
+  #
+  # The NAME is the point. ZO_DATA_RETENTION_DAYS, set here since 2026-05-13, is
+  # not a variable OpenObserve reads at all — the real one is
+  # ZO_COMPACT_DATA_RETENTION_DAYS. Its documented default is 3650, which is
+  # exactly what /config kept reporting while this file appeared to say 7, so
+  # nothing was ever pruned except the two streams holding an explicit
+  # per-stream override. Verify a change here by reading /config back, never by
+  # trusting the manifest: that assumption is what hid this for four months.
+  #
+  # 90d since 2026-09-29 (was 365). The year-long bound existed to protect the
+  # long history of the low-volume streams (DNS queries, NTP clients, router and
+  # switch events, crash records), but the 2026-09-23 per-stream sweep already
+  # kept that history on each of them, so the global no longer has to. 90 keeps
+  # the reversible direction open (90→30 later still reaches 30; 30 now would
+  # permanently destroy what 90 keeps). High-volume streams stay bounded
+  # individually (7/14/30d); the per-stream overrides that had been set to 90d
+  # were reset to inherit so they track this value instead of diverging from it.
+  ZO_COMPACT_DATA_RETENTION_DAYS: "90"
+  # AI assistant (EE only), 2026-09-01. These two are ALL OpenObserve itself
+  # needs — the model provider, model name and API key live on the o2-sre-agent
+  # Deployment, so no LLM credential is held by the log store. Without
+  # O2_AGENT_URL the chat endpoint answers 400 "AI agent URL is not set" even
+  # with O2_AI_ENABLED=true, because OpenObserve only proxies to the agent.
+  O2_AI_ENABLED: "true"
+  O2_AGENT_URL: "http://o2-sre-agent.openobserve.svc.cluster.local:8000"
+  # ── Trace-derived features, switched on 2026-09-22 with the first emitters ──
+  #
+  # These were all false on v0.92.0 and are useless without spans, which is why
+  # they stayed off: until today NOTHING on this estate emitted a single span --
+  # no collector, no Jaeger, no Tempo, and not one otlp/otel string anywhere in
+  # this repo. They are turned on in the SAME change that wires litellm and
+  # Keycloak, so there is something for them to chew on.
+  #
+  # ⛔⛔ VERIFY THESE BY READING THE CONFIG BACK, NOT FROM THIS FILE. envy
+  # ignores an unknown variable in silence -- that is exactly how
+  # ZO_DATA_RETENTION_DAYS sat here for four months doing nothing. On v0.92.0
+  # these three could not be confirmed from open source at all (the EE crate is
+  # closed); we are on v1.0.3 now, which is what the published docs describe, so
+  # the names are trustworthy for the first time. Confirm anyway.
+  #
+  # ⚠️ AND THE READ-BACK MOVED. On v1.0.x the bare /config is a trimmed public
+  # endpoint that no longer even carries `version`; the real flag set is at
+  # /api/<org>/config. Checking the old path would show nothing and look like
+  # these had failed.
+  #
+  # Service graph = service dependencies derived from spans, recomputed every
+  # O2_SERVICE_GRAPH_PROCESSING_INTERVAL_SECS (default 300).
+  O2_SERVICE_GRAPH_ENABLED: "true"
+  # Service catalog = correlates existing LOG streams to the services discovered
+  # from those spans. This is the one that finally gives pod_logs a service
+  # dimension rather than a namespace one. Sampling knobs left at defaults.
+  O2_SERVICE_STREAMS_ENABLED: "true"
+  # Drill-down links between a log record and its trace. Cheap, and the thing
+  # that makes the other two usable rather than merely present.
+  ZO_ENABLE_CROSS_LINKING: "true"
+  #
+  # ─── Incidents + AI RCA, ROUND 2 (2026-09-24, user asked to retry) ─────────
+  # Round 1 (reverted in !494) failed because gemma's THINKING mode swallowed tool
+  # calls, NOT because of model size or context (max prompt 40k of 131k loaded).
+  # Round 2 points the o2-sre-agent at a thinking-off local group (`infra-sre`
+  # then; it was retired 2026-10-20 and the agent now asks for
+  # `auto-heuristic-local-cn`, whose local tier is local-closed-best-nothink since
+  # 2026-10-26 — O2 is exempt from the claude-api-sonnet tier, see o2-sre-agent.yml)
+  # and raises the logs.mdapi.ch ingress timeout, so a long RCA is no longer cut
+  # at 300 s (that also left the incident locked).
+  # Outcome: ~/o2-correlation-2026-09-23/DEMO-4-incidents.md, "Round 2".
+  # Read back at /api/default/config -> incidents_enabled.
+  O2_INCIDENTS_ENABLED: "true"
+  # RCA is a SEPARATE switch: without it, POST …/incidents/<id>/rca answers
+  # 400 "RCA is not enabled".
+  O2_INCIDENTS_RCA_ENABLED: "true"
+  O2_INCIDENTS_ALERT_GRAPH_ENABLED: "true"
+  # Default -1 = never auto-resolve; an incident would stay open forever.
+  # 240 (was 60) since 2026-09-25: External Alert Sources feed Alertmanager alerts
+  # in, and O2 stamps each one's last-seen time as receive time − 1 h. At 60, every
+  # alert already firing for >1 h opened an incident the INCIDENTS::JOB closed at
+  # its next sweep (12 of 12 on the first delivery, 23 s after opening, all still
+  # firing). The shadow routes repeat every 2h, so a firing alert stays <= 3 h
+  # stale; genuine closure comes from Alertmanager's resolved notification.
+  # Keep this > shadow repeat_interval + 60 (monitoring-*/o2-incidents-*.yml).
+  O2_INCIDENTS_AUTO_RESOLVE_AFTER_MINUTES: "240"
+  #
+  # ⛔ NOT enabled here, deliberately:
+  #   ZO_TRACES_SPAN_METRICS_ENABLED — would create the estate's FIRST metrics
+  #     streams in OpenObserve. Metrics live in VictoriaMetrics; standing up a
+  #     second metrics store is an architecture decision, not a side effect of
+  #     turning on tracing.
+  #   ZO_TRACING_ENABLED — OpenObserve tracing ITSELF into itself. Genuinely
+  #     useful (it is the missing evidence from the 08-10 search-layer
+  #     blindness) but it is a feedback loop on a single node holding ~595 GB,
+  #     and its volume is unmeasured. Turn on with a sampler, on purpose, alone.
+  #   ZO_SYNTHETICS_ENABLED — a SECOND
+  #     alerting plane beside VictoriaMetrics + vmalert. Scope that first.
+  #
+  # ─── RUM on OpenObserve's OWN web UI (2026-09-23) ──────────────────────────
+  # The zero-privacy-risk first RUM deployment: O2 reporting on its own console,
+  # so nobody else's page carries a script and no customer DOM is involved.
+  # Variable names taken from the official environment-variable reference, not
+  # inferred from the /config key names — inventing a config surface is what
+  # caused the Keycloak outage on 2026-09-22.
+  #
+  # ZO_RUM_CLIENT_TOKEN is deliberately absent here: it comes from the
+  # openobserve-rum ExternalSecret (o2-es.yml) so the publicly-mirrored repo does
+  # not carry it. It is public once served all the same — see that file.
+  #
+  # ⛔ Session replay HAS no ZO_RUM_* switch — the SDK decides — and the earlier
+  # claim here that it was 'not part of this' was WRONG: measured 2026-09-23,
+  # `_sessionreplay` held 132 events / 29 MB, all application_id
+  # `openobserve-ui`, i.e. this console recording the DOM of whatever logs
+  # were on screen. Because config cannot switch it off, the control lives in
+  # o2-rum-ing.yml, which returns 403 on the replay ingest route for EVERY RUM
+  # source — this console and all 11 injected hosts, webmail and Nextcloud
+  # included, where the DOM would be email and documents.
+  #
+  # Verify by reading /config back, never by trusting this file — the
+  # ZO_DATA_RETENTION_DAYS note above is why.
+  # ─── Outbound endpoint validation ───────────────────────────────────────
+  # O2's SSRF guard rejects EVERY private range — 10/8, 172.16/12, 192.168/16,
+  # 169.254/16, 100.64/10 — for any endpoint an operator configures. That made
+  # the LLM-provider integration impossible in all three shapes:
+  #   litellm.litellm.svc.cluster.local -> "internal domain not allowed"
+  #   10.53.51.44 (ClusterIP)           -> "private IP address"
+  #   llm.mdapi.ch                      -> accepted on registration, then the
+  #     CONNECTION is refused, because split-horizon DNS resolves it to the
+  #     MetalLB VIP 192.168.1.191. Proved from ingress_access: the O2 pod
+  #     (10.52.1.252) never appeared there at all.
+  # ZO_SSRF_ALLOW_LOOPBACK does not help — it permits loopback only.
+  #
+  # ⚠️ This disables that validation for ALL outbound endpoint features (LLM
+  # providers, alert destinations, enrichment URLs), not just the provider.
+  # Accepted because configuring any of them requires O2 admin, and an O2 admin
+  # can already read every log on this estate — so the guard was not the control
+  # keeping an untrusted party out. It is still a real reduction.
+  #
+  # ⭐ With it off, O2 uses the in-cluster Service, which is the pattern CLAUDE.md
+  # prescribes for litellm — and the 10.52.0.0/16 whitelist widening added to
+  # litellm-ing.yml for the public-hostname workaround is reverted in the same
+  # change, because it buys nothing now.
+  ZO_SKIP_SSRF_CHECKS: "true"
+  ## ── RBAC (Phase 1, 2026-09-24) ─────────────────────────────────────────
+  ## Authorisation checks go to OpenFGA (bundle `openfga`, Postgres-backed). Rehearsed on a
+  ## scratch O2 first: grants survive O2 AND OpenFGA restarts; root-owned alerts, SLOs and
+  ## anomaly jobs keep running; ingestion tokens still ingest and still 401 on reads;
+  ## a role-less account gets 403 (MCP StreamDelete too). If OpenFGA is DOWN, root and
+  ## ingestion keep working and only non-root reads get 403 (fail-closed).
+  ## ⛔ Roles can only be created WHILE this is on ("OpenFGA store not initialized yet"
+  ## otherwise). The Windmill read account windmill-o2@mdapi.ch gets role windmill_probes.
+  ## ROLLBACK: delete these two keys → one O2 roll → today's behaviour (every account admin
+  ## again). Grants stay in OpenFGA, so re-enabling restores them (rehearsed both ways).
+  ## O2_OPENFGA_LIST_ONLY_PERMITTED left at its default (off): only needed for tenant views.
+  O2_OPENFGA_ENABLED: "true"
+  O2_OPENFGA_BASE_URL: "http://openfga.openfga.svc.cluster.local:8080"
+  ZO_RUM_ENABLED: "true"
+  ZO_RUM_APPLICATION_ID: "openobserve-ui"
+  ZO_RUM_SITE: "logs.mdapi.ch"
+  ZO_RUM_SERVICE: "openobserve-ui"
+  ZO_RUM_ENV: "production"
+  ZO_RUM_ORGANIZATION_IDENTIFIER: "default"
+  ZO_RUM_API_VERSION: "v1"
+  ZO_RUM_INSECURE_HTTP: "false"
+  ## ── Memory circuit breaker (2026-10-23) ────────────────────────────────
+  ## ⛔ BEFORE ADDING ANY ZO_* KEY HERE: envy IGNORES an unknown variable in
+  ## silence. ZO_DATA_RETENTION_DAYS sat in this file for four months doing
+  ## nothing. Checked against OpenObserve's config source:
+  ##   ZO_MEMORY_CIRCUIT_BREAKER_ENABLED — bool, default false
+  ##   ZO_MEMORY_CIRCUIT_BREAKER_RATIO   — percent, default 90
+  ## Both still need confirming ON THIS BUILD by reading the effective config
+  ## back after the roll (enterprise v1.1.2 here); adding a key that is not
+  ## read costs nothing and proves nothing.
+  ##
+  ## WHY: openobserve-0 dies from a sub-20-second burst — 3.50 GiB at the last
+  ## cadvisor scrape, dead 25 s later, against an 8 GiB limit. A limit cannot
+  ## be tuned against a spike the scraper never sees, and raising 4Gi→8Gi on
+  ## 2026-10-23 07:45Z only moved the cycle from ~40 min to ~4 h (three kills
+  ## in the 13 h after the roll). The breaker is the other half: past RATIO
+  ## percent of the limit, O2 REJECTS work instead of being SIGKILLed, so the
+  ## pod stays up and Cribl/OTel retry. A 429 an emitter can retry beats a
+  ## crashloop that blacks out pod_logs for minutes at a time.
+  ##
+  ## ⛔ DELIBERATELY NOT SET, so nobody re-adds them:
+  ##  · ZO_COMPACT_FAST_MODE=false — a no-op here. check_memory_config forces
+  ##    fast_mode back to TRUE whenever ZO_LOCAL_MODE is on, and it is.
+  ##  · ZO_MEM_TABLE_MAX_SIZE — it takes MB, not "2Gi", and already defaults
+  ##    to 25% of the limit in local mode (~2 GiB). Measured memtables never
+  ##    pass ~135 MB, so the flush expansion is PER REQUEST, not accumulation;
+  ##    capping it lower would only produce more small parquet files for
+  ##    compaction to chew. The lever is request-size bound, not memtable size.
+  ZO_MEMORY_CIRCUIT_BREAKER_ENABLED: "true"
+  ZO_MEMORY_CIRCUIT_BREAKER_RATIO: "90"
+  ## ── Search-side memory bounds (2026-10-31) ─────────────────────────────
+  ## WHY: the breaker above did not save the pod, because it is checked only
+  ## when work is ADMITTED (ingest, and the start of a search), never while a
+  ## query runs. 10-31: a 34 h trace aggregation over traces/default (5.8 GB
+  ## scan, 141 files, root via the built-in MCP) started at 04:59:38Z, the
+  ## breaker first tripped at 04:59:44Z, an identical second query from the
+  ## SAME user started at 05:00:08Z, OOMKilled at 05:00:17Z. Both were in the
+  ## "short" group: classification is by scan size, and short meant < 16 GB.
+  ## The 23.7 GB pod_logs scans of the same session were "long" but cheap
+  ## (2.9 s, DataFusion peak 0 bytes): scan_size is pre-pruning, not RSS.
+  ##
+  ## Names verified 2026-10-31 for THIS build: ZO_* in config.rs at OSS tag
+  ## v1.1.2 (d16d693b); O2_WORK_GROUP_* (closed EE crate) as strings in the
+  ## v1.1.2-amd64 binary of the pinned digest, defaults from the upstream
+  ## work-group doc. EE work groups DO run in local mode: the pod logs
+  ## `work_group: Some("short"|"long"|"background")` per query.
+  ##
+  ## MB. DataFusion memory pool BASE. Default in local mode is
+  ## (limit - ZO_MEMORY_CACHE_MAX_SIZE default 25%) / 2 = (8 - 2) / 2 GiB,
+  ## logged as memory_size 3221225472. A work-grouped query gets a fraction
+  ## of the base PER SESSION, fixed when the session is built (measured:
+  ## short 0.4 -> 0.2 -> 0.1 -> floor 0.08 as more run; long and background
+  ## 0.2), and one search builds ~4 sessions (leader, flight, storage x2,
+  ## plus WAL). PromQL and parquet merges carry NO work group and get the
+  ## whole base each. Measured peaks (DataFusion's own peak log, ~1750
+  ## sessions): merges <= 15 MB, PromQL < 1 MB, searches <= 516 MB (one 4 h
+  ## LLM-trace view, 660 MB scan). Worst case tracked at 1024: short
+  ## 0.78 x 1 GiB x 4 sessions = 3.1 GiB, long 1 x 0.2 x 4 = 0.8 GiB, plus
+  ## ~2 GiB RSS at rest (container_memory_rss p50, 3 d) = ~6 GiB, under the
+  ## 7.2 GiB breaker and the 8 GiB limit. At the default 3 GiB the same sum
+  ## passes 8 GiB with two queries. Over its share a query fails ("Resources
+  ## exhausted") or spills instead of killing the pod.
+  ## ⚠️ The pool only bounds what DataFusion ACCOUNTS. The 05:00 query ran
+  ## under a 644 MB pool and still pushed RSS past 7.2 GiB, so the
+  ## concurrency limits below are the lever for the unaccounted part.
+  ## If the LLM-observability trace list starts failing with "Resources
+  ## exhausted", raise this to 1536 TOGETHER with SHORT_MAX_CONCURRENCY 2.
+  ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE: "1024"
+  ## Seconds (default 10). A query is "long" when
+  ## scan_MB / 1024 MB/s / (cores x 0.8 short share) > this. With the 2-CPU
+  ## limit that is 1.6 cores: 10 s = 16 GB, 2 s = 3.2 GB. Of 241 searches
+  ## logged around the 10-31 OOM, 217 scanned < 1 GB and 15 1-3.2 GB (still
+  ## short); the 5 at 3.2-8 GB, the killer among them, become long.
+  O2_WORK_GROUP_BASE_SECS: "2"
+  ## Long queries run ONE AT A TIME (default 5 globally, 2 per user). One
+  ## node with 2 CPUs gains nothing from running two in parallel, and a
+  ## second heavy query on top of a first is exactly what killed the pod.
+  ## Excess queries wait FIFO in the group queue, up to ZO_QUERY_TIMEOUT.
+  O2_WORK_GROUP_LONG_MAX_CONCURRENCY: "1"
+  O2_WORK_GROUP_USER_LONG_MAX_CONCURRENCY: "1"
+  ## Short queries: default 10 globally, 4 per user. Every AI agent session
+  ## AND the human share ONE identity (root), so "per user" means the whole
+  ## estate here. 2 per user still lets a dashboard drain its panels
+  ## (sub-second each, < 1 GB scans), only two at a time.
+  O2_WORK_GROUP_SHORT_MAX_CONCURRENCY: "4"
+  O2_WORK_GROUP_USER_SHORT_MAX_CONCURRENCY: "2"
+  ##
+  ## ⛔ DELIBERATELY NOT SET here:
+  ##  · ZO_DEFAULT_MAX_QUERY_RANGE_DAYS (days, default 0 = unlimited) applies
+  ##    to EVERY stream without an override, including the long-history ones
+  ##    the retention note above protects. A range cap belongs on the heavy
+  ##    streams (traces/default, logs/pod_logs) as the per-stream
+  ##    max_query_range setting (hours): an O2 API change, outside git.
+  ##  · ZO_MAX_QUERY_RANGE_FOR_SA (hours, default 0) caps SERVICE ACCOUNTS
+  ##    only. The agents use root, so it would bound nothing until they move
+  ##    to their own service account; the windmill-o2 probe account would be
+  ##    capped by it, so measure its ranges before setting it.
+  ##  · ZO_QUERY_TIMEOUT (s, default 600): a time limit, not a memory one.
+  ##    The 10-31 query went from start to breaker in 6 s.
+  ##  · ZO_FEATURE_QUERY_QUEUE_ENABLED: in local mode it only gates a dist
+  ##    lock (None either way); the EE work-group check runs regardless.

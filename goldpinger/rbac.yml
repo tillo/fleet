@@ -1,0 +1,33 @@
+## goldpinger discovers its peers by listing pods in its OWN namespace
+## (NAMESPACE defaults to the pod's namespace), so a namespaced Role is enough —
+## not upstream's ClusterRoleBinding to `view`. Node lookups only happen for
+## IPv6 (getHostIP), which this cluster does not run.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: goldpinger
+  namespace: goldpinger
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: goldpinger
+  namespace: goldpinger
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: goldpinger
+  namespace: goldpinger
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: goldpinger
+subjects:
+  - kind: ServiceAccount
+    name: goldpinger
+    namespace: goldpinger

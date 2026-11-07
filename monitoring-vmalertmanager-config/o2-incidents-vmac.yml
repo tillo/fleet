@@ -1,0 +1,82 @@
+## SHADOW copy of every team=mdapi alert into OpenObserve Incidents (2026-09-25).
+##
+## O2 v1.0.3 has "External Alert Sources" (logs.mdapi.ch/web/alert-sources): a
+## webhook that accepts Alertmanager / Grafana / any JSON and correlates the alerts
+## into Incidents. This CR sends every team=mdapi alert to the source
+## `vmalertmanager` IN ADDITION to the normal routes — the operator renders each
+## VMAlertmanagerConfig as its own top-level route with `continue: true`, so
+## mdapi-team-vmac.yml keeps paging exactly as before. It is a separate CR on
+## purpose: if the operator ever rejects this one, paging is unaffected.
+##
+## The O2 source has NO incident destination, so O2 notifies nobody. Purpose: a
+## week of measurement before deciding whether O2 becomes the correlating hop in
+## front of Pushover — incident count vs Pushover message count, and how many
+## alerts actually correlate. O2 keys incidents on the `namespace` + `service`
+## labels; an alert carrying neither becomes an incident of its own.
+##
+## ⚠️ Measured 2026-09-25 (after !529 went live):
+##   - an Alertmanager "resolved" DOES close the incident when that alert is its
+##     only open member;
+##   - O2 stamps each received alert's last-seen time as receive time − 1 h (the
+##     start is clamped to that), so an alert firing for >1 h arrives already
+##     "60 min stale". With the old 60-min auto-resolve, the INCIDENTS::JOB closed
+##     all 12 first incidents 23 s after they opened, while all were still firing.
+##   ⇒ repeat_interval 2h here + O2_INCIDENTS_AUTO_RESOLVE_AFTER_MINUTES 240 in
+##     openobserve/o2-cm.yml: a still-firing alert is refreshed at worst 3 h stale,
+##     inside the 4 h window. Keep repeat_interval + 1h < that threshold.
+##
+## The black-holed inventory alerts are excluded with the SAME regex as the
+## black-hole route in mdapi-team-vmac.yml — they never clear, so in O2 they
+## would be permanently open incidents. Keep the two regexes in sync.
+##
+## The webhook URL embeds the source's token (the only auth on that endpoint), so
+## it lives in akeyless, never in git. It sits under /mdapi/pushover/ because that
+## folder is in the ESO access-id's ACL (same as healthchecks-watchdog-url).
+## Rotating the token in O2 = updating that akeyless value.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: o2-incidents-vm
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: o2-incidents-vm
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/pushover/o2-incidents-vmalertmanager-url
+      secretKey: url
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: o2-incidents
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  route:
+    receiver: o2-incidents
+    matchers:
+    - 'team="mdapi"'
+    - 'alertname!~"InfoInhibitor|Watchdog|NamespaceWithCriticalCves|NewImageWithCriticalCves|HostUpdateAvailable|ComponentUpgradeAvailable|K8sOrphanObjects"'
+    ## One notification per alert, so O2 sees each alert and its resolve
+    ## individually rather than as a batched group.
+    group_by: ['...']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 2h
+  receivers:
+  - name: o2-incidents
+    webhook_configs:
+    - url_secret:
+        name: o2-incidents-vm
+        key: url
+      send_resolved: true
+      max_alerts: 0

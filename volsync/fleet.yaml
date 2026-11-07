@@ -1,0 +1,24 @@
+## VolSync operator — scheduled CSI-snapshot + restic backup of Ceph (RBD + CephFS)
+## PVCs to the external Garage `ceph-backup` bucket (salt/pepper), which the daily
+## rgw_offsite_backup job then replicates to B2 + SFTP — mirroring how Longhorn
+## backs up to harvester-backup. ReplicationSources (per-PVC) are added separately,
+## with the restic secret rendered from Akeyless (/mdapi/volsync/ceph-backup/*) via
+## ExternalSecret. Needs the snapshot-controller (present) + the ceph
+## VolumeSnapshotClasses (rook-ceph-csi-drivers/volumesnapshotclasses.yml).
+defaultNamespace: volsync-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  releaseName: volsync
+  repo: https://backube.github.io/helm-charts/
+  chart: volsync
+  version: 0.17.0
+  maxHistory: 25

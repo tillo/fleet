@@ -1,0 +1,29 @@
+defaultNamespace: dellambrogio
+namespace: dellambrogio
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-cert-manager
+  - name: mdapi-prod-external-secrets
+helm:
+  maxHistory: 25
+
+# VPA (mode=Auto) writes resources.requests/limits onto running pods.
+# Strip the resources block from both sides before diff so Fleet stops
+# flagging the bundle as Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: dellambrogio
+    namespace: dellambrogio
+    operations:
+    - {"op": "remove", "path": "/spec/template/spec/containers/0/resources"}

@@ -1,0 +1,82 @@
+# app-batch-jobs.pki-crl-freshness (infra-3rm.12): f/probe/pki_crl_freshness publishes
+# each CRL's nextUpdate. A stopped daily re-sign is invisible until nextUpdate passes,
+# then every CRL-enforcing client rejects the whole CA. Warn at 7 days, page at 2.
+# vmalert-tool's clock starts at 2000-01-01T00:00:00Z (time() = 946684800 + t).
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: a-crl-a-week-from-expiry-warns-two-days-from-expiry-pages
+  interval: 5m
+  input_series:
+  # nextUpdate fixed at origin + 8 days: 8 d left at t=0, 6 d left after 2 days
+  - series: pki_crl_next_update_timestamp_seconds{job="pki_crl_freshness",crl="mdapi-issuing-ca-01"}
+    values: '947376000x2000'
+  - series: pki_crl_freshness_probe_success{job="pki_crl_freshness"}
+    values: '1x2000'
+  alert_rule_test:
+  - eval_time: 12h
+    groupname: app-batch-jobs.pki-crl-freshness
+    alertname: PkiCrlExpiringSoon
+    exp_alerts: []
+  - eval_time: 2d
+    groupname: app-batch-jobs.pki-crl-freshness
+    alertname: PkiCrlExpiringSoon
+    exp_alerts:
+    - exp_labels:
+        crl: mdapi-issuing-ca-01
+        job: pki_crl_freshness
+        service: crl.mdapi.ch
+        namespace: stream
+        severity: warning
+        component: Security
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "CRL mdapi-issuing-ca-01 expires in 6 days and has not been re-signed"
+        description: "The published CRL mdapi-issuing-ca-01 (https://crl.mdapi.ch/crls/mdapi-issuing-ca-01) reaches its nextUpdate\nin 6 days. It is re-signed daily with a 28-day window, so this means the\ndaily re-sign has stopped for about three weeks. When nextUpdate passes, every\nCRL-enforcing client rejects every certificate the CA issued. Check the CA's CRL\ngeneration in Stream (ns stream) and that crl.mdapi.ch serves the new file.\n"
+  - eval_time: 2d
+    groupname: app-batch-jobs.pki-crl-freshness
+    alertname: PkiCrlExpiryImminent
+    exp_alerts: []
+  - eval_time: 6d18h
+    groupname: app-batch-jobs.pki-crl-freshness
+    alertname: PkiCrlExpiryImminent
+    exp_alerts:
+    - exp_labels:
+        crl: mdapi-issuing-ca-01
+        job: pki_crl_freshness
+        service: crl.mdapi.ch
+        namespace: stream
+        severity: critical
+        component: Security
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "CRL mdapi-issuing-ca-01 expires in 1 day: every certificate of the CA will be rejected"
+        description: "See PkiCrlExpiringSoon. Re-sign and publish the CRL now.\n"
+- name: a-probe-that-cannot-read-the-crl-warns-after-12h
+  interval: 5m
+  input_series:
+  - series: pki_crl_freshness_probe_success{job="pki_crl_freshness"}
+    values: '0x200'
+  alert_rule_test:
+  - eval_time: 11h
+    groupname: app-batch-jobs.pki-crl-freshness
+    alertname: PkiCrlProbeFailing
+    exp_alerts: []
+  - eval_time: 13h
+    groupname: app-batch-jobs.pki-crl-freshness
+    alertname: PkiCrlProbeFailing
+    exp_alerts:
+    - exp_labels:
+        job: pki_crl_freshness
+        service: crl.mdapi.ch
+        namespace: stream
+        severity: warning
+        component: Security
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "f/probe/pki_crl_freshness cannot read a CRL from crl.mdapi.ch"
+        description: "For 12 h the probe could not fetch or parse a published CRL, so CRL expiry is\nunwatched. Read the job log (it names the CRL and the error):\n  https://windmill.mdapi.ch/runs?path=f%2Fprobe%2Fpki_crl_freshness\n"

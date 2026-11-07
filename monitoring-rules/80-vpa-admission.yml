@@ -1,0 +1,107 @@
+## VPA admission gap — pods running BELOW their VPA floor (infra-r9mzd.5).
+##
+## THE INCIDENT (2026-11-03): the qua outage re-created the VPA admission controller
+## pod at 19:21:25Z and it was Ready only at 19:50:28Z. The mutating webhook
+## vpa-webhook-config is failurePolicy Ignore, so every pod created in that window was
+## admitted UNMUTATED, at its chart/manifest defaults: cribl logstream-leader 1Gi vs a
+## 1.95Gi lowerBound, Plex pms-docker 4Gi vs 6.1Gi, rancher-turtles 128Mi vs 512Mi
+## (OOM-looped 71x). A single-replica Recreate target never self-repairs: the updater
+## runs --min-replicas=2. Nothing showed it — VPA status was correct the whole time.
+##
+## Fixes in the same change: admission controller 2 replicas + hostname anti-affinity
+## + PDB (vpa/values.yaml), and this alert for whatever still slips through.
+##
+## ⭐ The VPA metrics come from kube-state-metrics customResourceState
+## (rancher-monitoring-config): KSM 2.x dropped its built-in VPA collector, so before
+## this change there was no VPA series at all.
+##
+## Memory only, on purpose: a memory request below the floor is OOM/eviction risk; a CPU
+## request below it only costs scheduling share, and the measured CPU cases were
+## 5m-vs-10m noise.
+##
+## Pod -> workload: a Deployment pod's owner is its ReplicaSet, whose name is the
+## Deployment's plus "-<pod-template-hash>"; label_replace strips the hash rather than
+## joining kube_replicaset_owner, which is one series fewer to go stale.
+##
+## Snapshot before shipping (2026-11-04, kubectl over all 62 VPAs): 4 running pods sit
+## below their memory floor in a non-Off VPA, all Recreate single-replica (the two
+## 11-03 window pods + two long-lived pods whose VPA cannot apply); 17 more are below
+## an Off-mode VPA, which is recommendation-only by design and excluded.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: vpa-admission
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: platform.vpa-admission
+    rules:
+
+    ## One series per running pod: (namespace, pod) -> (target_kind, target_name).
+    - record: mdapi:pod_workload:info
+      expr: |
+        max by (namespace, pod, target_kind, target_name) (
+          label_replace(
+            label_replace(kube_pod_owner{owner_kind="ReplicaSet"},
+              "target_name", "$1", "owner_name", "(.+)-[a-z0-9]+"),
+            "target_kind", "Deployment", "", "")
+          or
+          label_replace(
+            label_replace(kube_pod_owner{owner_kind=~"StatefulSet|DaemonSet"},
+              "target_name", "$1", "owner_name", "(.+)"),
+            "target_kind", "$1", "owner_kind", "(.+)")
+        )
+        and on (namespace, pod) (kube_pod_status_phase{phase="Running"} == 1)
+
+    - alert: PodBelowVpaFloor
+      expr: |
+        (
+          max by (namespace, pod, container, resource) (
+            kube_pod_container_resource_requests{resource="memory"})
+          * on (namespace, pod) group_left (target_kind, target_name)
+            mdapi:pod_workload:info
+        )
+          < on (namespace, target_kind, target_name, container, resource) group_left (verticalpodautoscaler)
+        max by (namespace, target_kind, target_name, container, resource, verticalpodautoscaler) (
+          kube_verticalpodautoscaler_status_recommendation_containerrecommendations_lowerbound{
+            resource="memory", update_mode!="Off"})
+      for: 30m
+      labels:
+        service: vpa
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) runs with memory request {{ $value | humanize }}, below its VPA floor {{ with printf `max(kube_verticalpodautoscaler_status_recommendation_containerrecommendations_lowerbound{namespace=%q,verticalpodautoscaler=%q,container=%q,resource=\"memory\"})` $labels.namespace $labels.verticalpodautoscaler $labels.container | query }}{{ . | first | value | humanize }}{{ end }}"
+        description: |
+          The pod's memory request is below the lowerBound of VPA {{ $labels.namespace }}/{{ $labels.verticalpodautoscaler }}
+          ({{ $labels.target_kind }} {{ $labels.target_name }}) and has been for 30 min. Either it was admitted while
+          the VPA admission webhook was down (failurePolicy Ignore), or the
+          updater cannot apply the recommendation (Recreate on a single replica:
+          --min-replicas=2). It is at OOM risk under the load VPA measured.
+          Check: kubectl -n {{ $labels.namespace }} get pod {{ $labels.pod }} -o jsonpath='{.metadata.annotations.vpaUpdates}'
+          Fix: recreate the pod once, or move the VPA to InPlaceOrRecreate +
+          updatePolicy.minReplicas: 1 (vpa-objects/vpa-auto.yaml header).
+
+    ## The admission controller lost its redundancy: one more node loss reopens the
+    ## 11-03 window. `for: 15m` tolerates a rolling update.
+    - alert: VpaAdmissionControllerDegraded
+      expr: |
+        kube_deployment_status_replicas_available{namespace="kube-system",
+          deployment="vpa-vertical-pod-autoscaler-admission-controller"} < 2
+      for: 15m
+      labels:
+        service: vpa
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      annotations:
+        summary: "VPA admission controller has {{ $value }} available replica (want 2)"
+        description: |
+          One more node loss and the VPA mutating webhook (failurePolicy Ignore)
+          admits every new pod at its chart defaults, unmutated — the 11-03 qua
+          outage window. Check: kubectl -n kube-system get pods -o wide -l app.kubernetes.io/component=admission-controller

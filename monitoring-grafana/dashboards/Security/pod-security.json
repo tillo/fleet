@@ -1,0 +1,511 @@
+{
+  "uid": "psa-coverage",
+  "title": "Pod Security Admission — coverage and drift",
+  "tags": [
+    "security",
+    "pod-security",
+    "psa",
+    "mdapi"
+  ],
+  "editable": true,
+  "links": [],
+  "refresh": "5m",
+  "schemaVersion": 36,
+  "timezone": "browser",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "version": 2,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "The cluster default is **`enforce: privileged`** — there is no admission floor. Namespaces carrying `warn`+`audit`=baseline have made a promise: nothing in them violates baseline. **Nothing is enforced**, so these numbers are the only thing that would say the promise broke.\n\nProducer: `f/probe/psa_coverage`, hourly at :53 · Alerts: `app-security.psa-coverage`"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Namespaces labelled",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_namespaces_labelled",
+          "refId": "A",
+          "legendFormat": "labelled"
+        },
+        {
+          "expr": "psa_namespaces_total",
+          "refId": "B",
+          "legendFormat": "total"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "textMode": "value_and_name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Drift — conforms, unlabelled",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 4
+      },
+      "description": "Free coverage going unclaimed, and the fingerprint of Fleet recreating a namespace: Fleet stamps namespaceLabels only at creation and never reconciles them. Alerts at >0 sustained 6h.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_unlabelled_conforming",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Regression — promised, now violating",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "description": "A namespace labelled baseline that is now running something which breaks it. The signal the labels exist for. Alerts at >0 sustained 2h — bootstrap's GitLab CI runner pods violate transiently and must not page.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_labelled_violating",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Probe could read the cluster",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 4
+      },
+      "description": "0 means every other gauge here is ABSENT rather than zero — coverage unknown, not fine. The probe fails closed on purpose.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_coverage_check_ok",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "BLIND",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "OK",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Coverage over time",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "description": "conforming should track labelled. A gap between them is unclaimed coverage; labelled rising above conforming means a labelled namespace started violating.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_namespaces_total",
+          "refId": "A",
+          "legendFormat": "namespaces"
+        },
+        {
+          "expr": "psa_namespaces_conforming",
+          "refId": "B",
+          "legendFormat": "conforming"
+        },
+        {
+          "expr": "psa_namespaces_labelled",
+          "refId": "C",
+          "legendFormat": "labelled"
+        },
+        {
+          "expr": "psa_namespaces_violating",
+          "refId": "D",
+          "legendFormat": "violating"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Exemption surface — pods that would fail baseline",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "description": "Mostly storage and platform DaemonSets that genuinely need host access. A rise is a new workload taking host privileges — worth a look even though nothing blocks it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_pods_violating",
+          "refId": "A",
+          "legendFormat": "pods violating"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission decisions — straight from the API server",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "description": "pod_security_evaluations_total is published by the API server itself and needs no probe. It catches violations the hourly probe misses — a pod created and deleted between runs. It cannot say WHICH namespace: its namespace label is the apiserver's own, which is the gap the probe above fills.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum by (mode, decision) (increase(pod_security_evaluations_total{decision=\"deny\"}[1h]))",
+          "refId": "A",
+          "legendFormat": "{{mode}} / {{decision}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "bars"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "Exempt namespaces — why each one cannot take the label",
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "description": "The namespaces deliberately left unlabelled, and the reason for each. This is the attribution the API server's own pod_security_evaluations_total cannot give — its namespace label is the apiserver's, not the evaluated namespace's.\n\n⭐ A Pods value of 0 with reasons set is a REAL reading, not a missing one: the violation lives in a workload template with nothing running right now. kube-bench is the standing example — its CronJob is privileged, so it looks conforming between runs and would oscillate if judged on live pods alone.\n\nLabelled=true here would be a regression: a namespace that promised baseline and now violates it. The PsaBaselineRegression alert covers that case.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "psa_namespace_violating_pods",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "prometheus": true,
+              "service": true,
+              "instance": true
+            },
+            "renameByName": {
+              "namespace": "Namespace",
+              "Value": "Pods",
+              "reasons": "Why it fails baseline",
+              "labelled": "Labelled"
+            },
+            "indexByName": {
+              "namespace": 0,
+              "Value": 1,
+              "reasons": 2,
+              "labelled": 3
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Pods",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pods"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 10
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Namespace"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 230
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Labelled"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "false": {
+                        "text": "exempt",
+                        "color": "text",
+                        "index": 0
+                      },
+                      "true": {
+                        "text": "REGRESSION",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

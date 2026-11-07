@@ -1,0 +1,153 @@
+# PodBelowVpaFloor (infra-r9mzd.5): a running pod whose memory REQUEST sits below its
+# VPA's lowerBound for 30 min — the pod was admitted unmutated (webhook down) or the VPA
+# cannot apply its recommendation (single-replica Recreate). Off-mode VPAs are
+# recommendation-only and must never fire. Pod -> Deployment is joined through the
+# ReplicaSet name.
+rule_files:
+- monitoring-rules/80-vpa-admission.yml
+evaluation_interval: 1m
+tests:
+- name: below-floor-pages-after-30m
+  interval: 1m
+  input_series:
+  - series: kube_pod_owner{namespace="cribl",pod="leader-abc12-xyz",owner_kind="ReplicaSet",owner_name="leader-abc12"}
+    values: 1x60
+  - series: kube_pod_status_phase{namespace="cribl",pod="leader-abc12-xyz",phase="Running"}
+    values: 1x60
+  - series: kube_pod_container_resource_requests{namespace="cribl",pod="leader-abc12-xyz",container="leader",resource="memory",unit="byte"}
+    values: 1073741824x60
+  - series: kube_verticalpodautoscaler_status_recommendation_containerrecommendations_lowerbound{namespace="cribl",verticalpodautoscaler="leader",target_kind="Deployment",target_name="leader",container="leader",resource="memory",unit="byte",update_mode="Recreate"}
+    values: 2048000000x60
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: platform.vpa-admission
+    alertname: PodBelowVpaFloor
+    exp_alerts: []
+  - eval_time: 40m
+    groupname: platform.vpa-admission
+    alertname: PodBelowVpaFloor
+    exp_alerts:
+    - exp_labels:
+        namespace: cribl
+        pod: leader-abc12-xyz
+        container: leader
+        resource: memory
+        target_kind: Deployment
+        target_name: leader
+        verticalpodautoscaler: leader
+        service: vpa
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      exp_annotations:
+        summary: "cribl/leader-abc12-xyz (leader) runs with memory request 1.074G, below its VPA floor 2.048G"
+        description: |
+          The pod's memory request is below the lowerBound of VPA cribl/leader
+          (Deployment leader) and has been for 30 min. Either it was admitted while
+          the VPA admission webhook was down (failurePolicy Ignore), or the
+          updater cannot apply the recommendation (Recreate on a single replica:
+          --min-replicas=2). It is at OOM risk under the load VPA measured.
+          Check: kubectl -n cribl get pod leader-abc12-xyz -o jsonpath='{.metadata.annotations.vpaUpdates}'
+          Fix: recreate the pod once, or move the VPA to InPlaceOrRecreate +
+          updatePolicy.minReplicas: 1 (vpa-objects/vpa-auto.yaml header).
+- name: at-or-above-floor-silent
+  interval: 1m
+  input_series:
+  - series: kube_pod_owner{namespace="tv",pod="plex-def34-uvw",owner_kind="ReplicaSet",owner_name="plex-def34"}
+    values: 1x60
+  - series: kube_pod_status_phase{namespace="tv",pod="plex-def34-uvw",phase="Running"}
+    values: 1x60
+  - series: kube_pod_container_resource_requests{namespace="tv",pod="plex-def34-uvw",container="plex",resource="memory",unit="byte"}
+    values: 9000000000x60
+  - series: kube_verticalpodautoscaler_status_recommendation_containerrecommendations_lowerbound{namespace="tv",verticalpodautoscaler="plex",target_kind="Deployment",target_name="plex",container="plex",resource="memory",unit="byte",update_mode="Recreate"}
+    values: 6400000000x60
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: platform.vpa-admission
+    alertname: PodBelowVpaFloor
+    exp_alerts: []
+- name: off-mode-vpa-silent
+  interval: 1m
+  input_series:
+  - series: kube_pod_owner{namespace="db",pod="pg-1",owner_kind="StatefulSet",owner_name="pg"}
+    values: 1x60
+  - series: kube_pod_status_phase{namespace="db",pod="pg-1",phase="Running"}
+    values: 1x60
+  - series: kube_pod_container_resource_requests{namespace="db",pod="pg-1",container="pg",resource="memory",unit="byte"}
+    values: 100000000x60
+  - series: kube_verticalpodautoscaler_status_recommendation_containerrecommendations_lowerbound{namespace="db",verticalpodautoscaler="pg",target_kind="StatefulSet",target_name="pg",container="pg",resource="memory",unit="byte",update_mode="Off"}
+    values: 900000000x60
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: platform.vpa-admission
+    alertname: PodBelowVpaFloor
+    exp_alerts: []
+- name: statefulset-below-floor-pages
+  interval: 1m
+  input_series:
+  - series: kube_pod_owner{namespace="db",pod="pg-1",owner_kind="StatefulSet",owner_name="pg"}
+    values: 1x60
+  - series: kube_pod_status_phase{namespace="db",pod="pg-1",phase="Running"}
+    values: 1x60
+  - series: kube_pod_container_resource_requests{namespace="db",pod="pg-1",container="pg",resource="memory",unit="byte"}
+    values: 100000000x60
+  - series: kube_verticalpodautoscaler_status_recommendation_containerrecommendations_lowerbound{namespace="db",verticalpodautoscaler="pg",target_kind="StatefulSet",target_name="pg",container="pg",resource="memory",unit="byte",update_mode="Initial"}
+    values: 900000000x60
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: platform.vpa-admission
+    alertname: PodBelowVpaFloor
+    exp_alerts:
+    - exp_labels:
+        namespace: db
+        pod: pg-1
+        container: pg
+        resource: memory
+        target_kind: StatefulSet
+        target_name: pg
+        verticalpodautoscaler: pg
+        service: vpa
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      exp_annotations:
+        summary: "db/pg-1 (pg) runs with memory request 100M, below its VPA floor 900M"
+        description: |
+          The pod's memory request is below the lowerBound of VPA db/pg
+          (StatefulSet pg) and has been for 30 min. Either it was admitted while
+          the VPA admission webhook was down (failurePolicy Ignore), or the
+          updater cannot apply the recommendation (Recreate on a single replica:
+          --min-replicas=2). It is at OOM risk under the load VPA measured.
+          Check: kubectl -n db get pod pg-1 -o jsonpath='{.metadata.annotations.vpaUpdates}'
+          Fix: recreate the pod once, or move the VPA to InPlaceOrRecreate +
+          updatePolicy.minReplicas: 1 (vpa-objects/vpa-auto.yaml header).
+- name: admission-controller-single-replica-warns
+  interval: 1m
+  input_series:
+  - series: kube_deployment_status_replicas_available{namespace="kube-system",deployment="vpa-vertical-pod-autoscaler-admission-controller"}
+    values: 2x10 1x50
+  alert_rule_test:
+  - eval_time: 20m
+    groupname: platform.vpa-admission
+    alertname: VpaAdmissionControllerDegraded
+    exp_alerts: []
+  - eval_time: 40m
+    groupname: platform.vpa-admission
+    alertname: VpaAdmissionControllerDegraded
+    exp_alerts:
+    - exp_labels:
+        namespace: kube-system
+        deployment: vpa-vertical-pod-autoscaler-admission-controller
+        service: vpa
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      exp_annotations:
+        summary: "VPA admission controller has 1 available replica (want 2)"
+        description: |
+          One more node loss and the VPA mutating webhook (failurePolicy Ignore)
+          admits every new pod at its chart defaults, unmutated — the 11-03 qua
+          outage window. Check: kubectl -n kube-system get pods -o wide -l app.kubernetes.io/component=admission-controller

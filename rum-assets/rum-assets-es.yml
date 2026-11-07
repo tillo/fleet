@@ -1,0 +1,23 @@
+# The RUM client token, same Akeyless key the OpenObserve StatefulSet uses.
+#
+# ⚠️ Public by construction: it ends up inside rum.js, which every visitor
+# downloads, and OpenObserve already serves the same value unauthenticated at
+# logs.mdapi.ch/config. It lives in Akeyless so the publicly mirrored fleet repo
+# does not carry it — the thing that actually bounds abuse is the rate limit on
+# /rum in openobserve/o2-rum-ing.yml.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: rum-client-token
+  namespace: rum-assets
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: rum-client-token
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/openobserve/rum/client-token }
+    secretKey: RUM_CLIENT_TOKEN

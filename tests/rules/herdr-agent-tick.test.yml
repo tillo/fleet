@@ -1,0 +1,123 @@
+# HerdrAgentTickStale / HerdrAgentTickSeatUnreachable (infra-7iw8e): f/desk/herdr_agent_tick
+# (every 5 min) fires the jump seat's spooled herdr-agent sessions. Stale or never pushed =
+# scheduled sessions silently never start; reachable==0 on a FRESH tick = the seat is down
+# longer than a roll. A frozen reachable==0 from a dead tick is the stale alert's, not this one.
+# vmalert-tool evaluates at 2000-01-01T00:00:00Z + t (time() = 946684800 + t), so the
+# timestamp series start there.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: tick-stops-pushing-fires-stale
+  interval: 1m
+  input_series:
+  # pushgateway keeps re-serving the last timestamp after the tick dies at 5m
+  - series: herdr_agent_tick_last_run_timestamp_seconds{job="herdr_agent_tick",namespace="monitoring"}
+    values: '946684800+60x5 946685100x60'
+  - series: herdr_agent_tick_reachable{job="herdr_agent_tick",namespace="monitoring"}
+    values: '1x65'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickStale
+    exp_alerts: []
+  - eval_time: 45m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickStale
+    exp_alerts:
+    - exp_labels:
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "f/desk/herdr_agent_tick has not run for 30 min: scheduled agent sessions are not starting"
+        description: "f/desk/herdr_agent_tick has not pushed for 30 min, or has never pushed.\nIt fires the jump seat's spooled herdr-agent sessions\n(~/bin/herdr-agent.sh --at), so none of them start, and the expiry pings\nthat would say so come only from a working tick. Check the schedule is\nenabled and recent runs succeed:\n  https://windmill.mdapi.ch/runs?path=f%2Fdesk%2Fherdr_agent_tick\n"
+  - eval_time: 45m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickSeatUnreachable
+    exp_alerts: []
+- name: never-pushed-fires-stale
+  interval: 1m
+  input_series:
+  - series: up{job="unrelated"}
+    values: '1x20'
+  alert_rule_test:
+  - eval_time: 3m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickStale
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickStale
+    exp_alerts:
+    - exp_labels:
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "f/desk/herdr_agent_tick has not run for 30 min: scheduled agent sessions are not starting"
+        description: "f/desk/herdr_agent_tick has not pushed for 30 min, or has never pushed.\nIt fires the jump seat's spooled herdr-agent sessions\n(~/bin/herdr-agent.sh --at), so none of them start, and the expiry pings\nthat would say so come only from a working tick. Check the schedule is\nenabled and recent runs succeed:\n  https://windmill.mdapi.ch/runs?path=f%2Fdesk%2Fherdr_agent_tick\n"
+- name: seat-unreachable-on-fresh-tick-fires-after-30m
+  interval: 1m
+  input_series:
+  - series: herdr_agent_tick_last_run_timestamp_seconds{job="herdr_agent_tick",namespace="monitoring"}
+    values: '946684800+60x60'
+  - series: herdr_agent_tick_reachable{job="herdr_agent_tick",namespace="monitoring"}
+    values: '1x5 0x55'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickSeatUnreachable
+    exp_alerts: []
+  - eval_time: 40m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickSeatUnreachable
+    exp_alerts:
+    - exp_labels:
+        service: jump-bastion
+        namespace: jump
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "f/desk/herdr_agent_tick cannot reach the jump seat for 30 min"
+        description: "The tick runs but cannot reach the jump seat, for longer than a roll\ntakes. Spooled herdr-agent sessions are not starting. Check\ndeploy/jump-bastion in ns jump and the seat's sshd.\n"
+  - eval_time: 40m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickStale
+    exp_alerts: []
+- name: healthy-is-silent
+  interval: 1m
+  input_series:
+  - series: herdr_agent_tick_last_run_timestamp_seconds{job="herdr_agent_tick",namespace="monitoring"}
+    values: '946684800+60x60'
+  - series: herdr_agent_tick_reachable{job="herdr_agent_tick",namespace="monitoring"}
+    values: '1x60'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickStale
+    exp_alerts: []
+  - eval_time: 55m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickSeatUnreachable
+    exp_alerts: []
+- name: dead-tick-with-frozen-reachable-0-is-not-seat-unreachable
+  interval: 1m
+  input_series:
+  - series: herdr_agent_tick_last_run_timestamp_seconds{job="herdr_agent_tick",namespace="monitoring"}
+    values: '946684800+60x5 946685100x60'
+  - series: herdr_agent_tick_reachable{job="herdr_agent_tick",namespace="monitoring"}
+    values: '0x65'
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-batch-jobs.herdr-agent-tick
+    alertname: HerdrAgentTickSeatUnreachable
+    exp_alerts: []

@@ -1,0 +1,36 @@
+crds:
+  enabled: false # CRDs pre-installed; hook job times out in Fleet
+
+admissionController:
+  enabled: true
+  # 2 replicas on different nodes + PDB (2026-11-04, infra-r9mzd.5). With one
+  # replica a single node loss takes the mutating webhook down, and it is
+  # failurePolicy Ignore: on 11-03 the qua outage left it unready 19:21-19:50Z
+  # and every pod created in that window was admitted at its defaults (cribl
+  # leader, Plex, rancher-turtles OOM-looped 71x). The webhook is stateless
+  # (both replicas serve the same Service and TLS secret). Cost: ~100Mi /
+  # <0.01 core measured peak per replica (7 d); nodes qui/quo have 12-13 GiB
+  # of unrequested memory. Required (not preferred) anti-affinity: with 4 nodes
+  # a second replica on the SAME node would buy nothing.
+  replicaCount: 2
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: vertical-pod-autoscaler
+              app.kubernetes.io/instance: vpa
+              app.kubernetes.io/component: admission-controller
+  pdb:
+    create: true
+    minAvailable: 1
+
+recommender:
+  replicaCount: 1
+
+# Updater disabled initially — gather recommendations first for ~1 week,
+# then enable to allow VPA to evict+resize pods. Safe to enable once
+# PDBs are in place (minAvailable:1) and recommendations look sane.
+updater:
+  enabled: true

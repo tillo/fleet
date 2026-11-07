@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-mcp-config
+data:
+  # kubernetes-mcp-server reads this via --config (keys: docs/configuration.md
+  # of the upstream release the image is built from).
+  #
+  # in-cluster: talk to mdapi-prod only, as the k8s-mcp ServiceAccount
+  # (k8s-mcp-rbac.yml). No kubeconfig, so the `config` toolset
+  # (configuration_view, contexts_list) has nothing to show and is left out,
+  # and so is `helm` (its releases are Secrets, which this SA cannot read).
+  #
+  # enabled_tools is the allowlist of what the SA can actually serve. The write
+  # tools (pods_run, pods_delete, resources_create_or_update, resources_delete,
+  # resources_scale) would only ever answer 403, and nodes_log /
+  # nodes_stats_summary need nodes/proxy, which is deliberately not granted.
+  # Keep this list and the RBAC in step: widening one without the other is
+  # either a dead tool or a silent grant.
+  config.toml: |
+    port = "9090"
+    stateless = true
+    cluster_provider_strategy = "in-cluster"
+    toolsets = ["core"]
+    enabled_tools = [
+      "namespaces_list",
+      "events_list",
+      "pods_list",
+      "pods_list_in_namespace",
+      "pods_get",
+      "pods_log",
+      "pods_top",
+      "pods_exec",
+      "nodes_top",
+      "resources_list",
+      "resources_get",
+    ]
+
+    # Belt and braces: the SA cannot read Secrets anyway (view excludes them).
+    [[denied_resources]]
+    group = ""
+    version = "v1"
+    kind = "Secret"

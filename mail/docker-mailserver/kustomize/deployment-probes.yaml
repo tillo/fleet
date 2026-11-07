@@ -1,0 +1,49 @@
+# Probes that see a crash-looping Dovecot (infra-1ts0d).
+#
+# The chart hardcodes all three probes as `dms-healthcheck` (templates/
+# deployment.yaml, no values hook), and that script only asks supervisord whether
+# each service is RUNNING. supervisord's [program:dovecot] has `startsecs=0` and
+# `autorestart=true`, so a Dovecot that dies at config load is RUNNING again as
+# soon as it is respawned. On 2026-11-03 the chart-6.0.0 Dovecot 2.4 config was
+# fatal on the frozen 2.3 base, so IMAP was down for ~4 h while the pod read
+# 2/2 Ready.
+#
+# `doveadm service status` asks the live Dovecot master over
+# /run/dovecot/master and needs a config that parses, so it fails in both of
+# those cases (rc 75 when the master is gone or the socket is stale, rc 89 when
+# the config is fatal; measured in the pod). It takes ~50 ms and needs no login,
+# so it adds nothing to the mail log, which a TCP connect to :143 every 10 s
+# would. It runs AFTER dms-healthcheck, so startup timing is unchanged:
+# dms-healthcheck already waits for dovecot to be RUNNING, and the master socket
+# is up by then. Valid only while SMTP_ONLY=0 (it is; this pod is the IMAP server).
+#
+# Strategic merge by container name: only `exec.command` is replaced, and the
+# chart's period/timeout/threshold values are kept. No namespace, for the same
+# reason as deployment-image-pin.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-mailserver
+spec:
+  template:
+    spec:
+      containers:
+        - name: docker-mailserver
+          startupProbe:
+            exec:
+              command:
+                - bash
+                - -c
+                - dms-healthcheck && doveadm service status imap-login >/dev/null
+          livenessProbe:
+            exec:
+              command:
+                - bash
+                - -c
+                - dms-healthcheck && doveadm service status imap-login >/dev/null
+          readinessProbe:
+            exec:
+              command:
+                - bash
+                - -c
+                - dms-healthcheck && doveadm service status imap-login >/dev/null

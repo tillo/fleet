@@ -1,0 +1,22 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: tsig-secret
+  namespace: nameserver
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: tsig-secret
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        named-key: "{{ .namedKey }}"
+        tsig-secret-key: '{{ regexReplaceAll "(?s).*secret \"([^\"]+)\".*" .namedKey "${1}" }}'
+  data:
+    - remoteRef:
+        key: /mdapi/nameserver/tsig-secret/named-key
+      secretKey: namedKey

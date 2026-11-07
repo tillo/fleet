@@ -1,0 +1,674 @@
+## gheim round-trip guardrail: what was transformed, per class and per door.
+##
+## litellm's Guardrails Monitor answers "blocked or passed". This dashboard answers
+## the other question -- which entity classes were masked, how often, through which
+## -gheim door, and whether the values were given back on the response. The
+## counters are emitted by the guardrail itself (gheim-rt-guard), value-free by
+## construction: a count, the detector's entity class, the door name, this
+## process's tag. Never a value.
+##
+## Lives in THIS bundle rather than a new gheim-dashboards/ directory on purpose:
+## gitrepo/mdapi-prod enumerates its bundle dirs in spec.paths, so a new directory
+## is invisible to Fleet until that list is patched on the mgmt cluster. Adding a
+## file to an already-listed bundle needs no such step. The AI folder is created
+## by Grafana's file provisioning (foldersFromFilesStructure).
+##
+## Every PromQL expression here was evaluated against live VictoriaMetrics before
+## commit. ⛔ What was NOT verified this way is Grafana's own rendering of the
+## table's joinByField transformation; the queries behind it return the right
+## numbers, but if that panel looks wrong in the UI, the transform is the suspect.
+##
+## ⚠️ Two litellm replicas run the guardrail independently and both push
+## cumulative counters, so every series carries a `replica` tag and every panel
+## aggregates with sum by (...). Reading a raw series would show one replica's
+## total, which is not the fleet's, and would run backwards as the two processes
+## take turns overwriting each other.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gheim-dashboard
+  namespace: cattle-dashboards
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: AI
+data:
+  gheim-roundtrip.json: |
+    {
+      "title": "Guardrail \u2014 what the round trip transformed",
+      "uid": "ai-gheim-roundtrip",
+      "description": "What the gheim round-trip PII guardrail masked, per entity class and per door, and whether the values came back. litellm's own Guardrails Monitor only distinguishes Blocked from Pass, which cannot show any of this.",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "1m",
+      "time": {
+        "from": "now-24h",
+        "to": "now"
+      },
+      "tags": [
+        "ai",
+        "litellm",
+        "guardrail",
+        "pii"
+      ],
+      "editable": true,
+      "graphTooltip": 1,
+      "annotations": {
+        "list": []
+      },
+      "templating": {
+        "list": []
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Restore failures (range)",
+          "description": "The one true alarm. A sentinel came back to the caller with its ciphertext still attached: the value is lost in the reply AND an opaque blob was displayed. Any non-zero value here is a broken round trip. Compare with the door panel below to see WHICH door's model mangled a blob -- an instruction-following model sometimes rewrites part of a long opaque token.",
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(increase(gheim_rt_restore_failures_total[$__range])) or vector(0)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Mask-only (vault was down)",
+          "description": "Spans masked WITHOUT a recoverable blob, because CipherTrust did not answer and the guardrail fell back to its mask-only floor. The upstream still never saw the value, but the reply cannot be restored. The guardrail deliberately stays up here -- this is the counter that says it cost you the round trip.",
+          "gridPos": {
+            "x": 4,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(increase(gheim_rt_floor_spans_total[$__range])) or vector(0)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Detector failures",
+          "description": "The PII detector on mbp-mda did not answer. These requests went upstream UNMASKED. A single failure is a blip; a sustained one means the doors are passing data in clear.",
+          "gridPos": {
+            "x": 8,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(increase(gheim_rt_detect_failures_total[$__range])) or vector(0)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Calls sent unmasked (breaker)",
+          "description": "The circuit breaker tripped after repeated detector or vault failures and deliberately stopped guarding for a while. Nothing about such a request looks different, which is exactly why it has its own panel.",
+          "gridPos": {
+            "x": 12,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(increase(gheim_rt_breaker_skips_total[$__range])) or vector(0)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "Replicas reporting",
+          "description": "Distinct guardrail processes that have pushed a counter. Both litellm replicas should appear, each as its own series: two processes pushing the same labels would otherwise overwrite each other and run the values backwards. A re-registration of the guardrail starts a new series, so this reads high for a few minutes after a reload.",
+          "gridPos": {
+            "x": 16,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "count(count by (replica) (gheim_rt_calls_total)) or vector(0)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "Telemetry push failures",
+          "description": "Counts failed pushes to VictoriaMetrics. This exists so a silent metrics store is visible as a number rather than as an absence of data -- which is the one failure mode a counter cannot otherwise show.",
+          "gridPos": {
+            "x": 20,
+            "y": 0,
+            "w": 4,
+            "h": 4
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(gheim_rt_push_failures_total) or vector(0)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "colorMode": "background",
+            "graphMode": "none",
+            "textMode": "auto"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 7,
+          "type": "timeseries",
+          "title": "Masked spans \u2014 by door and entity class",
+          "description": "What was transformed, how often, and where. One span is one value taken out of the request and replaced by a sentinel. The class names are the detector's own labels. Empty stretches are simply requests with no PII in them.",
+          "gridPos": {
+            "x": 0,
+            "y": 4,
+            "w": 14,
+            "h": 9
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (door,label) (increase(gheim_rt_masked_spans_total[$__rate_interval]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "{{door}} \u00b7 {{label}}"
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 8,
+          "type": "piechart",
+          "title": "Which PII classes, over the whole range",
+          "description": "The same data as the panel to the left, totalled over the selected range and split by entity class only, so the mix is readable at a glance.",
+          "gridPos": {
+            "x": 14,
+            "y": 4,
+            "w": 10,
+            "h": 9
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (label) (increase(gheim_rt_masked_spans_total[$__range]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "{{label}}",
+              "instant": true
+            }
+          ],
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "pieType": "donut",
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "values": [
+                "value",
+                "percent"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi"
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 9,
+          "type": "timeseries",
+          "title": "Round trip outcomes \u2014 restored vs failed",
+          "description": "Whether the values came back. `restored` is a sentinel that was unsealed and put back; `FAILED` is the alarm panel above, shown here per door so a model that reliably mangles one token is identifiable rather than just counted.",
+          "gridPos": {
+            "x": 0,
+            "y": 13,
+            "w": 12,
+            "h": 9
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (door) (increase(gheim_rt_restored_spans_total[$__rate_interval]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "restored \u00b7 {{door}}"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (door) (increase(gheim_rt_restore_failures_total[$__rate_interval]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "FAILED \u00b7 {{door}}"
+            }
+          ],
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "right",
+              "calcs": [
+                "sum",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 10,
+          "type": "table",
+          "title": "Per-door totals over the range",
+          "description": "One row per door: values masked, values given back, values lost, and spans masked with no recoverable blob because the vault was unreachable. `door=unknown` is either the rearm sidecar's own registration probe or a call that reached the response hook with no model in its request data.",
+          "gridPos": {
+            "x": 12,
+            "y": 13,
+            "w": 12,
+            "h": 9
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (door) (increase(gheim_rt_masked_spans_total[$__range]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "masked",
+              "instant": true,
+              "format": "table"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (door) (increase(gheim_rt_restored_spans_total[$__range]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "restored",
+              "instant": true,
+              "format": "table"
+            },
+            {
+              "refId": "C",
+              "expr": "sum by (door) (increase(gheim_rt_restore_failures_total[$__range]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "failed",
+              "instant": true,
+              "format": "table"
+            },
+            {
+              "refId": "D",
+              "expr": "sum by (door) (increase(gheim_rt_floor_spans_total[$__range]))",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "victoriametrics"
+              },
+              "legendFormat": "mask-only",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "joinByField",
+              "options": {
+                "byField": "door",
+                "mode": "outer"
+              }
+            }
+          ],
+          "options": {
+            "showHeader": true
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "align": "auto"
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 11,
+          "type": "text",
+          "title": "What this dashboard is, and what it deliberately cannot show",
+          "gridPos": {
+            "x": 0,
+            "y": 22,
+            "w": 24,
+            "h": 6
+          },
+          "options": {
+            "mode": "markdown",
+            "content": "**Value-free by construction.** The round trip exists so the upstream never holds the data, and telemetry is the one place a leak could undo that without anyone looking. What is exported is a count, the detector's own entity class, and the door name \u2014 never a value, a fragment, a length, or the request text. A harness (`telemetry_harness_rt.py`) feeds synthetic PII through the real sandbox and fails if any input substring reaches the payload.\n\n**Door** is the litellm model name of the `-gheim` door, taken from the request. The response pass of a round trip often carries no model at all, so the masking pass remembers the blob and the restore pass asks it back \u2014 without that, every restore was attributed to `unknown`.\n\n**This cannot tell you *what* a value was, only that one was there** \u2014 by design; if you need the actual text, that is what the guardrail is protecting you from storing. It also cannot tell you which *conversation* or *user* a span belonged to: the counters carry no request identity. For per-request detail, litellm's own request logs are the place, and `gheim-pii-guard` exists as the second, mask-only guardrail."
+          }
+        }
+      ]
+    }

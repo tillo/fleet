@@ -1,0 +1,36 @@
+## goldpinger — node-pair connectivity mesh, POD path vs HOST path (beads infra-5lii).
+##
+## WHY THIS EXISTS. 2026-10-27 12:01:21-12:03:06Z all 7 quo OSDs and mon.t lost
+## their qua/qui peers for ~100 s (infra-mzaj, memory
+## quo_pod_network_ceph_cut_2026_10_27). After the fact it was undiagnosable: the
+## only per-pair evidence was Ceph's own heartbeat log. What could be reconstructed:
+## the HOST path was healthy (etcd peer RTT flat, 0 send failures), while
+## ESTABLISHED pod (flannel VXLAN) flows lost heartbeats intermittently and FRESH
+## connections and vmagent scrapes still got through. Switch, conntrack, felix,
+## flannel and disks were all clean. The cause stayed unidentified.
+##
+## WHAT IT MEASURES, per ordered node pair, every 5 s:
+##   * pod path  — DaemonSet goldpinger-pod (pod network, flannel VXLAN)
+##   * host path — DaemonSet goldpinger-host (hostNetwork, same NICs, bond, switch)
+## and on each path two flow shapes:
+##   * HTTP ping over a KEEP-ALIVE connection (Go's default transport, reused
+##     while pings come every 5 s): the long-lived flow, same 5-tuple and so the
+##     same VXLAN outer source port and the same bond/LACP member every time —
+##     the shape that broke on 10-27. A timeout closes that connection, so the
+##     next ping re-dials.
+##     -> goldpinger_peers_response_time_s{call_type="ping"} (failures are
+##        observed too, at ~PING_TIMEOUT)
+##   * UDP burst from a NEW socket each cycle (fresh source port, so a fresh
+##     outer hash): the fresh-flow shape that kept working on 10-27.
+##     -> goldpinger_peers_loss_pct
+## Alerts: monitoring-rules/72-goldpinger.yml (pod path lossy while host path
+## clean, per pair).
+##
+## Post-merge: append `goldpinger` to the live GitRepo paths (see fleet-paths.txt).
+defaultNamespace: goldpinger
+namespace: goldpinger
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25

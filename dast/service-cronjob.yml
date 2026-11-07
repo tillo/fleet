@@ -1,0 +1,129 @@
+# ACTIVE DAST against app SERVICES, behind the WAF (infra-7rog.31.5). The edge scan
+# (cronjob.yml) is passive and goes through the ingress; this one attacks:
+#
+#   zap    -- zap-full-scan.py (spider + ACTIVE rules), or zap-api-scan.py when the
+#             target names an OpenAPI URL. Sends payloads and POSTs.
+#   nuclei -- the HTTP templates (`-t http/`), which the edge scan must never run
+#             through the WAF. -ni: no interactsh callback server.
+#
+# Targets: dast-service-targets (service-targets.yml), which ships EMPTY - with no
+# line the job prints "no app enrolled" and exits 0 before downloading anything, so
+# the generic CronJobStale/CronJobNeverSucceeded rules stay green and nothing is hit.
+# Reports use the edge scan's BEGIN/END pod-log markers ("zap-full <name>",
+# "nuclei-http <name>"); wiring them into the DefectDojo sync is the first enrolment's
+# job. A target whose report is missing makes its container exit 1.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: service-dast
+  namespace: dast
+spec:
+  # Weekly, Sunday 03:17 UTC: an active scan is load on the target; odd minute.
+  schedule: "17 3 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 10800
+      ttlSecondsAfterFinished: 172800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: service-dast
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          priorityClassName: mdapi-low
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 1000
+            seccompProfile: {type: RuntimeDefault}
+          volumes:
+            - name: targets
+              configMap: {name: dast-service-targets}
+            - name: zap-wrk
+              emptyDir: {sizeLimit: 512Mi}
+            - name: nuclei-home
+              emptyDir: {sizeLimit: 512Mi}
+          containers:
+            - name: zap
+              image: docker.io/zaproxy/zap-stable:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+              securityContext:
+                runAsUser: 1000
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 250m, memory: 1Gi}
+                limits: {cpu: "1", memory: 3Gi}
+              volumeMounts:
+                - {name: targets, mountPath: /targets, readOnly: true}
+                - {name: zap-wrk, mountPath: /zap/wrk}
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  if ! grep -qvE '^[[:space:]]*(#|$)' /targets/targets; then
+                    echo "zap: no app enrolled (dast-service-targets is empty)"; exit 0
+                  fi
+                  RC=0
+                  while read -r name url api; do
+                    case "$name" in ''|'#'*) continue ;; esac
+                    r=0
+                    f="/zap/wrk/zap-$name.xml"
+                    ua="-config connection.defaultUserAgent=mdapi-dast/zap-active"
+                    if [ -n "${api:-}" ]; then
+                      zap-api-scan.py -t "$api" -f openapi -z "$ua" -x "zap-$name.xml" || r=$?
+                    else
+                      zap-full-scan.py -t "$url" -m 5 -z "$ua" -x "zap-$name.xml" || r=$?
+                    fi
+                    if [ "$r" -ge 3 ] || [ ! -s "$f" ]; then
+                      echo "zap: no report for $name (exit $r)"; RC=1; continue
+                    fi
+                    echo "-----BEGIN DAST REPORT zap-full $name-----"
+                    gzip -c "$f" | base64
+                    echo "-----END DAST REPORT zap-full $name-----"
+                  done < /targets/targets
+                  exit $RC
+            - name: nuclei
+              image: docker.io/projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
+              securityContext:
+                runAsUser: 65534
+                runAsGroup: 65534
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              env:
+                - {name: HOME, value: /home/nuclei}
+              resources:
+                requests: {cpu: 50m, memory: 256Mi}
+                limits: {cpu: 500m, memory: 1Gi}
+              volumeMounts:
+                - {name: targets, mountPath: /targets, readOnly: true}
+                - {name: nuclei-home, mountPath: /home/nuclei}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  if ! grep -qvE '^[[:space:]]*(#|$)' /targets/targets; then
+                    echo "nuclei: no app enrolled (dast-service-targets is empty)"; exit 0
+                  fi
+                  nuclei -ut -silent || { echo "nuclei: template download failed"; exit 1; }
+                  RC=0
+                  while read -r name url _openapi; do
+                    case "$name" in ''|'#'*) continue ;; esac
+                    f="$HOME/nuclei-$name.jsonl"
+                    # -t http/ (a directory, never -pt: that parses the whole tree,
+                    # 809 MiB). -ni: no interactsh. -es info: inventory is not a finding.
+                    if ! nuclei -target "$url" -t http/ -es info -ni -duc -silent -nc \
+                         -H "User-Agent: mdapi-dast/nuclei-active" -jsonl -o "$f"; then
+                      echo "nuclei: scan failed for $name"; RC=1; continue
+                    fi
+                    [ -s "$f" ] || echo "[]" > "$f"   # DefectDojo rejects an empty upload
+                    echo "-----BEGIN DAST REPORT nuclei-http $name-----"
+                    gzip -c "$f" | base64
+                    echo "-----END DAST REPORT nuclei-http $name-----"
+                  done < /targets/targets
+                  exit $RC

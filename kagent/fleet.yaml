@@ -1,0 +1,99 @@
+# kagent — in-cluster AI agents (epic infra-7rog.3). READ-ONLY by design:
+#
+#  - kagent-tools is OFF: its default ClusterRole is cluster-admin and its
+#    tool list includes ApplyManifest/DeleteResource. Every sample agent of
+#    the chart is OFF with it (they are built around those tools).
+#  - Kubernetes and memory-brain tools come through the MCP front door
+#    (agentgateway, mcp.agentgateway:8080) with the `kagent` client
+#    key: k8s-mcp is get/list/watch only and Secret-blind, and the gateway
+#    denies `pods_exec` to this client. Agents live in the kagent-mdapi/
+#    sibling bundle (a helm bundle never applies loose manifests).
+#  - Model: LiteLLM door local-tail-cn-flash-best-nothink (local first, cloud
+#    fallback; user choice 2026-11-02) on the alias-named key `kagent`
+#    (scope: that group + its two fallback hops, $15/30d).
+#
+# The UI has no login of its own (auth.mode unsecure ⇒ everyone is
+# admin@kagent.dev); kagent.mdapi.ch is gated by oauth2-proxy-admin.
+defaultNamespace: kagent
+dependsOn:
+  - name: mdapi-prod-kagent-crds
+# Post-render the chart with kustomize to annotate the bundled Postgres PVC
+# backup-exempt — chart 0.10.4 exposes no value for it (see kustomize/).
+kustomize:
+  dir: kustomize
+helm:
+  maxHistory: 25
+  releaseName: kagent
+  chart: oci://ghcr.io/kagent-dev/kagent/helm/kagent
+  version: 0.10.6
+  values:
+    # Confine the controller to its own namespace. Unscoped, its ClusterRoles
+    # grant get/list/watch on EVERY core resource (Secrets included) and
+    # create/update/patch/delete on them cluster-wide.
+    rbac:
+      namespaces: [kagent]
+    providers:
+      default: openAI
+      openAI:
+        provider: OpenAI
+        model: local-tail-cn-flash-best-nothink
+        apiKeySecretRef: kagent-litellm
+        apiKeySecretKey: OPENAI_API_KEY
+        config:
+          baseUrl: http://litellm.litellm.svc.cluster.local:4000/v1
+    # The bundled Postgres password is the chart's public constant "kagent";
+    # kagent-mdapi/kagent-netpol.yml admits only the controller to it.
+    database:
+      postgres:
+        bundled:
+          storage: 1Gi
+          storageClassName: ceph-block
+          resources:
+            requests:
+              cpu: 20m
+              memory: 96Mi
+            limits:
+              cpu: null   # delete the chart's 500m default (helm merges maps); see tests/test_kagent_limits_drop_chart_cpu_default.py
+              memory: 256Mi
+    controller:
+      resources:
+        requests:
+          cpu: 20m
+          memory: 96Mi
+        limits:
+          cpu: null   # delete the chart's CPU default, as for postgres above
+          memory: 384Mi
+    ui:
+      resources:
+        requests:
+          cpu: 20m
+          memory: 128Mi
+        limits:
+          cpu: null   # delete the chart's CPU default, as for postgres above
+          memory: 512Mi
+    kmcp:
+      enabled: false
+    kagent-tools:
+      enabled: false
+    grafana-mcp:
+      enabled: false
+    k8s-agent:
+      enabled: false
+    kgateway-agent:
+      enabled: false
+    istio-agent:
+      enabled: false
+    promql-agent:
+      enabled: false
+    observability-agent:
+      enabled: false
+    argo-rollouts-agent:
+      enabled: false
+    helm-agent:
+      enabled: false
+    cilium-policy-agent:
+      enabled: false
+    cilium-manager-agent:
+      enabled: false
+    cilium-debug-agent:
+      enabled: false

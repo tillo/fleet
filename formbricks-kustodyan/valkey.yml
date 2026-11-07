@@ -1,0 +1,48 @@
+# Valkey for Formbricks (cache, rate limiting, BullMQ, sessions). Ephemeral on purpose in the
+# sandbox: a restart only logs users out. noeviction as Formbricks' compose insists.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: formbricks-valkey
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: formbricks-valkey
+  template:
+    metadata:
+      labels:
+        app: formbricks-valkey
+    spec:
+      priorityClassName: mdapi-low
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: valkey
+          image: valkey/valkey:9@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
+          imagePullPolicy: IfNotPresent
+          args: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory-policy", "noeviction"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: [valkey-cli, ping]
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: formbricks-valkey
+spec:
+  selector:
+    app: formbricks-valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: 6379

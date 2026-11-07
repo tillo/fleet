@@ -1,0 +1,131 @@
+## kagent — in-cluster read-only AI agents (ns `kagent`, epic infra-7rog.3).
+##
+## Internal tooling: warning tier, INTERNAL component `Automation` (never
+## mapped to mdapi.statuspage.io).
+##
+## What covers what:
+##   * workload arms — controller, UI, bundled Postgres and every Agent's own
+##     Deployment (the controller creates one per Agent) short of replicas;
+##   * KagentUiUnreachable — the in-cluster UI Service answers at all;
+##   * KagentTlsExpiring — kagent.mdapi.ch's certificate (the oauth2 gate
+##     answers 302; TLS is still measured).
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-kagent
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-kagent.rules
+      rules:
+        - alert: KagentWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="kagent", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="kagent", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "kagent" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "kagent/{{ $labels.deployment }} unavailable"
+            description: |
+              A kagent Deployment is short of replicas (controller, UI, Postgres or an
+              Agent's own pod). Nothing else depends on kagent. Check:
+                kubectl --context mdapi-prod-direct -n kagent get pod,agent,remotemcpserver
+                kubectl --context mdapi-prod-direct -n kagent logs deploy/kagent-controller --tail=50
+
+        ## ⚠️ Keep this arm even though it matches nothing today: the coverage
+        ## probe treats a namespace-only selector as covering both kinds.
+        - alert: KagentStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="kagent", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="kagent", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "kagent" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "kagent/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in ns kagent has fewer available replicas than desired.
+
+        - alert: KagentUiUnreachable
+          expr: avg_over_time(probe_success{probe="kagent-ui"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: kagent
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "kagent UI does not answer in-cluster"
+            description: |
+              The probe of http://kagent-ui.kagent.svc.cluster.local:8080/ failed for >15m:
+              the UI pod, its Service or kagent-mdapi/kagent-netpol.yml.
+                kubectl --context mdapi-prod-direct -n kagent get pod,svc,networkpolicy
+
+        - alert: KagentTlsExpiring
+          ## Re-provided because the target carries no `component` (see Probe below),
+          ## so SyntheticProbeTLSExpiringSoon does not cover it.
+          expr: (probe_ssl_earliest_cert_expiry{probe="kagent-tls"} - time()) < 14 * 86400
+          for: 1h
+          labels:
+            service: kagent
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "kagent.mdapi.ch certificate expires in {{ $value | humanizeDuration }}"
+            description: |
+              cert-manager should have renewed at 30 days. Check:
+                kubectl --context mdapi-prod-direct -n kagent describe certificate kagent-cert
+---
+## No `component`/`team` on the targets, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: kagent-ui
+  namespace: monitoring
+spec:
+  jobName: kagent-ui
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - http://kagent-ui.kagent.svc.cluster.local:8080/
+      labels:
+        probe: kagent-ui
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: kagent-tls
+  namespace: monitoring
+spec:
+  jobName: kagent-tls
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://kagent.mdapi.ch/
+      labels:
+        probe: kagent-tls

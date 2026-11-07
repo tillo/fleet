@@ -1,0 +1,25 @@
+defaultNamespace: bootstrap
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA: warn+audit at baseline, deliberately WITHOUT enforce. Since the
+  # Rancher 2.15.2 / Fleet v0.16 upgrade (2026-10-29) Fleet sets the live
+  # labels to EXACTLY this list, so it is authoritative, and every other bundle
+  # deploying into bootstrap that declares namespaceLabels (gitlab/fleet.yaml)
+  # must carry the identical list or the last one deployed wins
+  # (infra-r9mzd.14, PsaLabelDrift).
+  # enforce=baseline was tried and reverted the same hour: the GitLab runner
+  # creates job pods with container.apparmor...=unconfined (its
+  # pod_annotations config), which the API server denies under baseline
+  # enforce — the first CI job after the label failed "violates PodSecurity
+  # baseline:latest: forbidden AppArmor profiles" (pipeline 43935). warn+audit
+  # still satisfies the coverage probe and keeps the promise audible.
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+- name: mdapi-prod-cloudnative-pg
+- name: mdapi-prod-external-secrets
+helm:
+  maxHistory: 25

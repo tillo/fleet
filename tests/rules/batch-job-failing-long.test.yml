@@ -1,0 +1,51 @@
+# BatchJobFailingLong (infra-drfv, decided A 2026-11-04): BatchJobLastRunFailed and
+# BatchJobStale are warnings, which reach the -quiet receiver (Pushover -1, repeat 1w),
+# so a multi-day batch outage produced one silent notification and then a week of
+# nothing (ceph_pvc_snapshot failed ~39 h unnoticed, 2026-10-30). Held for 24 h, either
+# one escalates to critical (priority 1, repeat 4h) through this one generic rule.
+# It reads the ALERTS series, so it survives a vmalert restart that a `for: 24h` would lose.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: a-failure-held-for-24h-pages-a-shorter-one-does-not
+  interval: 5m
+  input_series:
+  - series: ALERTS{alertname="BatchJobLastRunFailed",alertstate="firing",job="ceph_pvc_snapshot",severity="warning"}
+    values: '1x300'
+  - series: ALERTS{alertname="BatchJobStale",alertstate="firing",job="config_backup",severity="warning"}
+    values: '_x60 1x240'
+  alert_rule_test:
+  - eval_time: 23h
+    groupname: app-batch-jobs.escalation
+    alertname: BatchJobFailingLong
+    exp_alerts: []
+  - eval_time: 24h
+    groupname: app-batch-jobs.escalation
+    alertname: BatchJobFailingLong
+    exp_alerts:
+    - exp_labels:
+        job: ceph_pvc_snapshot
+        service: ceph_pvc_snapshot
+        namespace: windmill
+        severity: critical
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      exp_annotations:
+        summary: "Batch job ceph_pvc_snapshot has been failing or stale for 24 h"
+        description: "BatchJobLastRunFailed or BatchJobStale has fired for ceph_pvc_snapshot for 24 h\nwithout a break. Those warnings notify once, quietly, then stay silent for a\nweek; this escalation pages every 4 h until the job is healthy. Its runs\n(search for ceph_pvc_snapshot): https://windmill.mdapi.ch/runs\n"
+- name: a-gap-restarts-the-clock-and-a-pending-alert-never-counts
+  interval: 5m
+  input_series:
+  - series: ALERTS{alertname="BatchJobLastRunFailed",alertstate="firing",job="docs_checkout_refresh",severity="warning"}
+    values: '1x120 _x24 1x160'
+  - series: ALERTS{alertname="BatchJobStale",alertstate="pending",job="lm_doctor",severity="warning"}
+    values: '1x300'
+  - series: ALERTS{alertname="SomethingElse",alertstate="firing",job="lm_doctor",severity="warning"}
+    values: '1x300'
+  alert_rule_test:
+  - eval_time: 25h
+    groupname: app-batch-jobs.escalation
+    alertname: BatchJobFailingLong
+    exp_alerts: []

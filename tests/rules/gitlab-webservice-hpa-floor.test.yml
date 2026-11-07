@@ -1,0 +1,78 @@
+# GitLabWebserviceUnavailable (fleet !1822, infra-cn7yo): an HPA scale-up whose
+# extra pod is still starting is not an outage. Quiet while available >= the HPA's
+# minReplicas; fires below the floor; with no HPA the old `spec - available > 0`
+# behaviour is kept.
+rule_files:
+- monitoring-rules/03-gitlab.yml
+evaluation_interval: 1m
+tests:
+- name: hpa-scale-up-quiet
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="bootstrap",deployment="gitlab-webservice-default"}
+    values: 2x9 3x7 2x30
+  - series: kube_deployment_status_replicas_available{namespace="bootstrap",deployment="gitlab-webservice-default"}
+    values: 2x50
+  - series: kube_horizontalpodautoscaler_spec_min_replicas{namespace="bootstrap",horizontalpodautoscaler="gitlab-webservice-default"}
+    values: 2x50
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: app-gitlab.workload
+    alertname: GitLabWebserviceUnavailable
+    exp_alerts: []
+- name: below-hpa-floor-fires
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="bootstrap",deployment="gitlab-webservice-default"}
+    values: 2x50
+  - series: kube_deployment_status_replicas_available{namespace="bootstrap",deployment="gitlab-webservice-default"}
+    values: 2x9 1x40
+  - series: kube_horizontalpodautoscaler_spec_min_replicas{namespace="bootstrap",horizontalpodautoscaler="gitlab-webservice-default"}
+    values: 2x50
+  alert_rule_test:
+  - eval_time: 13m
+    groupname: app-gitlab.workload
+    alertname: GitLabWebserviceUnavailable
+    exp_alerts: []
+  - eval_time: 16m
+    groupname: app-gitlab.workload
+    alertname: GitLabWebserviceUnavailable
+    exp_alerts:
+    - exp_labels:
+        namespace: bootstrap
+        deployment: gitlab-webservice-default
+        service: gitlab-webservice-default
+        severity: critical
+        component: Platform
+        statuspage: include
+        team: mdapi
+      exp_annotations:
+        summary: 'GitLab webservice gitlab-webservice-default: 1 replicas unavailable'
+        description: 'gitlab.mdapi.ch will be unreachable. Check: kubectl -n bootstrap logs deployment/gitlab-webservice-default'
+- name: no-hpa-keeps-old-behaviour
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="bootstrap",deployment="gitlab-webservice-default"}
+    values: 3x50
+  - series: kube_deployment_status_replicas_available{namespace="bootstrap",deployment="gitlab-webservice-default"}
+    values: 2x50
+  alert_rule_test:
+  - eval_time: 3m
+    groupname: app-gitlab.workload
+    alertname: GitLabWebserviceUnavailable
+    exp_alerts: []
+  - eval_time: 7m
+    groupname: app-gitlab.workload
+    alertname: GitLabWebserviceUnavailable
+    exp_alerts:
+    - exp_labels:
+        namespace: bootstrap
+        deployment: gitlab-webservice-default
+        service: gitlab-webservice-default
+        severity: critical
+        component: Platform
+        statuspage: include
+        team: mdapi
+      exp_annotations:
+        summary: 'GitLab webservice gitlab-webservice-default: 1 replicas unavailable'
+        description: 'gitlab.mdapi.ch will be unreachable. Check: kubectl -n bootstrap logs deployment/gitlab-webservice-default'
