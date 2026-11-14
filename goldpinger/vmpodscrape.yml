@@ -1,0 +1,24 @@
+## Scrapes BOTH arms. `path` (pod|host) is the label the alerts in
+## monitoring-rules/72-goldpinger.yml join on; it comes from the pod's
+## app.kubernetes.io/component, so it cannot drift from the arm that produced it.
+##
+## 15 s, not the 30 s default: goldpinger_peers_loss_pct is a gauge of the LAST
+## 5 s cycle only, so a 30 s scrape keeps one cycle in six. ~200 series per pod.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: goldpinger
+  namespace: goldpinger
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: goldpinger
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      relabelConfigs:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          regex: "(pod|host)-path"
+          targetLabel: path
+          replacement: "$1"

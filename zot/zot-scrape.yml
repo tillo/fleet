@@ -1,0 +1,69 @@
+## Scrape zot's Prometheus endpoint into VictoriaMetrics.
+##
+## WHY THIS EXISTS (infra-8f4.56): until now zot was only watched from OUTSIDE
+## (the blackbox Probe `zot-registry` in monitoring-rules/10-blackbox-probes.yml
+## and the daily orphan-image probe). Nothing knew about push failures, sync
+## fetch failures, GC errors, storage growth or latency — and zot now holds the
+## only copy of our own images.
+##
+## vmagent-mdapi discovers every VMPodScrape cluster-wide (its
+## podScrapeNamespaceSelector/podScrapeSelector are empty in monitoring-vm/
+## vmagent.yml), so this object needs no registration anywhere else.
+##
+## ⛔ WHY IT CARRIES credentials. zot serves /metrics through the same authn +
+## authz chain as everything else, and MetricsAuthzHandler denies BOTH anonymous
+## and every authenticated user unless the username appears in
+## accessControl.metrics.users (pkg/api/authz.go). The `zot` user — read-only
+## since the D1 change — is named there, and this scrape authenticates as it.
+## The alternative, accessControl.metrics.anonymousPolicy ["read"], would leave
+## /metrics anonymously readable through the public ingress; it is deliberately
+## NOT used. The plaintext lives in Akeyless /mdapi/zot/zot-auth/password (the
+## same item the orphan-image probe already reads) and reaches the cluster only
+## through ESO.
+##
+## 60s, not 30s: the series are counters/gauges about a registry that changes on
+## a human timescale, and the alert rules below use 10m rates.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-metrics-auth
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-metrics-auth
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## The username is not a secret; it is templated anyway so the scrape
+        ## has ONE source for both halves and no literal to drift.
+        username: "zot"
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/zot/zot-auth/password
+      secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: zot
+  namespace: zot
+spec:
+  selector:
+    matchLabels:
+      app: zot
+  podMetricsEndpoints:
+    - port: registry
+      path: /metrics
+      interval: 60s
+      basicAuth:
+        username:
+          name: zot-metrics-auth
+          key: username
+        password:
+          name: zot-metrics-auth
+          key: password

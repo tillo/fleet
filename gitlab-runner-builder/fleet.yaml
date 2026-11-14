@@ -1,0 +1,28 @@
+## Namespace owner for `gitlab-runner-builder`, nothing else.
+##
+## This bundle used to install the persistent-workspace runner (tag
+## builder-persistent, job make_fast, pinned to the CP+etcd node quo with
+## cpu_limit 24 and a 60Gi rep-1 workspace PVC). That lane was retired
+## (infra-5ypt): kernel iterations use the normal make_mr lane on quarto.
+##
+## The bundle stays because it OWNS the namespace (labels + PSA below) and the
+## two nested runner bundles, fullbuild/ and fullbuild-mr/, dependsOn it by name.
+## Moving the namespace ownership would touch both of them for no gain.
+## Fleet still renders it as release `gitlab-runner-builder`, so the chart's
+## objects (runner Deployment, RBAC, token ExternalSecret, workspace PVC) are
+## removed by the upgrade to this chart-less release.
+defaultNamespace: gitlab-runner-builder
+namespace: gitlab-runner-builder
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25
+  releaseName: gitlab-runner-builder

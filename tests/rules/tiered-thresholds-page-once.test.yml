@@ -1,0 +1,83 @@
+# Two-tier threshold pairs (infra-3rm.8 items 8/9): the lower tier is BOUNDED above by the
+# upper tier's threshold, so one condition raises exactly one alert at the level it has
+# reached. Without the bound both tiers fire together in the worse band: two notifications
+# for one event.
+# (FluentdCriblOutputBuffer* is bounded the same way; its file also holds a ServiceMonitor,
+# which this runner cannot load, so it is proven against VictoriaMetrics instead.)
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+- monitoring-rules/27-cert-renewal.yml
+evaluation_interval: 5m
+tests:
+- name: fio-reserves-in-the-warning-band-warn-only
+  interval: 5m
+  input_series:
+  - series: fio_card_reserves_pct{node="quo",card="fct1",model="m",sn="s"}
+    values: '20x40'
+  alert_rule_test:
+  - eval_time: 1h
+    groupname: app-batch-jobs.fio-card-wear
+    alertname: FioCardReservesLow
+    exp_alerts:
+    - exp_labels: {node: quo, card: fct1, model: m, sn: s, service: fusionio, severity: warning, component: Storage, team: mdapi}
+      exp_annotations:
+        summary: "fio card quo/fct1 reserves down to 20%"
+        description: "Reserve space on m SN s has fallen\nbelow 25%. The card raises its OWN warning at 10%, so this is the\nearly page. Baseline 2026-08-23: quo fct1 52.80%, every other card\n100%. Plan the replacement now — do not wait for 10%.\n"
+  - eval_time: 1h
+    groupname: app-batch-jobs.fio-card-wear
+    alertname: FioCardReservesCritical
+    exp_alerts: []
+- name: fio-reserves-in-the-critical-band-raise-only-the-critical
+  interval: 5m
+  input_series:
+  - series: fio_card_reserves_pct{node="quo",card="fct1",model="m",sn="s"}
+    values: '5x40'
+  alert_rule_test:
+  - eval_time: 1h
+    groupname: app-batch-jobs.fio-card-wear
+    alertname: FioCardReservesLow
+    exp_alerts: []
+- name: device-cert-in-the-warning-band-warns-only
+  interval: 5m
+  input_series:
+  - series: printer_cert_days_to_expiry
+    values: '10x100'
+  alert_rule_test:
+  - eval_time: 7h
+    groupname: cert-renewal.rules
+    alertname: DeviceCertExpiringSoon
+    exp_alerts:
+    - exp_labels: {service: device-certs, severity: warning, component: Platform, team: mdapi, statuspage: exclude}
+      exp_annotations:
+        summary: "Device cert printer_cert_days_to_expiry at 10d to expiry — renewal not landing"
+        description: "A device cert tracked by *_cert_days_to_expiry is under 14 days and has not renewed.\nCheck the event-driven path (Horizon on_expire → cert_renew_dispatch / ilo_cert_renew)\nand the backstop cron/schedule for that device.\n"
+  - eval_time: 7h
+    groupname: cert-renewal.rules
+    alertname: DeviceCertExpiringCritical
+    exp_alerts: []
+- name: device-cert-in-the-critical-band-raises-only-the-critical
+  interval: 5m
+  input_series:
+  - series: printer_cert_days_to_expiry
+    values: '3x100'
+  alert_rule_test:
+  - eval_time: 7h
+    groupname: cert-renewal.rules
+    alertname: DeviceCertExpiringSoon
+    exp_alerts: []
+- name: licence-ratios-in-the-critical-band-raise-only-the-critical
+  interval: 5m
+  input_series:
+  - series: horizon_license_items_used_ratio{job="horizon_license_usage"}
+    values: '0.97x40'
+  - series: stream_license_certificate_used_ratio{job="stream_license_usage"}
+    values: '0.97x40'
+  alert_rule_test:
+  - eval_time: 2h
+    groupname: app-batch-jobs.horizon-license
+    alertname: HorizonLicenseItemsApproachingLimit
+    exp_alerts: []
+  - eval_time: 2h
+    groupname: app-batch-jobs.stream-license
+    alertname: StreamCertCountApproachingLicense
+    exp_alerts: []

@@ -1,0 +1,202 @@
+# The MCP gateway's grant matrix: a seat's access lives in a row of
+# the gateway's database, so nothing in git drifts when it changes and nothing turns
+# red when it breaks. These groups pin the five arms of 77b-agentgateway-grants.yml.
+#
+# ⚠️ Two facts that cost an hour here:
+#   * vmalert-tool's clock starts at 2000-01-01T00:00:00Z, so time() is 946684800 at
+#     eval_time 0: a FROZEN stamp is a constant 946684800, a healthy one must walk
+#     forward 60 per minute or the staleness arm fires on it;
+#   * `max by (seat, server, route)` DROPS `job`, so that one alert carries no job
+#     label while the other four do.
+#
+rule_files:
+- monitoring-rules/77b-agentgateway-grants.yml
+evaluation_interval: 1m
+tests:
+- name: a-healthy-matrix-is-silent
+  interval: 1m
+  input_series:
+  - series: agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"}
+    values: 946684800+60x130
+  - series: agentgateway_grants_last_run_success{job="agentgateway_catalog_export"}
+    values: 1x131
+  - series: agentgateway_mcp_seat_granted{job="agentgateway_catalog_export",seat="seat-jump"}
+    values: 5x131
+  - series: agentgateway_mcp_grant{job="agentgateway_catalog_export",seat="seat-jump",server="notes"}
+    values: 1x131
+  alert_rule_test:
+  - eval_time: 120m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantExportStale
+    exp_alerts: []
+  - eval_time: 120m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantExportFailed
+    exp_alerts: []
+  - eval_time: 120m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantInconsistent
+    exp_alerts: []
+  - eval_time: 120m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewaySeatLostAllGrants
+    exp_alerts: []
+  - eval_time: 120m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantMatrixEmpty
+    exp_alerts: []
+- name: a-frozen-stamp-pages-after-the-hour
+  interval: 1m
+  input_series:
+  - series: agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"}
+    values: 946684800x131
+  - series: agentgateway_grants_last_run_success{job="agentgateway_catalog_export"}
+    values: 1x131
+  - series: agentgateway_mcp_seat_granted{job="agentgateway_catalog_export",seat="seat-jump"}
+    values: 5x131
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantExportStale
+    exp_alerts: []
+  - eval_time: 120m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantExportStale
+    exp_alerts:
+    - exp_labels:
+        alertgroup: app-agentgateway-grants.rules
+        alertname: AgentgatewayGrantExportStale
+        job: agentgateway_catalog_export
+        severity: warning
+        component: Automation
+        team: mdapi
+        service: agentgateway
+      exp_annotations:
+        summary: The MCP gateway grant export has not run for over an hour
+        description: "agentgateway-catalog-export has not pushed a fresh stamp in more than\n3600 s, so agentgateway_mcp_seat_granted and agentgateway_mcp_grant\ndescribe the gateway as it was, not as it is. Its own `create` for\nthe grants ConfigMap is the usual cause of a lost permission.\n  kubectl --context mdapi-prod-direct -n agentgateway get cronjob,job\n  kubectl --context mdapi-prod-direct\
+          \ -n agentgateway logs -l app.kubernetes.io/name=agentgateway-catalog-export --tail=50\n  kubectl --context mdapi-prod-direct -n agentgateway get role agentgateway-catalog-export -o yaml\n"
+- name: a-failed-run-pages-even-with-a-fresh-stamp
+  interval: 1m
+  input_series:
+  - series: agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"}
+    values: 946684800+60x40
+  - series: agentgateway_grants_last_run_success{job="agentgateway_catalog_export"}
+    values: 1 0x40
+  - series: agentgateway_mcp_seat_granted{job="agentgateway_catalog_export",seat="seat-jump"}
+    values: 5x41
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantExportFailed
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantExportFailed
+    exp_alerts:
+    - exp_labels:
+        alertgroup: app-agentgateway-grants.rules
+        alertname: AgentgatewayGrantExportFailed
+        job: agentgateway_catalog_export
+        severity: warning
+        component: Automation
+        team: mdapi
+        service: agentgateway
+      exp_annotations:
+        summary: The MCP gateway grant export failed on its last run
+        description: "The job read the gateway's admin API or wrote a ConfigMap and raised,\nso it pushed success=0 and left the matrix from an earlier run. The\nadmin API answers 4001 without authenticating, so a reaching failure\nmeans the pod lost the NetworkPolicy allowance, the gateway is down,\nor the API answered with something that is not a resource document.\n  kubectl --context mdapi-prod-direct\
+          \ -n agentgateway logs -l app.kubernetes.io/name=agentgateway-catalog-export --tail=50\n"
+- name: a-seat-that-holds-nothing-pages
+  interval: 1m
+  input_series:
+  - series: agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"}
+    values: 946684800+60x70
+  - series: agentgateway_grants_last_run_success{job="agentgateway_catalog_export"}
+    values: 1x71
+  - series: agentgateway_mcp_seat_granted{job="agentgateway_catalog_export",seat="seat-jump"}
+    values: 5x71
+  - series: agentgateway_mcp_seat_granted{job="agentgateway_catalog_export",seat="seat-bpi-r4"}
+    values: '0x71'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewaySeatLostAllGrants
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewaySeatLostAllGrants
+    exp_alerts:
+    - exp_labels:
+        alertgroup: app-agentgateway-grants.rules
+        alertname: AgentgatewaySeatLostAllGrants
+        job: agentgateway_catalog_export
+        severity: warning
+        component: Automation
+        team: mdapi
+        service: seat-bpi-r4
+        seat: seat-bpi-r4
+      exp_annotations:
+        summary: MCP seat seat-bpi-r4 holds no grant at all
+        description: "The gateway still carries a key for seat-bpi-r4, but no route\nauthorises it for a single server, so every tool call answers 401 or\n403. Either the seat was meant to be retired (delete its key from every\nroute and its entry in Akeyless /mdapi/agentgateway-system/mcp-clients)\nor its metadata.servers was emptied by an edit.\n  kubectl --context mdapi-prod-direct -n agentgateway\
+          \ get cm agentgateway-grants -o jsonpath='{.data.grants\\.json}'\n"
+- name: a-grant-claimed-on-the-wrong-row-pages
+  interval: 1m
+  input_series:
+  - series: agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"}
+    values: 946684800+60x70
+  - series: agentgateway_grants_last_run_success{job="agentgateway_catalog_export"}
+    values: 1x71
+  - series: agentgateway_mcp_seat_granted{job="agentgateway_catalog_export",seat="seat-jump"}
+    values: 5x71
+  - series: agentgateway_mcp_grant_invalid{job="agentgateway_catalog_export",seat="seat-jump",server="notes",route="mcp-memsearch"}
+    values: 1x71
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantInconsistent
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantInconsistent
+    exp_alerts:
+    - exp_labels:
+        alertgroup: app-agentgateway-grants.rules
+        alertname: AgentgatewayGrantInconsistent
+        severity: warning
+        component: Automation
+        team: mdapi
+        service: seat-jump
+        seat: seat-jump
+        server: notes
+        route: mcp-memsearch
+      exp_annotations:
+        summary: MCP grant notes for seat-jump is recorded on mcp-memsearch only
+        description: "Route mcp-memsearch lists `notes` in the key's\nmetadata.servers, but the route that serves notes does\nnot. Every route row repeats the same list, so the pair exists through\ncopy drift: that seat reaches the servers its own rows authorise and\ngets 401 on notes, while the metadata says otherwise.\nFix the key's metadata on the route that serves the server \u2014 the routes\n\
+          are database rows, so add it in the admin UI (or the config API), not\nin git.\n  kubectl --context mdapi-prod-direct -n agentgateway get cm agentgateway-grants -o jsonpath='{.data.grants\\.json}'\n"
+- name: a-matrix-with-no-seat-at-all-pages-after-2h
+  interval: 1m
+  input_series:
+  - series: agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"}
+    values: 946684800+60x130
+  - series: agentgateway_grants_last_run_success{job="agentgateway_catalog_export"}
+    values: 1x131
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantMatrixEmpty
+    exp_alerts: []
+  - eval_time: 130m
+    groupname: app-agentgateway-grants.rules
+    alertname: AgentgatewayGrantMatrixEmpty
+    exp_alerts:
+    - exp_labels:
+        alertgroup: app-agentgateway-grants.rules
+        alertname: AgentgatewayGrantMatrixEmpty
+        job: agentgateway_catalog_export
+        severity: warning
+        component: Automation
+        team: mdapi
+        service: agentgateway
+      exp_annotations:
+        summary: The MCP gateway published no seat grants at all
+        description: "No agentgateway_mcp_seat_granted series exists, so the export read a\ngateway with no apiKey policy carrying a client name \u2014 the shape of a\nroute table that was wiped or rebuilt without its key metadata. Every\nseat is locked out and the other grant rules have nothing to say.\n  kubectl --context mdapi-prod-direct -n agentgateway get cm agentgateway-catalog -o jsonpath='{.data.resources\\\
+          .json}'\n  kubectl --context mdapi-prod-direct -n agentgateway get cluster agentgateway-pg -o wide\n"

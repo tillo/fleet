@@ -1,0 +1,26 @@
+## Scheduled DAST of the estate's public edge (infra-7rog.31.4). One CronJob
+## (cronjob.yml) scans each host in targets.yml the way a stranger reaches it:
+## DNS, then the ingress, the WAF and whatever auth sits in front of the app.
+## The CI side (ci-templates /dast.yml) scans the image before it ships; this
+## scans what is actually live.
+##
+## Monitoring: no bespoke rules file. The generic CronJobStale and
+## CronJobNeverSucceeded (monitoring-rules/12-batch-jobs.yml) cover every
+## CronJob by namespace with no edit, and the findings themselves are records
+## in DefectDojo (product mdapi-prod, engagement edge-dast), not alerts.
+defaultNamespace: dast
+namespace: dast
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  ## Both scanners run as non-root with every capability dropped, so the
+  ## namespace can ENFORCE restricted, not merely warn. A scanner is a
+  ## workload that talks to strangers' content; it gets the tightest profile.
+  pod-security.kubernetes.io/enforce: restricted
+  pod-security.kubernetes.io/enforce-version: latest
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25

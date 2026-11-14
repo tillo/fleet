@@ -1,0 +1,260 @@
+## VMAlertmanagerConfig for vmalertmanager-mdapi. After Phase 4 cutover
+## (vmalert ruleSelector narrowed to monitoring-stack=mdapi + vmAM
+## configSelector selecting this CR), the route below is the ONLY path
+## team=mdapi alerts take. Bundled Alertmanager will no longer see them.
+##
+## Format reference: https://docs.victoriametrics.com/operator/api/#vmalertmanagerconfigspec
+## Field names follow Go json tags from the VM operator (snake_case),
+## matching native alertmanager.yaml — not the camelCase used by
+## monitoring.coreos.com/AlertmanagerConfig.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAlertmanagerConfig
+metadata:
+  name: mdapi-team
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  route:
+    ## Parent route is a no-op black-hole. Anything not matching a child
+    ## route is silently dropped — symmetric with the prior
+    ## AlertmanagerConfig design.
+    receiver: black-hole
+    group_by: [component, alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+    ## Severity-tiered notification to fight alarm fatigue. Same receiver
+    ## (statuspage-and-pushover) but the Pushover `priority` template keys
+    ## off severity, and repeat_interval is split per route:
+    ##   critical -> priority 1 (interrupts), repeat 4h
+    ##   warning  -> priority -1 (in-app, NO sound/vibration), repeat 24h
+    ##   info/etc -> priority -2 (silent, badge only), repeat 24h
+    ## First-match-wins: criticals take the first route; everything else
+    ## team=mdapi falls to the catch-all second route. You keep full
+    ## visibility in the Pushover app; only criticals buzz.
+    ## InfoInhibitor / Watchdog stay exclude-listed defensively (vendor
+    ## rules, no mdapi label post-cutover) so a stray label can't page.
+    ## CVE inventory alert deliberately NOT notified (2026-07-13, user
+    ## decision): the grype curator digest is the single CVE channel and
+    ## this alert duplicated it (it was also the top flap source — 298
+    ## episodes/13d). The rule still evaluates (AM UI, dashboards, PromQL
+    ## via ALERTS) — it just routes to the black-hole. Listed FIRST so it
+    ## wins regardless of severity.
+    ##
+    ## 2026-08-29: NamespaceWithCriticalCves was replaced by
+    ## NewImageWithCriticalCves, which alerts on newly-flagged images rather
+    ## than restating the standing inventory (see 12-batch-jobs.yml for why).
+    ## The matcher is a regex so the successor inherits the SAME silence —
+    ## a rename must not quietly re-enable CVE notifications and undo the
+    ## 2026-07-13 decision. ⚠️ If you ever want the delta to notify, that is a
+    ## deliberate choice to make here, not a side effect of renaming a rule:
+    ## the new alert is much quieter (0 firing at the time of the change, vs
+    ## 26 for its predecessor), so it is a defensible thing to un-silence.
+    ## 2026-08-31 (user decision, beads infra-3rm.14): four more inventory alerts
+    ## joined the black-hole. Measured share of the previous 30 days spent FIRING —
+    ## HostUpdateAvailable 96%, ComponentUpgradeAvailable 86%, CertExpiringSoon
+    ## (info tier) 72%, K8sOrphanObjects chronic. They are info so they never paged,
+    ## but they never CLEAR either, and an alert that is always on is functionally
+    ## off — worse, it camouflages a genuinely new info alert in the same list.
+    ## These are inventory: "updates exist" and "there are orphan objects" are
+    ## permanently true in a live estate. They belong in a digest, and the rules stay
+    ## evaluable for dashboards and PromQL.
+    ##
+    ## ⚠️ CertExpiringSoon has TWO tiers and only the INFO one is silenced here. The
+    ## warning tier — a cert inside 30 days with NO future renewalTime, i.e. nothing
+    ## is going to renew it — keeps notifying, because that one is genuinely
+    ## actionable. Matching on alertname alone would have silenced both; the severity
+    ## matcher is what keeps them apart.
+    ## ⚠️ o2-incidents-vmac.yml excludes the same alertnames from the O2 shadow
+    ## copy — keep its regex in sync with this one.
+    - receiver: black-hole
+      matchers:
+      - 'alertname=~"NamespaceWithCriticalCves|NewImageWithCriticalCves|HostUpdateAvailable|ComponentUpgradeAvailable|K8sOrphanObjects"'
+    ## 2026-11-08 (Pushover pool, ~485 msgs/day vs 284 sustainable): the INFO tier
+    ## of LonghornVolumeDegraded is the single loudest flapper on the estate —
+    ## measured 39 firing transitions in 24 h, 27 % of ALL team=mdapi transitions,
+    ## for an alert that renders at priority -2 and therefore never makes a sound.
+    ## It exists only to be scrollable in the Pushover list, which a dashboard or
+    ## `ALERTS` does better.
+    ## ⚠️ Severity-matched ON PURPOSE, exactly like CertExpiringSoon above: the
+    ## WARNING tier of this same alertname ("degraded 12 h+, rebuild not happening")
+    ## is genuinely actionable and MUST keep notifying. Matching on alertname alone
+    ## would silence both.
+    ## Kept evaluable — the rule, the 12 h warning tier, LonghornRebuildStuck,
+    ## LonghornGhostSlotStuck and the auto-heals all stay live.
+    ## ⚠️ o2-incidents-vmac.yml carries the SAME exclusion; keep the two in sync.
+    - receiver: black-hole
+      matchers:
+      - 'alertname="LonghornVolumeDegraded"'
+      - 'severity="info"'
+    ## 2026-09-22: the black-hole route that matched CertExpiringSoon +
+    ## severity="info" is GONE, because the rule it silenced is gone — that tier
+    ## is now a recording rule (cert:expiring_soon_with_renewal_scheduled:days in
+    ## monitoring-rules/12-batch-jobs.yml). Silencing it here stopped the Pushover
+    ## but left it in every list view at a measured 61% of the month firing, and
+    ## the console actually used for live alarms has no severity filter.
+    ## A silencer kept for a rule that no longer exists is config that does
+    ## nothing and misleads the next reader, so it is retired in the same change.
+    ## ⚠️ The WARNING tier of CertExpiringSoon was never silenced and still is not
+    ## — a cert inside 30 days with nothing scheduled to renew it still notifies.
+    - receiver: statuspage-and-pushover
+      matchers:
+      - 'team="mdapi"'
+      - 'alertname!~"InfoInhibitor|Watchdog"'
+      - 'severity="critical"'
+      repeat_interval: 4h
+    ## 2026-11-08: NON-CRITICALS NO LONGER REACH PUSHOVER AT ALL — statuspage
+    ## webhook only. Measured over 24 h of team=mdapi transitions, the route
+    ## below was carrying 112 messages/day (56 warning + 56 info) and every one
+    ## of them rendered at priority -1 or -2, i.e. NO sound and NO vibration.
+    ## They existed purely to be scrollable in the app, which Grafana and
+    ## `ALERTS` already do better; meanwhile the shared Pushover pool was down
+    ## to 6,394 of 10,000 with 22 days left in the month.
+    ## ⭐ A phone should buzz for pages. A warning you cannot hear is not a page:
+    ## it is a log line with a delivery cost. Statuspage, Grafana and the O2
+    ## incident stream all still receive these — only the handset is spared.
+    ## ⚠️ This is the continuation of the 2026-07-13 change that turned OFF
+    ## `send_resolved` here: that removed half the non-critical volume, this
+    ## removes the other half.
+    - receiver: statuspage-only
+      matchers:
+      - 'team="mdapi"'
+      - 'alertname!~"InfoInhibitor|Watchdog"'
+      ## 168h/7d (was 24h): chronic conditions (cve/upgrade/cert/backup-missing)
+      ## stay firing for days and were re-paged daily — the #1 Pushover-pool
+      ## drain (5,251/mo, 2026-06). Weekly re-page is plenty for priority -1
+      ## warnings. (Kept in `h` units to match the rest of this file.)
+      repeat_interval: 168h
+      ## 30m (was parent 5m): a group whose member set churns (e.g. 45
+      ## NamespaceWithCriticalCves namespaces flapping through one group
+      ## during pod churn) re-notifies at group_interval, not
+      ## repeat_interval — 5m turned every flap wave into a message every
+      ## 5 minutes (measured 2026-07-13: ~65 msgs/day baseline, 1,685 on
+      ## the 06-30 outage day). Criticals keep the parent 5m.
+      group_interval: 30m
+
+  inhibit_rules:
+  ## When LonghornVolumeDegraded fires for a given (pvc_namespace, pvc),
+  ## mute the chart-side LonghornVolumeStatusWarning on the same volume.
+  ## Same intent as the prior AC's inhibitRule; kept here so the rule
+  ## travels with the route.
+  - source_matchers:
+    - 'alertname="LonghornVolumeDegraded"'
+    target_matchers:
+    - 'alertname="LonghornVolumeStatusWarning"'
+    equal: [pvc_namespace, pvc]
+  ## A probe that is outright failing should not ALSO page for being slow:
+  ## during ingress/node incidents both fire per instance and double the
+  ## message count (storm audit 2026-07-13).
+  - source_matchers:
+    - 'alertname="SyntheticProbeFailing"'
+    target_matchers:
+    - 'alertname="SyntheticProbeSlowResponse"'
+    equal: [instance]
+  ## 2026-09-22: openbao-mirror is covered TWICE — by the generic
+  ## CronJobStale (app-batch-jobs.cronjob-freshness, threshold derived from the
+  ## job's own cadence via cronjob_stale_after_seconds) and by the purpose-built
+  ## OpenBaoMirrorStale (app-openbao.mirror-freshness, hardcoded 4h). One broken
+  ## CronJob therefore produced two Pushover messages, and the generic one is the
+  ## less useful of the pair: it cannot say what the mirror is FOR or how to
+  ## diagnose it.
+  ##
+  ## Inhibition rather than deleting either rule: the specific alert keeps its
+  ## openbao runbook, and the generic rule keeps covering every OTHER cronjob
+  ## without anyone having to remember to exclude this one. Both carry namespace
+  ## and cronjob labels (verified against the live Alertmanager API), so the
+  ## `equal` join is exact and cannot bleed onto a different job.
+  - source_matchers:
+    - 'alertname="OpenBaoMirrorStale"'
+    target_matchers:
+    - 'alertname="CronJobStale"'
+    equal: [namespace, cronjob]
+
+  ## 2026-11-04 Pushgateway freshness AND-gate (infra-hdh9). Pushgateway re-serves
+  ## the LAST sample of a job that stopped pushing, so every alert computed from
+  ## that job's series latches on frozen data (09-09: a zombie Windmill worker
+  ## stranded the bpi-r4 probe for days; its alerts stayed ON ~3 days, one of them
+  ## degrading the public status page). Once the job is KNOWN stale, its own
+  ## staleness alert is the true statement and everything derived from its frozen
+  ## series is muted. One rule here instead of an `and push_time_seconds` clause on
+  ## every Pushgateway-fed expression: pushed series keep the pusher's `job` label
+  ## (honor_labels), so `equal: [job]` reaches exactly that job's alerts and no
+  ## other job's. An alert that aggregates `job` away is not gated - by design,
+  ## nothing here can tell which job fed it.
+  - source_matchers:
+    - 'alertname=~"BatchJobStale|PushgatewayGroupStale"'
+    target_matchers:
+    - 'alertname!~"BatchJobStale|PushgatewayGroupStale"'
+    equal: [job]
+
+  receivers:
+  - name: black-hole
+
+  - name: statuspage-and-pushover
+    webhook_configs:
+    - url: http://statuspage-adapter.monitoring.svc.cluster.local:8080/webhook
+      send_resolved: true
+      max_alerts: 0
+    pushover_configs:
+    - user_key:
+        name: pushover
+        key: user-key
+      token:
+        name: pushover
+        key: api-token
+      ## 2026-11-08: OFF. A resolved message renders at priority -2 (silent) by
+      ## the template below, so it was never a page — but it still cost one
+      ## message from the shared monthly pool. Measured ~31/day. Resolution is
+      ## still visible everywhere it matters: this receiver's webhook keeps
+      ## `send_resolved: true`, so statuspage clears the component, and Grafana
+      ## and `ALERTS` show the state change.
+      send_resolved: false
+      ## Severity -> Pushover priority. critical interrupts (1); warning is
+      ## delivered silently (-1, no sound/vibration); info and anything else
+      ## is badge-only (-2). CommonLabels.severity is stable because the
+      ## group_by includes alertname (one severity per rule).
+      ## RESOLVED messages are always -2 (badge only): before 2026-07-13 a
+      ## resolved critical buzzed at priority 1 — every flap episode of a
+      ## critical rule produced TWO interrupts. The ✅ line stays visible
+      ## in the app; it just never buzzes.
+      priority: |-
+        {{- if eq .Status "resolved" -}}-2
+        {{- else if eq .CommonLabels.severity "critical" -}}1
+        {{- else if eq .CommonLabels.severity "warning" -}}-1
+        {{- else -}}-2
+        {{- end -}}
+      title: |-
+        [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.component }}: {{ .CommonLabels.alertname }}
+      message: |-
+        {{ range .Alerts -}}
+        {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .Annotations.summary }}
+        {{ end }}
+        {{ if .CommonAnnotations.description -}}
+        ---
+        {{ .CommonAnnotations.description }}
+        {{- end }}
+      ## One-tap from notification to the live time-series view.
+      url: |-
+        {{- $c := .CommonLabels.component -}}
+        {{- if or (eq $c "Internet") (eq $c "Time") (eq $c "VPN") (eq $c "DNS") -}}
+        https://grafana.mdapi.ch/d/bpi-r4-overview
+        {{- else if eq $c "Home" -}}
+        https://grafana.mdapi.ch/d/home-assistant-overview
+        {{- else -}}
+        https://grafana.mdapi.ch
+        {{- end -}}
+      url_title: 📊 Open Grafana
+
+  ## Statuspage only — NO Pushover. Carries every non-critical team=mdapi alert.
+  ## `send_resolved` stays ON for the webhook so the adapter still clears the
+  ## component on recovery; that is the whole job of this receiver now.
+  ## Was `statuspage-and-pushover-quiet` until 2026-11-08; the Pushover half was
+  ## removed rather than muted, so there is no silent config left behind that a
+  ## future reader could mistake for an active delivery path.
+  - name: statuspage-only
+    webhook_configs:
+    - url: http://statuspage-adapter.monitoring.svc.cluster.local:8080/webhook
+      send_resolved: true
+      max_alerts: 0

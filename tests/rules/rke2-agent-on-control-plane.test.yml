@@ -1,0 +1,33 @@
+# RKE2AgentEnabledOnControlPlane (infra-9cjp): the parity probe's per-node gauge is 1
+# when rke2-agent is enabled/active on a control-plane node. Two hourly runs = page.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: re-enabled-agent-warns-after-an-hour
+  interval: 1m
+  input_series:
+  - series: harvester_node_rke2_agent_on_control_plane{job="harvester_node_config_parity",node="quo"}
+    values: 1x90
+  - series: harvester_node_rke2_agent_on_control_plane{job="harvester_node_config_parity",node="qui"}
+    values: '0x90'
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: app-batch-jobs.harvester_node_config_parity
+    alertname: RKE2AgentEnabledOnControlPlane
+    exp_alerts: []
+  - eval_time: 70m
+    groupname: app-batch-jobs.harvester_node_config_parity
+    alertname: RKE2AgentEnabledOnControlPlane
+    exp_alerts:
+    - exp_labels:
+        job: harvester_node_config_parity
+        node: quo
+        service: harvester-node-config
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "rke2-agent is enabled on control-plane node quo"
+        description: "f/probe/harvester_node_config_parity saw rke2-agent enabled or active on\nquo, which runs rke2-server. Harmless until the next boot,\nwhen kube-apiserver loses :6443 to the agent and crash-loops - fix it\nBEFORE that node reboots (and before any Harvester upgrade hop):\n  ssh rancher@<node> sudo systemctl disable --now rke2-agent\nthen confirm `systemctl is-enabled rke2-agent` prints disabled. If the\napiserver is already crash-looping, the 5-step fix is in memory\nquo_rke2_agent_enabled_beside_server_steals_6443_2026_10_03.\nDurable fail-closed fix (mask) is a node-window step (infra-9cjp).\n"

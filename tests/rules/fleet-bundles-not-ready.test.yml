@@ -1,0 +1,97 @@
+# FleetBundlesNotReady / FleetBundlesNotReadySustained (o2 row infra-4v0ra).
+#
+# WHY (measured 2026-11-08 on the 7 d before the change)
+# fleet_bundle_deployment_not_ready_info is a PUSHGATEWAY SNAPSHOT: daily_infra_health
+# PUTs the group once an hour and the group keeps serving that value until the next
+# push, so one not-ready bundle stays in the gauge for a full hour. A `for: 30m` gate
+# on the per-cluster count is therefore satisfied by ANY single push that caught a
+# bundle mid-rollout — it cannot express "brief". Measured: 199 episodes in 7 d, 181 of
+# them exactly one push; 64% of those had a commit touching that bundle's own directory
+# within the preceding 2 h (median 7.7 min) against a 9% base rate and 16-24% under a
+# +/-6/12/18 h shift control. The estate merges 10-39 bundle directories per hour
+# (Renovate's image-digests commit alone touches 13-28 at once, 3-4x/day), so a rollout
+# was in flight at the top of the hour most hours: 24 P4 incidents in 7 d. The rest of
+# them are fleet-agent restarts (4 unavailable windows in 7 d, 2/2/6/20 min); the first
+# push after an outage carries a burst of bundles that never reported anything wrong
+# (11-05 23:52 -> 00:16: 15 not-ready bundles, none with an agent record). Where a
+# record exists it is a workload rollout (Deployment below minimum availability, CNPG
+# "Cluster Is Not Ready", CephCluster generation lag), never a Fleet fault.
+#
+# The info tier was retired rather than re-gated: raising `for:` on the per-cluster
+# COUNT would re-introduce the trap fixed 2026-10-27 (two different bundles, one push
+# each, read as one sustained failure). The two-push condition only works per bundle,
+# and it already exists below as the Sustained warning.
+#
+# vmalert-tool's clock is 2000-01-01 (946684800 + eval_time); these series carry no
+# timestamps, so t=0 means "the first push".
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+# A bundle caught mid-rollout by one hourly push must NOT be an incident. This is the
+# regression guard: reintroducing any alert named FleetBundlesNotReady whose gate a
+# single push can satisfy fails here.
+- name: one-hourly-push-is-not-an-incident
+  interval: 1m
+  input_series:
+  # exactly what the pushgateway serves after one push that saw one not-ready bundle
+  - series: fleet_bundle_deployment_not_ready_info{cluster="mdapi",bundle="mdapi-prod-gitlab"}
+    values: '1x60'
+  alert_rule_test:
+  - eval_time: 45m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReady
+    exp_alerts: []
+  - eval_time: 59m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReady
+    exp_alerts: []
+  # the next push no longer carries the bundle: nothing to report
+  - eval_time: 90m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReady
+    exp_alerts: []
+# A bundle that is still not ready at the NEXT hourly push is the real signal and must
+# keep firing — 75 min in, so a single push cannot satisfy it either.
+- name: two-consecutive-pushes-fire-the-sustained-warning
+  interval: 1m
+  input_series:
+  - series: fleet_bundle_deployment_not_ready_info{cluster="mdapi",bundle="mdapi-prod-gitlab"}
+    values: '1x300'
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReadySustained
+    exp_alerts: []
+  - eval_time: 78m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReadySustained
+    exp_alerts:
+    - exp_labels:
+        service: fleet
+        namespace: cattle-fleet-system
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+        cluster: mdapi
+        bundle: mdapi-prod-gitlab
+      exp_annotations:
+        summary: "Fleet bundle mdapi-prod-gitlab not Ready on mdapi for >1h"
+        description: "mdapi-prod-gitlab was not Ready in two consecutive hourly pushes, so this is not a rollout blip. Read the Bundle's Ready condition and status.summary.nonReadyResources with `kubectl --context mdapi-rancher -n fleet-default get bundle mdapi-prod-gitlab -o yaml` (a BundleDeployment can read ready=true while its Bundle is WaitApplied; there is no mdapi-mgmt context)."
+# The perpetual other-cluster fleet agents are WaitApplied by design and must stay muted
+# at both tiers (2026-10-30).
+- name: remote-fleet-agent-bundles-stay-muted
+  interval: 1m
+  input_series:
+  - series: fleet_bundle_deployment_not_ready_info{cluster="c-6pgh5",bundle="fleet-agent-c-6pgh5"}
+    values: '1x300'
+  alert_rule_test:
+  - eval_time: 78m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReadySustained
+    exp_alerts: []
+  - eval_time: 78m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundlesNotReady
+    exp_alerts: []

@@ -1,0 +1,70 @@
+# WindmillWorkerCrashLoop (infra-20qr): a Windmill upgrade rolls the workers alongside the
+# server, and a new-version worker exits after 10 x 3 s waiting for the server's DB
+# migration ("Timed out after 10 attempts waiting for migration version ..."), then
+# succeeds on restart 2-4. That fired the alert for every worker pool at 2026-11-06T16:15Z
+# (pods 4 min old) and again 11-08T08:30Z (one pod 2 min old). A new pod
+# is therefore exempt for 30 min (start-up + the 15m window); an established pod, or a
+# new one still crashing at 30 min, still alerts.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: startup-restarts-of-a-new-pod-do-not-fire-an-established-pod-does
+  interval: 1m
+  input_series:
+  # created at 2h on the vmalert-tool clock (946684800 + 7200)
+  - series: kube_pod_created{namespace="windmill",pod="wk-new"}
+    values: '946692000x200'
+  - series: kube_pod_container_status_restarts_total{namespace="windmill",pod="wk-new",container="windmill-worker"}
+    values: '0x120 1 2 3 3x80'
+  # created a day before the clock origin
+  - series: kube_pod_created{namespace="windmill",pod="wk-old"}
+    values: '946598400x200'
+  - series: kube_pod_container_status_restarts_total{namespace="windmill",pod="wk-old",container="windmill-worker"}
+    values: '0x120 1 2 3 3x80'
+  alert_rule_test:
+  - eval_time: 2h5m
+    groupname: app-batch-jobs.workers
+    alertname: WindmillWorkerCrashLoop
+    exp_alerts:
+    - exp_labels:
+        container: windmill-worker
+        pod: wk-old
+        service: windmill-workers-default
+        namespace: windmill
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Windmill wk-old crash-looping (3 restarts in 15m)"
+        description: "A windmill-namespace container restarted 3+ times in 15 minutes.\nJobs on that worker's tags are dying and will zombie for 24h,\nwhich also delays their schedules' next ticks by a day. Check\n`kubectl -n windmill get pod wk-old` lastState (OOM\nbursts can be faster than the scrape interval — trust the\ntermination reason, not the memory graph) and the affected\nscripts' runs at https://windmill.mdapi.ch/runs. History:\nwk-certs killed daily at 06:47Z by aruba_aos6_cert_sync since\n2026-08-07 (infra-health ledger restart:windmill/windmill-workers-certs).\n"
+- name: a-new-pod-still-crashing-after-its-grace-fires
+  interval: 1m
+  input_series:
+  - series: kube_pod_created{namespace="windmill",pod="wk-bad"}
+    values: '946692000x200'
+  # a restart every 3 min from creation, for the whole run
+  - series: kube_pod_container_status_restarts_total{namespace="windmill",pod="wk-bad",container="windmill-worker"}
+    values: '0x120 1+0x2 2+0x2 3+0x2 4+0x2 5+0x2 6+0x2 7+0x2 8+0x2 9+0x2 10+0x2 11+0x2 12+0x2 13+0x2'
+  alert_rule_test:
+  - eval_time: 2h25m
+    groupname: app-batch-jobs.workers
+    alertname: WindmillWorkerCrashLoop
+    exp_alerts: []
+  - eval_time: 2h35m
+    groupname: app-batch-jobs.workers
+    alertname: WindmillWorkerCrashLoop
+    exp_alerts:
+    - exp_labels:
+        container: windmill-worker
+        pod: wk-bad
+        service: windmill-workers-default
+        namespace: windmill
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Windmill wk-bad crash-looping (5 restarts in 15m)"
+        description: "A windmill-namespace container restarted 3+ times in 15 minutes.\nJobs on that worker's tags are dying and will zombie for 24h,\nwhich also delays their schedules' next ticks by a day. Check\n`kubectl -n windmill get pod wk-bad` lastState (OOM\nbursts can be faster than the scrape interval — trust the\ntermination reason, not the memory graph) and the affected\nscripts' runs at https://windmill.mdapi.ch/runs. History:\nwk-certs killed daily at 06:47Z by aruba_aos6_cert_sync since\n2026-08-07 (infra-health ledger restart:windmill/windmill-workers-certs).\n"

@@ -1,0 +1,85 @@
+{{- if .Values.enabled }}
+{{- $imageCfg := dict "global" .Values.global.image "local" .Values.image -}}
+{{- include "database.datamodel.prepare" . -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "migrations.jobname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+    {{- /* The target version is used to easily query the Job responsible for migrating
+           the DB schema to a specific Rails version. */}}
+    gitlab.com/target-version: {{ include "gitlab.versionTag" . | quote }}
+  {{- if .Values.annotations }}
+  annotations:
+  {{- range $key, $value := .Values.annotations }}
+    {{ $key }}: {{ $value | quote }}
+  {{- end }}
+  {{- end }}
+spec:
+  activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+  backoffLimit: {{ .Values.backoffLimit }}
+  template:
+    metadata:
+      {{- if or .Values.podAnnotations .Values.annotations}}
+      annotations:
+      {{- range $key, $value := merge .Values.podAnnotations (deepCopy .Values.annotations) }}
+        {{ $key }}: {{ $value | quote }}
+      {{- end }}
+      {{- end }}
+      labels:
+        {{- include "gitlab.standardLabels" . | nindent 8 }}
+        {{- include "gitlab.commonLabels" . | nindent 8 }}
+        {{- include "gitlab.podLabels" . | nindent 8 }}
+    spec:
+      {{- include "gitlab.podSecurityContext" .Values.securityContext | nindent 6 }}
+      {{- if or .Values.serviceAccount.enabled .Values.global.serviceAccount.enabled }}
+      serviceAccountName: {{ include "gitlab.serviceAccount.name" . }}
+      {{- end }}
+      {{- include "gitlab.automountServiceAccountToken" . | nindent 6 }}
+      {{- include "gitlab.priorityClassName" . | nindent 6 }}
+      initContainers:
+      {{- include "migrations.job.initContainers" . }}
+      restartPolicy: OnFailure
+      {{- include "gitlab.image.pullSecrets" $imageCfg | indent 6 }}
+      containers:
+        {{- include "gitlab.extraContainers" . | nindent 8 }}
+        - name: {{ .Chart.Name }}
+          image: "{{ coalesce .Values.image.repository (include "image.repository" .) }}:{{ coalesce .Values.image.tag (include "gitlab.versionTag" . ) }}{{ include "gitlab.image.tagSuffix" . }}"
+          args:
+            - /bin/bash
+            - -c
+            - |
+            {{- tpl .Values.scriptTpl $ | nindent 14 }}
+          {{- include "gitlab.image.pullPolicy" $imageCfg | indent 10 }}
+          {{- include "gitlab.containerSecurityContext" $ | indent 10 }}
+          env:
+            - name: CONFIG_TEMPLATE_DIRECTORY
+              value: '/var/opt/gitlab/templates'
+            - name: CONFIG_DIRECTORY
+              value: '/srv/gitlab/config'
+            - name: BYPASS_SCHEMA_VERSION
+              value: 'true'
+            {{- if include "gitlab.geo.secondary" $ }}
+            - name: DB_SCHEMA_TARGET
+              value: 'geo'
+            {{- end }}
+            {{- if .Values.global.rails.bootsnap.enabled }}
+            - name: ENABLE_BOOTSNAP
+              value: '1'
+            {{- end }}
+            {{- include "gitlab.extraEnv" . | nindent 12 }}
+            {{- include "gitlab.extraEnvFrom" (dict "root" $ "local" .) | nindent 12 }}
+            {{- include "gitlab.timeZone.env" . | nindent 12 }}
+          volumeMounts:
+          {{- include "migrations.job.volumeMounts" . }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+      {{- include "migrations.job.volumes" . }}
+      {{- include "gitlab.nodeSelector" . | nindent 6 }}
+      {{- include "gitlab.tolerations" . | nindent 6 }}
+      {{- include "gitlab.dnsConfig" . | nindent 6 }}
+{{- end }}

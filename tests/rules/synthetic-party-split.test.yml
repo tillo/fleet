@@ -1,0 +1,62 @@
+# SyntheticProbeFailing first/third-party split (infra-3rm.7, user decision 2026-08-31):
+# first-party pages critical at 8m; `party: third` targets only warn (same alertname)
+# after 20m; `alerting: dedicated` targets (own rule elsewhere) raise nothing here.
+# Values are QUOTED: a bare 0x40 is YAML hex (= 64), not "0 for 40 steps".
+rule_files:
+- monitoring-rules/11-blackbox-alerts.yml
+evaluation_interval: 1m
+tests:
+- name: first-party-pages-third-party-warns-dedicated-is-skipped
+  interval: 1m
+  input_series:
+  - series: probe_success{job="files-mirror",instance="https://mirror.mdapi.ch",component="Files & Documents",team="mdapi",probe="mirror"}
+    values: '0x40'
+  - series: probe_success{job="dns-upstream",instance="45.90.28.16:53",component="DNS",team="mdapi",probe="dns_upstream_nextdns_a",party="third"}
+    values: '0x40'
+  - series: probe_success{job="dns-technitium",instance="192.168.1.54:53",component="DNS",team="mdapi",probe="technitium_vip",alerting="dedicated"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - &id001
+      exp_labels:
+        job: files-mirror
+        instance: https://mirror.mdapi.ch
+        component: Files & Documents
+        team: mdapi
+        probe: mirror
+        service: https://mirror.mdapi.ch
+        severity: critical
+        statuspage: include
+      exp_annotations:
+        summary: 'Files & Documents: probe mirror failing'
+        description: "Blackbox probe `https://mirror.mdapi.ch` (module: )\nhas had <80% success over the last 5m for >8m.\nComponent Files & Documents on statuspage will go to major_outage.\nInvestigate\
+          \ from a workstation:\n  curl -v https://mirror.mdapi.ch    (for HTTP probes)\n  dig @https://mirror.mdapi.ch mdapi.ch  (for DNS)\n"
+  - eval_time: 30m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - *id001
+    - exp_labels:
+        job: dns-upstream
+        instance: 45.90.28.16:53
+        component: DNS
+        team: mdapi
+        probe: dns_upstream_nextdns_a
+        party: third
+        service: 45.90.28.16:53
+        severity: warning
+        statuspage: exclude
+      exp_annotations:
+        summary: 'DNS: third-party probe dns_upstream_nextdns_a failing'
+        description: 'Blackbox probe `45.90.28.16:53` (module: ), a
+
+          third-party vantage or upstream, has had <80% success over 5m for >20m.
+
+          Not ours to fix unless the first-party probes for DNS
+
+          fail too. Check: dig @45.90.28.16 mdapi.ch
+
+          '

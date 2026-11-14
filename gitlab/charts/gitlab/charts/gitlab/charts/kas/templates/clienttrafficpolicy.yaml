@@ -1,0 +1,32 @@
+{{- if .Values.global.kas.enabled -}}
+{{- if eq "true" (include "gitlab.gatewayApi.route.enabled" .) -}}
+{{- if eq "true" (include "kas.gatewayApi.sectionCtp.enabled" .) -}}
+{{- if .Values.clientTrafficPolicy.spec -}}
+{{/*
+ClientTrafficPolicy targeting the KAS listener (gatewayRoute.sectionName).
+Envoy Gateway stops advertising HTTP/2 (ALPN h2) on a listener whose certificate
+overlaps with another listener on the same port, for example one wildcard
+certificate shared by every host (Gateway API GEP-3567). Agents need HTTP/2 for
+native gRPC (grpcs://), so the chart enables it explicitly on the KAS listener
+only; the other listeners keep Envoy Gateway's default. See values.yaml.
+*/}}
+{{- $spec := deepCopy .Values.clientTrafficPolicy.spec }}
+{{- if not $spec.targetRefs }}
+{{-   $ref := (include "gitlab.gatewayApi.gatewayRef" . | fromYamlArray) }}
+{{-   $_ := unset (first $ref) "namespace" }}
+{{-   $_ := set $spec "targetRefs" $ref }}
+{{- end }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: {{ template "fullname" . }}-ctp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+spec:
+  {{- $spec | toYaml | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

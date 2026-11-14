@@ -1,0 +1,213 @@
+## Backstage — the developer portal (ns `backstage`, epic infra-7rog.5).
+##
+## Internal tooling: warning tier, INTERNAL component `Automation` (never
+## mapped to mdapi.statuspage.io). An outage hides the catalog and the docs;
+## nothing else depends on it.
+##
+## What covers what:
+##   * workload arms — the backstage Deployment, any StatefulSet ever added,
+##     and the CNPG backstage-pg instances (Pods of a CNPG Cluster are neither
+##     a Deployment nor a StatefulSet: BackstageDatabaseUnready covers them);
+##   * BackstageUnready — the in-cluster readiness endpoint (database
+##     reachable, plugins started), which the pod's own probes also gate on;
+##   * BackstageTlsExpiring — backstage.mdapi.ch's certificate (the oauth2
+##     gate answers 302; TLS is still measured).
+##   * catalog CONTENT — BackstageCatalogKindShrank and BackstageCatalogUnplaced,
+##     on the gauges f/backstage/catalog_sync pushes (Pushgateway job
+##     `catalog_sync`, daily). The pod being up says nothing about what is in
+##     the catalog, and emptying out is silent: on 2026-11-04 all three mcp-*
+##     APIs vanished from all.yaml while every rule here stayed green.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-backstage
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-backstage.rules
+      rules:
+        - alert: BackstageWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="backstage", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="backstage", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "backstage" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "backstage/{{ $labels.deployment }} unavailable"
+            description: |
+              The portal is short of replicas. Check:
+                kubectl --context mdapi-prod-direct -n backstage get pod
+                kubectl --context mdapi-prod-direct -n backstage logs deploy/backstage --tail=50
+
+        - alert: BackstageStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="backstage", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="backstage", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "backstage" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "backstage/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in the backstage namespace is short of replicas (none
+              exists today; this arm makes the namespace-wide claim true later).
+                kubectl --context mdapi-prod-direct -n backstage get statefulset,pod
+
+        - alert: BackstageDatabaseUnready
+          expr: |
+            count by (namespace) (kube_pod_status_ready{namespace="backstage", condition="true", pod=~"backstage-pg-[0-9]+"} == 1) < 2
+          for: 30m
+          labels:
+            service: backstage-pg
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "backstage-pg has fewer than 2 ready instances"
+            description: |
+              The CNPG cluster behind the portal runs degraded. Check:
+                kubectl --context mdapi-prod-direct -n backstage get cluster.postgresql.cnpg.io,pod -l cnpg.io/cluster=backstage-pg
+
+        - alert: BackstageUnready
+          expr: avg_over_time(probe_success{probe="backstage-readiness"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: backstage
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "Backstage reports not ready in-cluster"
+            description: |
+              http://backstage.backstage.svc.cluster.local:7007/.backstage/health/v1/readiness
+              failed for >15m: the pod, its database (backstage-pg-rw, TLS against
+              backstage-pg-ca), or backstage/backstage-netpol.yml.
+                kubectl --context mdapi-prod-direct -n backstage get pod,svc,networkpolicy
+
+        - alert: BackstageTlsExpiring
+          ## Re-provided because the target carries no `component` (see Probe below),
+          ## so SyntheticProbeTLSExpiringSoon does not cover it.
+          expr: (probe_ssl_earliest_cert_expiry{probe="backstage-tls"} - time()) < 14 * 86400
+          for: 1h
+          labels:
+            service: backstage
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "backstage.mdapi.ch certificate expires in {{ $value | humanizeDuration }}"
+            description: |
+              cert-manager should have renewed at 30 days. Check:
+                kubectl --context mdapi-prod-direct -n backstage describe certificate backstage-tls
+
+        ## -- what is IN the catalog (f/backstage/catalog_sync) ----------------
+        ## The arms above prove the portal is up. None of them can see the
+        ## catalog going thin: on 2026-11-04 the standalone agentgateway moved
+        ## its routes out of the CRDs, `_mcp_apis` found nothing to list, and
+        ## all three mcp-* APIs disappeared from all.yaml with every rule here
+        ## green — an empty list reads exactly like "the estate runs no MCP
+        ## servers". The sync now publishes one series per entity kind,
+        ## zeros included, plus what it could not place.
+        - alert: BackstageCatalogKindShrank
+          ## Compared against the same kind's own 7-day best, offset past the
+          ## current run so the drop is against history and not itself. Self-
+          ## calibrating: the estate only grows, so 80% of the best week is a
+          ## floor that never needs re-tuning. A legitimate removal (an
+          ## archived project, a retired bundle) stays under 20% of a kind.
+          expr: |
+            backstage_catalog_entities
+              < 0.8 * max_over_time(backstage_catalog_entities[7d] offset 12h)
+          for: 6h
+          labels:
+            service: backstage-catalog
+            severity: warning
+            component: Automation
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "Backstage catalog has lost {{ $labels.kind }} entities ({{ $value }})"
+            description: |
+              The catalog holds 20% fewer {{ $labels.kind }} entities than its best
+              day in the last week. Something the sync used to read has stopped
+              being readable — a CRD the gateway no longer writes, a GitLab token
+              scope, an empty list where a list of objects was expected.
+
+              Compare the file with the run:
+                kubectl --context mdapi-prod-direct -n windmill logs \
+                  deploy/windmill-worker | grep catalog_sync
+              then count that kind in mdapi/backstage-catalog's all.yaml.
+
+        - alert: BackstageCatalogUnplaced
+          ## What systems.yaml claims but does not match: a glob whose target was
+          ## renamed or retired, or a project listed under a system that is not
+          ## in the group any more. It went quiet for weeks in 2026-10 because a
+          ## dead glob matches nothing and looks like "nothing to do".
+          ## 48h: the sync runs daily, so this is two missed chances to notice.
+          expr: backstage_catalog_unplaced > 0
+          for: 48h
+          labels:
+            service: backstage-catalog
+            severity: warning
+            component: Automation
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "{{ $value }} project(s) or glob(s) in systems.yaml resolve to nothing"
+            description: |
+              systems.yaml names something the run could not place. The entries are
+              in the job result (`unplaced`), in the form `project`, `bundles:<glob>`
+              or `jobs:<glob>`. Either the thing was renamed/retired (fix the line)
+              or the sync stopped reading its source (the kind-shrank alert above).
+---
+## No `component`/`team` on the targets, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: backstage-readiness
+  namespace: monitoring
+spec:
+  jobName: backstage-readiness
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - http://backstage.backstage.svc.cluster.local:7007/.backstage/health/v1/readiness
+      labels:
+        probe: backstage-readiness
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: backstage-tls
+  namespace: monitoring
+spec:
+  jobName: backstage-tls
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://backstage.mdapi.ch/
+      labels:
+        probe: backstage-tls

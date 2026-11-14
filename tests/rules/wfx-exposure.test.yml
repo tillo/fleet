@@ -1,0 +1,123 @@
+# app-batch-jobs.wfx_exposure: f/probe/wfx_exposure_audit's daily match of what we consume
+# from GitHub against SafeDep's wfx affected-repos feed. A clean day, and a day whose only
+# match is acknowledged, stay silent; an unacked match warns; a poisoned Go module pages;
+# a run that measures nothing (probe failed, feed or inventory collapsed) is never "clean".
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: clean-or-acked-is-silent
+  interval: 1m
+  input_series:
+  - {series: 'wfx_exposure_audit_probe_success', values: '1x120'}
+  - {series: 'wfx_exposure_unacked_matches', values: '0x120'}
+  - {series: 'wfx_poisoned_module_refs', values: '0x120'}
+  - {series: 'wfx_feed_affected_repos', values: '8092x120'}
+  - {series: 'wfx_inventory_github_repos', values: '420x120'}
+  - {series: 'wfx_exposure_match{kind="owner",repo="nextcloud/docker",status="payload_committed",acked="true"}', values: '1x120'}
+  alert_rule_test:
+  - {eval_time: 2h, groupname: app-batch-jobs.wfx_exposure, alertname: WfxExposureUnreviewedMatch, exp_alerts: []}
+  - {eval_time: 2h, groupname: app-batch-jobs.wfx_exposure, alertname: WfxPoisonedModulePinned, exp_alerts: []}
+  - {eval_time: 2h, groupname: app-batch-jobs.wfx_exposure, alertname: WfxExposureProbeFailing, exp_alerts: []}
+  - {eval_time: 2h, groupname: app-batch-jobs.wfx_exposure, alertname: WfxExposureBlind, exp_alerts: []}
+- name: unacked-match-warns-per-repo
+  interval: 1m
+  input_series:
+  - {series: 'wfx_exposure_audit_probe_success', values: '1x30'}
+  - {series: 'wfx_exposure_unacked_matches', values: '1x30'}
+  - {series: 'wfx_exposure_match{kind="repo",repo="evil/lib",status="payload_committed",acked="false"}', values: '1x30'}
+  - {series: 'wfx_exposure_match{kind="owner",repo="nextcloud/docker",status="payload_committed",acked="true"}', values: '1x30'}
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.wfx_exposure
+    alertname: WfxExposureUnreviewedMatch
+    exp_alerts:
+    - exp_labels: {kind: repo, repo: evil/lib, status: payload_committed, acked: "false", service: windmill, namespace: windmill, severity: warning, component: Security, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "wfx: we consume evil/lib (repo match), which the CI stealer was pushed into"
+        description: |
+          f/probe/wfx_exposure_audit matched evil/lib (status payload_committed) from
+          SafeDep's wfx affected-repos list against what we consume from GitHub. kind=repo:
+          we reference that exact repo; kind=owner: we consume another repo or image of the
+          same GitHub owner, whose org secrets may be stolen.
+          Review: IOC commits/branches/PRs on the repo we actually use (`ci: refresh build
+          cache`, `wfx-docs`, `chore: add ci helper`), and whether any release, tag or image
+          we pin was built after 2026-11-10. Then either remove/pin the dependency, or add a
+          dated reason to ACKED in f/probe/wfx_exposure_audit.
+- name: poisoned-module-pages
+  interval: 1m
+  input_series:
+  - {series: 'wfx_poisoned_module_refs', values: '1x10'}
+  alert_rule_test:
+  - eval_time: 2m
+    groupname: app-batch-jobs.wfx_exposure
+    alertname: WfxPoisonedModulePinned
+    exp_alerts:
+    - exp_labels: {service: windmill, namespace: windmill, severity: critical, component: Security, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "wfx: 1 poisoned Go module version pinned in our GitLab projects"
+        description: |
+          A go.mod/go.sum in an mdapi GitLab project pins a module version SafeDep lists as
+          poisoned by the wfx campaign. The payload sits in that module's workflows, so `go
+          get` alone does not run it, but our CI building that tree may. The project is in
+          the POISONED line of the last f/probe/wfx_exposure_audit run log. Bump past the
+          version, rebuild, and rotate any CI secrets that pipeline held.
+- name: failed-probe-warns
+  interval: 1m
+  input_series:
+  - {series: 'wfx_exposure_audit_probe_success', values: '0x150'}
+  alert_rule_test:
+  - eval_time: 1h
+    groupname: app-batch-jobs.wfx_exposure
+    alertname: WfxExposureProbeFailing
+    exp_alerts: []
+  - eval_time: 2h30m
+    groupname: app-batch-jobs.wfx_exposure
+    alertname: WfxExposureProbeFailing
+    exp_alerts:
+    - exp_labels: {service: windmill, namespace: windmill, severity: warning, component: Security, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "wfx exposure audit failing: we no longer know whether anything we consume is hit"
+        description: |
+          f/probe/wfx_exposure_audit's last run failed (feed fetch, GitLab archive or pod
+          list). Its match gauges are gone on purpose, so no alert above can fire. Read the
+          FAIL line in the last job log. The feed is
+          https://safedep.io/data/blogs/wfx-github-actions-affected-repositories.csv.
+- name: collapsed-feed-is-blind
+  interval: 1m
+  input_series:
+  - {series: 'wfx_exposure_audit_probe_success', values: '1x150'}
+  - {series: 'wfx_feed_affected_repos', values: '12x150'}
+  - {series: 'wfx_inventory_github_repos', values: '420x150'}
+  alert_rule_test:
+  - eval_time: 2h30m
+    groupname: app-batch-jobs.wfx_exposure
+    alertname: WfxExposureBlind
+    exp_alerts:
+    - exp_labels: {service: windmill, namespace: windmill, severity: warning, component: Security, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "wfx exposure audit is blind: feed 12 repos, inventory 420 repos"
+        description: |
+          The probe ran but one side of the match collapsed (baseline 2026-11-13: feed 8092,
+          inventory 420 GitHub repos). A near-empty feed means SafeDep moved or reshaped
+          the CSV; a near-empty inventory means the GitLab archive scan broke. Either way
+          "0 matches" means nothing until it is fixed.
+- name: collapsed-inventory-is-blind
+  interval: 1m
+  input_series:
+  - {series: 'wfx_exposure_audit_probe_success', values: '1x150'}
+  - {series: 'wfx_feed_affected_repos', values: '8092x150'}
+  - {series: 'wfx_inventory_github_repos', values: '199x150'}
+  alert_rule_test:
+  - eval_time: 2h30m
+    groupname: app-batch-jobs.wfx_exposure
+    alertname: WfxExposureBlind
+    exp_alerts:
+    - exp_labels: {service: windmill, namespace: windmill, severity: warning, component: Security, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "wfx exposure audit is blind: feed 8092 repos, inventory 199 repos"
+        description: |
+          The probe ran but one side of the match collapsed (baseline 2026-11-13: feed 8092,
+          inventory 420 GitHub repos). A near-empty feed means SafeDep moved or reshaped
+          the CSV; a near-empty inventory means the GitLab archive scan broke. Either way
+          "0 matches" means nothing until it is fixed.

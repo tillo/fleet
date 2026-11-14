@@ -1,0 +1,79 @@
+## Offsite restic backup of data-dolt-0, the Dolt store behind the beads tracker
+## (infra-qfam, decided 2026-11-12: the estate's standard VolSync/restic channel).
+##
+## Before this the only copy off the cluster was the daily `bd export` JSONL
+## (f/desk/beads_backup 04:25 -> ~/beads-backups -> jump-home VolSync), RPO ~24 h,
+## plus the monthly Longhorn `default` backup to in-cluster RGW, which does not
+## survive losing the cluster. The JSONL stays: it is the PORTABLE artifact (it
+## restores into any bd); this copy is the whole Dolt database incl. its history.
+##
+## Crash-consistency, stated rather than assumed: this snapshots a LIVE Dolt
+## server. Dolt's storage is an append-only journal (.dolt/noms) that recovers to
+## the last durable commit, so a restore is consistent-but-rolled-back, not a
+## quiesced dump.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: volsync-ceph-backup-restic
+  namespace: backlog
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: volsync-ceph-backup-restic
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## Its OWN repository: a shared RESTIC_REPOSITORY mixes untagged snapshots
+        ## of two volumes and lets one source's retain prune the other's. The
+        ## Secret NAME is the estate-wide one on purpose: windmill-worker-heal reads
+        ## it by name (restic_snapshot_freshness), granted via windmill/rbac.
+        ## Same shared credentials and per-PVC subpath as every other source.
+        RESTIC_REPOSITORY: "s3:https://s3.us-west-001.backblazeb2.com/saltminio/ceph-backup/data-dolt-0"
+        RESTIC_PASSWORD: "{{ .restic_password }}"
+        AWS_ACCESS_KEY_ID: "{{ .b2_key_id }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .b2_app_key }}"
+  data:
+    - secretKey: restic_password
+      remoteRef:
+        key: /mdapi/volsync/ceph-backup/restic-password
+    - secretKey: b2_key_id
+      remoteRef:
+        key: /mdapi/volsync/b2/account-id
+    - secretKey: b2_app_key
+      remoteRef:
+        key: /mdapi/volsync/b2/account-key
+---
+apiVersion: volsync.backube/v1alpha1
+kind: ReplicationSource
+metadata:
+  name: data-dolt-0
+  namespace: backlog
+spec:
+  sourcePVC: data-dolt-0
+  trigger:
+    ## Every 6 h at :50 — clear of O2's :23 and jump's :17/:37, and of the 04:25
+    ## JSONL export. 277 MiB on disk, low churn, so a run is cheap; 6 h takes the
+    ## volume's RPO from ~24 h to ~6 h.
+    schedule: "50 */6 * * *"
+  restic:
+    repository: volsync-ceph-backup-restic
+    copyMethod: Snapshot
+    ## data-dolt-0 is harvester-longhorn-2replicas, a LONGHORN volume: ceph-block
+    ## would never produce a snapshot and the mover would wait forever.
+    volumeSnapshotClassName: longhorn-snapshot
+    ## NO moverSecurityContext, deliberately: the data is root-owned (uid 0,
+    ## setgid group 1000 from the pod's fsGroup), so the default root mover reads
+    ## all of it. jump's uid-1000 block would not.
+    ## Cache sized by file count, not bytes: a Dolt store is a few hundred files.
+    cacheCapacity: 1Gi
+    cacheStorageClassName: volsync-cache
+    pruneIntervalDays: 7
+    retain:
+      hourly: 8
+      daily: 14
+      weekly: 8
+      monthly: 6

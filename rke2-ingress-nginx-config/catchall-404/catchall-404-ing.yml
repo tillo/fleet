@@ -1,0 +1,28 @@
+# Every *.mdapi.ch name without its own Ingress lands here instead of on the
+# hostless cattle-system/rancher-expose (see fleet.yaml for why that one stays).
+#
+# ⛔ No tls: section and no *.mdapi.ch certificate on purpose. HTTPS gets the
+# controller's default certificate (cattle-system/tls-ingress), which is what
+# these names already got from Rancher. A publicly trusted wildcard key for the
+# whole zone would be a far more valuable secret than a 404 page is worth.
+#
+# No ModSecurity annotation either: the global WAF config already runs on every
+# server, and an unknown name falls into its DetectionOnly catch-all (rule 1914).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: catchall-404
+  namespace: ingress-catchall
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: "*.mdapi.ch"
+      http:
+        paths:
+          - backend:
+              service:
+                name: catchall-404
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix

@@ -1,0 +1,116 @@
+## Harvester Addon CR for rancher-monitoring (adopted into Fleet 2026-09-24).
+##
+## Until 2026-09-24 this CR was hand-applied (kubectl last-applied-configuration)
+## and existed only in the cluster. It is now Fleet-owned, like
+## monitoring-logging/addon.yml. The harvester-addon-controller still installs the
+## chart from it (HelmChart cattle-monitoring-system/rancher-monitoring).
+##
+## ⚠️ THE REAL CUSTOMIZATIONS DO NOT LIVE HERE. They live in
+## rancher-monitoring-helmchartconfig.yml (same bundle), whose values WIN over this
+## valuesContent: embedded Prometheus/Alertmanager/Grafana/adapter retired,
+## node-exporter resources + filesystem exclusions, KSM label allowlist. This
+## valuesContent is Harvester's own default, kept BYTE-IDENTICAL to what the
+## cluster had (so adoption causes no chart change); several keys in it
+## (prometheus.*, alertmanager.*, grafana.*) are overridden to disabled by the
+## HelmChartConfig.
+##
+## Harvester upgrades: Harvester bumps spec.version (and may re-seed
+## valuesContent). fleet.yaml ignores /spec/version in the drift diff so Fleet does
+## NOT fight an upgrade in progress. ⛔ AFTER every Harvester upgrade, bump
+## spec.version below to the version the upgrade set (`kubectl -n
+## cattle-monitoring-system get addon rancher-monitoring -o
+## jsonpath={.spec.version}`); otherwise the next Fleet deploy of this bundle would
+## push the OLD version back (a chart downgrade).
+apiVersion: harvesterhci.io/v1beta1
+kind: Addon
+metadata:
+  name: rancher-monitoring
+  namespace: cattle-monitoring-system
+spec:
+  enabled: true
+  repo: http://harvester-cluster-repo.cattle-system.svc/charts
+  chart: rancher-monitoring
+  version: "108.0.2+up77.9.1-rancher.11"
+  valuesContent: |
+    prometheus:
+      prometheusSpec:
+        resources:
+          limits:
+            cpu: 4000m
+            memory: 10000Mi
+          requests:
+            cpu: 1500m
+            memory: 3000Mi
+        evaluationInterval: 1m
+        scrapeInterval: 1m
+        retention: 5d
+        retentionSize: 50GiB
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 50Gi
+              storageClassName: harvester-longhorn
+              volumeMode: Filesystem
+        externalUrl: >-
+          https://192.168.1.191/api/v1/namespaces/cattle-monitoring-system/services/http:rancher-monitoring-prometheus:9090/proxy/
+      service:
+        port: 9090
+    prometheus-node-exporter:
+      resources:
+        limits:
+          cpu: 1000m
+          memory: 420Mi
+        requests:
+          cpu: 500m
+          memory: 150Mi
+    grafana:
+      resources:
+        limits:
+          cpu: 200m
+          memory: 500Mi
+        requests:
+          cpu: 100m
+          memory: 200Mi
+      persistence:
+        enabled: true
+        size: 2Gi
+        storageClassName: harvester-longhorn
+        type: pvc
+        accessModes:
+          - ReadWriteOnce
+    alertmanager:
+      enabled: true
+      alertmanagerSpec:
+        retention: 120h
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 600Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        externalUrl: >-
+          https://192.168.1.191/api/v1/namespaces/cattle-monitoring-system/services/http:rancher-monitoring-alertmanager:9093/proxy/
+        storage:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: harvester-longhorn
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 5Gi
+      config:
+        global:
+          resolve_timeout: 5m
+      service:
+        port: 9093
+    rancherMonitoring:
+      enabled: false
+    kube-state-metrics:
+      metricLabelsAllowlist:
+        - nodes=[*]

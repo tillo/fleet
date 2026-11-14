@@ -1,0 +1,16 @@
+# max_connections 100 (image default) is passed during a full roll of every group:
+# app 2+1 pods x DATABASE_CONNECTIONS 15 = 45, workers ~38, worker surges ~32 => ~115,
+# and every client is superuser, so superuser_reserved_connections cannot keep
+# break-glass psql open (infra-az8.19.9). 200 x ~10 MB per backend fits the pod.
+# "postgres" must stay first: args replace the image CMD.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: windmill-postgresql
+  namespace: windmill
+spec:
+  template:
+    spec:
+      containers:
+      - name: postgres
+        args: ["postgres", "-c", "max_connections=200"]

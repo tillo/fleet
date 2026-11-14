@@ -1,0 +1,46 @@
+# Model key: the alias-named LiteLLM virtual key `kagent` (scope
+# local-tail-cn-flash-best-nothink + its fallback hops cn-deepseek-flash and
+# claude-api-sonnet; $15/30d). The chart's ModelConfig reads OPENAI_API_KEY.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: kagent-litellm
+  namespace: kagent
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: kagent-litellm
+    creationPolicy: Owner
+  data:
+    - secretKey: OPENAI_API_KEY
+      remoteRef:
+        key: /mdapi/kagent/litellm-key
+---
+# MCP client key `kagent` at the agentgateway front door (the gateway holds
+# only its sha256, in route mcp-* apiKey policies in its database), rendered as
+# the whole Authorization header because RemoteMCPServer.headersFrom copies a
+# Secret value verbatim.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: kagent-mcp
+  namespace: kagent
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: kagent-mcp
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        Authorization: 'Bearer {{ .key }}'
+  data:
+    - secretKey: key
+      remoteRef:
+        key: /mdapi/agentgateway-system/mcp-clients/kagent

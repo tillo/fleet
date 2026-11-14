@@ -1,0 +1,86 @@
+# ApiVipRefusedWhileApiHealthy (infra-8f4.37): the kube-vip SERVICES lease holder owns
+# 192.168.1.191 but its own kube-apiserver is down, so .191:6443 refuses while the
+# in-cluster API (any apiserver behind the ClusterIP) answers. Both down = a cluster
+# outage, which other rules own: stay silent then.
+rule_files:
+- monitoring-rules/82-api-vip.yml
+evaluation_interval: 1m
+tests:
+- name: vip-refused-api-healthy-pages-after-5m
+  interval: 1m
+  input_series:
+  - series: probe_success{job="api-vip-6443",probe="api-vip-6443",team="mdapi"}
+    values: 1 1 0 0 0 0 0 0 0 0 0 0
+  - series: probe_success{job="api-clusterip",probe="api-clusterip",team="mdapi"}
+    values: 1x12
+  - series: kube_lease_owner{namespace="harvester-system",lease="plndr-svcs-lock",lease_holder="quo"}
+    values: 1x12
+  alert_rule_test:
+  - eval_time: 5m
+    groupname: platform.api-vip
+    alertname: ApiVipRefusedWhileApiHealthy
+    exp_alerts: []
+  - eval_time: 8m
+    groupname: platform.api-vip
+    alertname: ApiVipRefusedWhileApiHealthy
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        service: kube-apiserver
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+        namespace: harvester-system
+        job: api-vip-6443
+        probe: api-vip-6443
+      exp_annotations:
+        summary: "192.168.1.191:6443 refuses while the in-cluster API is healthy"
+        description: "The kube-vip services lease holder (quo)\nowns 192.168.1.191 but its own kube-apiserver does not answer on :6443.\nEvery -direct kubeconfig and LAN script that dials .191:6443 is down.\nMove the VIP: delete that node's kube-vip pod in harvester-system\n(the lease moves in ~5 s), then find why its apiserver is down\n(kubectl -n kube-system get pod kube-apiserver-<node>).\n"
+- name: both-down-is-not-this-alert
+  interval: 1m
+  input_series:
+  - series: probe_success{job="api-vip-6443",probe="api-vip-6443",team="mdapi"}
+    values: '0x12'
+  - series: probe_success{job="api-clusterip",probe="api-clusterip",team="mdapi"}
+    values: '0x12'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: platform.api-vip
+    alertname: ApiVipRefusedWhileApiHealthy
+    exp_alerts: []
+- name: healthy-vip-is-silent
+  interval: 1m
+  input_series:
+  - series: probe_success{job="api-vip-6443",probe="api-vip-6443",team="mdapi"}
+    values: 1x12
+  - series: probe_success{job="api-clusterip",probe="api-clusterip",team="mdapi"}
+    values: 1x12
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: platform.api-vip
+    alertname: ApiVipRefusedWhileApiHealthy
+    exp_alerts: []
+- name: apiserver-crashloop-warns
+  interval: 1m
+  input_series:
+  - series: kube_pod_container_status_restarts_total{namespace="kube-system",pod="kube-apiserver-quo",container="kube-apiserver"}
+    values: 0+1x80
+  - series: kube_pod_container_status_restarts_total{namespace="kube-system",pod="kube-apiserver-qui",container="kube-apiserver"}
+    values: 2x80
+  alert_rule_test:
+  - eval_time: 75m
+    groupname: platform.api-vip
+    alertname: KubeApiserverRestarting
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        service: kube-apiserver
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+        namespace: kube-system
+        pod: kube-apiserver-quo
+        container: kube-apiserver
+      exp_annotations:
+        summary: "kube-apiserver-quo restarted 60 times in 1 h"
+        description: "A control-plane apiserver is crash-looping. If its node holds the kube-vip\nservices lease (kubectl -n harvester-system get lease plndr-svcs-lock),\n192.168.1.191:6443 is refused for every -direct kubeconfig - see\nApiVipRefusedWhileApiHealthy. Logs: kubectl -n kube-system logs kube-apiserver-quo --previous.\n"

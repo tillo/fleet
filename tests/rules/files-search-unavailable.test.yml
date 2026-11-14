@@ -1,0 +1,92 @@
+# Nextcloud full-text search down = a WARNING, not a Files & Documents outage (infra-jughd).
+# nextcloud-aio-fulltextsearch is one Elasticsearch pod on an RWO ceph-block PVC holding a
+# rebuildable index; every unavailability 11-03..11-08 was a node outage, and files stayed
+# reachable throughout. So it pages FilesSearchUnavailable (warning, statuspage: exclude)
+# and FilesDeploymentUnavailable keeps paging critical for every OTHER nextcloud-aio-*
+# workload, in both the wholesale `nextcloud` namespace and the opt-in `envuassu` one.
+# ⚠️ `0x15` is HEX 21 to vmalert-tool, not "0 repeated 15 times": write `0+0x15`.
+rule_files:
+- monitoring-rules/04-files.yml
+evaluation_interval: 1m
+tests:
+- name: search-down-is-a-warning-only
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="nextcloud",deployment="nextcloud-aio-fulltextsearch"}
+    values: 1x15
+  - series: kube_deployment_status_replicas_available{namespace="nextcloud",deployment="nextcloud-aio-fulltextsearch"}
+    values: 0+0x15
+  - series: kube_deployment_spec_replicas{namespace="envuassu",deployment="nextcloud-aio-fulltextsearch"}
+    values: 1x15
+  - series: kube_deployment_status_replicas_available{namespace="envuassu",deployment="nextcloud-aio-fulltextsearch"}
+    values: 0+0x15
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts: []
+  - eval_time: 10m
+    groupname: app-files.workload
+    alertname: FilesSearchUnavailable
+    exp_alerts:
+    - exp_labels:
+        namespace: nextcloud
+        deployment: nextcloud-aio-fulltextsearch
+        service: nextcloud-aio-fulltextsearch
+        severity: warning
+        component: Files & Documents
+        statuspage: exclude
+        team: mdapi
+      exp_annotations: &ann_nc
+        summary: 'nextcloud/nextcloud-aio-fulltextsearch: full-text search unavailable'
+        description: |
+          Nextcloud full-text search (Elasticsearch, 1 replica, RWO volume) has no ready
+          pod. Files stay reachable; only search is down. Usually a node outage: check
+          the node beads first. The index is rebuildable (occ fulltextsearch:index).
+    - exp_labels:
+        namespace: envuassu
+        deployment: nextcloud-aio-fulltextsearch
+        service: nextcloud-aio-fulltextsearch
+        severity: warning
+        component: Files & Documents
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'envuassu/nextcloud-aio-fulltextsearch: full-text search unavailable'
+        description: |
+          Nextcloud full-text search (Elasticsearch, 1 replica, RWO volume) has no ready
+          pod. Files stay reachable; only search is down. Usually a node outage: check
+          the node beads first. The index is rebuildable (occ fulltextsearch:index).
+- name: nextcloud-itself-still-critical
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="envuassu",deployment="nextcloud-aio-nextcloud"}
+    values: 1x15
+  - series: kube_deployment_status_replicas_available{namespace="envuassu",deployment="nextcloud-aio-nextcloud"}
+    values: 0+0x15
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-files.workload
+    alertname: FilesSearchUnavailable
+    exp_alerts: []
+  - eval_time: 10m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts:
+    - exp_labels:
+        namespace: envuassu
+        deployment: nextcloud-aio-nextcloud
+        service: nextcloud-aio-nextcloud
+        severity: critical
+        component: Files & Documents
+        statuspage: include
+        team: mdapi
+      exp_annotations:
+        summary: 'envuassu/nextcloud-aio-nextcloud: 1 replicas unavailable'
+        description: |
+          File-storage component is degraded. Affected services:
+            Nextcloud  -> cloud.mdapi.ch (household) / cloud.envuassu.ch (PPE)
+            SFTPGo     -> *.files.mdapi.ch
+            Paperless  -> documents.mdapi.ch (DMS)
+            Mirror     -> mirror.mdapi.ch (public rsync/HTTP mirror: blackarch,
+                          archstrike, ctan, gentoo-portage, gnu, slackware, tails)

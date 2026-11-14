@@ -1,0 +1,80 @@
+## external-dns talks RFC2136 to Technitium primary inside the cluster.
+## TSIG key is loaded from secret 'external-dns-tsig' (synced from Akeyless).
+## Policy is sync: external-dns deletes the records it OWNS (those carrying an
+## extdns- registry TXT) once the source Ingress/Service is gone. Records
+## WITHOUT an extdns- TXT — manual entries and Technitium DHCP leases — are
+## never considered and never touched. Ownership scope is further narrowed by
+## the manage=mdapi annotation filter below. Verified 2026-05-22: only
+## Ingress/transit/garage carries the annotation, so the managed set is
+## api.garage + console.garage; sync additionally reaps the stale
+## api.minio/console.minio registry TXTs left orphaned by the MinIO decom.
+
+provider:
+  name: rfc2136
+
+policy: sync
+
+sources:
+  - service
+  - ingress
+
+domainFilters:
+  - home.tillo.ch
+
+txtOwnerId: mdapi-prod
+txtPrefix: extdns-
+
+extraArgs:
+  - --rfc2136-host=technitium-primary.technitium.svc.cluster.local
+  - --rfc2136-port=53
+  - --rfc2136-zone=home.tillo.ch
+  - --rfc2136-tsig-keyname=external-dns.home.tillo.ch
+  - --rfc2136-tsig-secret-alg=hmac-sha256
+  ## Read the current zone via (TSIG-signed) AXFR. Without this external-dns
+  ## cannot see existing records and re-issues an ADD for every managed
+  ## record every reconcile — a perpetual no-op churn that never converges.
+  ## Verified 2026-05-21: TSIG AXFR of home.tillo.ch from a cluster pod works.
+  - --rfc2136-tsig-axfr
+  ## Opt-in: only Ingresses/Services explicitly carrying the annotation
+  ## external-dns.alpha.kubernetes.io/manage=mdapi are reconciled. Avoids
+  ## colliding with DHCP-driven records in home.tillo.ch (e.g. cm.home.tillo.ch
+  ## which exists both as a DMZ DHCP host AND as a cluster Ingress).
+  - --annotation-filter=external-dns.alpha.kubernetes.io/manage=mdapi
+  ## Records use a 5m TTL by default; let resources override per-host via
+  ## external-dns.alpha.kubernetes.io/ttl.
+  - --min-ttl=300s
+  ## Pin every managed record to the harvester-managed ingress VIP rather
+  ## than the per-node IPs that status.loadBalancer.ingress exposes for
+  ## the DaemonSet ingress controller. --force-default-targets makes this
+  ## override the Ingress's status (not just fall back when empty).
+  - --default-targets=192.168.1.191
+  - --force-default-targets
+
+env:
+  - name: EXTERNAL_DNS_RFC2136_TSIG_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: external-dns-tsig
+        key: TSIG_KEY_SECRET
+
+logLevel: info
+logFormat: text
+
+interval: 5m
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+podLabels:
+  app.kubernetes.io/component: external-dns
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  additionalLabels:
+    release: rancher-monitoring

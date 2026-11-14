@@ -1,0 +1,71 @@
+# Mail SyntheticProbeFailing: silent for 10 min after a docker-mailserver pod creation
+# (fleet !1812, infra-r9mzd.2). A planned rollout's 4-min blackout must not page; the
+# same blackout with no pod creation must; a failure outlasting the window must too.
+# Clock origin is 2000-01-01: kube_pod_created 946685400 = a pod created at t=10m.
+rule_files:
+- monitoring-rules/11-blackbox-alerts.yml
+evaluation_interval: 30s
+tests:
+- name: rollout-muted
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Mail",team="mdapi",instance="mail.mdapi.ch:25"}
+    values: 1x19 0x8 1x40
+  - series: kube_pod_created{namespace="mail",pod="docker-mailserver-abc"}
+    values: 946685400x66
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts: []
+  - eval_time: 16m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts: []
+- name: unplanned-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Mail",team="mdapi",instance="mail.mdapi.ch:25"}
+    values: 1x19 0x8 1x40
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels:
+        component: Mail
+        team: mdapi
+        instance: mail.mdapi.ch:25
+        service: mail.mdapi.ch:25
+        severity: critical
+        statuspage: include
+      exp_annotations: &id001
+        summary: 'Mail: probe mail.mdapi.ch:25 failing'
+        description: "Blackbox probe `mail.mdapi.ch:25` (module: )\nhas had <80% success\
+          \ over the last 5m for >4m.\nComponent Mail on statuspage will go to major_outage.\n\
+          Investigate from a workstation:\n  curl -v mail.mdapi.ch:25    (for HTTP\
+          \ probes)\n  dig @mail.mdapi.ch:25 mdapi.ch  (for DNS)\n"
+- name: long-failure-after-restart-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Mail",team="mdapi",instance="mail.mdapi.ch:25"}
+    values: 1x19 0x60
+  - series: kube_pod_created{namespace="mail",pod="docker-mailserver-abc"}
+    values: 946685400x80
+  alert_rule_test:
+  - eval_time: 19m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts: []
+  - eval_time: 26m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels:
+        component: Mail
+        team: mdapi
+        instance: mail.mdapi.ch:25
+        service: mail.mdapi.ch:25
+        severity: critical
+        statuspage: include
+      exp_annotations: *id001

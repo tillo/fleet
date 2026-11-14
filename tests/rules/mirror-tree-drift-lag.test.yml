@@ -1,0 +1,82 @@
+# MirrorTreeDrift (fleet !1822, infra-1t1nx): alert on how long we have been behind
+# (age - drift = now - upstream stamp, only while drift > 0), not on the stamp gap.
+# A fresh upstream publish after a quiet spell (gap 40 h > limit 30 h) stays quiet; a
+# sync that stopped fires once the publish we lack is older than the limit for 1 h;
+# negative drift (we are ahead of the compared source) never fires.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: publish-after-quiet-spell-quiet
+  interval: 1m
+  input_series:
+  - series: mirror_tree_age_seconds{tree="slackware"}
+    values: 144000+60x200
+  - series: mirror_tree_drift_seconds{tree="slackware"}
+    values: 144000x200
+  - &id001
+    series: mirror_tree_drift_limit_seconds{tree="slackware"}
+    values: 108000x200
+  alert_rule_test:
+  - eval_time: 90m
+    groupname: app-batch-jobs.mirror-sync
+    alertname: MirrorTreeDrift
+    exp_alerts: []
+  - eval_time: 180m
+    groupname: app-batch-jobs.mirror-sync
+    alertname: MirrorTreeDrift
+    exp_alerts: []
+- name: stopped-sync-fires
+  interval: 1m
+  input_series:
+  - series: mirror_tree_age_seconds{tree="slackware"}
+    values: 248400+60x200
+  - series: mirror_tree_drift_seconds{tree="slackware"}
+    values: 144000x200
+  - *id001
+  alert_rule_test:
+  - eval_time: 110m
+    groupname: app-batch-jobs.mirror-sync
+    alertname: MirrorTreeDrift
+    exp_alerts: []
+  - eval_time: 125m
+    groupname: app-batch-jobs.mirror-sync
+    alertname: MirrorTreeDrift
+    exp_alerts:
+    - exp_labels:
+        tree: slackware
+        service: mirror
+        severity: warning
+        component: Files & Documents
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: mirror tree slackware is 1d 7h 5m 0s behind its upstream
+        description: "The mirror's copy of this tree is older than the marker its OWN upstream\npublishes,\
+          \ by more than the tolerated lag, so our sync has stopped\nadvancing while upstream is still\
+          \ moving. Unlike MirrorTreeStale this\nstays quiet while upstream is quiet, so a firing MirrorTreeDrift\
+          \ with a\nsilent MirrorTreeStale means the sync really has stopped.\n\nThe limit is one sync\
+          \ interval \u2014 the worst-case lag between upstream\npublishing and our next rsync \u2014\
+          \ plus slack for the script falling through\nto a different source than the one compared against.\n\
+          \nCheck, in order:\n  1. Is the sync running at all? These are `/etc/crontab` entries that\n\
+          \     run as user `mirror` (NOT systemd timers, NOT /etc/cron.d \u2014 both are\n     empty\
+          \ here, which makes the first look misleading).\n  2. Did the pod roll recently? The mirror\
+          \ runs `:latest` with strategy\n     Recreate, and a Renovate digest MR is what rolls it now;\
+          \ a roll\n     wipes /home/mirror, where the logs live.\n  3. Is upstream mid-publish? Re-read\
+          \ the upstream marker \u2014 a stamp that\n     is still advancing means we are merely between\
+          \ runs and this will\n     clear on the next one.\n  4. Before touching anything, dry-run against\
+          \ the ORIGIN (not the source\n     in the sync script): `rsync -n -v` transferring 0 files means\
+          \ we ARE\n     in sync and the comparison source is the lagging one.\n"
+- name: negative-drift-never-fires
+  interval: 1m
+  input_series:
+  - series: mirror_tree_age_seconds{tree="slackware"}
+    values: 300000+60x200
+  - series: mirror_tree_drift_seconds{tree="slackware"}
+    values: -144000x200
+  - *id001
+  alert_rule_test:
+  - eval_time: 125m
+    groupname: app-batch-jobs.mirror-sync
+    alertname: MirrorTreeDrift
+    exp_alerts: []

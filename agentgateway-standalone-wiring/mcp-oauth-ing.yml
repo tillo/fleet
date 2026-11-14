@@ -1,0 +1,58 @@
+## mcp.mdapi.ch — the Keycloak-OAuth routes ONLY, for hosted connectors (claude.ai) that
+## can send a URL but no header (infra-az8.49, infra-az8.46).
+##
+## The gateway routes under /oauth/<server>/mcp validate a realm tilloch JWT
+## (client mcp-gateway, aud mcp-gateway, kc-gate role mdapi-mcp-oauth) and inject the
+## upstream's own credential; the routes serve the MCP authorization discovery documents
+## under /.well-known/oauth-*/oauth/<server>/mcp themselves.
+##
+## The API-key routes stay LAN-only on the `mcp` Ingress: this one carries the public
+## source range, and its paths are exactly the OAuth prefixes, so the longest-prefix match
+## sends everything else to the LAN-only Ingress
+## (tests/test_mcp_front_door_upstreams_and_exposure.py).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-oauth
+  namespace: agentgateway
+  annotations:
+    ## Same stance as the `mcp` Ingress: MCP JSON-RPC bodies would score constantly.
+    ## The gate is the gateway's JWT validation.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    ## LAN (+ the Jool NAT64 LAN source .3) and Anthropic's published OUTBOUND ranges
+    ## (MCP connector egress; docs.anthropic.com/en/api/ip-addresses, 2026-11-12;
+    ## measured callers 160.79.106.0/24 in ingress_access).
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24,192.168.164.3/32,160.79.104.0/21,153.61.208.0/20"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mcp.mdapi.ch
+      http:
+        paths:
+          - path: /oauth/
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8080
+          - path: /.well-known/oauth-protected-resource/oauth/
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8080
+          - path: /.well-known/oauth-authorization-server/oauth/
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - mcp.mdapi.ch
+      secretName: mcp-cert

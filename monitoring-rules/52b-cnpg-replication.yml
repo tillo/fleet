@@ -1,0 +1,146 @@
+## CNPG replication: a standby that is up but does not stream (infra-3rm.32).
+##
+## 2026-11-08T09:00Z bussola-pg-1 stopped replaying WAL (looping on "record with
+## incorrect prev-link") and stayed that way for 4 days. Nothing alerted, because
+## everything else looked healthy:
+##   * the Cluster phase stayed "Cluster in healthy state" (it comes from pod
+##     readiness, not from replication);
+##   * the pod was Ready, so no pod or DatabaseUnready rule fired;
+##   * writes on the primary could hang in SyncRep, since the cluster runs
+##     synchronous replication (ANY 1) and its only standby was not confirming;
+##   * backup.target defaults to prefer-standby, so the daily Backups 11-09..11-12
+##     all ran ON the frozen standby, reported phase=completed with the same LSN
+##     range 1/AA000028-1/AB000000, and CnpgBackupStale (it reads backup TIME)
+##     stayed green.
+##
+## Two views of the same fault:
+##   CnpgReplicaNotStreaming     the primary's view, per cluster: it streams to
+##                               fewer standbys than the cluster has. critical
+##                               where synchronous replication is configured
+##                               (writes can hang), warning where it is not.
+##   CnpgStandbyNotReceivingWal  the standby's view, per pod: in recovery with no
+##                               WAL receiver. Names the pod to re-clone, and is
+##                               the signal for frozen prefer-standby backups --
+##                               there is no metric for a Backup's LSN, and while
+##                               this holds every backup taken on that pod stops
+##                               at the same position.
+##
+## ⛔ Not usable for this: cnpg_pg_replication_lag read 0 on bussola-pg-1 for the
+## whole 4 days (CNPG reports 0 when receive LSN == replay LSN, and a standby with
+## no receiver receives nothing), and cnpg_pg_stat_replication_* is published by
+## the primary only for standbys that are connected, so a disconnected one has no
+## series at all.
+##
+## Labels: cnpg_collector_up is the only CNPG series that carries `cluster`; it is
+## joined onto the others by (namespace, pod). `job` is <namespace>/<podmonitor>.
+##
+## Expected standbys = collectors that are up, minus one. A replica whose
+## collector is not scraped at all (pod gone, Pending, crashlooping) therefore
+## lowers the expectation instead of firing here; those cases are pod-level and
+## covered by the readiness rules. Single-instance clusters expect 0 and never fire.
+##
+## for: 15m, measured on VictoriaMetrics over 2026-10-13..11-12: outside bussola
+## the longest run of CnpgReplicaNotStreaming being true was 7 min (backstage and
+## guac, 11-08 08:26, a node drain) and of CnpgStandbyNotReceivingWal under 5 min,
+## so a switchover or a pod roll does not fire; bussola was true for 5607 min.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cnpg-replication
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: cnpg-replication.streaming
+      rules:
+        - record: cnpg:streaming_replicas:max
+          expr: |
+            max by (namespace, cluster) (
+              cnpg_pg_replication_streaming_replicas
+              * on (namespace, pod) group_left (cluster)
+              group by (namespace, pod, cluster) (cnpg_collector_up)
+            )
+        - record: cnpg:standbys_expected:count
+          expr: count by (namespace, cluster) (cnpg_collector_up == 1) - 1
+        - record: cnpg:sync_replicas_expected:max
+          expr: |
+            max by (namespace, cluster) (
+              cnpg_collector_sync_replicas{value="expected"}
+              * on (namespace, pod) group_left (cluster)
+              group by (namespace, pod, cluster) (cnpg_collector_up)
+            )
+        - alert: CnpgReplicaNotStreaming
+          expr: |
+            (cnpg:streaming_replicas:max < on (namespace, cluster) cnpg:standbys_expected:count)
+            and on (namespace, cluster) (cnpg:sync_replicas_expected:max > 0)
+          for: 15m
+          labels:
+            service: '{{ $labels.cluster }}'
+            severity: critical
+            component: Storage
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}/{{ $labels.cluster }}: the primary streams to {{ $value }} standby(s), fewer than the cluster has"
+            description: |
+              The primary of {{ $labels.namespace }}/{{ $labels.cluster }} streams WAL to fewer standbys
+              than the cluster has, while the Cluster phase can still read healthy. With synchronous
+              replication configured, writes on the primary can hang waiting for the missing standby;
+              backups with target prefer-standby run on the stuck standby and stop at a frozen LSN.
+              See which standby is missing on the primary:
+                kubectl -n {{ $labels.namespace }} exec <primary> -c postgres -- psql -c "select application_name, state, replay_lsn from pg_stat_replication"
+              CnpgStandbyNotReceivingWal names the stuck pod. Fix: re-clone it (delete its PVC with
+              --wait=false, then the pod; memory cnpg_replica_checkpoint_record_corrupt_reclone_2026_10_26).
+              Before that, take a backup with target: primary.
+        - alert: CnpgReplicaNotStreaming
+          expr: |
+            (cnpg:streaming_replicas:max < on (namespace, cluster) cnpg:standbys_expected:count)
+            unless on (namespace, cluster) (cnpg:sync_replicas_expected:max > 0)
+          for: 15m
+          labels:
+            service: '{{ $labels.cluster }}'
+            severity: warning
+            component: Storage
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}/{{ $labels.cluster }}: the primary streams to {{ $value }} standby(s), fewer than the cluster has"
+            description: |
+              The primary of {{ $labels.namespace }}/{{ $labels.cluster }} streams WAL to fewer standbys
+              than the cluster has, while the Cluster phase can still read healthy. With synchronous
+              replication configured, writes on the primary can hang waiting for the missing standby;
+              backups with target prefer-standby run on the stuck standby and stop at a frozen LSN.
+              See which standby is missing on the primary:
+                kubectl -n {{ $labels.namespace }} exec <primary> -c postgres -- psql -c "select application_name, state, replay_lsn from pg_stat_replication"
+              CnpgStandbyNotReceivingWal names the stuck pod. Fix: re-clone it (delete its PVC with
+              --wait=false, then the pod; memory cnpg_replica_checkpoint_record_corrupt_reclone_2026_10_26).
+              Before that, take a backup with target: primary.
+        - alert: CnpgStandbyNotReceivingWal
+          expr: |
+            (
+              (max by (namespace, pod) (cnpg_pg_replication_in_recovery) == 1)
+              and on (namespace, pod) (max by (namespace, pod) (cnpg_pg_replication_is_wal_receiver_up) == 0)
+              unless on (namespace, pod) (max by (namespace, pod) (cnpg_collector_replica_mode) == 1)
+            )
+            * on (namespace, pod) group_left (cluster)
+            group by (namespace, pod, cluster) (cnpg_collector_up)
+          for: 15m
+          labels:
+            service: '{{ $labels.cluster }}'
+            severity: warning
+            component: Backups
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "CNPG {{ $labels.namespace }}/{{ $labels.pod }}: standby has no WAL receiver, its data and its backups are frozen"
+            description: |
+              {{ $labels.namespace }}/{{ $labels.pod }} is in recovery but has no WAL receiver, so it
+              replays nothing new. Every backup that runs on it (backup.target prefer-standby, the
+              default) completes at the same LSN day after day while lastSuccessfulBackupTime stays
+              fresh. Compare beginLSN across the last Backups:
+                kubectl -n {{ $labels.namespace }} get backups.postgresql.cnpg.io -o custom-columns=NAME:.metadata.name,POD:.status.instanceID.podName,BEGIN:.status.beginLSN
+              and read why it does not stream:
+                kubectl -n {{ $labels.namespace }} logs {{ $labels.pod }} -c postgres --since=1h
+              Fix: re-clone the standby (memory cnpg_replica_checkpoint_record_corrupt_reclone_2026_10_26).

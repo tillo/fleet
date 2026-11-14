@@ -1,0 +1,82 @@
+# LonghornVolumeSnapshotsNearMax (infra-8uw9): a volume holding snapshot-max-count
+# (6) snapshots can neither rebuild a replica nor take a backup or VolSync snapshot
+# ("snapshot count usage N is equal or larger than snapshotMaxCount 6"). The count
+# includes snapshots marked removed but not yet purged: they are still on disk.
+rule_files:
+- monitoring-rules/20c-longhorn-snapshot-count.yml
+evaluation_interval: 1m
+tests:
+- name: five-snapshots-warn-four-do-not
+  interval: 1m
+  input_series:
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-a",snapshot="s1",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-a",snapshot="s2",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-a",snapshot="s3",user_created="true"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-a",snapshot="s4",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-a",snapshot="s5",user_created="false"}
+    values: '_x10 1x30'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-b",snapshot="t1",user_created="false"}
+    values: '1x40'
+  - series: longhorn_volume_robustness{volume="pvc-a",pvc="volsync-src-x-cache",pvc_namespace="x",state="unknown",namespace="longhorn-system"}
+    values: '1x40'
+  alert_rule_test:
+  - eval_time: 9m
+    groupname: app-longhorn-snapshots.count
+    alertname: LonghornVolumeSnapshotsNearMax
+    exp_alerts: []
+  - eval_time: 25m
+    groupname: app-longhorn-snapshots.count
+    alertname: LonghornVolumeSnapshotsNearMax
+    exp_alerts: []
+  - eval_time: 40m
+    groupname: app-longhorn-snapshots.count
+    alertname: LonghornVolumeSnapshotsNearMax
+    exp_alerts:
+    - exp_labels:
+        volume: pvc-a
+        pvc: volsync-src-x-cache
+        pvc_namespace: x
+        service: longhorn
+        namespace: longhorn-system
+        severity: warning
+        component: Backups
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Longhorn volume x/volsync-src-x-cache holds 5 snapshots (max 6)"
+        description: "At 6 snapshots Longhorn refuses to rebuild a replica, back up, or take a VolSync\nsnapshot of pvc-a. The hourly snapshotcleanup RecurringJob only purges system\nsnapshots of ATTACHED volumes, so a volume that is detached between runs (VolSync\ncaches) keeps every rebuild's snapshot. List them:\n  kubectl -n longhorn-system get snapshots.longhorn.io -o wide | grep pvc-a\nand delete the oldest system ones (userCreated=false), or let the cache PVC be\nrecreated. A node drain causes rebuilds: clear this before a node window.\n"
+- name: a-volume-without-a-robustness-series-still-alerts
+  interval: 1m
+  input_series:
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-c",snapshot="u1",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-c",snapshot="u2",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-c",snapshot="u3",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-c",snapshot="u4",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-c",snapshot="u5",user_created="false"}
+    values: '1x40'
+  - series: longhorn_snapshot_actual_size_bytes{volume="pvc-c",snapshot="u6",user_created="false"}
+    values: '1x40'
+  alert_rule_test:
+  - eval_time: 35m
+    groupname: app-longhorn-snapshots.count
+    alertname: LonghornVolumeSnapshotsNearMax
+    exp_alerts:
+    - exp_labels:
+        volume: pvc-c
+        service: longhorn
+        namespace: longhorn-system
+        severity: warning
+        component: Backups
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Longhorn volume / holds 6 snapshots (max 6)"
+        description: "At 6 snapshots Longhorn refuses to rebuild a replica, back up, or take a VolSync\nsnapshot of pvc-c. The hourly snapshotcleanup RecurringJob only purges system\nsnapshots of ATTACHED volumes, so a volume that is detached between runs (VolSync\ncaches) keeps every rebuild's snapshot. List them:\n  kubectl -n longhorn-system get snapshots.longhorn.io -o wide | grep pvc-c\nand delete the oldest system ones (userCreated=false), or let the cache PVC be\nrecreated. A node drain causes rebuilds: clear this before a node window.\n"

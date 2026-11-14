@@ -1,0 +1,77 @@
+# Applies keycloak-config-cli-cm.yml to the live realm (infra-u3cv), so what that
+# file declares survives a realm rebuild, import or restore and hand drift is put
+# back within 6 h. It waits for Keycloak itself (availability check), so a run
+# that lands during a Keycloak roll just waits.
+#
+# Scope: ONLY what the file lists. IMPORT_MANAGED_CLIENT=no-delete plus remote
+# state (default on) means kcc never deletes a client the file does not list;
+# top-level realm keys the file omits are left alone. Measured against a
+# throwaway Keycloak 26.8.2 seeded from a tilloch partial export: the only writes
+# besides the declared client are kcc's two bookkeeping realm attributes
+# de.adorsys.keycloak.config.{import-checksum-default,state-default-clients-0}.
+#
+# IMPORT_CACHE_ENABLED=false: with the cache on, kcc skips a file whose checksum
+# it already recorded, so a hand edit of the live realm would never be reverted.
+#
+# Image: no kcc build targets Keycloak 26.8 yet; 6.5.1-26.5.5 (the newest) is the
+# one tested against the live 26.8.2.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-config-cli
+spec:
+  schedule: "23 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          priorityClassName: mdapi-low
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: keycloak-config-cli
+              image: docker.io/adorsys/keycloak-config-cli:6.5.1-26.5.5@sha256:0955d98c8a341898b7aa177477edf8a1e90569ae50bbe7598141c1270b773274
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: KEYCLOAK_URL
+                  value: http://keycloak.keycloak.svc.cluster.local:8080
+                - name: KEYCLOAK_AVAILABILITYCHECK_ENABLED
+                  value: "true"
+                - name: KEYCLOAK_AVAILABILITYCHECK_TIMEOUT
+                  value: 300s
+                - name: IMPORT_FILES_LOCATIONS
+                  value: /config/*
+                - name: IMPORT_CACHE_ENABLED
+                  value: "false"
+                - name: IMPORT_MANAGED_CLIENT
+                  value: no-delete
+              envFrom:
+                - secretRef:
+                    name: keycloak-config-cli-apibot
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 50m, memory: 256Mi}
+                limits: {memory: 512Mi}
+              volumeMounts:
+                - {name: config, mountPath: /config, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+          volumes:
+            - name: config
+              configMap:
+                name: keycloak-config-cli-realm
+            - name: tmp
+              emptyDir: {}

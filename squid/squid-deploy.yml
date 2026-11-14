@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: squid
+  namespace: squid
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: squid
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: squid
+    spec:
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: squid
+          # Our own build (mdapi/squid, infra-e7mk): ubuntu 26.04 + squid-openssl. The
+          # ubuntu/squid rock ran squid-gnutls, which sends only the leaf from
+          # tls-cert=, so strict clients failed with verify code 21. The OpenSSL build
+          # sends the intermediates in squid-cert's tls.crt; squid.conf is unchanged.
+          image: zot.mdapi.ch/mdapi/squid:7.7-mdapi.17@sha256:29d7066407ad1e7e78c6c1ade595213e2b9b8d6ca8d46cc4bf58ee9e6a88d842
+          imagePullPolicy: IfNotPresent
+          # Same contract as the rock: tails squid's log files to stdout, then execs squid.
+          command: ["/usr/local/bin/entrypoint.sh"]
+          args: ["-f", "/etc/squid/squid.conf", "-NYC"]
+          resources: {}
+          ports:
+            - containerPort: 443
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            - name: squid-conf
+              mountPath: /etc/squid/squid.conf
+              subPath: squid.conf
+            - name: squid-cert
+              mountPath: /etc/squid/ssl
+              readOnly: true
+            - name: squid-ldap
+              mountPath: /etc/squid/ldap
+              readOnly: true
+      volumes:
+        - name: squid-conf
+          configMap:
+            name: squid-conf
+        - name: squid-cert
+          secret:
+            secretName: squid-cert
+        - name: squid-ldap
+          secret:
+            secretName: squid-ldap

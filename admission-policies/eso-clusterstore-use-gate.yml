@@ -1,0 +1,108 @@
+## Who may point an ExternalSecret or a PushSecret at a CLUSTER-scoped store
+## (infra-p6q07.1, SA token audit 2026-11-10).
+##
+## ClusterSecretStores cm-akeyless and openbao have no spec.conditions, and the
+## ESO chart aggregates create on externalsecrets AND pushsecrets into the
+## stock edit/admin roles. So before this policy anyone with `edit` in ANY
+## namespace — a tenant user, a CI runner SA, a heal job — could read every
+## Akeyless item through cm-akeyless, and overwrite items through a PushSecret.
+##
+## ESO itself only offers a coarse fence (spec.conditions on the store), which
+## would need a namespace list on a store that 84 namespaces legitimately use.
+## The real distinction is not WHICH namespace but WHO wrote the object: every
+## ExternalSecret on this cluster is shipped by Fleet. So the gate asks the
+## authorizer, at admission, whether the requester holds the cluster-scoped
+##   external-secrets.io / clustersecretstores / use   on the referenced store
+## (or clustergenerators / use for a ClusterGenerator). No namespace
+## RoleBinding can grant a cluster-scoped check, so today only `*` holders pass:
+## cluster-admin and fleet-agent. A tenant can still use a SecretStore in its
+## own namespace.
+##
+## Covered references: spec.secretStoreRef, spec.data[].sourceRef.storeRef,
+## spec.dataFrom[].sourceRef.storeRef / generatorRef (ExternalSecret), and
+## spec.secretStoreRefs[] by name OR labelSelector (PushSecret; a selector can
+## reach every store, so it needs `use` on all of them).
+##
+## Exempt: the ESO controller SA — it creates ExternalSecrets from a
+## ClusterExternalSecret (cluster-scoped, cluster-admin to create) and writes
+## finalizers. UPDATEs that leave spec unchanged pass (force-sync annotations).
+##
+## The Akeyless side was narrowed the same day: the /k8s auth method lost the
+## account `admin` role for role `eso` (read /mdapi/* /kyos/*, write only
+## /mdapi/findmy/icloud/*). This policy is the per-namespace half.
+##
+## Rollout: Warn + Audit first (the test script counts a warning as a refusal);
+## flip the binding to Deny + Audit once the audit log stays quiet.
+## Test: ./eso-clusterstore-use-gate.test.sh [--replay]
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: eso-clusterstore-use-gate
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["external-secrets.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["externalsecrets", "pushsecrets"]
+        scope: Namespaced
+  matchConditions:
+    - name: not-the-eso-controller
+      expression: "request.userInfo.username != 'system:serviceaccount:external-secrets:external-secrets'"
+    - name: spec-changes
+      expression: "request.operation == 'CREATE' || oldObject == null || object.spec != oldObject.spec"
+  variables:
+    - name: isPush
+      expression: "request.resource.resource == 'pushsecrets'"
+    ## Names of ClusterSecretStores referenced; '*' stands for "any" (label selector).
+    - name: stores
+      expression: >-
+        variables.isPush
+          ? (has(object.spec.secretStoreRefs) ? object.spec.secretStoreRefs
+              .filter(r, has(r.kind) && r.kind == 'ClusterSecretStore')
+              .map(r, has(r.name) && r.name != '' ? r.name : '*') : [])
+          : (
+              (has(object.spec.secretStoreRef) && has(object.spec.secretStoreRef.kind) &&
+               object.spec.secretStoreRef.kind == 'ClusterSecretStore'
+                 ? [object.spec.secretStoreRef.name] : []) +
+              (has(object.spec.data) ? object.spec.data
+                 .filter(d, has(d.sourceRef) && has(d.sourceRef.storeRef) &&
+                            has(d.sourceRef.storeRef.kind) && d.sourceRef.storeRef.kind == 'ClusterSecretStore')
+                 .map(d, d.sourceRef.storeRef.name) : []) +
+              (has(object.spec.dataFrom) ? object.spec.dataFrom
+                 .filter(d, has(d.sourceRef) && has(d.sourceRef.storeRef) &&
+                            has(d.sourceRef.storeRef.kind) && d.sourceRef.storeRef.kind == 'ClusterSecretStore')
+                 .map(d, d.sourceRef.storeRef.name) : [])
+            )
+    - name: generators
+      expression: >-
+        !variables.isPush && has(object.spec.dataFrom) ? object.spec.dataFrom
+          .filter(d, has(d.sourceRef) && has(d.sourceRef.generatorRef) &&
+                     has(d.sourceRef.generatorRef.kind) && d.sourceRef.generatorRef.kind == 'ClusterGenerator')
+          .map(d, d.sourceRef.generatorRef.name) : []
+    - name: storesDenied
+      expression: >-
+        variables.stores.filter(n, !(n == '*'
+          ? authorizer.group('external-secrets.io').resource('clustersecretstores').check('use').allowed()
+          : authorizer.group('external-secrets.io').resource('clustersecretstores').name(n).check('use').allowed()))
+    - name: generatorsDenied
+      expression: >-
+        variables.generators.filter(n,
+          !authorizer.group('generators.external-secrets.io').resource('clustergenerators').name(n).check('use').allowed())
+  validations:
+    - expression: "size(variables.storesDenied) == 0 && size(variables.generatorsDenied) == 0"
+      messageExpression: >-
+        request.userInfo.username + ' may not reference cluster-scoped secret stores ' +
+        (variables.storesDenied + variables.generatorsDenied).join(', ') +
+        ': that needs cluster-scoped use on external-secrets.io/clustersecretstores. ' +
+        'Ship the object through Fleet, or use a SecretStore in this namespace (infra-p6q07.1)'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: eso-clusterstore-use-gate
+spec:
+  policyName: eso-clusterstore-use-gate
+  validationActions: ["Warn", "Audit"]

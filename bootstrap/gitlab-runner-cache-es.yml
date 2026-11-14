@@ -1,0 +1,28 @@
+## S3 credentials for the GitLab runner's shared CI cache (bucket gitlab-runner-cache
+## on the in-cluster Ceph RGW). Consumed by the gitlab chart through
+## gitlab-runner.runners.cache.secretName: the runner subchart projects this Secret
+## to /secrets and its entrypoint exports accesskey/secretkey as CACHE_S3_*, which
+## `register --template-config` writes into config.toml at every pod start.
+## Until infra-h0xb.2 (2026-10-06) the same two values sat inline in
+## runners.config in ~/bootstrap/gitlab-values.yaml, which blocked that file from
+## ever living in this repo. The Akeyless items mirror the Rook object-store user
+## rook-ceph/rook-ceph-object-user-ceph-objectstore-gitlab - if that user's key is
+## ever rotated, update both items or the CI cache silently stops working.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: gitlab-runner-cache-s3
+  namespace: bootstrap
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: gitlab-runner-cache-s3
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/gitlab/rgw/access-key }
+    secretKey: accesskey
+  - remoteRef: { key: /mdapi/gitlab/rgw/secret-key }
+    secretKey: secretkey

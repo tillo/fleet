@@ -1,0 +1,116 @@
+## clamav — the ONE shared clamd (ns clamav, infra-8f4.50) that docker-mailserver's
+## rspamd and the personal Nextcloud (files_antivirus, daemon mode) both scan through.
+##
+## Why `Mail` and why ClamdDown pages: rspamd's antivirus module FAILS OPEN by
+## default (CLAM_VIRUS_FAIL, score 0, mail delivered unscanned). mail/docker-mailserver
+## turns that symbol into a SOFT REJECT, so with clamd unreachable every inbound
+## message is deferred (senders retry for days, nothing is lost) and every
+## authenticated submission gets a 4xx. That is mail visibly degraded => critical,
+## statuspage include. Nextcloud keeps serving files either way.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract); the
+## `deployment=~".+"` / `statefulset=~".+"` matchers are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check.
+##
+## The Probe (in 10-blackbox-probes.yml) asks clamd for VERSION over the real Service on :3310 —
+## the same path rspamd and Nextcloud use, through clamav/clamav-netpol.yml — so it
+## fails on a dead process, an unloaded database AND a NetworkPolicy regression.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-clamav
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-clamav.rules
+      rules:
+        - alert: ClamdDown
+          expr: |
+            probe_success{probe="clamav"} == 0
+          for: 5m
+          labels:
+            service: clamd
+            namespace: clamav
+            severity: critical
+            component: Mail
+            team: mdapi
+            statuspage: include
+          annotations:
+            summary: "clamd (ns clamav) does not answer VERSION on :3310"
+            description: |
+              Inbound mail is being DEFERRED (rspamd soft-rejects on
+              CLAM_VIRUS_FAIL) and authenticated submission returns 4xx until
+              clamd answers again. Nextcloud uploads are not scanned meanwhile.
+                kubectl --context mdapi-prod-direct -n clamav get pods
+                kubectl --context mdapi-prod-direct -n clamav logs deploy/clamav -c clamd
+              A fresh pod needs ~1-2 min to load the database (startupProbe);
+              an empty PVC first downloads ~170 MB in the init container.
+              Emergency fail-open (delivers mail UNSCANNED): remove the
+              CLAM_VIRUS_FAIL rule from force_actions in
+              mail/docker-mailserver/values.yml user-patches.sh.
+
+        - alert: ClamavSignaturesStale
+          ## The probe exports the daily build as a label of probe_expect_info.
+          ## A CURRENT series (the `and`) first seen more than 3 days ago means
+          ## freshclam has stopped landing updates; upstream publishes several
+          ## dailies a day. min_over_time over the subquery = when this daily
+          ## build was first seen within the 4-day window.
+          expr: |
+            (
+              time() - min_over_time(timestamp(probe_expect_info{probe="clamav"})[4d:10m])
+            ) > 3 * 86400
+            and probe_expect_info{probe="clamav"}
+          for: 1h
+          labels:
+            service: clamd
+            namespace: clamav
+            severity: warning
+            component: Mail
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "ClamAV daily signatures {{ $labels.daily }} have not changed for 3 days"
+            description: |
+              freshclam is not updating the shared clamd. Mail and Nextcloud are
+              still scanned, against an old database.
+                kubectl --context mdapi-prod-direct -n clamav logs deploy/clamav -c freshclam --tail=50
+              A 429 from database.clamav.net is a CDN cool-down: freshclam backs off
+              by itself; do NOT restart it in a loop.
+
+        - alert: ClamavWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="clamav", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="clamav", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "clamav" }}'
+            severity: warning
+            component: Mail
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "clamav/{{ $labels.deployment }} has {{ $value }} unavailable replica(s)"
+            description: |
+              The impact is paged by ClamdDown (probe-based); this rule only keeps
+              the namespace covered for f/probe/alert_coverage_check.
+                kubectl --context mdapi-prod-direct -n clamav get pods
+
+        - alert: ClamavStatefulSetUnavailable
+          ## Empty today — the arm exists so the namespace-wide claim stays true.
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="clamav", statefulset=~".+"}
+              < kube_statefulset_status_replicas{namespace="clamav", statefulset=~".+"}
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "clamav" }}'
+            severity: warning
+            component: Mail
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "clamav/{{ $labels.statefulset }} has unavailable replicas"
+            description: |
+                kubectl --context mdapi-prod-direct -n clamav get sts,pods

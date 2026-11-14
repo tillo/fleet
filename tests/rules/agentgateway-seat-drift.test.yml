@@ -1,0 +1,158 @@
+# Seat-side MCP drift (the other half of 77b): the gateway KNOWS what a seat may reach, and
+# this measures whether the seat's own client config agrees. Three states, and only one of
+# them is good news — a check that cannot run is not "in sync", and the Mac being asleep is
+# not an outage of anything (hence the seat-jump-only staleness rule).
+rule_files:
+- monitoring-rules/77c-agentgateway-seat-drift.yml
+evaluation_interval: 1m
+tests:
+- name: a-clean-seat-is-silent
+  interval: 1m
+  input_series:
+  - series: agentgateway_seat_mcp_check_last_run_success{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 1x70
+  - series: agentgateway_seat_mcp_check_last_run_timestamp_seconds{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 946684800x70
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-jump",client="pi"}
+    values: '0x70'
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-jump",client="claude"}
+    values: '0x70'
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpConfigDrift
+    exp_alerts: []
+  - eval_time: 60m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckFailed
+    exp_alerts: []
+  - eval_time: 60m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckStale
+    exp_alerts: []
+- name: a-drifted-client-pages-after-an-hour
+  interval: 1m
+  input_series:
+  - series: agentgateway_seat_mcp_check_last_run_success{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 1x70
+  - series: agentgateway_seat_mcp_check_last_run_timestamp_seconds{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 946684800x70
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-jump",client="pi"}
+    values: 1x70
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-jump",client="claude"}
+    values: '0x70'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpConfigDrift
+    exp_alerts: []
+  - eval_time: 61m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpConfigDrift
+    exp_alerts:
+    - exp_labels:
+        service: agentgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        alertgroup: app-agentgateway-seat-drift.rules
+        job: agentgateway_seat_mcp_drift
+        seat: seat-jump
+        client: pi
+      exp_annotations:
+        summary: MCP client config on seat-jump drifted from the gateway (pi)
+        description: "`agw-mcp-sync --check` walked seat-jump and found pi out of\ndate with the gateway's\
+          \ grant matrix: a server the gateway grants is missing, a key was\nrotated, or an entry points\
+          \ at a stale base URL. That client either cannot reach a server\nit is entitled to, or is still\
+          \ holding one the gateway no longer grants.\n\nFix it on the seat, then restart the client so\
+          \ it re-reads the file:\n\n    ~/bin/agw-mcp-sync --check    # the same report, by hand\n  \
+          \  ~/bin/agw-mcp-sync --apply    # write it, timestamped backup kept\n\nThe gateway rows are\
+          \ the source of truth and are not wrong: this alert only ever means\nthe seat's copy fell behind.\
+          \ A server granted but never rendered shows up here first."
+- name: a-failing-check-pages-after-30m
+  interval: 1m
+  input_series:
+  - series: agentgateway_seat_mcp_check_last_run_success{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: '0x70'
+  - series: agentgateway_seat_mcp_check_last_run_timestamp_seconds{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 946684800x70
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-jump",client="pi"}
+    values: '0x70'
+  alert_rule_test:
+  - eval_time: 20m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckFailed
+    exp_alerts: []
+  - eval_time: 32m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckFailed
+    exp_alerts:
+    - exp_labels:
+        service: agentgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        alertgroup: app-agentgateway-seat-drift.rules
+        job: agentgateway_seat_mcp_drift
+        seat: seat-jump
+      exp_annotations:
+        summary: The MCP drift check on seat-jump is failing
+        description: "The seat ran `agw-mcp-sync --check` and it exited with an error rather than a verdict,\
+          \ so\nthe drift state of seat-jump is not being measured \u2014 silence from this metric\nmeans\
+          \ nothing until it recovers.\n\nMost often the seat cannot reach the gateway admin API or the\
+          \ Pushgateway. From the seat:\n\n    ~/bin/agw-mcp-sync --check      # read the actual error\n\
+          \    kubectl --context mdapi-prod-direct -n agentgateway get pods\n\nOn seat-jump the same failure\
+          \ also shows as the Windmill job f/desk/seat_mcp_drift\nfailing, which is where the ssh hop\
+          \ would break first."
+- name: seat-jump-goes-quiet-pages-after-a-day
+  interval: 1m
+  input_series:
+  - series: agentgateway_seat_mcp_check_last_run_success{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 1x70
+  - series: agentgateway_seat_mcp_check_last_run_timestamp_seconds{job="agentgateway_seat_mcp_drift",seat="seat-jump"}
+    values: 946584800x70
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-jump",client="pi"}
+    values: '0x70'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckStale
+    exp_alerts: []
+  - eval_time: 62m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckStale
+    exp_alerts:
+    - exp_labels:
+        service: agentgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        alertgroup: app-agentgateway-seat-drift.rules
+        job: agentgateway_seat_mcp_drift
+        seat: seat-jump
+      exp_annotations:
+        summary: seat-jump has not reported its MCP drift state for over a day
+        description: "The last successful publish from seat-jump is more than 26 hours old, so the drift\n\
+          alerts above are blind: they can only fire on a state somebody published.\n\nThe chain is Windmill\
+          \ f/desk/seat_mcp_drift (every 6 h) \u2192 ssh \u2192 `agw-mcp-sync\n--check --push` \u2192\
+          \ Pushgateway \u2192 scrape. Check the first link, then the rest:\n\n    cd ~/windmill && wmill\
+          \ script run f/desk/seat_mcp_drift\n    ssh jump-bastion \"~/bin/agw-mcp-sync --check --push\"\
+          \n    kubectl --context mdapi-prod-direct -n monitoring get pods -l app=pushgateway"
+- name: the-mac-being-asleep-is-not-an-outage
+  interval: 1m
+  input_series:
+  - series: agentgateway_seat_mcp_check_last_run_success{job="agentgateway_seat_mcp_drift",seat="seat-mbp-mda"}
+    values: 1x70
+  - series: agentgateway_seat_mcp_check_last_run_timestamp_seconds{job="agentgateway_seat_mcp_drift",seat="seat-mbp-mda"}
+    values: 946384800x70
+  - series: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift",seat="seat-mbp-mda",client="ccx"}
+    values: '0x70'
+  alert_rule_test:
+  - eval_time: 62m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckStale
+    exp_alerts: []
+  - eval_time: 62m
+    groupname: app-agentgateway-seat-drift.rules
+    alertname: AgentgatewaySeatMcpDriftCheckFailed
+    exp_alerts: []

@@ -1,0 +1,83 @@
+## Who may talk to the shared clamd, and what it may reach. ENFORCING from birth.
+##
+## WHY. clamd parses hostile files for a living (every emailed attachment, every
+## uploaded file) — it is the estate's largest parser attack surface, so it gets the
+## narrowest door: exactly the two platform callers it was built for, plus the probe.
+## ⛔ Tenant namespaces (envuassu, ...) are NOT admitted: they run their own ClamAV.
+##
+## ⚠️ A wrongly-blocked caller shows up on the CALLER's side only: rspamd logs
+## CLAM_VIRUS_FAIL and soft-rejects (mail deferred), the Nextcloud entrypoint waits
+## 90 s for :3310 and then DISABLES files_antivirus. Nothing logs here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clamav-restricted
+  namespace: clamav
+spec:
+  podSelector:
+    matchLabels:
+      app: clamav
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    ## 1. The callers. Pod selectors, not whole namespaces: the mail namespace also
+    ## runs roundcube/autoconfig/mta-sts, nextcloud runs a dozen AIO containers, and
+    ## none of them scans anything.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: mail
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: docker-mailserver
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: nextcloud
+          podSelector:
+            matchLabels:
+              io.kompose.service: nextcloud-aio-nextcloud
+        ## 2. The blackbox exporter, for the VERSION Probe (10-blackbox-probes.yml).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+      ports:
+        - protocol: TCP
+          port: 3310
+    ## The kubelet's probes are exec (clamdscan over the in-pod socket), so no node
+    ## ipBlock is needed.
+  egress:
+    ## 1. DNS, by SELECTOR (CoreDNS pod IPs; an ipBlock on the 10.53.0.10 VIP would
+    ## block resolution, since policy is evaluated post-DNAT). freshclam reads the
+    ## current versions from the TXT record current.cvd.clamav.net.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    ## 2. freshclam -> database.clamav.net (Cloudflare CDN), HTTPS/HTTP only, never
+    ## anything private: a compromised clamd must not reach the LAN or the cluster.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

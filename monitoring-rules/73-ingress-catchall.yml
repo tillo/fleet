@@ -1,0 +1,174 @@
+## ingress-catchall: the 404 backend behind the *.mdapi.ch wildcard Ingress
+## (ns `ingress-catchall`, bundle rke2-ingress-nginx-config/catchall-404/,
+## beads infra-az8.19.5).
+##
+## Before 2026-10-28 every *.mdapi.ch name without an Ingress reached Rancher
+## through the hostless cattle-system/rancher-expose. The first canary proves
+## that it no longer does, the second that a Host of our own public WAN IP is
+## denied by the WAF (ModSecurity rule 1899); the workload rules cover the
+## backend itself.
+##
+## Severity is warning and component is Platform with `statuspage: exclude`: no
+## real site depends on this backend. If it fails, unknown names get a 503 from
+## the controller instead of a 404, and the only thing worth a notification is
+## the canary seeing Rancher again.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check: without them a namespace-only
+## selector claims coverage of a kind it can never fire on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ingress-catchall
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-ingress-catchall.rules
+      rules:
+        - alert: IngressCatchallWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="ingress-catchall", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="ingress-catchall", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "catchall-404" }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "ingress-catchall/{{ $labels.deployment }} has {{ $value }} unavailable replica(s)"
+            description: |
+              The 404 backend for unknown *.mdapi.ch names is short of replicas.
+              With none left the controller answers those names with a 503, which
+              still keeps them away from Rancher.
+                kubectl --context mdapi-prod-direct -n ingress-catchall get pods
+                kubectl --context mdapi-prod-direct -n ingress-catchall describe deploy/{{ $labels.deployment }}
+
+        - alert: IngressCatchallStatefulSetUnavailable
+          ## Empty today. The arm exists so the namespace-wide claim above stays
+          ## true if a StatefulSet is ever added here.
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="ingress-catchall", statefulset=~".+"}
+              < kube_statefulset_status_replicas{namespace="ingress-catchall", statefulset=~".+"}
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "catchall-404" }}'
+            severity: warning
+            component: Platform
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "ingress-catchall/{{ $labels.statefulset }} has unavailable replicas"
+
+        - alert: UnknownHostNotCaught
+          ## Every canary sample in 15m failed (5m interval, so 3 samples), or
+          ## the canary series is missing. A failure means the request for an
+          ## unknown *.mdapi.ch name did not get a clean 404: Rancher answered
+          ## (rancher-expose became the winner again, e.g. the wildcard Ingress was
+          ## deleted or lost its class), the controller returned 503 (backend
+          ## down, which IngressCatchallWorkloadUnavailable also reports), or the
+          ## VIP did not answer at all.
+          ## Aggregated `by (probe)` so a target edit does not leave the retired
+          ## series behind in the window (see app-blackbox.waf in 11-blackbox-alerts.yml).
+          expr: |
+            max by (probe) (max_over_time(probe_success{probe="ingress-catchall-canary"}[15m])) == 0
+              or absent_over_time(probe_success{probe="ingress-catchall-canary"}[30m])
+          for: 10m
+          labels:
+            service: catchall-404
+            namespace: ingress-catchall
+            severity: warning
+            component: Platform
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "An unknown *.mdapi.ch name no longer gets the ingress-catchall 404"
+            description: |
+              Probe ingress-catchall-canary (module http_catchall_404) sends
+              Host: catchall-canary.mdapi.ch to the ingress VIP and expects a 404
+              without an X-Api-Cattle-Auth header. Check what answers now:
+                curl -s -o /dev/null -D - -H 'Host: catchall-canary.mdapi.ch' http://192.168.1.191/ | grep -i -E '^HTTP|cattle'
+                kubectl --context mdapi-prod-direct -n ingress-catchall get ingress,pods
+              A 302/200 with x-api-cattle-auth means Rancher, through the hostless
+              cattle-system/rancher-expose. ⛔ Do not fix that by giving
+              rancher-expose a host: the Harvester nodes reach Rancher by IP through
+              it. Source: fleet rke2-ingress-nginx-config/catchall-404/. Memory:
+              harvester_nodes_curl_vip_through_hostless_rancher_expose_2026_10_28.
+
+        - alert: WanIpLiteralHostNotDenied
+          ## Same shape as UnknownHostNotCaught, for the other half of the fix:
+          ## an IP literal cannot be an Ingress host, so a Host of our own public
+          ## WAN IP is closed in the WAF (rule 1899), not by the catch-all.
+          expr: |
+            max by (probe) (max_over_time(probe_success{probe="ingress-wan-ip-literal-canary"}[15m])) == 0
+              or absent_over_time(probe_success{probe="ingress-wan-ip-literal-canary"}[30m])
+          for: 10m
+          labels:
+            service: ingress-modsec-global
+            namespace: kube-system
+            severity: warning
+            component: Platform
+            statuspage: exclude
+            team: mdapi
+          annotations:
+            summary: "A request with Host = our public WAN IP is no longer denied by the WAF"
+            description: |
+              Probe ingress-wan-ip-literal-canary (module http_wan_ip_literal_403)
+              sends Host: 31.3.128.50 to the ingress VIP over HTTPS and expects a
+              403 without an X-Api-Cattle-Auth header. Check what answers now:
+                curl -sk -o /dev/null -D - -H 'Host: 31.3.128.50' https://192.168.1.191/ | grep -i -E '^HTTP|cattle'
+              A 302/200 with x-api-cattle-auth means Rancher again: ModSecurity
+              rule 1899 is gone, moved below a ctl:ruleEngine rule, or the engine
+              is off. ⛔ Do not fix it by widening the rule to 192.168.x or the
+              node IPs: the Harvester nodes reach Rancher by IP through
+              rancher-expose. Source: fleet
+              rke2-ingress-nginx-config/modsec-global-cm.yml (id:1899).
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ingress-catchall-canary
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: ingress-catchall-canary
+  interval: 5m
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_catchall_404
+  targets:
+    staticConfig:
+      static:
+        ## The ingress VIP (kube-vip services lease, ingress-expose LoadBalancer).
+        ## The module sets Host: catchall-canary.mdapi.ch.
+        - http://192.168.1.191/
+      labels:
+        probe: ingress-catchall-canary
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: ingress-wan-ip-literal-canary
+  namespace: monitoring
+  labels:
+    release: rancher-monitoring
+spec:
+  jobName: ingress-wan-ip-literal-canary
+  interval: 5m
+  prober:
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_wan_ip_literal_403
+  targets:
+    staticConfig:
+      static:
+        ## The ingress VIP. The module sets Host: 31.3.128.50 (the public A of
+        ## mdapi.ch), so this tests what a scanner hitting the WAN IP gets.
+        - https://192.168.1.191/
+      labels:
+        probe: ingress-wan-ip-literal-canary

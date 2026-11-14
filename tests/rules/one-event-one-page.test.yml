@@ -1,0 +1,99 @@
+# Duplicate alert pairs (infra-3rm.8): where one rule's condition contains another's, the
+# broader rule is bounded with `unless` so one event raises one alert. Each case asserts
+# the bounded rule stays silent while its sibling owns the event.
+rule_files:
+- monitoring-rules/03-gitlab.yml
+- monitoring-rules/12-batch-jobs.yml
+- monitoring-rules/24-etcd-quorum.yml
+evaluation_interval: 1m
+tests:
+- name: no-etcd-member-sees-a-leader-pages-only-etcd-no-leader
+  interval: 1m
+  input_series:
+  - series: etcd_server_has_leader{instance="a"}
+    values: '0x20'
+  - series: etcd_server_has_leader{instance="b"}
+    values: '0x20'
+  - series: etcd_server_has_leader{instance="c"}
+    values: '0x20'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: cluster-etcd-quorum.rules
+    alertname: EtcdQuorumLost
+    exp_alerts: []
+- name: a-dead-wan-carrier-pages-only-the-carrier-alert
+  interval: 1m
+  input_series:
+  - series: bpir4_wan_up{job="bpir4_health"}
+    values: '0x20'
+  - series: bpi_r4_wan_carrier{job="bpi_r4"}
+    values: '0x20'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.bpir4
+    alertname: Bpir4WanDown
+    exp_alerts: []
+- name: a-stale-gitlab-backup-object-warns-only-once
+  interval: 1m
+  input_series:
+  # last success 2 days before the vmalert-tool origin (946684800 - 172800); the newest object is 2 days old
+  - series: kube_cronjob_status_last_successful_time{namespace="bootstrap",cronjob="gitlab-toolbox-backup"}
+    values: '946512000x20'
+  - series: gitlab_backup_age_days{job="gitlab_backup_health"}
+    values: '2x20'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-gitlab.workload
+    alertname: GitLabBackupCronJobMissed
+    exp_alerts: []
+# ...and each bounded rule still fires for the part of its condition no sibling covers.
+- name: one-of-three-etcd-members-sees-a-leader-still-pages-quorum-lost
+  interval: 1m
+  input_series:
+  - series: etcd_server_has_leader{instance="a"}
+    values: '1x20'
+  - series: etcd_server_has_leader{instance="b"}
+    values: '0x20'
+  - series: etcd_server_has_leader{instance="c"}
+    values: '0x20'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: cluster-etcd-quorum.rules
+    alertname: EtcdQuorumLost
+    exp_alerts:
+    - exp_labels: {service: etcd, namespace: kube-system, severity: critical, component: Platform, statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "etcd quorum at risk -- only 1 member(s) see a leader"
+        description: "Fewer than 2 etcd members report a leader -- quorum is lost or about to be.\nThe Kubernetes API will be unstable/unavailable. Recover with a single-member\n`rke2 server --cluster-reset` on the healthiest node, then sequentially rejoin\nthe others (see qui_etcd_member_removed_rejoin_pending).\n"
+- name: pppoe-down-with-the-carrier-up-or-unknown-still-pages-wan-down
+  interval: 1m
+  input_series:
+  - series: bpir4_wan_up{job="bpir4_health"}
+    values: '0x20'
+  - series: bpi_r4_wan_carrier{job="bpi_r4"}
+    values: '1x20'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.bpir4
+    alertname: Bpir4WanDown
+    exp_alerts:
+    - exp_labels: {job: bpir4_health, service: bpi-r4, severity: critical, component: Internet, statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "BPI-R4 WAN is down"
+        description: "PPPoE WAN reports no IP. HA storm/PON automations may already be acting; this is the slow-cron-side confirmation."
+- name: a-failing-backup-cronjob-with-a-fresh-object-still-warns
+  interval: 1m
+  input_series:
+  - series: kube_cronjob_status_last_successful_time{namespace="bootstrap",cronjob="gitlab-toolbox-backup"}
+    values: '946512000x20'
+  - series: gitlab_backup_age_days{job="gitlab_backup_health"}
+    values: '0.5x20'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-gitlab.workload
+    alertname: GitLabBackupCronJobMissed
+    exp_alerts:
+    - exp_labels: {cronjob: gitlab-toolbox-backup, namespace: bootstrap, service: gitlab-toolbox-backup, severity: warning, component: Platform, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "GitLab backup CronJob hasn't succeeded in 2d 0h 10m 0s"
+        description: "Schedule is daily at 02:00. >36h means at least one missed run.\nCheck: kubectl -n bootstrap get jobs | grep toolbox-backup\n"

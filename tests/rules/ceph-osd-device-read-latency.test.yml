@@ -1,0 +1,86 @@
+# CephOSDDeviceReadLatencyHigh (infra-r9mzd.21): names the slow Ceph OSD DEVICE
+# (node + sd* + osd id) when its mean read latency stays > 100 ms, instead of the rbdN
+# client devices that queue behind it. 1-min samples; rate()[5m] needs a few samples,
+# then `for: 10m`. Reads 30/s throughout: read_time +540 s/min = 300 ms per read,
+# +9 s/min = 5 ms per read.
+rule_files:
+- monitoring-rules/30b-ceph-osd-device-latency.yml
+evaluation_interval: 1m
+tests:
+- name: consumer-ssd-stall-names-the-osd
+  interval: 1m
+  input_series:
+  - series: node_uname_info{job="node-exporter",instance="192.168.1.190:9796",nodename="qui"}
+    values: 1x40
+  - series: ceph_disk_occupation{job="rook-ceph-mgr",instance="qui",ceph_daemon="osd.4",device="/dev/sdd",devices="sdd"}
+    values: 1x40
+  - series: ceph_disk_occupation{job="rook-ceph-mgr",instance="qui",ceph_daemon="osd.17",device="/dev/sdc",devices="sdc"}
+    values: 1x40
+  # osd.4 (INTENSO) collapses to 300 ms per read
+  - series: node_disk_reads_completed_total{job="node-exporter",instance="192.168.1.190:9796",device="sdd"}
+    values: 0+1800x40
+  - series: node_disk_read_time_seconds_total{job="node-exporter",instance="192.168.1.190:9796",device="sdd"}
+    values: 0+540x40
+  # osd.17 (TEAM) on the same node stays at 5 ms: must stay silent
+  - series: node_disk_reads_completed_total{job="node-exporter",instance="192.168.1.190:9796",device="sdc"}
+    values: 0+1800x40
+  - series: node_disk_read_time_seconds_total{job="node-exporter",instance="192.168.1.190:9796",device="sdc"}
+    values: 0+9x40
+  # rbd0 (a CLIENT device, the victim) and sdg (iSCSI, not an OSD) are just as slow: no alert
+  - series: node_disk_reads_completed_total{job="node-exporter",instance="192.168.1.190:9796",device="rbd0"}
+    values: 0+1800x40
+  - series: node_disk_read_time_seconds_total{job="node-exporter",instance="192.168.1.190:9796",device="rbd0"}
+    values: 0+540x40
+  - series: node_disk_reads_completed_total{job="node-exporter",instance="192.168.1.190:9796",device="sdg"}
+    values: 0+1800x40
+  - series: node_disk_read_time_seconds_total{job="node-exporter",instance="192.168.1.190:9796",device="sdg"}
+    values: 0+540x40
+  alert_rule_test:
+  - eval_time: 8m
+    groupname: app-ceph-osd-device-latency
+    alertname: CephOSDDeviceReadLatencyHigh
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-ceph-osd-device-latency
+    alertname: CephOSDDeviceReadLatencyHigh
+    exp_alerts:
+    - exp_labels:
+        job: node-exporter
+        instance: 192.168.1.190:9796
+        nodename: qui
+        device: sdd
+        ceph_daemon: osd.4
+        service: qui
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'Ceph osd.4 read latency 300ms on qui/sdd'
+        description: &desc |
+          Ceph osd.4 (qui /dev/sdd) has averaged 300ms per read for 10 minutes (healthy TEAM OSDs: 2-8 ms).
+          This is the cause of a cluster-wide IO stall, not a victim: every RBD/CephFS client that hits a PG with this OSD as primary waits on it, so rbdN devices, mirror/tv/cribl IO PSI and Ceph SLOW_OPS follow.
+          Known hardware problem: the 8 DRAM-less consumer SSDs (qui INTENSO osd.0/2/4/7, quo EMTEC osd.1/3/6/9) collapse on reads once Ceph client writes pass ~5 MB/s. Capacity signal, not a page.
+          Fix: infra-r9mzd.19 (primary-affinity 0 on those 8) / infra-r9mzd.20 (replace them). Diagnosis: infra-r9mzd.9, disk-io-diag skill.
+          If this names a TEAM/SanDisk OSD or a qua device, it is a NEW problem: check SMART (smartctl -d cciss,N) and ssacli.
+- name: short-spike-stays-silent
+  interval: 1m
+  input_series:
+  - series: node_uname_info{job="node-exporter",instance="192.168.1.192:9796",nodename="quo"}
+    values: 1x40
+  - series: ceph_disk_occupation{job="rook-ceph-mgr",instance="quo",ceph_daemon="osd.1",device="/dev/sdb",devices="sdb"}
+    values: 1x40
+  - series: node_disk_reads_completed_total{job="node-exporter",instance="192.168.1.192:9796",device="sdb"}
+    values: 0+1800x40
+  # 5 ms, then 6 min at 300 ms, then 5 ms again
+  - series: node_disk_read_time_seconds_total{job="node-exporter",instance="192.168.1.192:9796",device="sdb"}
+    values: 0+9x10 90+540x6 3330+9x24
+  alert_rule_test:
+  - eval_time: 20m
+    groupname: app-ceph-osd-device-latency
+    alertname: CephOSDDeviceReadLatencyHigh
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: app-ceph-osd-device-latency
+    alertname: CephOSDDeviceReadLatencyHigh
+    exp_alerts: []

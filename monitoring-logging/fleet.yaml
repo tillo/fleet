@@ -1,0 +1,30 @@
+## monitoring-logging — Harvester-managed install of rancher-logging.
+##
+## This bundle no longer installs the Helm chart itself. Instead it owns the
+## Harvester Addon CR (cattle-logging-system/rancher-logging) and the
+## harvester-addon-controller installs the chart on top, using whatever
+## valuesContent the Addon CR carries.
+##
+## Why: the chart is "rancher-logging" managed by Harvester's addon system
+## (visible in the Harvester UI Logging tab). Two parallel installs (Fleet
+## helm + Harvester addon) of the same release name fight; this bundle keeps
+## Fleet authoritative for the Addon CR (so our customizations survive
+## Harvester upgrades that would otherwise reset valuesContent), and lets
+## the addon-controller drive the actual chart upgrade per Harvester version.
+##
+## ClusterFlow / ClusterOutput / Flow / Output CRs live in the separate
+## `monitoring-logging-flows` bundle (they're upgrade-independent of the chart).
+
+defaultNamespace: cattle-logging-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+
+## Auto-restore the Addon CR if anything reverts it (e.g. Harvester re-runs
+## its installer apply during an upgrade and seeds back the stock defaults).
+## Without this, our resource overrides + Harvester-default-augmenting
+## comments would be lost on every Harvester minor upgrade and would need
+## a manual `kubectl apply -f addon.yml` to restore.
+correctDrift:
+  enabled: true
+  force: true

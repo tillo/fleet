@@ -1,0 +1,30 @@
+## plex-oidc-bridge: Plex sign-in as PROOF OF IDENTITY for onboarding (2026-09-24).
+##
+## A "Continue with Plex" button on start.mdapi.ch/request (and ONLY there) sends the
+## visitor through this bridge, which runs the Plex PIN sign-in and lets through
+## only Plex accounts shared on our Plex server (server-scoped friend filter). The
+## door then prefills the request with the verified email and posts it to
+## f/marketplace/request_membership_plex, which waits for the admin's approval.
+##
+## Plex is NOT a login method: Keycloak has no Plex IdP and is untouched by this
+## bundle. The bridge's only OIDC client is the door (confidential client).
+## Design and decisions: ~/o2-correlation-2026-09-23/PLEX-FEDERATION-DESIGN.md,
+## build: PLEX-ONBOARDING-BUILD.md.
+defaultNamespace: plex-auth
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  ## A new namespace, so these land at creation (Fleet stamps namespaceLabels only
+  ## then). The one workload is non-root, read-only, no capabilities, seccomp
+  ## RuntimeDefault: it passes `restricted`, so enforce that, with the full
+  ## warn+audit pair the PSA coverage probe expects.
+  pod-security.kubernetes.io/enforce: restricted
+  pod-security.kubernetes.io/enforce-version: latest
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-external-secrets
+helm:
+  maxHistory: 25

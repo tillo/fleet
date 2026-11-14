@@ -1,0 +1,27 @@
+{{- if and .Values.global.gatewayApi.enabled (eq "true" (include "gitlab.gatewayApi.envoy.proxy.enabled" .)) }}
+{{- $spec := .Values.gatewayApiResources.envoy.proxySpec }}
+{{- if and $spec.provider $spec.provider.kubernetes (hasKey $spec.provider.kubernetes "envoyDaemonSet") }}
+{{-   $_ := unset $spec.provider.kubernetes "envoyDeployment" }}
+{{- end }}
+{{- if and .Values.global.gatewayApi.installEnvoy $spec.provider $spec.provider.kubernetes }}
+{{-   $kubernetes := $spec.provider.kubernetes }}
+{{-   if not (include "gitlab.gatewayApi.envoy.proxy.imageSource" $kubernetes) }}
+{{-     $workload := include "gitlab.gatewayApi.envoy.proxy.workload" $kubernetes }}
+{{-     $workloadSpec := get $kubernetes $workload | default dict }}
+{{-     $container := get $workloadSpec "container" | default dict }}
+{{-     $_ := set $container "image" (include "gitlab.gatewayApi.envoy.proxy.image" .) }}
+{{-     $_ := set $workloadSpec "container" $container }}
+{{-     $_ := set $kubernetes $workload $workloadSpec }}
+{{-   end }}
+{{- end }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: {{ include "gitlab.gatewayApi.envoy.config.name" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+spec:
+  {{ $spec | toYaml | nindent 2 }}
+{{- end }}

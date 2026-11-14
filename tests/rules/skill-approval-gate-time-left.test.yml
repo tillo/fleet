@@ -1,0 +1,141 @@
+# SkillApprovalGateUndecided (infra-r9mzd.57, user decision 2026-11-13): approval gates live
+# 7 days (they lived 48 h, while decision sittings come every ~6 days, so the alert never went
+# quiet). The rule keys on TIME LEFT (skill_gate_soonest_expiry_seconds, pushed by
+# f/desk/skill_dispatch from each gate's own suspend timeout), so it never encodes a gate's
+# life: info within 48 h of expiry, warning within 24 h, warning for a gate that already died
+# undecided in the last 24 h (value -1). Nothing fires when the dispatcher itself is dead.
+# vmalert-tool evaluates at 2000-01-01T00:00:00Z + t (time() = 946684800 + t).
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: a-3-day-old-7-day-gate-is-quiet
+  interval: 1m
+  input_series:
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800+60x40'
+  - series: skill_gate_oldest_pending_age_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '259200x40'
+  - series: skill_gate_soonest_expiry_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '345600x40'
+  - series: skill_gate_expired_24h{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillApprovalGateUndecided
+    exp_alerts: []
+
+- name: thirty-hours-left-is-info
+  interval: 1m
+  input_series:
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800+60x40'
+  - series: skill_gate_soonest_expiry_seconds{job="skill_dispatch",namespace="monitoring",skill="backlog-sync"}
+    values: '108000x40'
+  - series: skill_gate_expired_24h{job="skill_dispatch",namespace="monitoring",skill="backlog-sync"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillApprovalGateUndecided
+    exp_alerts:
+    - exp_labels:
+        skill: backlog-sync
+        service: skill-dispatch
+        namespace: windmill
+        severity: info
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: "backlog-sync's next approval gate dies in 1d 6h 0m 0s — undecided"
+        description: "It has been pending for most of its life and expires within two days,\napplying nothing. Decide it in the f/desk/approval_deck app.\n"
+
+- name: ten-hours-left-is-warning
+  interval: 1m
+  input_series:
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800+60x40'
+  - series: skill_gate_soonest_expiry_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '36000x40'
+  - series: skill_gate_expired_24h{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillApprovalGateUndecided
+    exp_alerts:
+    - exp_labels:
+        skill: infra-health
+        service: skill-dispatch
+        namespace: windmill
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: "infra-health approval gate dies in 10h 0m 0s"
+        description: &warn_desc "Either the next pending gate expires within 24h and will apply nothing, or a\ngate already hit its suspend timeout with neither Approve nor Deny in the last\n24h, so its proposals were dropped. Decide it in the f/desk/approval_deck app:\nApprove takes the whole itemised list, and the selection box narrows it to\nindividual proposals.\n\nA superseded gate needs no action: a newer gate for the same skill cancels it\nautomatically when its own item list provably covers this one's, and for\nbacklog-sync (every run carries all unapplied proposals forward) whenever a\nnewer one is launched. For the other ledger-less skills a newer run may propose\nsomething else entirely, so both gates stay and this keeps firing until one is\ndecided.\n\nTo see what is open and how long it has left: run f/desk/skill_dispatch with\n`gate_audit: true` (read-only), or open the f/desk/approval_deck app.\n"
+
+- name: an-expiry-in-the-last-day-is-warning
+  interval: 1m
+  input_series:
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800+60x40'
+  - series: skill_gate_expired_24h{job="skill_dispatch",namespace="monitoring",skill="contrib-audit"}
+    values: '1x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillApprovalGateUndecided
+    exp_alerts:
+    - exp_labels:
+        skill: contrib-audit
+        service: skill-dispatch
+        namespace: windmill
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: "contrib-audit approval gate EXPIRED undecided in the last 24h"
+        description: *warn_desc
+
+- name: an-expiry-outranks-a-young-gate-of-the-same-skill
+  interval: 1m
+  input_series:
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800+60x40'
+  - series: skill_gate_soonest_expiry_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '518400x40'
+  - series: skill_gate_expired_24h{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '1x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillApprovalGateUndecided
+    exp_alerts:
+    - exp_labels:
+        skill: infra-health
+        service: skill-dispatch
+        namespace: windmill
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: "infra-health approval gate EXPIRED undecided in the last 24h"
+        description: *warn_desc
+
+- name: a-dead-dispatcher-silences-its-frozen-gauges
+  interval: 1m
+  input_series:
+  # the dispatcher last pushed 3 h before the window: pushgateway keeps re-serving it
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946674000x40'
+  - series: skill_gate_soonest_expiry_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '3600x40'
+  - series: skill_gate_expired_24h{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '1x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillApprovalGateUndecided
+    exp_alerts: []

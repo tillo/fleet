@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opennic-tier2
+  namespace: opennic
+spec:
+  selector:
+    matchLabels:
+      app: opennic-tier2
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: opennic-tier2
+    spec:
+      containers:
+      - name: opennic-tier2
+        image: zot.mdapi.ch/mdapi/opennic-tier2:latest@sha256:1f9d2d4f9d65c48be7196fd5221d17caa157e80f8214db73c6a4b0ab67dbe0d6
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        ports:
+        - name: nameserver-udp
+          containerPort: 53
+          protocol: UDP
+        - name: nameserver-tcp
+          containerPort: 53
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers:
+        - 127.0.0.1
+      imagePullSecrets:
+      - name: zot-pull

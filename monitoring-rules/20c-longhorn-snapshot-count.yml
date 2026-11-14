@@ -1,0 +1,58 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-longhorn-snapshots
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-longhorn-snapshots.count
+    rules:
+    - alert: LonghornVolumeSnapshotsNearMax
+      ## infra-8uw9 (follow-up to infra-jks8, fleet !1435). With
+      ## auto-cleanup-system-generated-snapshot=false every rebuild leaves one system
+      ## snapshot until the hourly snapshotcleanup RecurringJob purges it, and that job
+      ## only reaches ATTACHED volumes. At snapshot-max-count (6, the setting and every
+      ## volume's spec on 2026-11-05) a volume can neither rebuild nor be backed up.
+      ##
+      ## Counted from longhorn_snapshot_actual_size_bytes, one series per snapshot. It
+      ## includes snapshots marked removed but not yet purged, which still occupy the
+      ## chain. 6 is a constant here: the limit is not exported (re-check
+      ## `kubectl -n longhorn-system get settings.longhorn.io snapshot-max-count`).
+      ## Measured when written (2026-11-05 23:25): 6 volumes at >= 5, all VolSync
+      ## restic caches (paperless, jump openvpn-pki, spider3, openobserve-0 at 7;
+      ## cribl 6; esphome 5). Their VolSync runs still succeed: the cap bites at the
+      ## next rebuild.
+      ##
+      ## The pvc labels come from longhorn_volume_robustness, added as 0 so the value
+      ## stays the count; without that series the alert still fires, unlabelled.
+      ## Staleness of the snapshotcleanup CronJob itself is already covered by the
+      ## generic cronjob_freshness rule (12-batch-jobs.yml).
+      expr: |
+        (
+          (count by (volume) (longhorn_snapshot_actual_size_bytes) >= 5)
+          + on (volume) group_left (pvc, pvc_namespace)
+          (0 * max by (volume, pvc, pvc_namespace) (longhorn_volume_robustness))
+        )
+        or on (volume)
+        (count by (volume) (longhorn_snapshot_actual_size_bytes) >= 5)
+      for: 30m
+      labels:
+        service: 'longhorn'
+        namespace: longhorn-system
+        severity: warning
+        component: Backups
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} holds {{ $value }} snapshots (max 6)"
+        description: |
+          At 6 snapshots Longhorn refuses to rebuild a replica, back up, or take a VolSync
+          snapshot of {{ $labels.volume }}. The hourly snapshotcleanup RecurringJob only purges system
+          snapshots of ATTACHED volumes, so a volume that is detached between runs (VolSync
+          caches) keeps every rebuild's snapshot. List them:
+            kubectl -n longhorn-system get snapshots.longhorn.io -o wide | grep {{ $labels.volume }}
+          and delete the oldest system ones (userCreated=false), or let the cache PVC be
+          recreated. A node drain causes rebuilds: clear this before a node window.

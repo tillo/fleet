@@ -1,0 +1,50 @@
+# SkillRunStale (infra-7pp): a headless skill run by f/desk/skill_dispatch has not
+# SUCCEEDED for more than 2x its registry min_interval_hours. BatchJobStale only sees the
+# dispatcher itself, so a skill that silently stops succeeding is invisible without this.
+# Event-driven skills (pvc-space-reclaim, activity_signal pvc_reclaim) have no cadence and
+# never fire. A dead dispatcher is BatchJobStale's, not this rule's.
+# vmalert-tool evaluates at 2000-01-01T00:00:00Z + t (time() = 946684800 + t).
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1h
+tests:
+- name: infra-health-stops-succeeding-fires-after-2x-cadence
+  interval: 1h
+  input_series:
+  - series: skill_run_last_success_timestamp_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '946684800x60'
+  - series: skill_run_last_success_timestamp_seconds{job="skill_dispatch",namespace="monitoring",skill="pvc-space-reclaim"}
+    values: '0x60'
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800+3600x60'
+  alert_rule_test:
+  - eval_time: 47h
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillRunStale
+    exp_alerts: []
+  - eval_time: 50h
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillRunStale
+    exp_alerts:
+    - exp_labels:
+        skill: infra-health
+        service: skill-dispatch
+        namespace: windmill
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: "skill infra-health has not succeeded for 2d 2h 0m 0s (more than 2x its registry cadence)"
+        description: "f/desk/skill_dispatch has not completed a successful headless run of this skill for more\nthan twice its registry min_interval_hours. Read the newest skill_dispatch run log for\nthe reason (not due, window, activity signal, failure); the cadences in this rule\nmirror ~/.claude/automation/registry.yml and must be changed with it.\n"
+- name: dead-dispatcher-is-not-this-rules-business
+  interval: 1h
+  input_series:
+  - series: skill_run_last_success_timestamp_seconds{job="skill_dispatch",namespace="monitoring",skill="infra-health"}
+    values: '946684800x60'
+  - series: skill_dispatch_last_run_timestamp_seconds{job="skill_dispatch",namespace="monitoring"}
+    values: '946684800x60'
+  alert_rule_test:
+  - eval_time: 55h
+    groupname: app-batch-jobs.skill-approval-gates
+    alertname: SkillRunStale
+    exp_alerts: []

@@ -1,0 +1,32 @@
+## VNC + guest SSH for the macOS VM, LAN only.
+##
+## ⛔ `loadBalancerClass` is required and IMMUTABLE. Without it the Service sits
+## at EXTERNAL-IP <pending> indefinitely and emits no events, which reads as a
+## broken load balancer rather than a missing field -- and correcting it means
+## deleting and recreating the Service.
+##
+## The address is pinned rather than allocated: this is the address the VNC
+## console is reached at, so it must not move on its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: macos-vm-vnc
+  namespace: macos-vm
+  annotations:
+    metallb.io/loadBalancerIPs: 192.168.1.70
+spec:
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  selector:
+    app: macos-vm
+  ports:
+    - name: vnc
+      port: 5999
+      targetPort: 5999
+      protocol: TCP
+    ## QEMU hostfwd to the guest's sshd -- how files leave the VM and how the
+    ## key export runs without a GUI session.
+    - name: ssh
+      port: 10022
+      targetPort: 10022
+      protocol: TCP

@@ -1,0 +1,32 @@
+## Only the broker's three clients may reach it (infra-az8.24). Everything
+## else -- other pods, the LAN through LoadBalancer 192.168.1.43 -- is dropped
+## before it can even try a password. The clients were read from the broker's
+## connection log on 2026-11-10; a new client needs a line here AND a user.
+## ⭐ externalTrafficPolicy Local keeps a LAN source address, so the LAN is
+## refused by this policy too, not only by the missing user.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eclipse-mosquitto-clients
+  namespace: mqtt
+spec:
+  podSelector:
+    matchLabels:
+      app: eclipse-mosquitto
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: home-assistant}
+          podSelector:
+            matchLabels: {app: home-assistant}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: frigate}
+          podSelector:
+            matchLabels: {app: frigate}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: findmy}
+          podSelector:
+            matchLabels: {app: findmy-collector}
+      ports:
+        - {protocol: TCP, port: 1883}

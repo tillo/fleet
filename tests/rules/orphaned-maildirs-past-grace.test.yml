@@ -1,0 +1,46 @@
+# OrphanedMaildirsPastGrace (infra-az8.1): the probe pushes one series per domain tier;
+# a past-grace orphan in either tier fires that tier's alert after 1h, zero stays silent.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: hosted-past-grace-fires-own-zero-stays-silent
+  interval: 1m
+  input_series:
+  - series: mail_orphaned_maildirs_past_grace{job="orphaned_maildir_audit",tier="hosted",namespace="monitoring"}
+    values: 1x90
+  - series: mail_orphaned_maildirs_past_grace{job="orphaned_maildir_audit",tier="own",namespace="monitoring"}
+    values: 0x90
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.mail-retention
+    alertname: OrphanedMaildirsPastGrace
+    exp_alerts: []
+  - eval_time: 75m
+    groupname: app-batch-jobs.mail-retention
+    alertname: OrphanedMaildirsPastGrace
+    exp_alerts:
+    - exp_labels:
+        severity: info
+        service: docker-mailserver
+        component: Storage
+        team: mdapi
+        namespace: mail
+        job: orphaned_maildir_audit
+        tier: hosted
+        exported_namespace: monitoring
+      exp_annotations:
+        summary: "1 orphaned maildir(s) on hosted domains past the retention grace"
+        description: "Mail belonging to nobody has outlived its retention grace (own domains\n12 months, hosted domains 6 months). Next step per maildir:\nown domain: ask the user for approval, then erase.\nhosted domain: ask the domain owner (offer an mbox export), then\nerase on approval.\nNothing is erased automatically, and every erase needs an approval.\n\nThe names are NOT in these metrics by design. Get them from the probe's\nown run at https://windmill.mdapi.ch/runs (script\nf/probe/orphaned_maildir_audit) — each is a `FAIL PAST-GRACE` line with its\nsize and age.\n\n⚠️ Age is the DIRECTORY mtime, which is a proxy: a bulk migration or a\nrestore resets it, so a cluster of maildirs sharing an identical age is\nprobably the date of that event, not the date the mail was last used.\nTreat such an age as a LOWER bound.\n\nReclaiming is manual and mail is priority 1: confirm 0 LDAP references\nfirst (person, mail value AND room object), list the siblings before and\nafter so the blast radius is provable, then remove exactly one path.\n\n⛔ An \"orphan\" is NOT automatically safe to erase, and the probe cannot\ntell you that it is. Dovecot resolves mail_location from the USERNAME\nwhile postfix resolves delivery from the LDAP room `description`; when\nthose disagree a flagged maildir is a LIVE mailbox its owner can still\nopen over IMAP. Gate every deletion on `doveadm user -f mail <addr>`\nreturning EMPTY — inline in the delete loop, not as a one-off\npre-flight. This is not hypothetical: a substantial share of the\nmaildirs flagged in the 2026-09-16 pass turned out to be live.\n"
+- name: zero-in-both-tiers-is-silent
+  interval: 1m
+  input_series:
+  - series: mail_orphaned_maildirs_past_grace{job="orphaned_maildir_audit",tier="hosted"}
+    values: 0x90
+  - series: mail_orphaned_maildirs_past_grace{job="orphaned_maildir_audit",tier="own"}
+    values: 0x90
+  alert_rule_test:
+  - eval_time: 80m
+    groupname: app-batch-jobs.mail-retention
+    alertname: OrphanedMaildirsPastGrace
+    exp_alerts: []

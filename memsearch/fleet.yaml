@@ -1,0 +1,21 @@
+defaultNamespace: memsearch
+namespace: memsearch
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  ## Same PSA warn+audit pair as paperless-mcp; Fleet stamps namespaceLabels
+  ## only at namespace creation, so they must be here from the first deploy.
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  ## The three bearer/API secrets come from Akeyless.
+  - name: mdapi-prod-external-secrets
+## Deliberately NO dependsOn on mdapi-prod-zot-pull-secrets although the pull
+## Secret comes from there: that bundle cannot create its ExternalSecret until
+## this bundle has created the namespace, so the dependency would deadlock. On
+## the first deploy the pod sits in ImagePullBackOff for one reconcile and then
+## starts on its own (same reasoning as bussola/fleet.yml).
+helm:
+  maxHistory: 25

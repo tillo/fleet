@@ -1,0 +1,36 @@
+# HomeAssistantRollbackPinLive (infra-3rm.17): f/heal/ha_upgrade_rollback publishes
+# ha_upgrade_rollback_held=1 only while HA runs its live-only rollback pin (untagged
+# repo@sha256 ref + mdapi.ch/ha-upgrade-hold breadcrumb). The pin dies at the next Fleet
+# apply, which brings the broken digest back, so a pin that is still running after the
+# rollback page has gone quiet (1 h) means nobody fixed the manifest yet.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: a-pin-held-past-the-rollback-page-warns-the-steady-state-does-not
+  interval: 5m
+  input_series:
+  - series: ha_upgrade_rollback_held{job="ha_upgrade_rollback"}
+    values: '1x30'
+  - series: ha_upgrade_rollback_held{job="ha_upgrade_rollback_steady"}
+    values: '0x30'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-batch-jobs.ha-upgrade-rollback
+    alertname: HomeAssistantRollbackPinLive
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-batch-jobs.ha-upgrade-rollback
+    alertname: HomeAssistantRollbackPinLive
+    exp_alerts:
+    - exp_labels:
+        job: ha_upgrade_rollback
+        service: home-assistant
+        namespace: home-assistant
+        severity: warning
+        component: Smart Home
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Home Assistant is still on the auto-rollback's live-only pin"
+        description: "f/heal/ha_upgrade_rollback pinned HA back to its last-good digest more than an\nhour ago and that pin is still what runs. It is NOT a freeze: git still names\nthe broken digest, so the next Fleet apply of home-assistant brings it back.\nFix home-assistant/home-assistant-deploy.yml (revert or pin the digest) now.\n"

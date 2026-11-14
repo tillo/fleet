@@ -1,0 +1,37 @@
+# HarvesterNodeConfigFlagInert (infra-9l12): a CloudInit rke2 drop-in can be in
+# place while the flag it declares is absent from the running process, because a
+# later drop-in with a plain list key (kubelet-arg:, not kubelet-arg+:) replaced
+# it. The 07-28 kubelet memory reservation sat inert that way for 3 months.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: inert-flag-warns-after-two-runs-present-flag-stays-quiet
+  interval: 1m
+  input_series:
+  - series: harvester_node_config_effective_missing{node="quo",process="kubelet",flag="system-reserved",cloudinit="mdapi-kubelet-memory-reserve"}
+    values: '1x150'
+  - series: harvester_node_config_effective_missing{node="qui",process="kube-apiserver",flag="GOGC",cloudinit="mdapi-apiserver-gogc"}
+    values: '0x150'
+  alert_rule_test:
+  - eval_time: 59m
+    groupname: app-batch-jobs.harvester_node_config_parity
+    alertname: HarvesterNodeConfigFlagInert
+    exp_alerts: []
+  - eval_time: 61m
+    groupname: app-batch-jobs.harvester_node_config_parity
+    alertname: HarvesterNodeConfigFlagInert
+    exp_alerts:
+    - exp_labels:
+        node: quo
+        process: kubelet
+        flag: system-reserved
+        cloudinit: mdapi-kubelet-memory-reserve
+        service: harvester-node-config
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "quo: kubelet runs without --system-reserved that CloudInit mdapi-kubelet-memory-reserve declares"
+        description: "CloudInit `mdapi-kubelet-memory-reserve` puts an rke2 drop-in on\nquo that sets `system-reserved` for\nkubelet. The file is in place, but the running process\ndoes not carry that value (matched by sha256 of each argv/environ\nelement). Usual cause: a drop-in that sorts LATER uses the plain list\nkey and replaces the list - read the merge order on the node:\n  ls /etc/rancher/rke2/config.yaml.d/\nand use `<key>+:` in the CR, sorted after the Harvester drop-ins.\nOtherwise rke2 has not restarted since the file landed. For kubelet,\nthe effective value is also readable without ssh:\n  kubectl --context mdapi-prod-direct get --raw /api/v1/nodes/quo/proxy/configz\n"

@@ -1,0 +1,126 @@
+# app-batch-jobs.redis-ha (infra-3rm.13): f/probe/redis_ha_health's per-store judgement of
+# the oauth2-proxy session stores. Each failure shape pages once, by its own rule; a
+# healthy store and a store whose pods are merely DOWN (Oauth2ProxyRedisDegraded's) stay silent.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: healthy-store-is-silent
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_masters{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_master_confirmed{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_sentinels_agree{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_sentinels_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_redis_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_replicas_linked{store="s"}', values: '2x30'}
+  - {series: 'redis_ha_probe_success', values: '1x30'}
+  alert_rule_test:
+  - {eval_time: 30m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaSplitBrain, exp_alerts: []}
+  - {eval_time: 30m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaNoMaster, exp_alerts: []}
+  - {eval_time: 30m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaMasterUnconfirmed, exp_alerts: []}
+  - {eval_time: 30m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaReplicaDetached, exp_alerts: []}
+  - {eval_time: 30m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaProbeFailing, exp_alerts: []}
+- name: two-masters-page-split-brain-only
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_masters{store="s"}', values: '2x30'}
+  - {series: 'redis_ha_master_confirmed{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_sentinels_agree{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_sentinels_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_redis_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_replicas_linked{store="s"}', values: '1x30'}
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-batch-jobs.redis-ha
+    alertname: RedisHaSplitBrain
+    exp_alerts:
+    - exp_labels: {store: s, service: oauth2-proxy, namespace: oauth2-proxy, severity: critical, component: Sign-in (SSO), statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "SSO session store s: 2 redis pods claim master"
+        description: "Split brain in the s redis-ha set: more than one redis reports\nrole master. oauth2-proxy writes sessions wherever its sentinel lookup lands,\nso logins succeed and then vanish (login loops on every app behind this proxy),\nand the minority master's writes are lost when it is demoted.\nCheck: redis-cli -p 26379 sentinel master mymaster on each pod, and ROLE on\neach redis; the split-brain-fix sidecar should demote the stray master.\n"
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaMasterUnconfirmed, exp_alerts: []}
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaReplicaDetached, exp_alerts: []}
+- name: reachable-pods-and-no-master-pages-no-master
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_masters{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_master_confirmed{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_sentinels_agree{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_sentinels_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_redis_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_replicas_linked{store="s"}', values: '0x30'}
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-batch-jobs.redis-ha
+    alertname: RedisHaNoMaster
+    exp_alerts:
+    - exp_labels: {store: s, service: oauth2-proxy, namespace: oauth2-proxy, severity: critical, component: Sign-in (SSO), statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "SSO session store s: no redis is master"
+        description: "The s redis pods answer, but none of them is master: the\nsentinels have not promoted a replica. No session can be written, so every\nnew login behind this oauth2-proxy fails. Check sentinel logs for failover\nerrors (quorum, failover-timeout) and `sentinel ckquorum mymaster`.\n"
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaMasterUnconfirmed, exp_alerts: []}
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaReplicaDetached, exp_alerts: []}
+- name: every-pod-down-is-left-to-the-pod-alert
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_masters{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_master_confirmed{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_sentinels_agree{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_sentinels_reachable{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_redis_reachable{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_replicas_linked{store="s"}', values: '0x30'}
+  alert_rule_test:
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaNoMaster, exp_alerts: []}
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaMasterUnconfirmed, exp_alerts: []}
+  - {eval_time: 15m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaSplitBrain, exp_alerts: []}
+- name: sentinels-disagree-pages-unconfirmed
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_masters{store="s"}', values: '1x30'}
+  - {series: 'redis_ha_master_confirmed{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_sentinels_agree{store="s"}', values: '0x30'}
+  - {series: 'redis_ha_sentinels_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_redis_reachable{store="s"}', values: '3x30'}
+  - {series: 'redis_ha_replicas_linked{store="s"}', values: '2x30'}
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-batch-jobs.redis-ha
+    alertname: RedisHaMasterUnconfirmed
+    exp_alerts:
+    - exp_labels: {store: s, service: oauth2-proxy, namespace: oauth2-proxy, severity: critical, component: Sign-in (SSO), statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "SSO session store s: sentinels do not point at the master"
+        description: "In the s redis-ha set the sentinels disagree on the master, or\nname an address whose redis reports itself a replica. oauth2-proxy resolves the\nmaster through the sentinels, so session writes go to a read-only replica and\nlogins loop. A `sentinel reset mymaster` on the stale sentinel usually re-syncs\nit (the postStart hook in fleet oauth2-proxy/*/values.yml does exactly that).\n"
+- name: a-replica-up-but-unlinked-warns-after-30m
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_masters{store="s"}', values: '1x60'}
+  - {series: 'redis_ha_master_confirmed{store="s"}', values: '1x60'}
+  - {series: 'redis_ha_sentinels_agree{store="s"}', values: '1x60'}
+  - {series: 'redis_ha_sentinels_reachable{store="s"}', values: '3x60'}
+  - {series: 'redis_ha_redis_reachable{store="s"}', values: '3x60'}
+  - {series: 'redis_ha_replicas_linked{store="s"}', values: '1x60'}
+  alert_rule_test:
+  - {eval_time: 20m, groupname: app-batch-jobs.redis-ha, alertname: RedisHaReplicaDetached, exp_alerts: []}
+  - eval_time: 40m
+    groupname: app-batch-jobs.redis-ha
+    alertname: RedisHaReplicaDetached
+    exp_alerts:
+    - exp_labels: {store: s, service: oauth2-proxy, namespace: oauth2-proxy, severity: warning, component: Sign-in (SSO), statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "SSO session store s: 1 replica(s) not linked to the master"
+        description: "A s redis replica is up but not replicating from the master\n(wrong upstream, or link not `connected`). Sessions survive today; a failover\nonto that replica would lose them. Check ROLE on each pod.\n"
+- name: probe-that-cannot-list-warns
+  interval: 1m
+  input_series:
+  - {series: 'redis_ha_probe_success', values: '0x60'}
+  alert_rule_test:
+  - eval_time: 40m
+    groupname: app-batch-jobs.redis-ha
+    alertname: RedisHaProbeFailing
+    exp_alerts:
+    - exp_labels: {service: oauth2-proxy, namespace: oauth2-proxy, severity: warning, component: Sign-in (SSO), statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "redis-ha probe cannot list the session stores"
+        description: "f/probe/redis_ha_health could not list the *-redis-ha-server StatefulSets in\nns oauth2-proxy (API error or none found), so the redis-ha rules are blind.\nThe run's error names the cause:\n  https://windmill.mdapi.ch/runs?path=f%2Fprobe%2Fredis_ha_health\n"

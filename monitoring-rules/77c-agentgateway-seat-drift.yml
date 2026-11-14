@@ -1,0 +1,98 @@
+---
+# The seat half of the MCP front door (monitoring-rules/77b covers the gateway half).
+#
+# 77b proves the grant matrix: who the gateway SAYS may reach which server. That is not the
+# same as what a seat's client config actually holds — the config is a copy, written by
+# `agw-mcp-sync`, and a copy drifts: a client added and never rendered, a key rotated in
+# Akeyless, a config restored from a backup, a base URL still naming a retired namespace.
+#
+# So the seat publishes its own answer instead of keeping it to itself: `agw-mcp-sync
+# --check --push` writes to the Pushgateway under job `agentgateway_seat_mcp_drift`.
+#   seat-jump     Windmill f/desk/seat_mcp_drift every 6 h (ssh, no client in the loop)
+#   seat-mbp-mda  the seat's own launchd job, because the automation key is not authorized
+#                 there and a laptop is often asleep
+# Nothing here inspects the gateway, so these rules stay green during a gateway outage —
+# that is 77b's job, and a silent seat must not be blamed on the front door.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-agentgateway-seat-drift
+  labels:
+    # Without this the operator's selector skips the file: the rules exist, are valid,
+    # and are never loaded — a silence nobody hears (lint.py RULES-SELECTOR).
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-agentgateway-seat-drift.rules
+      rules:
+        - alert: AgentgatewaySeatMcpConfigDrift
+          expr: agentgateway_seat_mcp_drift{job="agentgateway_seat_mcp_drift"} > 0
+          for: 1h
+          labels:
+            service: agentgateway
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: >-
+              MCP client config on {{ $labels.seat }} drifted from the gateway ({{ $labels.client }})
+            description: |-
+              `agw-mcp-sync --check` walked {{ $labels.seat }} and found {{ $labels.client }} out of
+              date with the gateway's grant matrix: a server the gateway grants is missing, a key was
+              rotated, or an entry points at a stale base URL. That client either cannot reach a server
+              it is entitled to, or is still holding one the gateway no longer grants.
+
+              Fix it on the seat, then restart the client so it re-reads the file:
+
+                  ~/bin/agw-mcp-sync --check    # the same report, by hand
+                  ~/bin/agw-mcp-sync --apply    # write it, timestamped backup kept
+
+              The gateway rows are the source of truth and are not wrong: this alert only ever means
+              the seat's copy fell behind. A server granted but never rendered shows up here first.
+        - alert: AgentgatewaySeatMcpDriftCheckFailed
+          expr: agentgateway_seat_mcp_check_last_run_success{job="agentgateway_seat_mcp_drift"} == 0
+          for: 30m
+          labels:
+            service: agentgateway
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: The MCP drift check on {{ $labels.seat }} is failing
+            description: |-
+              The seat ran `agw-mcp-sync --check` and it exited with an error rather than a verdict, so
+              the drift state of {{ $labels.seat }} is not being measured — silence from this metric
+              means nothing until it recovers.
+
+              Most often the seat cannot reach the gateway admin API or the Pushgateway. From the seat:
+
+                  ~/bin/agw-mcp-sync --check      # read the actual error
+                  kubectl --context mdapi-prod-direct -n agentgateway get pods
+
+              On seat-jump the same failure also shows as the Windmill job f/desk/seat_mcp_drift
+              failing, which is where the ssh hop would break first.
+        - alert: AgentgatewaySeatMcpDriftCheckStale
+          # seat-jump only, and deliberately so: it is on around the clock, so a day without a
+          # report means the check itself broke. A laptop that has been asleep is not an outage,
+          # so the Mac is excluded rather than muted later.
+          expr: >-
+            time() - agentgateway_seat_mcp_check_last_run_timestamp_seconds
+            {job="agentgateway_seat_mcp_drift",seat="seat-jump"} > 93600
+          for: 1h
+          labels:
+            service: agentgateway
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: seat-jump has not reported its MCP drift state for over a day
+            description: |-
+              The last successful publish from seat-jump is more than 26 hours old, so the drift
+              alerts above are blind: they can only fire on a state somebody published.
+
+              The chain is Windmill f/desk/seat_mcp_drift (every 6 h) → ssh → `agw-mcp-sync
+              --check --push` → Pushgateway → scrape. Check the first link, then the rest:
+
+                  cd ~/windmill && wmill script run f/desk/seat_mcp_drift
+                  ssh jump-bastion "~/bin/agw-mcp-sync --check --push"
+                  kubectl --context mdapi-prod-direct -n monitoring get pods -l app=pushgateway

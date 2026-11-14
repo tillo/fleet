@@ -1,0 +1,46 @@
+## AlertmanagerConfig for the rancher-monitoring (OLD/vendor) AM.
+##
+## The bundled AM's selectors are wide-open
+## (`alertmanagerConfigSelector: {}`, `namespaceSelector: {}`,
+## `matcherStrategy: None`), so any AC CR we drop in -- anywhere -- is
+## merged into the live config. This is how we durably suppress
+## chart-managed vendor rules without ever editing the upstream
+## PrometheusRule (which would drift on every Harvester / Rancher
+## Monitoring chart upgrade).
+##
+## Pattern: each suppressed alert name gets an `inhibitRules` entry
+## that pairs against the always-firing `Watchdog` dead-man alert.
+## Since Watchdog always fires, the target alerts are *permanently*
+## inhibited -- they never reach a receiver, never count toward
+## delivery stats, and never trip the AM self-monitoring rules.
+##
+## (Earlier iteration routed matched alerts to a no-op webhook
+## receiver. That worked at the routing level but the webhook URL
+## couldn't resolve, AM retry-stormed, and the bundled
+## AlertmanagerFailedToSendAlerts self-rule fired against us. The
+## inhibit-rule pattern below has zero notification side-effects.)
+##
+## To replace a vendor alert with a custom-threshold version, the
+## companion PrometheusRule lives in fleet/monitoring-rules/ with
+## `monitoring-stack: mdapi` so only our own vmalert picks it up
+## (the bundled Prometheus excludes that label per Phase 4 split).
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: mdapi-vendor-rule-suppress
+  namespace: cattle-monitoring-system
+spec:
+  inhibitRules:
+  ## LonghornDiskStorageWarning: vendor threshold is 70% and noisy
+  ## while the quo mirror-srv resize work is in progress. Replaced
+  ## by our own LonghornDiskCapacityHigh at 85% via the bundled
+  ## monitoring-rules PR (sent through the new vmAM -> Pushover).
+  - sourceMatch:
+    - name: alertname
+      matchType: '='
+      value: Watchdog
+    targetMatch:
+    - name: alertname
+      matchType: '='
+      value: LonghornDiskStorageWarning
+    equal: []

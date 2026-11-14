@@ -1,0 +1,118 @@
+# PushgatewayRestartRevertedPushes fires on a REVERT (a group's push_time going
+# backwards), not on a restart (infra-r9mzd.6). A graceful replacement that keeps
+# every push must stay quiet; an ungraceful one that restores an older snapshot
+# must fire and clear once the window passes; VictoriaMetrics' ~1e-7 s float
+# read-back wobble on a held value must never count as a step.
+# Clock origin is 2000-01-01 (946684800): push_time 946684000 = a push 800 s
+# before t=0.
+rule_files:
+- monitoring-rules/16-monitor-the-monitoring.yml
+evaluation_interval: 1m
+tests:
+- name: graceful-restart-quiet
+  interval: 1m
+  input_series:
+  # pushed after the first process started; the pod is replaced at t=60m
+  # (process_start 946688400) and SIGTERM flushes, so push_time is kept.
+  - series: push_time_seconds{job="daily_a"}
+    values: 946684200x180
+  - series: push_time_seconds{job="daily_b"}
+    values: 946684200x180
+  - series: process_start_time_seconds{job="pushgateway",instance="pushgateway:9091"}
+    values: 946684100x59 946688400x120
+  alert_rule_test:
+  - eval_time: 120m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts: []
+- name: ungraceful-revert-fires-then-clears
+  interval: 1m
+  input_series:
+  - series: push_time_seconds{job="daily_a"}
+    values: 946684000x29 946686600x29 946684000x150
+  - series: push_time_seconds{job="daily_b"}
+    values: 946684000x210
+  alert_rule_test:
+  - eval_time: 59m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts: []
+  - eval_time: 61m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts:
+    - exp_labels:
+        service: pushgateway
+        namespace: monitoring
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: 'pushgateway: 1 pushed group(s) went back in time (accepted pushes reverted)'
+        description: |
+          1 group(s) now hold a push_time_seconds older than one this
+          pushgateway already served in the last 2 h. push_time only moves
+          forward on a live push, so the newer pushes were LOST: the pod died
+          without flushing (--persistence.interval 5m) and its replacement
+          restored the older PVC snapshot. Each pusher received a 2xx and its
+          job record is green.
+
+          Which groups, and how much each lost:
+            sort_desc(max_over_time(push_time_seconds[2h]) - push_time_seconds > 1)
+
+          Read this together with any PushgatewayGroupStale / BatchJobStale /
+          per-job staleness alert: those may describe a job that actually ran.
+          Check the job's own run record (Windmill), or re-run it, before
+          treating a staleness alert as a dead job. Clears when every reverted
+          group has pushed again (or after 2 h).
+  - eval_time: 150m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts:
+    - exp_labels:
+        service: pushgateway
+        namespace: monitoring
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: 'pushgateway: 1 pushed group(s) went back in time (accepted pushes reverted)'
+        description: |
+          1 group(s) now hold a push_time_seconds older than one this
+          pushgateway already served in the last 2 h. push_time only moves
+          forward on a live push, so the newer pushes were LOST: the pod died
+          without flushing (--persistence.interval 5m) and its replacement
+          restored the older PVC snapshot. Each pusher received a 2xx and its
+          job record is green.
+
+          Which groups, and how much each lost:
+            sort_desc(max_over_time(push_time_seconds[2h]) - push_time_seconds > 1)
+
+          Read this together with any PushgatewayGroupStale / BatchJobStale /
+          per-job staleness alert: those may describe a job that actually ran.
+          Check the job's own run record (Windmill), or re-run it, before
+          treating a staleness alert as a dead job. Clears when every reverted
+          group has pushed again (or after 2 h).
+  - eval_time: 185m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts: []
+- name: float-readback-wobble-quiet
+  interval: 1m
+  input_series:
+  # prod reads a held stamp back as ...545.8843899 / ...545.88439 (~1e-7 s);
+  # the test store normalises that pair to one value, so the wobble is widened
+  # to 1e-4 s here, still far below the 1 s gate.
+  - series: push_time_seconds{job="held"}
+    values: 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844 1792293545.8843 1792293545.8844
+  alert_rule_test:
+  - eval_time: 58m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts: []
+  - eval_time: 59m
+    groupname: meta-monitoring.workload
+    alertname: PushgatewayRestartRevertedPushes
+    exp_alerts: []

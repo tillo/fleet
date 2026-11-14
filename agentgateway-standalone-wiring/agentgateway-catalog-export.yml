@@ -1,0 +1,300 @@
+# The gateway's MCP routes, published where the Backstage catalog can read them.
+#
+# The standalone agentgateway keeps its routes in its own database, so there is
+# no HTTPRoute for f/backstage/catalog_sync to list — and its admin API (:4001)
+# is deliberately closed to every namespace but ingress-nginx, because it does
+# not authenticate callers: anyone who reaches it can rewrite routes, models and
+# API keys. So this CronJob reads that API from INSIDE the namespace, strips each
+# route to what a catalog needs (id, path prefix, gateway, upstream host/port/
+# path) and writes it to the ConfigMap `agentgateway-catalog`. Policies, API-key
+# hashes and model credentials never leave the namespace.
+#
+# The job is the ONE caller allowed to :4001 from this namespace (podSelector in
+# agentgateway-netpol.yml). A failed run leaves the previous export in place, and
+# the ConfigMap's own age is what a stale catalog would show.
+#
+# ⭐ It also publishes the GRANT MATRIX — which seat may reach which server — as
+# the ConfigMap `agentgateway-grants`, and pushes it to the Pushgateway so
+# monitoring-rules/77b-agentgateway-grants.yml can page.
+# The matrix is arithmetic over `policies.apiKey.keys[].metadata`, so no key and
+# no hash is published: a seat name and a server name, nothing else. A grant
+# counts only where the server's OWN route declares it — the row whose
+# authorization rule `"<server>" in apiKey.servers` reads it — and a pair
+# declared on another row instead is reported as invalid rather than granted,
+# because that seat reaches one server and not the server it names.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentgateway-catalog-export
+  namespace: agentgateway
+  labels:
+    app.kubernetes.io/name: agentgateway-catalog-export
+data:
+  export.py: |
+    """Publish the gateway's MCP routes and seat grants; push the grant matrix."""
+    import json
+    import os
+    import ssl
+    import time
+    import urllib.error
+    import urllib.request
+
+    ADMIN = os.environ.get(
+        "ADMIN_URL", "http://agentgateway-ui.agentgateway.svc.cluster.local:4001/api/config/resources")
+    PUSH = os.environ.get("PUSHGATEWAY_URL", "http://pushgateway.monitoring.svc.cluster.local:9091")
+    JOB = "agentgateway_catalog_export"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    NS = "agentgateway"
+    CATALOG, GRANTS = "agentgateway-catalog", "agentgateway-grants"
+    LABELS = {"app.kubernetes.io/name": "agentgateway-catalog-export"}
+
+
+    def resources():
+        doc = json.load(urllib.request.urlopen(ADMIN, timeout=20))
+        return doc.get("resources") or []
+
+
+    def server_of(value):
+        """The path prefix that names the server on this route, or None (an OAuth row)."""
+        for match in value.get("matches") or []:
+            prefix = (match.get("path") or {}).get("pathPrefix")
+            if prefix:
+                return prefix.strip("/")
+        return None
+
+
+    def catalog(rs):
+        """The MCP routes, stripped to what a catalog reads: no policies, no key hashes."""
+        out = []
+        for r in rs:
+            if r.get("kind") != "traffic.route":
+                continue
+            v = r.get("value") or {}
+            backend = next((b["mcp"] for b in v.get("backends") or [] if b.get("mcp")), {})
+            target = next(iter(backend.get("targets") or []), {}).get("mcp") or {}
+            prefix = server_of(v)
+            if not (prefix and target.get("host")):
+                continue
+            out.append({"kind": "traffic.route", "id": r["id"], "pathPrefix": "/%s/" % prefix,
+                        "gateway": v.get("gateways"),
+                        "upstream": {"host": target["host"], "port": target.get("port"),
+                                     "path": target.get("path", "")}})
+        return json.dumps({"resources": out}, indent=1, sort_keys=True) + "\n"
+
+
+    def claimed(rs):
+        """{(seat, route_server): (route id, {servers that route's key claims})}."""
+        out = {}
+        for r in rs:
+            if r.get("kind") != "traffic.route":
+                continue
+            server = server_of(r.get("value") or {})
+            if not server:
+                continue
+            policy = ((r.get("value") or {}).get("policies") or {}).get("apiKey") or {}
+            for k in policy.get("keys") or []:
+                md = k.get("metadata") or {}
+                seat = md.get("client")
+                if seat:
+                    entry = out.setdefault((seat, server), (r["id"], set()))
+                    entry[1].update(md.get("servers") or [])
+        return out
+
+
+    def grant_matrix(rs):
+        """(grants {seat: [servers]}, invalid [{seat, server, route}]).
+
+        A grant counts only where the SERVER'S OWN route declares it, because that is
+        the route whose authorization rule reads it. The same `servers` list rides on
+        every route row, so a pair claimed elsewhere but not on its own route is a
+        seat that reaches one server and not the one it names: reported, never granted.
+        """
+        claims = claimed(rs)
+        servers = {server for (_, server) in claims}
+        grants, invalid = {}, []
+        for (seat, server), (route_id, claimed_servers) in claims.items():
+            for other in sorted(claimed_servers):
+                if other == server:
+                    grants.setdefault(seat, set()).add(server)
+                elif other not in claims.get((seat, other), (None, set()))[1]:
+                    invalid.append({"seat": seat, "server": other, "route": route_id})
+        return ({seat: sorted(s) for seat, s in sorted(grants.items())},
+                sorted(invalid, key=lambda i: (i["seat"], i["server"], i["route"])))
+
+
+    def _esc(value):
+        return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+    def metrics_text(grants, invalid, success=1, now=None):
+        """The Pushgateway body: one series per grant, per seat total, per bad claim."""
+        stamp = int(time.time()) if now is None else now
+        lines = ["# TYPE agentgateway_grants_last_run_timestamp_seconds gauge",
+                 "agentgateway_grants_last_run_timestamp_seconds %d" % stamp,
+                 "# TYPE agentgateway_grants_last_run_success gauge",
+                 "agentgateway_grants_last_run_success %d" % (1 if success else 0),
+                 "# TYPE agentgateway_mcp_grant gauge"]
+        for seat, servers in sorted(grants.items()):
+            for server in servers:
+                lines.append('agentgateway_mcp_grant{seat="%s",server="%s"} 1' % (_esc(seat), _esc(server)))
+        lines.append("# TYPE agentgateway_mcp_seat_granted gauge")
+        for seat, servers in sorted(grants.items()):
+            lines.append('agentgateway_mcp_seat_granted{seat="%s"} %d' % (_esc(seat), len(servers)))
+        if invalid:
+            lines.append("# TYPE agentgateway_mcp_grant_invalid gauge")
+            for i in invalid:
+                lines.append('agentgateway_mcp_grant_invalid{seat="%s",server="%s",route="%s"} 1'
+                             % (_esc(i["seat"]), _esc(i["server"]), _esc(i["route"])))
+        return "\n".join(lines) + "\n"
+
+
+    def push(text, base=None, job=None):
+        """Replace the job's whole group: a group is only ever additive on PUT."""
+        url = "%s/metrics/job/%s" % ((base or PUSH).rstrip("/"), job or JOB)
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, method="DELETE"), timeout=20).read()
+        except urllib.error.HTTPError as e:
+            if e.code >= 500:
+                raise
+        urllib.request.urlopen(urllib.request.Request(url, data=text.encode(), method="PUT"),
+                               timeout=20).read()
+
+
+    def api(method, path, body=None):
+        token = open(SA + "/token").read().strip()
+        ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+        host, port = os.environ["KUBERNETES_SERVICE_HOST"], os.environ["KUBERNETES_SERVICE_PORT"]
+        kind = "application/merge-patch+json" if method == "PATCH" else "application/json"
+        req = urllib.request.Request(
+            f"https://{host}:{port}{path}",
+            data=json.dumps(body).encode() if body is not None else None, method=method,
+            headers={"Authorization": "Bearer " + token, "Content-Type": kind})
+        return json.load(urllib.request.urlopen(req, context=ctx, timeout=20))
+
+
+    def ensure_configmap(name, data):
+        """Create the ConfigMap, or patch it: a Job holds no state between runs."""
+        path = f"/api/v1/namespaces/{NS}/configmaps/{name}"
+        try:
+            api("GET", path)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            api("POST", f"/api/v1/namespaces/{NS}/configmaps", {
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": name, "namespace": NS, "labels": LABELS}, "data": data})
+        else:
+            api("PATCH", path, {"metadata": {"labels": LABELS}, "data": data})
+
+
+    def main():
+        try:
+            rs = resources()
+            grants, invalid = grant_matrix(rs)
+            ensure_configmap(CATALOG, {"resources.json": catalog(rs)})
+            ensure_configmap(GRANTS, {"grants.json": json.dumps(
+                {"grants": grants, "invalid": invalid}, indent=1, sort_keys=True) + "\n"})
+        except Exception:
+            push(metrics_text({}, [], success=0))
+            raise
+        push(metrics_text(grants, invalid))
+        print(json.dumps({"grants": grants, "invalid": invalid}, sort_keys=True))
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentgateway-catalog-export
+  namespace: agentgateway
+  labels:
+    app.kubernetes.io/name: agentgateway-catalog-export
+---
+# The export may only touch the two ConfigMaps it writes. `resourceNames` cannot
+# restrict `create` (the object does not exist yet), so `create` is narrowed to
+# this namespace instead.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agentgateway-catalog-export
+  namespace: agentgateway
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["agentgateway-catalog", "agentgateway-grants"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentgateway-catalog-export
+  namespace: agentgateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agentgateway-catalog-export
+subjects:
+  - kind: ServiceAccount
+    name: agentgateway-catalog-export
+    namespace: agentgateway
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentgateway-catalog-export
+  namespace: agentgateway
+  labels:
+    app.kubernetes.io/name: agentgateway-catalog-export
+spec:
+  # Every 15 minutes: the catalog sync runs at 05:41, and a route added through
+  # the UI must reach the catalog the same day.
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 120
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: agentgateway-catalog-export
+        spec:
+          serviceAccountName: agentgateway-catalog-export
+          restartPolicy: Never
+          enableServiceLinks: false
+          priorityClassName: mdapi-low
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: export
+              # python:3.13-alpine, pinned: the job speaks two HTTP APIs with the
+              # standard library only, so it needs no further dependency.
+              image: docker.io/library/python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/export/export.py"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              volumeMounts:
+                - name: export
+                  mountPath: /export
+                  readOnly: true
+          volumes:
+            - name: export
+              configMap: {name: agentgateway-catalog-export}

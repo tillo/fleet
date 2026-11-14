@@ -1,0 +1,106 @@
+# MeshCentral config.json, rendered by ESO because it now holds the SMTP password
+# (infra-o4i3m.1). Mail goes to 587 with a sender login: "tls": false means STARTTLS
+# (nodemailer upgrades on 587), with the certificate checked. It used to be port 25
+# without auth, which relayed only because the mail server trusted every pod's address.
+# Login meshcentral@smtp.mdapi.ch is SMTP-only; password Akeyless
+# /mdapi/mail/smtp-senders/meshcentral. Was meshcentral-config-cm.yml.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: meshcentral-config
+  namespace: meshcentral
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: meshcentral-config
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        config.json: |
+          {
+            "settings": {
+              "cert": "help.mdapi.ch",
+              "WANonly": true,
+              "tlsOffload": true,
+              "port": 4430,
+              "aliasPort": 443,
+              "portBind": "0.0.0.0",
+              "redirPort": 8080,
+              "redirAliasPort": 80,
+              "agentPing": 60,
+              "agentPong": 90,
+              "sessionTime": 86400,
+              "webRTC": true,
+              "allowFraming": false,
+              "selfUpdate": false,
+              "autoBackup": {
+                "backupIntervalHours": 24,
+                "keepLastDaysBackup": 14,
+                "zipPassword": "",
+                "backupPath": "/opt/meshcentral/meshcentral-backups"
+              },
+              "minify": true,
+              "compression": true,
+              "cookieIpCheck": false,
+              "trustedProxy": "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+            },
+            "smtp": {
+              "host": "mail.mdapi.ch",
+              "port": 587,
+              "from": "meshcentral@help.mdapi.ch",
+              "user": "meshcentral@smtp.mdapi.ch",
+              "pass": "{{ .password }}",
+              "tls": false,
+              "tlscertcheck": true,
+              "verifyemail": false
+            },
+            "domains": {
+              "": {
+                "title": "MDAPI Support",
+                "title2": "Remote Help",
+                "newAccounts": false,
+                "agentInviteCodes": true,
+                "certurl": "https://help.mdapi.ch/",
+                "userQuota": 1048576,
+                "meshQuota": 10485760,
+                "passwordRequirements": {
+                  "min": 10,
+                  "max": 256,
+                  "upper": 1,
+                  "lower": 1,
+                  "numeric": 1,
+                  "nonalpha": 0,
+                  "reset": 0,
+                  "force2factor": false
+                },
+                "limits": {
+                  "MaxDevices": 100,
+                  "MaxUserAccounts": 20
+                },
+                "consentMessages": {
+                  "Title": "MDAPI Support",
+                  "Desktop": "Allow {0} ({1}) to access your desktop?",
+                  "Terminal": "Allow {0} ({1}) to access your terminal?",
+                  "Files": "Allow {0} ({1}) to access your files?"
+                },
+                "userConsentFlags": {
+                  "DesktopNotify": true,
+                  "TerminalNotify": true,
+                  "FilesNotify": true,
+                  "DesktopPrompt": true,
+                  "TerminalPrompt": true,
+                  "FilesPrompt": true,
+                  "DesktopPrivacyBar": true
+                }
+              }
+            },
+            "_letsEncrypt": "disabled - cert-manager handles TLS at ingress"
+          }
+  data:
+    - remoteRef:
+        key: /mdapi/mail/smtp-senders/meshcentral
+      secretKey: password

@@ -1,0 +1,85 @@
+# Serves the Little Snitch rule-group files. Same pinned nginx-unprivileged image
+# as the mta-sts endpoint: one static file, no runtime, nothing to configure.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lsrules
+  namespace: mac-rules
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lsrules
+  template:
+    metadata:
+      labels:
+        app: lsrules
+      annotations:
+        # nginx renders `default.conf.template` ONCE, at container start, so a
+        # template edit only takes effect on a new pod. Two things produce one:
+        # Reloader (stakater, cluster-wide `--auto-reload-all`) injects
+        # STAKATER_LSRULES_CONFIGMAP here and rolls the Deployment when the
+        # ConfigMap changes — observed live 2026-10-22 — and this annotation is
+        # the explicit lever that works with or without Reloader. Bump it in any
+        # MR that edits the template, so the change cannot depend on one
+        # component being healthy.
+        lsrules/config-rev: "2"
+    spec:
+      containers:
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:1.31-alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        # The subscription path is a bearer capability (LS cannot authenticate
+        # the fetch), so it comes from a Secret and exists only inside the
+        # rendered nginx config — never in git, never in a ConfigMap.
+        - name: LS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: lsrules-path
+              key: token
+        # Restrict envsubst to LS_TOKEN alone. Without this the image renders
+        # EVERY defined env var into the template and would clobber nginx's own
+        # $uri / $host (the webtunnel-bridge bundle learned this the same way).
+        - name: NGINX_ENVSUBST_FILTER
+          value: "^LS_TOKEN$"
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 32Mi
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 20
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: rules
+          mountPath: /etc/lsrules
+          readOnly: true
+        - name: site
+          mountPath: /etc/nginx/templates
+          readOnly: true
+      volumes:
+      - name: rules
+        configMap:
+          name: lsrules
+          items:
+          - key: household.lsrules
+            path: household.lsrules
+      - name: site
+        configMap:
+          name: lsrules
+          items:
+          - key: default.conf.template
+            path: default.conf.template

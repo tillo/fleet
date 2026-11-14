@@ -1,0 +1,62 @@
+# DefectDojo's UI/API (nginx in front of uwsgi, port 8080) answers only:
+#  - rke2-ingress-nginx, for defectdojo.mdapi.ch (SSO-gated there);
+#  - the blackbox exporter, for the in-cluster availability probe;
+#  - windmill, whose scanners and the grype curator import findings and
+#    manage risk acceptances through the API (in-cluster, by API token);
+#  - backstage, whose GET-only proxy feeds the entity page's findings card
+#    (DefectDojo user `backstage`, scoped to the mdapi product types).
+# Nothing else on the estate has a reason to reach the findings store.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: defectdojo-django-from-known-callers
+  namespace: defectdojo
+spec:
+  podSelector:
+    matchLabels:
+      defectdojo.org/component: django
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: windmill
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: backstage
+          podSelector:
+            matchLabels:
+              app: backstage
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# The Celery broker is reached only by DefectDojo's own pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: defectdojo-valkey-same-namespace
+  namespace: defectdojo
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: valkey
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 6379

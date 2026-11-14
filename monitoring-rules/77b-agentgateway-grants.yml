@@ -1,0 +1,138 @@
+## agentgateway grants — the seat × server matrix the MCP front door really holds.
+##
+## Fed by CronJob agentgateway/agentgateway-catalog-export
+## (agentgateway-standalone-wiring/agentgateway-catalog-export.yml, Pushgateway job
+## agentgateway_catalog_export, every 15 min). Since fleet !1776 the routes and
+## their key policies are rows in the gateway's database, so git cannot say what a
+## seat may reach, and the failure is silent everywhere else: the seat's client
+## config still lists the server, the container stays Ready, and the call answers
+## 401 only when someone tries it.
+##
+## What covers what:
+##   * AgentgatewayGrantExportStale — the push stopped (CronJob suspended, admin
+##     API gone, RBAC lost): the matrix on the Pushgateway is old, and because a
+##     Pushgateway group never ages out on its own, `time() - stamp` is the ONLY
+##     thing that can notice;
+##   * AgentgatewayGrantExportFailed — the run itself raised, and it pushed
+##     success=0 before dying;
+##   * AgentgatewayGrantInconsistent — a route row claims a grant its server's own
+##     route does not declare, so that seat reaches one server and not the one it
+##     names;
+##   * AgentgatewaySeatLostAllGrants — a seat the gateway still knows holds
+##     nothing;
+##   * AgentgatewayGrantMatrixEmpty — the push carried no seat at all, which is
+##     also what a gateway whose apiKey policies were wiped looks like.
+##
+## `agentgateway_mcp_grant{seat,server}` (one series per grant) is the same data;
+## keep it for lookups, alert on the derived gauges. Unit tests:
+## tests/rules/agentgateway-grants.test.yml. Internal tooling: warning tier,
+## component `Automation`, never mapped to mdapi.statuspage.io.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-agentgateway-grants
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-agentgateway-grants.rules
+      rules:
+        - alert: AgentgatewayGrantExportStale
+          expr: |
+            time() - agentgateway_grants_last_run_timestamp_seconds{job="agentgateway_catalog_export"} > 3600
+          for: 30m
+          labels:
+            service: agentgateway
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "The MCP gateway grant export has not run for over an hour"
+            description: |
+              agentgateway-catalog-export has not pushed a fresh stamp in more than
+              3600 s, so agentgateway_mcp_seat_granted and agentgateway_mcp_grant
+              describe the gateway as it was, not as it is. Its own `create` for
+              the grants ConfigMap is the usual cause of a lost permission.
+                kubectl --context mdapi-prod-direct -n agentgateway get cronjob,job
+                kubectl --context mdapi-prod-direct -n agentgateway logs -l app.kubernetes.io/name=agentgateway-catalog-export --tail=50
+                kubectl --context mdapi-prod-direct -n agentgateway get role agentgateway-catalog-export -o yaml
+
+        - alert: AgentgatewayGrantExportFailed
+          expr: |
+            agentgateway_grants_last_run_success{job="agentgateway_catalog_export"} == 0
+          for: 15m
+          labels:
+            service: agentgateway
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "The MCP gateway grant export failed on its last run"
+            description: |
+              The job read the gateway's admin API or wrote a ConfigMap and raised,
+              so it pushed success=0 and left the matrix from an earlier run. The
+              admin API answers 4001 without authenticating, so a reaching failure
+              means the pod lost the NetworkPolicy allowance, the gateway is down,
+              or the API answered with something that is not a resource document.
+                kubectl --context mdapi-prod-direct -n agentgateway logs -l app.kubernetes.io/name=agentgateway-catalog-export --tail=50
+
+        - alert: AgentgatewayGrantInconsistent
+          expr: |
+            max by (seat, server, route) (agentgateway_mcp_grant_invalid{job="agentgateway_catalog_export"}) > 0
+          for: 1h
+          labels:
+            service: '{{ or $labels.seat "agentgateway" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "MCP grant {{ $labels.server }} for {{ $labels.seat }} is recorded on {{ $labels.route }} only"
+            description: |
+              Route {{ $labels.route }} lists `{{ $labels.server }}` in the key's
+              metadata.servers, but the route that serves {{ $labels.server }} does
+              not. Every route row repeats the same list, so the pair exists through
+              copy drift: that seat reaches the servers its own rows authorise and
+              gets 401 on {{ $labels.server }}, while the metadata says otherwise.
+              Fix the key's metadata on the route that serves the server — the routes
+              are database rows, so add it in the admin UI (or the config API), not
+              in git.
+                kubectl --context mdapi-prod-direct -n agentgateway get cm agentgateway-grants -o jsonpath='{.data.grants\.json}'
+
+        - alert: AgentgatewaySeatLostAllGrants
+          expr: |
+            agentgateway_mcp_seat_granted{job="agentgateway_catalog_export"} == 0
+          for: 1h
+          labels:
+            service: '{{ or $labels.seat "agentgateway" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "MCP seat {{ $labels.seat }} holds no grant at all"
+            description: |
+              The gateway still carries a key for {{ $labels.seat }}, but no route
+              authorises it for a single server, so every tool call answers 401 or
+              403. Either the seat was meant to be retired (delete its key from every
+              route and its entry in Akeyless /mdapi/agentgateway-system/mcp-clients)
+              or its metadata.servers was emptied by an edit.
+                kubectl --context mdapi-prod-direct -n agentgateway get cm agentgateway-grants -o jsonpath='{.data.grants\.json}'
+
+        - alert: AgentgatewayGrantMatrixEmpty
+          expr: |
+            absent(agentgateway_mcp_seat_granted{job="agentgateway_catalog_export"})
+          for: 2h
+          labels:
+            service: agentgateway
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "The MCP gateway published no seat grants at all"
+            description: |
+              No agentgateway_mcp_seat_granted series exists, so the export read a
+              gateway with no apiKey policy carrying a client name — the shape of a
+              route table that was wiped or rebuilt without its key metadata. Every
+              seat is locked out and the other grant rules have nothing to say.
+                kubectl --context mdapi-prod-direct -n agentgateway get cm agentgateway-catalog -o jsonpath='{.data.resources\.json}'
+                kubectl --context mdapi-prod-direct -n agentgateway get cluster agentgateway-pg -o wide

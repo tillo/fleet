@@ -1,0 +1,25 @@
+## SESSION_KEY of the standalone agentgateway: the AES key that encrypts the
+## MCP session ids it hands to clients, so any replica can resume a session
+## another one opened. Before this it was generated on first start into the
+## database (agw_config_resources kind `session.key`); that value was copied to
+## Akeyless unchanged, so declaring it here invalidated no open session.
+## With SESSION_KEY set the database row is ignored (ensure_session_key).
+## ⚠️ Rotating the Akeyless value ends every open MCP session at once: clients
+## get 404 on their Mcp-Session-Id and must re-initialize.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: agentgateway-session-key
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: agentgateway-session-key
+    creationPolicy: Owner
+  data:
+    - secretKey: key
+      remoteRef:
+        key: /mdapi/agentgateway/agentgateway-session-key/key

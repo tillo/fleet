@@ -1,0 +1,80 @@
+## Rate limit and body cap on the RUM ingest path.
+##
+## ⛔⛔ THIS IS A PREREQUISITE FOR ANY RUM DEPLOYMENT, not just the O2 UI pilot.
+##
+## RUM is a browser SDK, so its ingest credential is embedded in whatever page
+## carries it and is therefore PUBLIC by construction. For OpenObserve's own UI
+## that is literal: `https://logs.mdapi.ch/config` answers 200 with no
+## authentication at all and serves the whole `rum` block, client_token included,
+## to anyone on the internet. Verified 2026-09-23.
+##
+## The main `openobserve` Ingress sets `proxy-body-size: 100m` and no rate limit.
+## Publishing a RUM token against that would hand anyone who can reach port 443 a
+## 100 MB-per-request write into our ingestion — and the enterprise licence is a
+## 200 GB/day ceiling with `limit_breach_allowed_count: 3` and
+## `allow_search_after_limit_exceeded: false`. Three breaches and SEARCH STOPS.
+## That is a denial-of-observability vector, and it is the same reasoning already
+## written into rke2-ingress-nginx-config for `opentelemetry-trust-incoming-span`.
+##
+## ─── The numbers ─────────────────────────────────────────────────────────────
+## A real RUM batch is small: the synthetic view event used to validate the chain
+## was 516 bytes, and a batch carrying resource timings is tens of KB. 256k is
+## generous for that and cuts the worst case 400x from 100m.
+##
+## The SDK flushes roughly every 30 s per session, so ~2 r/m per session. 60 r/m
+## leaves room for many sessions behind one NAT while bounding a single source to
+## 60 x 256k = 15 MB/min. Exceeding it returns 503, because that is what
+## `limit_req_status` is set to globally.
+##
+## ⭐ A more specific path wins in nginx, so this Ingress governs /rum/ while the
+## main one continues to serve everything else with its 100m body size — which
+## the UI genuinely needs for bulk ingest.
+##
+## ⛔ Deliberately NO `cert-manager.io/cluster-issuer` annotation. This Ingress
+## reuses the `openobserve-cert` Secret that the main `openobserve` Ingress
+## already owns; adding the annotation here would have ingress-shim create a
+## SECOND Certificate for the same host and secret, and the two would fight over
+## renewal.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openobserve-rum
+  namespace: openobserve
+  annotations:
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/limit-rpm: "60"
+    ## ⛔ Session replay is refused here, not left to the SDK.
+    ##
+    ## Measured 2026-09-23: `_sessionreplay` already held 132 events /
+    ## 29 MB, all application_id `openobserve-ui` — O2's own console
+    ## recording the DOM of whatever logs were on screen. There is no
+    ## ZO_RUM_* switch for replay (the SDK decides), so a config note
+    ## saying 'we do not do replay' cannot be enforced. This can.
+    ##
+    ## It covers every RUM source at once: the O2 console and all 11
+    ## injected hosts, including webmail and Nextcloud where the DOM
+    ## would be email and documents.
+    ##
+    ## `if` + `return` is one of the safe uses of `if` in a location.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      if ($request_uri ~* "^/rum/v[0-9]+/[^/]+/replay") {
+        return 403;
+      }
+    nginx.ingress.kubernetes.io/proxy-body-size: "256k"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: logs.mdapi.ch
+      http:
+        paths:
+          - path: /rum
+            pathType: Prefix
+            backend:
+              service:
+                name: openobserve
+                port:
+                  number: 5080
+  tls:
+    - hosts:
+        - logs.mdapi.ch
+      secretName: openobserve-cert

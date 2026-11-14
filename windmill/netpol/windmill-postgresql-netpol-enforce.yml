@@ -1,0 +1,71 @@
+# ENFORCING (Ingress only). Windmill's Postgres is the automation plane's job queue:
+# a row written there is a job that a cluster-admin worker runs. Until 2026-10-28
+# ns windmill had no NetworkPolicy at all, so every pod in the cluster could open
+# 5432 on it (infra-az8.19, pentest-2026-10-22 F16/F26). This policy cuts that
+# down to the clients that exist.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ⭐ WHY THIS SKIPPED THE LEARN WINDOW (the programme's default, infra-az8.4)
+#
+# A learn window answers "who connects?" from packets. For a database the server
+# answers it better: every client has to authenticate, so it is in
+# pg_stat_activity. Read 2026-10-28 and reconciled against config:
+#   * windmill/windmill-app ×2 and every windmill-workers pod (6, all groups)
+#   * openobserve/o2-dbm-collector (role o2_dbm; fleet openobserve/o2-dbm-collector.yml
+#     is the ONLY manifest in fleet that names windmill-postgresql as a target)
+# Nothing else. windmill-extra and cert-host carry no DATABASE_URL and are left out.
+#
+# What that evidence cannot show is a client that connects rarely and did not hold
+# a session at that moment. That is what the Log rule is for: allowed traffic is
+# never logged (the Allows come first and terminate), so EVERY calico-packet line
+# whose dst is the Postgres pod is a BLOCK:
+#   SELECT src, dpt FROM "netpol_flows" WHERE dst = '<windmill-postgresql-0 IP>'
+# then `kubectl get pods -A -o wide | grep <src>` and add a selector rule here.
+#
+# ⚠️ Not affected: `kubectl -n windmill exec windmill-postgresql-0 -- psql …`
+# (local socket, no network path), and kubelet (Calico does not police
+# host->local-workload traffic without a HostEndpoint, proven 2026-08-31).
+#
+# EMERGENCY: `kubectl -n windmill delete networkpolicies.crd.projectcalico.org
+# enforce.windmill-postgresql` is instant but Fleet re-creates it in ~90s. The real
+# revert is `git revert` + push.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Egress is deliberately NOT governed: Postgres makes no outbound connections, and
+# an Egress type here would add a failure mode without closing a path.
+# Selector-based throughout: worker pods churn on every rollout, IPs would not.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.windmill-postgresql
+  namespace: windmill
+spec:
+  order: 500
+  # The chart's in-cluster Postgres StatefulSet (postgresql-demo-app.yaml) labels its pod so.
+  selector: app == "windmill-postgresql-demo-app"
+  types:
+    - Ingress
+
+  ingress:
+    # 1. Windmill itself: the API server and every worker group. All worker groups
+    #    share app=windmill-workers (workerGroup=<name> tells them apart), so a new
+    #    group is covered without touching this file. A future chart component that
+    #    needs the DB (indexer, hub) is NOT, and shows up as a block.
+    - action: Allow
+      protocol: TCP
+      source:
+        selector: app in {"windmill-app", "windmill-workers"}
+      destination:
+        ports: [5432]
+
+    # 2. OpenObserve DBM: query samples / top queries / index stats, every 10s.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "openobserve"
+        selector: app.kubernetes.io/name == "o2-dbm-collector"
+      destination:
+        ports: [5432]
+
+    - action: Log
+    - action: Deny

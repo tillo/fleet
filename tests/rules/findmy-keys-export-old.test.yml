@@ -1,0 +1,43 @@
+# findmy-collector reuses the last exported Find My keys while the macOS VM is off
+# (by design). Positions stay current; only tags enrolled after the export are
+# missed, so the age of the export is an info nudge at 60 days (infra-e7g.2).
+rule_files:
+- monitoring-rules/50-findmy.yml
+evaluation_interval: 1h
+tests:
+- name: keys-exported-at-start-nudge-after-60d
+  interval: 1h
+  input_series:
+  # vmalert-tool's clock starts at 2000-01-01T00:00:00Z (946684800): exported then.
+  - series: findmy_collector_keys_exported_timestamp_seconds{job="findmy_collector"}
+    values: 946684800x1500
+  alert_rule_test:
+  - eval_time: 59d
+    groupname: app-findmy.freshness
+    alertname: FindmyKeysExportOld
+    exp_alerts: []
+  - eval_time: 61d
+    groupname: app-findmy.freshness
+    alertname: FindmyKeysExportOld
+    exp_alerts:
+    - exp_labels:
+        service: findmy-collector
+        namespace: findmy
+        severity: info
+        component: Smart Home
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "Find My keys were last exported from the Mac 61d 0h 0m 0s ago"
+        description: "Positions are still current; a tag enrolled since the last export is\nnot tracked. Boot the macOS VM for an export session (fleet macos-vm\nreplicas 1, one collector cycle, back to 0), then check\nfindmy_collector_extract_ok == 1 once.\n"
+- name: keys-re-exported-is-silent
+  interval: 1h
+  input_series:
+  # re-exported every hour: the timestamp follows the clock
+  - series: findmy_collector_keys_exported_timestamp_seconds{job="findmy_collector"}
+    values: 946684800+3600x1500
+  alert_rule_test:
+  - eval_time: 61d
+    groupname: app-findmy.freshness
+    alertname: FindmyKeysExportOld
+    exp_alerts: []

@@ -1,0 +1,62 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: litellm
+  namespace: litellm
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # This gateway carries code/logs/commands as request bodies — CRS would
+    # false-positive constantly. Protection here is the LiteLLM master_key plus
+    # the source-range restriction below.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    # Anthropic-style streaming (SSE): don't buffer, allow long-lived responses.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # Unlike the other bundles this fronts a paid cloud key — keep it off the
+    # public internet. Restricted to the LAN.
+    # LAN-side IPv6 clients reach this host through Jool NAT64, which rewrites
+    # their source to pool4 in 192.168.164.0/24: `.3` for LAN clients, `.2` for
+    # external IPv6. Add only `.3/32` — whitelisting the /24 would admit `.2`,
+    # i.e. the public IPv6 source.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24,192.168.164.3/32"
+    # litellm trusts identity headers blindly. Two of them need no configuration
+    # at all — `x-litellm-customer-id` and `x-litellm-end-user-id`, litellm's
+    # STANDARD_CUSTOMER_ID_HEADERS, checked first in the end-user extraction chain
+    # (auth_utils.py:get_end_user_id_from_request_body, "always checked") — and the
+    # mapped X-OpenWebUI-User-Email is taken verbatim into the end-user record.
+    # So anyone holding ANY valid key could attribute their spend to someone else,
+    # and the Open WebUI key is not a secret from Open WebUI's own users: this is
+    # reachable without the master key.
+    #
+    # Open WebUI reaches the in-cluster Service directly and never through this
+    # host, so nothing legitimate arrives here carrying these. Drop them at the edge;
+    # the NetworkPolicy in litellm-netpol.yml closes the in-cluster path.
+    # (headers-more is compiled into this ingress-nginx build; snippets are enabled
+    # by allow-snippet-annotations=true in the controller ConfigMap.)
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_clear_input_headers "x-litellm-customer-id";
+      more_clear_input_headers "x-litellm-end-user-id";
+      # Open WebUI forwards this family when ENABLE_FORWARD_USER_INFO_HEADERS=true
+      # (openwebui-deploy.yml). Email is the one litellm maps today; the rest are
+      # stripped with it so that mapping a second one later cannot open a hole.
+      more_clear_input_headers "X-OpenWebUI-User-Email";
+      more_clear_input_headers "X-OpenWebUI-User-Id";
+      more_clear_input_headers "X-OpenWebUI-User-Name";
+      more_clear_input_headers "X-OpenWebUI-User-Role";
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: llm.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: litellm
+                port:
+                  number: 4000
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - llm.mdapi.ch
+      secretName: litellm-cert

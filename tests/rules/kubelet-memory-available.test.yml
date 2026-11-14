@@ -1,0 +1,28 @@
+# node:kubelet_memory_available_bytes (infra-8f4.40): capacity minus the ROOT cgroup
+# working set, per node; pod-level working-set series must not leak into it.
+rule_files:
+- monitoring-rules/81-kubelet-memory-available.yml
+evaluation_interval: 1m
+tests:
+- name: capacity-minus-root-working-set-per-node
+  interval: 1m
+  input_series:
+  - series: kube_node_status_capacity{node="qua",resource="memory",unit="byte",job="kube-state-metrics"}
+    values: 68719476736x10
+  - series: kube_node_status_capacity{node="qui",resource="memory",unit="byte",job="kube-state-metrics"}
+    values: 34359738368x10
+  - series: container_memory_working_set_bytes{job="kubelet",metrics_path="/metrics/cadvisor",node="qua",id="/"}
+    values: 51539607552x10
+  - series: container_memory_working_set_bytes{job="kubelet",metrics_path="/metrics/cadvisor",node="qui",id="/"}
+    values: 30064771072x10
+  # a pod cgroup on qua: must not be subtracted
+  - series: container_memory_working_set_bytes{job="kubelet",metrics_path="/metrics/cadvisor",node="qua",id="/kubepods.slice/x",pod="p"}
+    values: 999999999999x10
+  metricsql_expr_test:
+  - expr: node:kubelet_memory_available_bytes
+    eval_time: 5m
+    exp_samples:
+    - labels: 'node:kubelet_memory_available_bytes{node="qua"}'
+      value: 17179869184
+    - labels: 'node:kubelet_memory_available_bytes{node="qui"}'
+      value: 4294967296

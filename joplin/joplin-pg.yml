@@ -1,0 +1,236 @@
+## CloudNativePG cluster for Joplin Server, on PostgreSQL 18 (2026-11-13).
+##
+## Replaces the standalone `postgres` Deployment (postgres-deploy.yml, PG 17): no WAL
+## archive, no second instance, and not upgradable by a bare 17 -> 18 image bump
+## (Renovate !2295; an 18 server refuses a 17 data directory). Same pattern as
+## keycloak/keycloak-pg.yml.
+##
+## Bootstrap IMPORTS the live `joplin` database (~0.9 GB) from that Deployment
+## (`initdb.import`, microservice = logical dump/restore into 18). It runs once, when
+## the Cluster is created; writes made to the old database after that are not carried
+## over, so the cutover compares row counts before POSTGRES_HOST and the cleanup
+## CronJob are switched to joplin-pg-rw.
+##
+## The owner role and password are the SAME as before: `joplin-pg-app` is built from
+## the Akeyless item Joplin already reads (postgres-env-secret/POSTGRES_PASSWORD).
+##
+## ⭐ ObjectStore is declared BEFORE the Cluster on purpose: the plugin's pre-reconcile
+## hook stops a Cluster's reconcile (no requeue) when its ObjectStore is not yet in
+## the plugin cache (memory cnpg_plugin_pre_reconcile_hook_half_migration_2026_10_07).
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: joplin-pg
+  namespace: joplin
+spec:
+  configuration:
+    destinationPath: s3://cnpg-joplin-pg
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-joplin-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-joplin-pg
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    data:
+      compression: gzip
+      jobs: 1
+    wal:
+      compression: gzip
+  ## On the STORE, not the Cluster: left off, nothing prunes and nothing says so.
+  retentionPolicy: "14d"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: joplin-pg
+  namespace: joplin
+spec:
+  ## CNPG re-creates instance PVCs on every rebuild; this is the only place the
+  ## backup class survives one (tests/test_cnpg_clusters_declare_backup_class.py).
+  inheritedMetadata:
+    labels:
+      mdapi.ch/backup-class: default
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: 256MB
+      effective_cache_size: 768MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## O2 Database Monitoring login (openobserve/o2-dbm-collector.yml). The import copies
+  ## the database, not the cluster's roles, so the PG17 Deployment's hand-made o2_dbm
+  ## is declared here, with the Akeyless password the collector already holds.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        inherit: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: joplin-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: joplin
+      owner: joplin
+      secret:
+        name: joplin-pg-app
+      import:
+        type: microservice
+        databases:
+          - joplin
+        source:
+          externalCluster: legacy-postgres
+
+  ## The PG 17 Deployment this cluster was imported from. Only read at bootstrap;
+  ## delete this stanza together with postgres-deploy.yml once the soak is over.
+  externalClusters:
+    - name: legacy-postgres
+      connectionParameters:
+        host: postgres.joplin.svc.cluster.local
+        user: joplin
+        dbname: joplin
+        sslmode: disable
+      password:
+        name: postgres-env-secret
+        key: POSTGRES_PASSWORD
+
+  ## serverName stated explicitly: barman keys the archive <bucket>/<serverName>/,
+  ## and it is accepted only as a plugin parameter (CEL rejects it on the store).
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: joplin-pg
+        serverName: joplin-pg
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1536Mi
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: joplin-pg-daily
+  namespace: joplin
+spec:
+  schedule: "0 55 2 * * *"
+  backupOwnerReference: self
+  ## WAL archiving alone is not a backup: take the first base backup at once.
+  immediate: true
+  cluster:
+    name: joplin-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+---
+## Owner credential: the password Joplin already uses, so its env needs no change.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: joplin-pg-app
+  namespace: joplin
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: joplin-pg-app
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          ## CNPG only re-reads a password secret it watches.
+          cnpg.io/reload: "true"
+      data:
+        username: joplin
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/joplin/postgres-env-secret/POSTGRES_PASSWORD
+      secretKey: password
+---
+## Password for the o2_dbm login; CNPG wants a basic-auth secret whose username is the role.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: joplin-pg-o2dbm
+  namespace: joplin
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: joplin-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/joplin/postgres-o2dbm/password
+      secretKey: password
+---
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-joplin-pg
+  namespace: joplin
+spec:
+  bucketName: cnpg-joplin-pg
+  storageClassName: ceph-bucket
+  ## Declare the offsite grant so Rook OWNS it: the OBC reconciler deletes any policy
+  ## not listed here (rgw_bucket_policy_loss_incident_2026_09_29).
+  additionalConfig:
+    bucketPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"OffsiteSweepRead","Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/offsite"]},"Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::cnpg-joplin-pg","arn:aws:s3:::cnpg-joplin-pg/*"]}]}'
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: joplin
+stringData:
+  REGION: us-east-1

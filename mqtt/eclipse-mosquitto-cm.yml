@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-config
+  namespace: mqtt
+data:
+  mosquitto.conf: |
+    persistence true
+    persistence_location /mosquitto/data/
+    listener 1883
+    ## infra-az8.24: every client has a user (eclipse-mosquitto-es.yml); the
+    ## file is hashed at pod start by the init container, never kept in git.
+    password_file /mosquitto/auth/passwd
+    ## Off since 2026-11-10: every client (homeassistant, frigate, findmy, and
+    ## the Ruuvi Gateway until its MQTT output was switched off) was seen
+    ## logging in with its own user first.
+    allow_anonymous false
+    ## Each user is held to the topics it uses (aclfile below). A denied
+    ## publish is dropped silently by the broker, so a new topic needs a line
+    ## here BEFORE the client starts using it.
+    ## ⛔ Not /mosquitto/config/aclfile: a ConfigMap file is root-owned and
+    ## world-readable, and mosquitto 2.1 refuses to open it ("Unable to open
+    ## acl_file", CrashLoop 2026-11-10 21:24Z). The init container copies it
+    ## next to the password file, owned by mosquitto, mode 0600.
+    acl_file /mosquitto/auth/aclfile
+  ## Measured 2026-11-10 against a scratch broker: every flow below delivered,
+  ## and findmy -> frigate/*, frigate -> homeassistant/*, anyone else ->
+  ## findmy/* were dropped.
+  aclfile: |
+    # Home Assistant: MQTT discovery and its birth/will on homeassistant/#,
+    # Frigate's state and commands (frigate/<cam>/<x>/set, restart), and the
+    # findmy positions it displays.
+    user homeassistant
+    topic readwrite homeassistant/#
+    topic readwrite frigate/#
+    topic read findmy/#
+
+    # Frigate: its own tree (state out, commands in).
+    user frigate
+    topic readwrite frigate/#
+
+    # findmy collector: publishes retained discovery config and attributes.
+    user findmy
+    topic write homeassistant/device_tracker/+/config
+    topic write findmy/+/attributes

@@ -1,0 +1,143 @@
+## Backstage backend + the bundled frontend (one process, port 7007).
+## Code and CI: gitlab.mdapi.ch/mdapi/backstage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backstage
+  namespace: backstage
+  labels:
+    app: backstage
+  annotations:
+    ## Restart on a token rotation: the env is read once at start.
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backstage
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: backstage
+    spec:
+      serviceAccountName: backstage
+      ## The Kubernetes plugin reads mdapi-prod with this pod's own token.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backstage
+          ## Lane A: floating tag + resolved digest (Renovate owns the bump) +
+          ## IfNotPresent, so a registry outage does not stop a restart.
+          image: zot.mdapi.ch/mdapi/backstage:latest@sha256:4f24a4597af3edaebba424be2b6c4deb6a15a060ba46ab16e891cc0df6a0cfab
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 7007
+          env:
+            - name: POSTGRES_HOST
+              value: backstage-pg-rw.backstage.svc.cluster.local
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: backstage-pg-app
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: backstage-pg-app
+                  key: password
+            ## TLS to Postgres, verified. node-postgres defaults to NO TLS (unlike
+            ## libpq's `prefer`) and Backstage's pg connector leaves `ssl` unset,
+            ## so pg reads PGSSLMODE: any verifying mode means ssl=true, i.e. Node's
+            ## default verify-full (CA + hostname), with the CNPG CA added by
+            ## NODE_EXTRA_CA_CERTS. Proof: pg_stat_ssl shows ssl=t for user backstage.
+            - name: PGSSLMODE
+              value: verify-full
+            - name: NODE_EXTRA_CA_CERTS
+              value: /etc/backstage-pg-ca/ca.crt
+            - name: NODE_OPTIONS
+              value: --no-node-snapshot --max-old-space-size=1024
+          envFrom:
+            - secretRef:
+                name: backstage
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1536Mi
+          startupProbe:
+            httpGet:
+              path: /.backstage/health/v1/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /.backstage/health/v1/readiness
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /.backstage/health/v1/liveness
+              port: http
+            periodSeconds: 20
+          volumeMounts:
+            ## Scaffolder workspaces and the TechDocs build tree.
+            - name: tmp
+              mountPath: /tmp
+            ## TechDocs publisher (local): rebuilt on demand, so ephemeral.
+            - name: techdocs
+              mountPath: /var/lib/techdocs
+            ## The CNPG server CA: the client verifies backstage-pg-rw.
+            - name: pg-ca
+              mountPath: /etc/backstage-pg-ca
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: techdocs
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: pg-ca
+          secret:
+            secretName: backstage-pg-ca
+            items:
+              - key: ca.crt
+                path: ca.crt
+      imagePullSecrets:
+        - name: zot-pull
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backstage
+  namespace: backstage
+  labels:
+    app: backstage
+spec:
+  selector:
+    app: backstage
+  ports:
+    - name: http
+      port: 7007
+      targetPort: http

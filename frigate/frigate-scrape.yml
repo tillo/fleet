@@ -1,0 +1,28 @@
+## Frigate's own Prometheus endpoint (/api/metrics on :5000), bead infra-pypn.
+##
+## Why: FrigateUnavailable used to compare KSM replicas, and on 2026-09-04 that
+## gauge read "1 available" for about 2.5 h after the pod had gone Pending and
+## the footage had stopped. The alert fired about 3 h late. These series come from
+## the NVR process itself: frigate_service_last_updated_timestamp advances every
+## stats tick (~15 s), and when the pod is gone, the target is gone and the series
+## goes stale within one scrape. Nothing in between can lag.
+##
+## Keeps only frigate_* (~150 series); the python/process collector series are
+## dropped. The Service carries `app: frigate` for this selector only.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: frigate
+  namespace: frigate
+spec:
+  selector:
+    matchLabels:
+      app: frigate
+  endpoints:
+    - port: http
+      path: /api/metrics
+      interval: 30s
+      metricRelabelConfigs:
+        - sourceLabels: [__name__]
+          regex: "frigate_.*"
+          action: keep

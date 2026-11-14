@@ -1,0 +1,321 @@
+## zot — the registry of record (infra-8f4.56).
+##
+## WHY THIS EXISTS. zot.mdapi.ch now holds the ONLY copy of our own images
+## (infra-8f4.54 made it the registry of record; GitLab's registry is read-only).
+## Until this rule set it was watched only from OUTSIDE: the blackbox Probe
+## `zot-registry` and the daily orphan-image probe. Nothing measured pushes,
+## sync fetches, GC, storage growth or latency, so a broken write path or a
+## stalling GC would have been discovered by whoever's deploy failed.
+##
+## WHICH METRICS ARE PER-POD, and why that decides every expression here.
+## zot runs 2 replicas (Deployment `zot`, anti-affinity, PDB minAvailable 1 —
+## NOT 3; the extension-study note says 3 and is wrong for this deployment).
+## Each replica exports the SAME metrics over the SAME shared S3 store, so:
+##   * COUNTERS (http_requests_total, gc_runs_total, downloads) are additive:
+##     `sum(increase(...))` across pods is the true cluster-wide count. Summing
+##     two replicas is correct, not double counting.
+##   * A per-repo GAUGE would have to be deduped with `max by (repo)` before
+##     summing, because two replicas report the same repo. That case does not
+##     arise today: zot_repo_storage_bytes is NEVER populated under the S3 driver
+##     (see ZotRepoCountGrowth). If a byte gauge is added later, dedupe it.
+##   * HISTOGRAMS (http_method_latency_seconds) aggregate with
+##     `sum by (le) (rate(...))` BEFORE histogram_quantile.
+## A metric that exists on only ONE pod is a scrape/rollout transient, which is
+## why every expression below spans both pods rather than testing any single one.
+##
+## WHAT IS DELIBERATELY NOT ALERTED:
+##   * 401/403 on READ paths. The registry is public-facing and internet
+##     scanners request /v2/ continuously; that is a permanent floor, not a
+##     signal. Write-method auth failures DO get an alert (ZotPushAuthFailures)
+##     because a scanner does not start multipart uploads.
+##   * the periodic sync poll. zot's pollInterval sync fails `_catalog` on
+##     every upstream every cycle (unauthorized/404) — ~156 error lines/day/pod
+##     and harmless, on-demand sync works. Alerting on it is a permanently red
+##     alert, which is functionally off. The consumer-visible failure mode of a
+##     broken sync is a 503 on a read, which ZotSyncFetchFailures watches.
+##   * scrub findings. There is no scrub metric, and on a PULL-THROUGH mirror the
+##     findings are mostly benign by construction: scrub checks every child
+##     manifest of a multi-arch index while sync only fetched the platform that
+##     was actually pulled, so the attestation/`unknown` children are reported
+##     `blob not found` (measured 2026-11-08: 106 rows across 16 mirrored repos,
+##     ZERO in mdapi/**). They are fetched on demand. An alert on that count would
+##     be permanently red — the same trap as the sync poll. If scrub findings in
+##     `mdapi/**` ever need paging, that needs an O2 rule on the log line, not a
+##     vmalert rule on a metric zot does not publish.
+##
+## Thresholds are first-pass, calibrated against what a healthy week looks like
+## (this rule set went live with the metrics themselves); they are deliberately
+## generous so that the first real signal is not buried in rollout noise.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-zot
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-zot.rules
+    rules:
+    - alert: ZotPushFailures
+      ## Successful pushes increment repo_uploads_total; this watches the
+      ## server side of the write path (zot -> Ceph RGW) instead. A 5xx on an
+      ## upload method means a CI deploy did not publish — the digest it wanted
+      ## to deploy does not exist, and the failure is otherwise just a red
+      ## pipeline in one project.
+      expr: |
+        sum(increase(zot_http_requests_total{method=~"PUT|POST|PATCH",code=~"5.."}[15m])) > 0
+      for: 10m
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot is failing image pushes (5xx on an upload method)"
+        description: |
+          A write to zot answered 5xx in the last 15m — the push path
+          (zot -> Ceph RGW, bucket zot-images) is failing, so CI cannot publish
+          and a deploy that expects a fresh tag will fail with manifest unknown.
+
+          Check which replica and why:
+            kubectl -n zot logs deploy/zot --tail=200 | grep -i 'error\|500\|503'
+            kubectl -n zot exec deploy/zot -- true   # (no shell in the image)
+          Usual causes: the RGW endpoint (Secret zot-s3-config, keys
+          /mdapi/zot/ceph-s3-*) moved or is rejecting SigV4; the 5 GiB emptyDir
+          cache is full mid-upload; zot is OOM-restarting (see the pod's
+          restarts). The push probe for a real round-trip is described in
+          ~/zot-registry-move-2026-11-07/PLAN.md (follow-up).
+
+    - alert: ZotPushAuthFailures
+      ## The other way a push dies: the credential. ci-push is a protected
+      ## GitLab group var whose source of truth is Akeyless
+      ## /mdapi/zot/ci-push/*; if the htpasswd line and the group var drift,
+      ## EVERY project's push 401s and the only symptom is pipelines going red.
+      ## Read-path 401s are ignored (scanner floor); a burst on write methods is
+      ## not something scanners produce.
+      expr: |
+        sum(increase(zot_http_requests_total{method=~"POST|PUT|PATCH",code=~"401|403"}[15m])) > 20
+      for: 15m
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "a zot pusher's credential is being rejected"
+        description: |
+          More than 20 rejected upload requests in 15m. Read-path 401s are
+          ignored by this rule on purpose (public scanners); upload endpoints
+          are not scanned, so this is a real client being turned away.
+
+          Compare the htpasswd line in Akeyless /mdapi/zot/zot-auth/htpasswd
+          (users `ci-push`, `dev-push`) with the GitLab group variables
+          ZOT_USER/ZOT_PASSWORD and ZOT_DEV_USER/ZOT_DEV_PASSWORD, and with the
+          Akeyless items /mdapi/zot/{ci-push,dev-push}/password. The audit log
+          (O2 stream zot_audit) shows which subject the rejected requests claim.
+
+    - alert: ZotSyncFetchFailures
+      ## On-demand sync is how a tag that is not cached yet gets fetched. When
+      ## the upstream fetch fails, zot answers 503 (NOT 404) to the client — a
+      ## pod pulling an image that exists upstream crashloops with
+      ## ErrImagePull while zot's own log says why.
+      expr: |
+        sum(increase(zot_http_requests_total{method=~"GET|HEAD",code="503"}[1h])) > 5
+      for: 30m
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot cannot fetch what a client asked for (503 on reads)"
+        description: |
+          More than 5 read requests in the last hour ended 503. For zot that
+          means "this repo/tag is not local and the sync attempt failed", not
+          "not found" — a workload pulling it keeps retrying.
+
+          Distinguish the two cases before touching anything:
+            * the requested repo IS in the allowlist (Secret zot-s3-config,
+              extensions.sync.registries): the upstream is down or its
+              credential broke. registry.mdapi.ch uses the group deploy token in
+              sync-creds.json (Akeyless /mdapi/zot/gitlab-sync-*); GitHub/GHCR
+              and friends are anonymous, so there it is upstream reachability.
+            * the repo is NOT in the allowlist: nothing can ever fetch it — this
+              is the orphan-image class (see ZotOrphanImageInUse) and the image
+              must be copied in by digest.
+          ⛔ The periodic poll's own `_catalog` failures do NOT raise this alert;
+          they never reach a client.
+
+    - alert: ZotLatencyHigh
+      ## p95 over BOTH pods. Deliberately generous: the histogram covers blob
+      ## transfers, and a 400 MiB layer legitimately takes tens of seconds, so
+      ## this fires when the S3 path has genuinely degraded, not when someone
+      ## deploys a big image. It is the storage-latency canary for the RGW
+      ## ClusterIP (plain http inside the cluster).
+      expr: |
+        histogram_quantile(0.95,
+          sum by (le) (rate(zot_http_method_latency_seconds_bucket[10m]))
+        ) > 120
+      for: 1h
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot p95 request latency above 2 minutes for an hour"
+        description: |
+          The 95th percentile request has taken over 120s for an hour. Blob
+          pulls dominate this histogram, so a sustained shift means the path to
+          the object store — not one image — got slower.
+
+          Check the RGW in the same window (30-ceph.yml / 30a-ceph-rgw.yml
+          alerts, ceph_osd_apply_latency_ms, node disk saturation) and, on the
+          zot side, zot_storage_lock_latency_seconds{storageName="s3"} — a lock
+          histogram at the same threshold points at zot contending with itself
+          (GC or scrub running while serving).
+
+    - alert: ZotRepoCountGrowth
+      ## ⛔ WHY THIS IS COUNT, NOT BYTES — measured, do not "fix" it back.
+      ## zot publishes `zot_repo_storage_bytes`, but the S3 driver NEVER fills it:
+      ## the local hardlink lifecycle calls
+      ## monitoring.SetStorageUsage(rootDir, repo) (a local dir-size walk), while
+      ## the S3 store uses `remoteSharedBlobLifecycle`, whose
+      ## UpdateStorageUsage() is an empty function (v2.1.23
+      ## pkg/storage/imagestore/blob_lifecycle.go:289). Verified live after the
+      ## extension was enabled: ZERO zot_repo_storage_bytes series in
+      ## VictoriaMetrics while zot_info and every counter were present. A
+      ## byte-growth rule built on that gauge could never fire.
+      ## The RGW's own pool size is not a substitute: ceph_pool_bytes_used for
+      ## ceph-objectstore.rgw.buckets.data measures a 3.7 TB pool that also holds
+      ## the (frozen) GitLab registry and the config backups, so zot's own tens of
+      ## GiB are invisible in it.
+      ## So the attributable, already-measured growth signal is the daily
+      ## zot_orphan_images probe's repo count. It answers the question that
+      ## actually costs capacity — is something creating repositories faster than
+      ## GC/retention removes them — without pretending to know bytes.
+      ## THRESHOLD CALIBRATION (measured 2026-11-08, the day after the move):
+      ## 37 repos 7d before, 83 now — the registry move itself added 45 in a day.
+      ## 100 is therefore >2x the largest legitimate event on record, while a bad
+      ## `**` sync prefix or a retention that stopped deleting adds hundreds. An
+      ## earlier draft used 20 and was PENDING on day one for exactly that
+      ## migration: a threshold that fires on the known, intended change is a
+      ## permanently red alert with extra steps.
+      ## FOLLOW-UP (bead infra-tdxel): publish zot_bucket_bytes/_objects from
+      ## that probe via the S3 API, as gitlab_backup_health already does with
+      ## gitlab_backup_retention_bucket_bytes, and make this an actual byte rule.
+      expr: |
+        zot_repos_total{job="zot_orphan_images"}
+          - (zot_repos_total{job="zot_orphan_images"} offset 7d) > 100
+      for: 6h
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot gained more than 100 repositories in 7 days"
+        description: |
+          The registry grew by over 100 repos in a week (the probe re-measures
+          daily). The largest intended change on record is the 2026-11-07
+          registry move, which added 45; a jump this size usually means a sync
+          allowlist prefix that maps far more repos than intended, or retention /
+          GC having stopped (check ZotGcErrors and ZotGcNotRunning FIRST — GC is
+          what prunes mdapi-dev).
+          ⛔ There is no off-site copy of this bucket (accepted risk D3) and no
+          byte-level metric exists (see the comment on this rule), so repo count
+          and the Ceph capacity alerts are the only growth signals we have.
+
+    - alert: ZotGcErrors
+      ## GC is also the retention engine: the mdapi-dev/** 14-day policy is
+      ## executed by the same task. An errored run means blobs were not
+      ## collected and tags were not pruned.
+      expr: |
+        sum(increase(zot_gc_runs_total{error="true"}[26h])) > 0
+      for: 15m
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "a zot garbage-collection / retention run failed"
+        description: |
+          zot's GC task (gcInterval 24h, so 26h covers one cycle) reported an
+          error. GC is what enforces the mdapi-dev/** tag retention policy and
+          what deletes untagged manifests, so a failing run silently grows the
+          store (see ZotRepoCountGrowth; zot exposes no byte-level size under the
+          S3 driver) and leaves pruned tags in place.
+
+          Check: kubectl -n zot logs deploy/zot --tail=500 | grep -i 'garbage\|gc '
+          Usual causes: RGW errors/timeouts during delete, a storage lock
+          timeout (zot_storage_lock_latency_seconds), or a blob whose manifest
+          is gone — the last is what the weekly scrub is for.
+
+    - alert: ZotGcNotRunning
+      ## The complement: no run at all. zot's scheduler runs each generator
+      ## immediately at start and then every interval, so after ANY pod start a
+      ## run is expected within the hour; 2h of silence means the task is stuck
+      ## or the scheduler is starved. (2h `for` rides out the post-start full
+      ## scrub, which runs at LowPriority ahead of the GC task.)
+      expr: |
+        sum(increase(zot_gc_runs_total[26h])) == 0
+      for: 2h
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot has not completed a GC run in 26h"
+        description: |
+          No garbage-collection run succeeded or failed in 26h across both
+          replicas, against a 24h interval. Retention is not being applied and
+          untagged manifests are not being collected.
+
+          Check that the process is alive and the scheduler is working:
+            kubectl -n zot logs deploy/zot --tail=200 | grep -i 'scheduler\|gc'
+          and zot_scheduler_tasksqueue_length{priority="low"} — a queue that
+          only grows means workers are stuck on storage calls.
+
+    - alert: ZotMetricsMissing
+      ## A blind monitor is not an all-clear: if the scrape breaks (credential
+      ## rotated, path moved, VMPodScrape deleted) every rule above goes quiet
+      ## and looks exactly like a healthy registry.
+      expr: absent(zot_info)
+      for: 30m
+      labels:
+        service: 'zot'
+        namespace: 'zot'
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "zot metrics are absent — every zot alert is blind"
+        description: |
+          VictoriaMetrics has no zot_info series, so no zot counter is being
+          collected and every rule in this file is silently disabled.
+
+          Check, in order:
+            kubectl -n zot get vmPodScrape zot -o yaml     # object present?
+            kubectl -n zot get secret zot-metrics-auth    # ESO synced?
+            kubectl -n zot get externalsecret zot-metrics-auth
+            kubectl -n monitoring logs deploy/vmagent-mdapi | grep -i zot
+          A 401 here means the /mdapi/zot/zot-auth/password item and the
+          htpasswd line have drifted; both live in Akeyless.

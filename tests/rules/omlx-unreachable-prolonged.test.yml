@@ -1,0 +1,40 @@
+# OmlxUnreachableProlonged (infra-m42.6): oMLX lost for 3h pages (critical); the 1h
+# warning OmlxUnreachable stays the early signal, and an evening blip shorter than 3h never pages.
+rule_files:
+- monitoring-rules/64-omlx.yml
+evaluation_interval: 1m
+tests:
+- name: lost-for-3h-pages-critical
+  interval: 1m
+  input_series:
+  - series: omlx_up{job="omlx-exporter",namespace="monitoring"}
+    values: '0x240'
+  alert_rule_test:
+  - eval_time: 170m
+    groupname: app-omlx.rules
+    alertname: OmlxUnreachableProlonged
+    exp_alerts: []
+  - eval_time: 190m
+    groupname: app-omlx.rules
+    alertname: OmlxUnreachableProlonged
+    exp_alerts:
+    - exp_labels:
+        service: omlx
+        namespace: jump
+        severity: critical
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "oMLX unreachable for 3h \u2014 the local brain is down, every local door is on cloud fallback or failing closed"
+        description: "OmlxUnreachable (warning) has been firing for two more hours with no\nrecovery. Usual cause: mbp-mda rebooted and sits at the login window\n(oMLX is a login item of the DMG app \u2014 nothing starts before a GUI\nlogin, and nothing restarts it after a crash).\nRunbook (memory, ~/.claude/projects/-home-tillo/memory/):\n  mbp_mda_reboot_recovery_without_a_console_login_2026_10_16.md\n    \u2014 reach the Mac on its LAN IP over ssh, start the server by hand\n  omlx_runtime_is_the_dmg_app_launchd_job_retired_2026_10_19.md\n    \u2014 the current runtime (/Applications/oMLX.app) and its limits\nCheck first: ssh mbp-mda uptime  (0 users = the no-login reboot).\n"
+- name: blip-under-3h-never-pages
+  interval: 1m
+  input_series:
+  - series: omlx_up{job="omlx-exporter",namespace="monitoring"}
+    values: '0x150 1x100'
+  alert_rule_test:
+  - eval_time: 200m
+    groupname: app-omlx.rules
+    alertname: OmlxUnreachableProlonged
+    exp_alerts: []

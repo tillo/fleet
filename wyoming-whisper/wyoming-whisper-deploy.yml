@@ -1,0 +1,169 @@
+## Speech-to-text for Home Assistant Assist (Wyoming protocol, raw TCP 10300).
+##
+## Why this exists: the Assist pipeline "Casa" is Italian end to end but had
+## stt_engine: null, and with a null STT engine the companion apps do NOT send
+## audio to HA -- they fall back to the phone/watch's own recogniser, which the
+## Wear OS app launches WITHOUT RecognizerIntent.EXTRA_LANGUAGE. Android then
+## uses the device locale, so an English-locale watch transcribed Italian
+## speech as English and the it-IT agent answered "non ho capito".
+## Giving the pipeline a real stt_engine flips the apps to streaming audio, and
+## the transcription language becomes HA's (it) instead of the device's.
+##
+## CPU-only inference: no GPU in the cluster, and the Coral TPU on qui does not
+## accelerate Whisper (edgetpu runs int8 vision graphs, not encoder-decoder).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyoming-whisper
+  namespace: wyoming
+  labels:
+    app: wyoming-whisper
+  ## ⛔ NO live auto-updater on purpose. This image carries a PINNED tag, and a
+  ## pinned tag bumped live is the broken middle between the two lanes: the live
+  ## Deployment moves while git keeps claiming the old version, so the Fleet bundle
+  ## sits Modified forever and GitOps stops telling the truth. Measured here on
+  ## 2026-09-10: a live bump took wyoming-piper 2.4.3 -> 2.5.0 at 00:06 and the
+  ## bundle went Modified(1) within hours of the bundle being created.
+  ##   Lane-A = floating tag (:latest/:stable/...) + @sha256 digest -> cannot drift
+  ##   Lane-B = pinned tag + Renovate                               -> git stays the truth
+  ##   (in Lane-A the digest is what Renovate keeps current.)
+  ## These are Lane-B; renovate.json carries the matching rule. Same move as
+  ## joplin/server, caddy and eclipse-mosquitto before them.
+spec:
+  replicas: 1
+  ## Recreate, NOT RollingUpdate: the model cache is a ReadWriteOnce PVC, so a
+  ## second pod would sit ContainerCreating waiting for a volume the outgoing
+  ## pod still holds, and the rollout would never converge.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wyoming-whisper
+  template:
+    metadata:
+      labels:
+        app: wyoming-whisper
+    spec:
+      containers:
+      - name: wyoming-whisper
+        image: rhasspy/wyoming-whisper:3.8.1@sha256:ba6fcb6056ebe237d15a325381763a80af2fc8fcedaa04f6a714a7375eb20d80
+        imagePullPolicy: IfNotPresent
+        ## The image ENTRYPOINT (/usr/src/docker_run.sh in 3.7.0) already
+        ## supplies --uri, --data-dir and --device, and appends these after
+        ## them, so do not repeat those three here.
+        ## NB the published Dockerfile on master is NOT what built 3.7.0: the
+        ## real image runs from a venv at /usr/src/.venv and its entrypoint is
+        ## docker_run.sh, not run.sh. Check the image, not the repo.
+        args:
+          ## ⛔ Do NOT "optimise" this back to base-int8. It was tried and
+          ## reverted the same evening. Measured on 8 Italian phrases x 2 runs,
+          ## exact-match against what was spoken:
+          ##   base-int8  beam1  10/16  1.80s
+          ##   base-int8  beam5  12/16  2.31s
+          ##   small-int8 beam1  16/16  7.55s
+          ## The earlier "base is fine" call came from 3 phrases at n=1, which
+          ## is not a measurement. base-int8 does not fail on harmless syllables:
+          ## it fails on the exact words that carry the intent --
+          ## "accese" -> "acceze" and "spegni" -> "Spenni" -- so the sentence
+          ## transcribes almost right and then matches NOTHING. A voice
+          ## assistant that mishears the verb is not faster, it is broken.
+          ## Latency is bought below with CPU instead, where it costs only
+          ## burst headroom.
+          ##
+          ## Re-measured 2026-11-08 because a "smaller model, ~0.6 GiB" change
+          ## was proposed. Same piper audio (it_IT-paola), 8 Italian + 2
+          ## English phrases, exact match after normalisation; HA's own config
+          ## was read first and BOTH Assist pipelines ("Casa", "Casa LLM")
+          ## carry stt_language it, so Italian is the operative language:
+          ##   model       it    en   latency   cold-idle RSS
+          ##   small-int8  4/8   2/2  ~8.0 s    389 Mi
+          ##   base-int8   2/8   2/2  ~3.2 s    554 Mi   <-- MORE memory
+          ##   tiny-int8   1/8   2/2  ~1.1 s    165 Mi
+          ## The size table on the model hub does not predict the resident set:
+          ## torch + CTranslate2 dominate it, and base-int8 lands ABOVE
+          ## small-int8. So a smaller model cannot deliver the memory saving
+          ## that motivated the change, while it does cost Italian commands
+          ## (tiny turned "accendi le luci esterne" into "le luci stanno").
+          ## The saving is real, but it lives in the REQUEST below, not here.
+          - --model
+          - small-int8
+          ## Default language; HA still sends the pipeline's stt_language per
+          ## request, so this only decides what an unqualified request gets.
+          - --language
+          - it
+          ## beam-size 1 = greedy. small-int8 scores 16/16 at beam 1, so the
+          ## extra beams would buy nothing here but latency.
+          - --beam-size
+          - "1"
+          ## MUST match the CPU limit below. CTranslate2 sizes its thread pool
+          ## from the HOST core count -- os.cpu_count() reports 32 inside this
+          ## cgroup -- so left alone it spawns 32 threads to contend for the few
+          ## cores it actually has.
+          - --cpu-threads
+          - "8"
+        ports:
+        - name: wyoming
+          containerPort: 10300
+          protocol: TCP
+        volumeMounts:
+        - name: models
+          mountPath: /data
+        ## Wyoming speaks a bespoke line protocol over TCP, so a socket open is
+        ## the only dependency-free liveness signal available here. It is a
+        ## weak check (an accepting-but-wedged process still passes), which is
+        ## why the real functional coverage is HA's own stt entity, not this.
+        startupProbe:
+          tcpSocket:
+            port: 10300
+          periodSeconds: 10
+          ## 10 min: first start downloads the model over the internet.
+          failureThreshold: 60
+        readinessProbe:
+          tcpSocket:
+            port: 10300
+          periodSeconds: 20
+        livenessProbe:
+          tcpSocket:
+            port: 10300
+          periodSeconds: 30
+          failureThreshold: 5
+        resources:
+          requests:
+            cpu: 200m
+            ## Nodes sit at 83-92% of allocatable MEMORY REQUESTS, so this asks
+            ## for the measured working set and no more. Right-sized 1Gi ->
+            ## 512Mi on 2026-11-08: `kubectl top` read 360Mi idle, VmRSS 389Mi
+            ## cold and 470Mi after a transcription burst. The old "~900 MB"
+            ## figure was never measured -- it was inferred from the model
+            ## size -- and it over-reserved by ~2.5x on a node fleet where a
+            ## GiB of request is the scarce resource. 512Mi keeps ~40% headroom
+            ## over idle and does not sit below the post-burst footprint, which
+            ## is what node-memory-pressure eviction scores against.
+            memory: 512Mi
+          limits:
+            ## Bursty by nature: idle at ~0, then saturates threads for the
+            ## couple of seconds it takes to transcribe one utterance -- a
+            ## handful of times a day, never concurrently.
+            ##
+            ## Raised 4 -> 8 to buy latency WITHOUT giving up accuracy. The
+            ## earlier thread sweep (2/4/8/16 all ~8s) looked like "threads do
+            ## not help", but it was run inside the 4-CPU limit, so every
+            ## setting was capped at 4 cores of real work -- the sweep measured
+            ## the cgroup, not the thread count. A LIMIT reserves nothing (only
+            ## requests do, and that stays at 200m), so this costs the cluster
+            ## nothing while idle, which is ~all the time.
+            cpu: "8"
+            ## 3Gi -> 1Gi: peak RSS measured 600Mi across ten utterances, so
+            ## 1Gi leaves ~1.7x for a long one and a runaway dies inside its
+            ## own cgroup instead of taking 3Gi of the node. Like the CPU
+            ## limit this reserves nothing.
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: wyoming-whisper-models

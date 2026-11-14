@@ -1,0 +1,25 @@
+# The AIO chart's own ClamAV (Deployment + Service) is removed from the render:
+# files_antivirus now scans through the SHARED clamd in ns clamav (infra-8f4.50,
+# 2026-11-07), which frees ~0.93 GiB. The chart cannot do this itself —
+# CLAMAV_ENABLED drives BOTH the clamav objects and the files_antivirus setup in
+# the nextcloud container, so it stays "yes" in values.yaml and only the objects
+# are deleted here; CLAMAV_HOST is repointed in nextcloud-aio-nextcloud-deployment.yaml.
+# Its PVCs: the chart's nextcloud-aio-clamav is already delete-patched in
+# phase2-delete-old-pvcs.yaml, and nextcloud-aio-clamav-ceph was dropped from
+# phase2-ceph-pvcs.yaml (signatures only, rebuildable).
+#
+# `$patch: delete` at the DOCUMENT ROOT (nested under metadata it silently no-ops,
+# see phase2-delete-old-pvcs.yaml); the chart renders namespace:, so it stays here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-clamav
+  namespace: nextcloud
+$patch: delete
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nextcloud-aio-clamav
+  namespace: nextcloud
+$patch: delete

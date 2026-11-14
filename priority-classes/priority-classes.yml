@@ -1,0 +1,75 @@
+# Workload priority tiers (2026-07-04 N-1 / resource program).
+#
+# Under node-pressure eviction and scheduler preemption, pods without a
+# PriorityClass (priority 0) are all equal — mail competed with media.
+# Three tiers fix the ordering; creating them has ZERO effect until a
+# workload sets priorityClassName (assignment happens gradually per bundle,
+# since it recreates pods).
+#
+#   mdapi-critical  100000  mail, idp, dns, ingress-adjacent, nextclouds
+#   mdapi-default     1000  global default — anything unlabelled
+#   mdapi-low          100  media/tv, honeypot, batch; never preempts anyone
+#
+# (System classes sit far above: system-* at 2e9, longhorn/rancher/kubevirt
+# at 1e9 — user tiers deliberately stay below all of them.)
+#
+# mdapi-zero is NOT a fourth tier. It exists only to make third-party pod
+# templates that hardcode `priority: 0` admissible — see its comment below.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-critical
+value: 100000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Family-facing core services (mail, idp, dns, cloud) — evicted last among user workloads."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-default
+value: 1000
+globalDefault: true
+preemptionPolicy: PreemptLowerPriority
+description: "Default for all user workloads without an explicit class."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-low
+value: 100
+globalDefault: false
+preemptionPolicy: Never
+description: "Media, honeypots, batch — first evicted under pressure, never preempts others."
+---
+# Not a tier: a compatibility class that resolves to priority 0.
+#
+# The priority admission plugin rejects a pod whose spec states a priority or
+# preemptionPolicy that disagrees with the class it resolves to. Third-party
+# charts that hardcode `priority: 0` in a pod template therefore become
+# anonymous once a globalDefault exists: with mdapi-default (globalDefault,
+# value 1000, PreemptLowerPriority) resolved for them, every pod from that
+# template is refused with
+#   "the integer value of priority (0) must not be provided in pod spec;
+#    priority admission controller computed 1000 from the given PriorityClass name"
+# and the Deployment sits at 0/1 with ReplicaFailure.
+#
+# Current only consumer: harvester's whereabouts subchart
+# (kube-system/whereabouts-controller, templates/node-slice-controller.yaml:52-53
+# hardcodes `preemptionPolicy: PreemptLowerPriority` + `priority: 0`; unchanged in
+# harvester v1.9.0/v1.9.1-rc4). That Deployment also has to carry
+# `priorityClassName: mdapi-zero` — a live patch, since the pod template belongs
+# to the harvester ManagedChart and cannot be expressed here. If it is ever lost
+# (chart re-render, objectset replace), the pods go back to being rejected: check
+# `kubectl -n kube-system get deploy whereabouts-controller`.
+#
+# value/preemptionPolicy are immutable after creation and must match the pod
+# template exactly (0 + PreemptLowerPriority); keep globalDefault false.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mdapi-zero
+value: 0
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Resolves to priority 0 — admits third-party pods that hardcode priority: 0 (harvester whereabouts-controller). Not a workload tier."

@@ -1,0 +1,173 @@
+## Third GitLab runner: the openwrt FULL-BUILD lane (job `make` in mdapi/openwrt
+## .gitlab-ci.yml, tag `builder-full`).
+##
+## Why it exists — the full lane ran on the shared `mdapi` runner
+## (bootstrap/gitlab-values.yaml): concurrent=10, no cpu_limit, no node
+## placement. Its -j25 world build landed wherever the scheduler put it,
+## control-plane nodes included, and all of its I/O (tree, .ccache, dl and the
+## ~4 GiB cache tarball) went to that node's ONE boot LD, which also carries
+## etcd, kubelet and containerd. On 2026-10-26 that held quo's LD at ~100 %
+## busy and cost vm-operator and cdi-deployment their leader leases
+## (infra-u105). Earlier fixes bounded one dimension each — concurrency
+## (resource_group), memory (12Gi), ephemeral storage (60Gi); this bounds the
+## remaining three:
+##   * I/O: builds_dir is a rep-1 Longhorn PVC, so build I/O goes through the
+##     Longhorn engine to a fio disk and never touches a node's boot LD.
+##   * placement: pinned to quarto, the only node without etcd/apiserver.
+##   * CPU: cpu_limit 14 of quarto's ~19 allocatable — quarto's own baseline is
+##     ~4-7 busy cores, the jump-bastion seat included. nproc inside the pod
+##     still reports every host CPU, so CI derives -j from cgroup cpu.max.
+## concurrent = 1 matches resource_group openwrt-full-build.
+##
+## Unlike the fast lane (../values.yml), this lane stays the cold-tree
+## reproducibility baseline: CI keeps `git clean -ffdx` and excludes only
+## /dl/ (hash-verified when downloaded) and /.ccache/ (content-addressed), so
+## build_dir, staging_dir and feeds are rebuilt from scratch every job.
+##
+## PRODUCTION REFS ONLY (infra-5luo): runner 944 is access_level ref_protected
+## in GitLab. Only protected refs fetch the apk signing key, and a job on an
+## unprotected ref must never run in this workspace. Such a job controls its own
+## GIT_CLEAN_FLAGS, so it could read the key or poison .ccache/dl.
+## Branch and MR builds go to the twin runner in ../fullbuild-mr.
+
+image:
+  registry: registry.gitlab.com
+  image: gitlab-org/gitlab-runner
+  tag: alpine-v18.11.3
+
+gitlabUrl: https://gitlab.mdapi.ch/
+
+## Global config.toml settings are chart values; `runners.config` is only the
+## [[runners]] template and ignores them (see ../values.yml).
+concurrent: 1
+checkInterval: 3
+
+## Graceful stop (infra-4h19): SIGTERM is gitlab-runner's FORCEFUL shutdown and
+## aborts the running build. The preStop sends SIGQUIT (finish the job, then
+## exit) and blocks until the runner is gone. Full rationale in
+## gitlab/values.yaml (gitlab-runner.deploymentLifecycle).
+deploymentLifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "kill -QUIT 1; while kill -0 1 2>/dev/null; do sleep 5; done"]
+## A cold full build measured 120 min (job 149164), so the chart's 3600 s
+## would SIGKILL the runner mid-job. A node drain evicts the build pod as well,
+## which ends the job and with it the runner's wait.
+terminationGracePeriodSeconds: 10800
+
+runners:
+  secret: gitlab-runner-fullbuild-token
+  config: |
+    [[runners]]
+      ## The workspace itself. /builds is the PVC mount below.
+      builds_dir = "/builds"
+      environment = ["FF_USE_FASTZIP=true"]
+      [runners.kubernetes]
+        image = "alpine"
+        namespace = "gitlab-runner-builder"
+        privileged = false
+        cpu_request = "4"
+        cpu_limit = "14"
+        ## Peak 11.5 GiB measured against the shared runner's 12Gi limit.
+        memory_request = "8Gi"
+        memory_limit = "16Gi"
+        ## The tree is on the PVC; this bounds whatever else lands on quarto's
+        ## node disk (2026-10-21: an unbounded build filled it).
+        ephemeral_storage_request = "2Gi"
+        ephemeral_storage_limit = "20Gi"
+        helper_cpu_limit = "1"
+        helper_memory_limit = "512Mi"
+        ## Pinned: the workspace PVC is RWO, and quarto is the placement.
+        node_selector_overwrite_allowed = ""
+        poll_timeout = 900
+        [runners.kubernetes.node_selector]
+          "kubernetes.io/hostname" = "quarto"
+        [runners.kubernetes.pod_annotations]
+          "container.apparmor.security.beta.kubernetes.io/build" = "unconfined"
+        ## cpu_limit throttles a saturating make by design; exempt from
+        ## ContainerCpuThrottling like the shared runner (gitlab/values.yaml).
+        [runners.kubernetes.pod_labels]
+          "monitoring.mdapi.ch/cpu-throttle-exempt" = "true"
+        [[runners.kubernetes.volumes.pvc]]
+          name = "openwrt-full-workspace"
+          mount_path = "/builds"
+      ## No distributed cache: .ccache and dl persist on the PVC.
+
+  ## Token-based registration (glrt-…) from the ExternalSecret below; the
+  ## runner was pre-created on project 33 with tag `builder-full`,
+  ## run_untagged=false so it never takes ordinary `mdapi` jobs.
+  tags: "builder-full"
+  runUntagged: false
+  privileged: false
+
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "pods/exec", "pods/attach", "secrets", "configmaps", "services"]
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get", "list", "watch"]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector:
+  kubernetes.io/hostname: quarto
+
+metrics:
+  enabled: true
+
+## --- Supporting resources. NOTE: this chart renders extraObjects as
+##     `tpl (toYaml .)`, so entries must be MAPPINGS (not string blocks)
+##     and any ESO/Go-template braces must be tpl-escaped as below.
+extraObjects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: openwrt-full-workspace
+      namespace: gitlab-runner-builder
+      labels:
+        ## Backup class `none`: disposable build tree, ccache and source
+        ## tarballs. Same label set as openwrt-workspace in ../values.yml,
+        ## i.e. exactly what f/heal/backup_label_enforcer derives.
+        mdapi.ch/backup-class: none
+        recurring-job.longhorn.io/source: enabled
+        recurring-job-group.longhorn.io/nobackup: enabled
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      ## rep-1: the contents are reconstructible, and a second replica would
+      ## double the write traffic this runner exists to take off busy paths.
+      storageClassName: harvester-longhorn-1replica
+      resources:
+        requests:
+          ## ~27 GiB tree after a world build + dl 1.7G + .ccache 3G (job 149164).
+          storage: 80Gi
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: gitlab-runner-fullbuild-token
+      namespace: gitlab-runner-builder
+    spec:
+      refreshInterval: 5m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: gitlab-runner-fullbuild-token
+        creationPolicy: Owner
+        template:
+          engineVersion: v2
+          data:
+            runner-registration-token: ''
+            runner-token: '{{ "{{ .token }}" }}'
+      data:
+      - remoteRef:
+          key: /mdapi/gitlab/runner-fullbuild-token
+        secretKey: token

@@ -1,0 +1,83 @@
+## Secrets for the chat frontend. Both must exist in Akeyless BEFORE this
+## bundle can go green (the deployment will not start without them).
+##
+## OPENAI_API_KEY is a LiteLLM VIRTUAL KEY, not LITELLM_MASTER_KEY. The master
+## key is proxy-admin — it can mint keys, read every consumer's spend and edit
+## the gateway. A browser-facing app gets a scoped, revocable key instead.
+##
+## Minting it (requires litellm-pg from litellm/litellm-pg.yml to be up first,
+## since virtual keys live in that database):
+##
+##   curl -sX POST https://llm.mdapi.ch/key/generate \
+##     -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+##     -H 'Content-Type: application/json' \
+##     -d '{"key_alias":"openwebui",
+##          "models":["local-closed-best","local-closed-polyglot",
+##                    "local-tail-cn-flash-best","local-tail-cn-flash-best-fast",
+##                    "cn-deepseek-flash","cn-deepseek-pro"],
+##          "max_budget":25,"budget_duration":"30d"}'
+##
+## `models` is the real control here: it decides what the household can reach.
+## Minted 2026-08-26 with three ids; re-scoped 2026-10-01 to the gemma-era eight;
+## widened 2026-10-10 during the tiel-coder promotion, because `models` REPLACES
+## the array wholesale and nothing must outrun its scope inside a rename window.
+## RE-SCOPED 2026-10-18 to exactly the seven ids the picker offers: the five
+## tiel-large shims that had accumulated were dropped. They still RESOLVE for any
+## caller that names them, because litellm applies `model_group_alias` BEFORE it
+## checks the key's scope and then checks the RESOLVED group — measured
+## 2026-10-18: `local-closed-tiel-large` -> allowed (target in scope), while
+## `opus`, `work`, `cn-to-us` -> 403 (and `local-tail-cn-pro-best-gheim` did, before
+## its 2026-10-20 retirement).
+## So the shims are safe to keep in litellm and need not be in the scope; the
+## /v1/models listing under this key is now this scope and nothing wider.
+## 2026-10-19: + local-closed-polyglot (eight ids), the fail-closed Italian/French
+## local model.
+## 2026-10-20: - local-tail-cn-pro-best, - local-tail-cn-pro-best-nothink (six ids),
+## with the groups themselves; the household's "esperto" rows went too and the
+## flash-tail pair is the only Casa → Internet choice now.
+##
+## Deliberately NO `infra`/`infra-fable`: those silently fall through to the
+## cloud, which is a per-request privacy decision nobody at a chat prompt is
+## making consciously. The local-tail-cn-* rows above DO have a cloud tail, but
+## deliberately and visibly — the model description the household reads says so
+## in Italian.
+##
+## Deliberately NO `fable`/`opus`/`claude-*` either (owner decision 2026-08-26).
+## Those tails are claude-shim on the Max subscription, and since the Feb 2026
+## Consumer Terms, subscription OAuth tokens driving a third-party product are
+## explicitly banned. Open WebUI handed to friends and family is that pattern at
+## its most visible. Use the cn-deepseek-* rows for cloud-quality answers here;
+## keep the subscription tails for first-party tooling.
+##
+## Also excluded, measured 2026-10-01 rather than assumed: `work` and the
+## `claude-*-5-5` login doors (they need the CALLER's own claude.ai login in a
+## proxy header, which a browser app cannot supply — called with a plain virtual
+## key they fall through and answer from deepseek-flash, so the row would be
+## named Claude and serve DeepSeek), and `cn-to-us` (its head is DeepSeek, but a
+## DeepSeek outage would drive the Max subscription from this family-facing app).
+##
+##   akeyless create-secret -n /mdapi/openwebui/openwebui-secret/OPENAI_API_KEY  -v 'sk-...'
+##   akeyless create-secret -n /mdapi/openwebui/openwebui-secret/WEBUI_SECRET_KEY -v "$(openssl rand -hex 32)"
+##
+## WEBUI_SECRET_KEY signs session JWTs. Rotating it logs everyone out; losing it
+## is harmless beyond that (no data is encrypted with it by default).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: openwebui-secret
+  namespace: openwebui
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: openwebui-secret
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/openwebui/openwebui-secret/OPENAI_API_KEY
+      secretKey: OPENAI_API_KEY
+    - remoteRef:
+        key: /mdapi/openwebui/openwebui-secret/WEBUI_SECRET_KEY
+      secretKey: WEBUI_SECRET_KEY

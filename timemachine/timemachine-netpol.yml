@@ -1,0 +1,47 @@
+## Who may reach the Time Machine share, and what it may reach. ENFORCING from birth.
+##
+## WHY. The volume holds a full copy of the Mac's disk. SMB is LAN-only: no
+## router DNAT, no ingress, and this policy admits the LAN and the blackbox
+## probe on 445, nothing else. The pod needs no egress at all: it resolves
+## nothing and calls nothing, and the Samba user database is local.
+##
+## ⚠️ A wrongly-blocked caller shows up as a TCP timeout on the CALLER's side,
+## not as an error here — nothing logs a packet that never arrived.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: timemachine-restricted
+  namespace: timemachine
+spec:
+  podSelector:
+    matchLabels:
+      app: timemachine
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    ## 1. The LAN. externalTrafficPolicy: Local on the Service keeps the
+    ## client's source address, so this matches the Mac itself. The same
+    ## block also admits the kubelet's tcpSocket probes (they come from the
+    ## node IP).
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 445
+    ## 2. The blackbox exporter, for the tcp_connect Probe in
+    ## monitoring-rules/74-timemachine.yml. In-cluster traffic to the LB IP is
+    ## short-circuited by kube-proxy, so it arrives from the blackbox POD.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+      ports:
+        - protocol: TCP
+          port: 445
+  ## No egress rules = no egress.
+  egress: []

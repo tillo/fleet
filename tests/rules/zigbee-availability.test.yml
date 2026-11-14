@@ -1,0 +1,95 @@
+# app-home.zigbee (infra-39ga): zha_device_available is pushed every 15 min by
+# f/probe/zha_mesh_health from HA's zha/devices roster. ZHA itself marks a device
+# unavailable after its check-in window (mains 2 h, battery 6 h), so the flag is already
+# debounced: one device dark warns, the whole mesh dark (coordinator, or every device)
+# pages once instead of once per device.
+rule_files:
+- monitoring-rules/08-home.yml
+evaluation_interval: 5m
+tests:
+- name: one-device-unavailable-warns-for-that-device-only
+  interval: 1m
+  input_series:
+  - series: zha_device_available{device="ZBT-1",type="Coordinator",job="zha_mesh_health"}
+    values: '1x150'
+  - series: zha_device_available{device="Smoke Sensor Rack",type="EndDevice",job="zha_mesh_health"}
+    values: '0x150'
+  - series: zha_device_available{device="Ripetitore Bagno",type="Router",job="zha_mesh_health"}
+    values: '1x150'
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-home.zigbee
+    alertname: ZigbeeDeviceUnavailable
+    exp_alerts: []
+  - eval_time: 45m
+    groupname: app-home.zigbee
+    alertname: ZigbeeDeviceUnavailable
+    exp_alerts:
+    - exp_labels: {device: Smoke Sensor Rack, type: EndDevice, job: zha_mesh_health, service: zha, severity: warning, component: Smart Home, statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "Zigbee device Smoke Sensor Rack (EndDevice) is unavailable"
+        description: "ZHA reports Smoke Sensor Rack as unavailable: it missed its check-in window\n(mains-powered 2 h, battery 6 h), so it has been silent at least that long.\nA battery device usually has a flat battery; a router has lost power, and the\nend devices that used it as parent re-join elsewhere or drop too. Check the\ndevice in HA > ZHA, and the parent table (zigbee-mesh-audit skill).\n"
+  - eval_time: 45m
+    groupname: app-home.zigbee
+    alertname: ZigbeeMeshDown
+    exp_alerts: []
+- name: coordinator-down-pages-once-and-mutes-per-device-warnings
+  interval: 1m
+  input_series:
+  - series: zha_device_available{device="ZBT-1",type="Coordinator",job="zha_mesh_health"}
+    values: '0x150'
+  - series: zha_device_available{device="Smoke Sensor Rack",type="EndDevice",job="zha_mesh_health"}
+    values: '0x150'
+  - series: zha_device_available{device="Ripetitore Bagno",type="Router",job="zha_mesh_health"}
+    values: '0x150'
+  alert_rule_test:
+  - eval_time: 45m
+    groupname: app-home.zigbee
+    alertname: ZigbeeDeviceUnavailable
+    exp_alerts: []
+  - eval_time: 45m
+    groupname: app-home.zigbee
+    alertname: ZigbeeMeshDown
+    exp_alerts:
+    - exp_labels: {service: zha, severity: critical, component: Smart Home, statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "Zigbee mesh down: 0 of 3 devices available"
+        description: "The ZHA coordinator, or every Zigbee device, is unavailable. Every Zigbee\nsensor and switch is dark, including the smoke and water-leak sensors.\nCheck the ZHA integration in HA and the ZBT-1 coordinator stick (USB\npassthrough to the home-assistant pod).\n"
+- name: every-device-down-with-the-coordinator-up-is-also-mesh-down
+  interval: 1m
+  input_series:
+  - series: zha_device_available{device="ZBT-1",type="Coordinator",job="zha_mesh_health"}
+    values: '1x150'
+  - series: zha_device_available{device="Smoke Sensor Rack",type="EndDevice",job="zha_mesh_health"}
+    values: '0x150'
+  - series: zha_device_available{device="Ripetitore Bagno",type="Router",job="zha_mesh_health"}
+    values: '0x150'
+  alert_rule_test:
+  - eval_time: 45m
+    groupname: app-home.zigbee
+    alertname: ZigbeeDeviceUnavailable
+    exp_alerts: []
+  - eval_time: 45m
+    groupname: app-home.zigbee
+    alertname: ZigbeeMeshDown
+    exp_alerts:
+    - exp_labels: {service: zha, severity: critical, component: Smart Home, statuspage: include, team: mdapi}
+      exp_annotations:
+        summary: "Zigbee mesh down: 1 of 3 devices available"
+        description: "The ZHA coordinator, or every Zigbee device, is unavailable. Every Zigbee\nsensor and switch is dark, including the smoke and water-leak sensors.\nCheck the ZHA integration in HA and the ZBT-1 coordinator stick (USB\npassthrough to the home-assistant pod).\n"
+- name: all-available-is-silent
+  interval: 1m
+  input_series:
+  - series: zha_device_available{device="ZBT-1",type="Coordinator",job="zha_mesh_health"}
+    values: '1x150'
+  - series: zha_device_available{device="Smoke Sensor Rack",type="EndDevice",job="zha_mesh_health"}
+    values: '1x150'
+  alert_rule_test:
+  - eval_time: 2h
+    groupname: app-home.zigbee
+    alertname: ZigbeeMeshDown
+    exp_alerts: []
+  - eval_time: 2h
+    groupname: app-home.zigbee
+    alertname: ZigbeeDeviceUnavailable
+    exp_alerts: []

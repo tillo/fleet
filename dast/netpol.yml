@@ -1,0 +1,116 @@
+# Deny-by-default fence for the DAST scanners. A scanner reads content
+# written by whoever controls the target, so it gets only the egress its job
+# needs and no ingress at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: dast
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: edge-dast-egress
+  namespace: dast
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: edge-dast
+  policyTypes: [Egress]
+  egress:
+    ## 1. DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    ## 2. The targets, through the estate ingress. ⭐ Calico evaluates the
+    ## POST-DNAT far end, so the destination is an rke2-ingress-nginx
+    ## controller POD, not the LB VIP 192.168.1.191. An ipBlock on the VIP
+    ## matches nothing (same rule as mail-mcp-netpol.yml). Port 80 too, so
+    ## the scan can see the plain-HTTP redirect.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+      ports:
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 80}
+    ## 2a. nuclei-net: the LoadBalancer Services, every TCP port. ⭐ Post-DNAT,
+    ## a connection to a LoadBalancer IP lands on the backing POD, in any
+    ## namespace, so the rule is "every pod, TCP" -- the scan's whole job is
+    ## to touch every exposed port. The pod still carries no token, and
+    ## each target's own ingress policy still decides what it accepts.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - {protocol: TCP}
+    ## 2b. The API server, for the discover init container (list Ingresses).
+    ## ⭐ Post-DNAT again: kubernetes.default.svc lands on the control-plane
+    ## NODE addresses, so allow those, not the ClusterIP (kube-bench/netpol.yml).
+    - to:
+        - ipBlock: {cidr: 192.168.1.190/32}
+        - ipBlock: {cidr: 192.168.1.192/32}
+        - ipBlock: {cidr: 192.168.1.193/32}
+      ports:
+        - {protocol: TCP, port: 6443}
+    ## 3. Public HTTPS only. Nuclei fetches its templates from GitHub and
+    ## ZAP checks for add-on updates. Private ranges stay excluded, so this
+    ## rule opens no path into the LAN or the cluster.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10]
+      ports:
+        - {protocol: TCP, port: 443}
+---
+## The ACTIVE in-cluster scan (service-cronjob.yml). It gets NO path to any Service
+## until an app is enrolled: DNS and the public template download only. Enrolling
+## adds one rule per target Service here (template below, commented out), in the
+## same MR as its line in service-targets.yml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: service-dast-egress
+  namespace: dast
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: service-dast
+  policyTypes: [Egress]
+  egress:
+    ## 1. DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    ## 2. Enrolled targets - none yet. Template (Calico matches the post-DNAT POD):
+    # - to:
+    #     - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: <ns>}}
+    #       podSelector: {matchLabels: {app.kubernetes.io/name: <app>}}
+    #   ports: [{protocol: TCP, port: <container port>}]
+    ## 3. Public HTTPS only (Nuclei templates, ZAP add-on checks). Private ranges
+    ## excluded: no path into the LAN or the cluster.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10]
+      ports:
+        - {protocol: TCP, port: 443}

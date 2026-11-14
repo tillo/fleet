@@ -1,0 +1,29 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: joplin-env-secret
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: joplin-env-secret
+    creationPolicy: Owner
+
+  data:
+    - remoteRef:
+        key: /mdapi/joplin/postgres-env-secret/POSTGRES_PASSWORD
+      secretKey: POSTGRES_PASSWORD
+    # Joplin's own read-only LDAP account (infra-r1xf.2). It used to read the
+    # mailserver's key, so the two clients shared one credential; each consumer
+    # now has its own item and its own bind DN.
+    - remoteRef:
+        key: /mdapi/ldap/service-accounts/svc-joplin
+      secretKey: LDAP_1_BIND_PW
+    # SMTP-only sender login joplin@smtp.mdapi.ch (infra-o4i3m.1).
+    - remoteRef:
+        key: /mdapi/mail/smtp-senders/joplin
+      secretKey: MAILER_AUTH_PASSWORD

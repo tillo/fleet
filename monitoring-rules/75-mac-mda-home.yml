@@ -1,0 +1,168 @@
+## Mac seat (mbp-mda) home-folder hygiene alerts.
+##
+## Metrics are pushed once a day by ~/.local/bin/home-audit.sh through
+## launchd (ch.tillo.home-audit, 08:20) into Pushgateway under the job
+## `mac_mda_home`, instance `mbp-mda`. They are an INVENTORY, not a
+## liveness probe: the laptop is expected to be asleep or away, so every
+## rule below allows a wide window and the staleness rule is measured in
+## days, not minutes.
+##
+## ⚠️ A launchd agent without Full Disk Access cannot read ~/Downloads,
+## ~/Desktop or ~/Documents, and `tmutil latestbackup` fails outright.
+## When that happens the audit still succeeds and reports ZEROS — a
+## silent false all-clear. `MacMdaAuditBlindDirs` and
+## `MacMdaTimeMachineUnknown` exist to make that state loud instead.
+##
+## The rule of this seat is the inverse of the jump seat: default is
+## KEEP, and the reaper only touches an allow-list (~, ~/Downloads,
+## ~/Desktop, regular files, >30d). See ~/MAC-RULES.md on the Mac.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-mac-mda
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-mac-mda.home
+    rules:
+
+    ## 100 GB is roughly three months of normal use on this machine and
+    ## leaves room for a Parallels VM clone; below it macOS update and
+    ## Time Machine both start failing.
+    - alert: MacMdaDiskFilling
+      expr: |
+        mac_mda_home_disk_free_bytes{job="mac_mda_home"} < 100e9
+      for: 1h
+      labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "mbp-mda low on disk ({{ $value | humanize1024 }})"
+        description: |
+          Free space on the Mac seat is below 100 GB. The home folder is
+          the usual consumer (VMs under ~/Parallels, model caches under
+          ~/.omlx). Measure with `~/.local/bin/home-audit.sh --list`
+          before deleting anything, and remember that a large delete on
+          APFS frees nothing until the hourly local snapshots expire.
+
+    ## Home growth is compared against a week ago. If the Mac was asleep
+    ## at the offset the lookup finds no sample and the rule stays quiet
+    ## by design — it is a trend alarm, not a deadline.
+    - alert: MacMdaHomeGrowing
+      expr: |
+        mac_mda_home_bytes{job="mac_mda_home"}
+          - (mac_mda_home_bytes{job="mac_mda_home"} offset 7d) > 30e9
+      for: 6h
+      labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: "mbp-mda home grew by {{ $value | humanize1024 }} in a week"
+        description: |
+          The home folder gained more than 30 GB in seven days. Usual
+          causes: a new VM bundle, an oMLX/HF model pull, or a build
+          cache. Identify the consumer with `home-audit.sh --list`.
+
+    ## The audit pushes daily; ten days of silence means the agent is not
+    ## running (laptop off for a holiday, or launchd lost the job).
+    - alert: MacMdaAuditStale
+      expr: |
+        time() - mac_mda_home_last_run_timestamp_seconds{job="mac_mda_home"} > 10 * 86400
+      for: 30m
+      labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "mbp-mda home audit has not checked in for 10 days"
+        description: |
+          launchd job ch.tillo.home-audit has not pushed in ten days, so
+          the whole home-folder picture (and every other rule in this
+          group) is stale. Check `launchctl list | grep home-audit` and
+          ~/Library/Logs/home-hygiene/audit.log on the Mac.
+
+    ## The audit is running but reading nothing: Full Disk Access is
+    ## missing, so Downloads/Desktop/Documents look empty and "clean"
+    ## means nothing.
+    - alert: MacMdaAuditBlindDirs
+      expr: |
+        mac_mda_home_unreadable_dirs{job="mac_mda_home"} > 0
+      for: 6h
+      labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "mbp-mda audit cannot read {{ $value }} home director(y|ies)"
+        description: |
+          The scheduled audit reports at least one of ~/Downloads,
+          ~/Desktop, ~/Documents as unreadable. The agent needs Full Disk
+          Access (System Settings → Privacy & Security → Full Disk
+          Access). Until then those folders are counted as zero, and a
+          clean report is not evidence.
+
+    ## ⛔ Time Machine freshness is NOT alerted here on purpose: the Mac
+    ## backup is already covered from the destination side by
+    ## f/probe/timemachine_freshness (every 15 min, reads the Samba
+    ## share's own SnapshotHistory plist) and TimeMachineSnapshotStalled
+    ## in 74-timemachine.yml. A second, daily, Mac-side age alarm would
+    ## only duplicate it at a coarser resolution. The audit still
+    ## publishes mac_mda_home_tm_last_backup_age_seconds for the report,
+    ## and -1 there means `tmutil` could not answer.
+
+    ## Client work in the home folder is a structural defect, not a
+    ## daily event: one day of warning is enough to notice without
+    ## paging on a directory that will take a human to relocate.
+    - alert: MacMdaClientDataInHome
+      expr: |
+        mac_mda_home_out_of_place_bytes{job="mac_mda_home"} > 0
+      for: 24h
+      labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "mbp-mda holds {{ $value | humanize1024 }} of out-of-place client work"
+        description: |
+          The audit found a top-level folder that looks like client work
+          living in the home folder. It must be relocated into the
+          encrypted vault or the M365 tenant — the routine deliberately
+          never moves it, and its content is never read. The audit lists
+          the folder in its report section.
+
+    ## Four days of silence is generous on purpose (a laptop can be off
+    ## over a long weekend) but still catches "pushing stopped while the
+    ## Mac is up".
+    - alert: MacMdaPushStale
+      expr: |
+        time() - max by (job) (push_time_seconds{job="mac_mda_home"}) > 4 * 86400
+      for: 30m
+      labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Automation
+        team: mdapi
+      annotations:
+        summary: "mbp-mda Pushgateway job mac_mda_home is stale"
+        description: |
+          Nothing has been pushed under job=mac_mda_home for four days.
+          Either the Mac has not been online (then MacMdaAuditStale will
+          fire at ten days) or the push is failing while the audit still
+          runs — check ~/Library/Logs/home-hygiene/audit.log for the
+          "push failed" line.

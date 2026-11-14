@@ -1,0 +1,54 @@
+# Secrets the defectdojo chart reads but does not create (createSecret and
+# createValkeySecret are false in defectdojo/fleet.yaml), so they never sit in
+# a Helm release and a re-install cannot re-randomise them.
+#
+# DD_SECRET_KEY signs sessions; DD_CREDENTIAL_AES_256_KEY encrypts the tool
+# credentials DefectDojo stores -- losing it makes those unreadable, which is
+# why it lives in Akeyless rather than in a chart-generated Secret.
+# The database password is NOT here: CNPG generates it (defectdojo-pg-app).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: defectdojo
+  namespace: defectdojo
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: defectdojo
+    creationPolicy: Owner
+  data:
+    - secretKey: DD_ADMIN_PASSWORD
+      remoteRef:
+        key: /mdapi/defectdojo/defectdojo/DD_ADMIN_PASSWORD
+    - secretKey: DD_SECRET_KEY
+      remoteRef:
+        key: /mdapi/defectdojo/defectdojo/DD_SECRET_KEY
+    - secretKey: DD_CREDENTIAL_AES_256_KEY
+      remoteRef:
+        key: /mdapi/defectdojo/defectdojo/DD_CREDENTIAL_AES_256_KEY
+    - secretKey: METRICS_HTTP_AUTH_PASSWORD
+      remoteRef:
+        key: /mdapi/defectdojo/defectdojo/METRICS_HTTP_AUTH_PASSWORD
+---
+# Celery broker password, shared by the valkey subchart (auth.existingSecret)
+# and by every DefectDojo pod (DD_CELERY_BROKER_PASSWORD).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: defectdojo-valkey-specific
+  namespace: defectdojo
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: defectdojo-valkey-specific
+    creationPolicy: Owner
+  data:
+    - secretKey: valkey-password
+      remoteRef:
+        key: /mdapi/defectdojo/defectdojo-valkey/valkey-password

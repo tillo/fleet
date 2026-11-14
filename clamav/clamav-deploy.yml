@@ -1,0 +1,149 @@
+## The shared clamd (infra-8f4.50). ONE replica on purpose: the point of the
+## consolidation is one engine in memory instead of two. While it restarts (Recreate,
+## RWO volume; ~1-2 min to load the database) docker-mailserver's rspamd soft-rejects
+## (CLAM_VIRUS_FAIL -> 4xx), so mail is deferred and retried, never delivered
+## unscanned. ClamdDown (monitoring-rules/83-clamav.yml) pages on it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clamav
+  namespace: clamav
+  labels:
+    app: clamav
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: clamav
+  template:
+    metadata:
+      labels:
+        app: clamav
+    spec:
+      ## Mail is priority 1 and cannot accept mail without this pod.
+      priorityClassName: mdapi-critical
+      automountServiceAccountToken: false
+      ## The image's `clamav` user/group (100:101); the image's /init would chown
+      ## and sed as root, so it is bypassed and the binaries are run directly.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        ## clamd refuses to start without a database. Download only when there is
+        ## none (first start, or a lost volume), so a CDN outage never blocks a
+        ## restart that already has signatures. NotifyClamd is stripped because
+        ## there is no clamd yet to notify.
+        - name: seed-database
+          image: docker.io/clamav/clamav:1.5.4@sha256:45fe5149fbee5a46509c9848ef20d0c354b7b2323c9369f285939a37cf33422a
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              if ls /var/lib/clamav/main.c?d >/dev/null 2>&1; then
+                echo "signature database present, nothing to seed"; exit 0
+              fi
+              sed '/^NotifyClamd/d' /etc/clamav-mdapi/freshclam.conf > /tmp/freshclam-seed.conf
+              exec freshclam --stdout --config-file=/tmp/freshclam-seed.conf
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          securityContext: &containerSecurity
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts: &mounts
+            ## NOT /etc/clamav: that would shadow the image's /etc/clamav/certs,
+            ## which 1.5's database signature verifier needs (freshclam fails
+            ## "Invalid certs directory" without it).
+            - name: config
+              mountPath: /etc/clamav-mdapi
+              readOnly: true
+            - name: db
+              mountPath: /var/lib/clamav
+            - name: run
+              mountPath: /run/clamav
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: clamd
+          image: docker.io/clamav/clamav:1.5.4@sha256:45fe5149fbee5a46509c9848ef20d0c354b7b2323c9369f285939a37cf33422a
+          imagePullPolicy: IfNotPresent
+          command: ["clamd", "--config-file=/etc/clamav-mdapi/clamd.conf"]
+          ports:
+            - name: clamd
+              containerPort: 3310
+              protocol: TCP
+          ## Measured 2026-11-07: the engine alone is ~950-985 MiB RSS (both old
+          ## copies), and a concurrent reload holds a second engine for its
+          ## duration. Request = steady state, limit = the reload peak + headroom.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 1200Mi
+            limits:
+              memory: 2560Mi
+          ## Loading ~8 M signatures takes 20-60 s; the startupProbe allows 5 min.
+          ## PING over the in-pod socket is answered during a concurrent reload.
+          startupProbe:
+            exec:
+              command: ["clamdscan", "--config-file=/etc/clamav-mdapi/clamd.conf", "--ping", "1"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["clamdscan", "--config-file=/etc/clamav-mdapi/clamd.conf", "--ping", "1"]
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["clamdscan", "--config-file=/etc/clamav-mdapi/clamd.conf", "--ping", "1"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 4
+          securityContext: *containerSecurity
+          volumeMounts: *mounts
+        - name: freshclam
+          image: docker.io/clamav/clamav:1.5.4@sha256:45fe5149fbee5a46509c9848ef20d0c354b7b2323c9369f285939a37cf33422a
+          imagePullPolicy: IfNotPresent
+          command: ["freshclam", "--daemon", "--stdout", "--config-file=/etc/clamav-mdapi/freshclam.conf"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          securityContext: *containerSecurity
+          volumeMounts: *mounts
+      volumes:
+        - name: config
+          configMap:
+            name: clamav-config
+        - name: db
+          persistentVolumeClaim:
+            claimName: clamav-db
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        ## INSTREAM data is spooled here before scanning: up to 2000M per stream
+        ## (StreamMaxLength) for a Nextcloud upload. Room for a few at once.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi

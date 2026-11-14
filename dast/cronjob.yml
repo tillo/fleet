@@ -1,0 +1,275 @@
+# The edge DAST run (infra-7rog.31.4): every Ingress host in the cluster,
+# discovered at run time by the init container (discover.yml, infra-7rog.31.6),
+# plus the few non-Ingress fronts in targets.yml; each host every SHARDS days,
+# from inside the cluster through the same DNS, ingress, WAF and SSO that a
+# visitor meets (in-cluster DNS resolves the estate's hosts to the ingress).
+#
+#   zap    -- ZAP's BASELINE: spider plus passive rules (headers, cookies,
+#             information leaks). It sends no attack payloads.
+#   nuclei -- TLS templates only (`-t ssl/`): protocol versions, ciphers and
+#             certificate state. These are handshakes, not HTTP requests, so
+#             the WAF never sees them.
+#   nuclei-net -- the non-HTTP exposures (infra-7rog.31.7): every TCP port of
+#             every LoadBalancer Service, straight to its address (no WAF on
+#             that path): network/, ssl/ and javascript/ templates, i.e.
+#             service detection, known CVEs and misconfigurations (anonymous
+#             MQTT, open rsync modules, weak SSH algorithms). ⛔ Never the
+#             brute/default-login/intrusive/dos/fuzz tags: no login attempts,
+#             no fail2ban bans, no lockouts.
+#
+# ⛔ NOT the active scanners. Nuclei's HTTP templates (/.git/config, /.env,
+# traversal paths) are exactly what the CRS blocks. Every block from a 10/8
+# source raises ModSecBlockLikelyFalsePositive (the relay trusts internal
+# addresses), and a flood of those once OOM-killed OpenObserve through its
+# RCA agent (memory o2_oom_modsec_fp_flood_drives_rca_queries_2026_10_29).
+# Active scanning targets the Services directly, behind the WAF
+# (infra-7rog.31.5).
+#
+# Each container prints its report between BEGIN/END markers per host
+# (gzip+base64). Windmill f/security/defectdojo_grype_sync reads them back
+# from the pod log, as it does for kube-bench, and re-imports them into
+# DefectDojo (product mdapi-prod, engagement edge-dast). The pod keeps no
+# other copy. A host whose report is missing makes its container exit 1:
+# a scan that did not happen must not read as a clean one.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: edge-dast
+  namespace: dast
+spec:
+  # Daily 04:41 UTC, ahead of the 07:30 Europe/Zurich DefectDojo sync. Odd
+  # minute on purpose: no other scheduled job here uses it.
+  schedule: "41 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # 90 min: today's share (~1/4 of ~110 hosts, <= ~2.5 min each) must end
+      # before the 06:30Z DefectDojo sync reads the newest finished pod.
+      activeDeadlineSeconds: 5400
+      # 2 days: the pod, and the report in its log, must outlive the next
+      # sync. The sync reads the newest finished pod.
+      ttlSecondsAfterFinished: 172800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: edge-dast
+        spec:
+          restartPolicy: Never
+          serviceAccountName: edge-dast
+          # No automatic token: only the discover init container mounts one
+          # (the projected `api-token` volume). The scanners parse content a
+          # stranger controls and hold no credential at all.
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          priorityClassName: mdapi-low
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 1000
+            seccompProfile: {type: RuntimeDefault}
+          volumes:
+            - name: targets            # written by discover, read by the scanners
+              emptyDir: {sizeLimit: 1Mi}
+            - name: static-targets
+              configMap: {name: dast-targets}
+            - name: discover
+              configMap: {name: dast-discover}
+            - name: api-token
+              projected:
+                sources:
+                  - serviceAccountToken: {path: token, expirationSeconds: 3600}
+                  - configMap:
+                      name: kube-root-ca.crt
+                      items: [{key: ca.crt, path: ca.crt}]
+            - name: zap-wrk
+              emptyDir: {sizeLimit: 256Mi}
+            - name: nuclei-home
+              emptyDir: {sizeLimit: 512Mi}
+            - name: nuclei-net-home      # its own: two nuclei -ut into one dir race
+              emptyDir: {sizeLimit: 512Mi}
+          initContainers:
+            - name: discover
+              image: docker.io/library/python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                runAsUser: 65534
+                runAsGroup: 65534
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {cpu: 200m, memory: 128Mi}
+              volumeMounts:
+                - {name: discover, mountPath: /discover, readOnly: true}
+                - {name: static-targets, mountPath: /static, readOnly: true}
+                - {name: api-token, mountPath: /var/run/secrets/dast, readOnly: true}
+                - {name: targets, mountPath: /targets}
+              command: ["python3", "-I", "/discover/discover.py"]
+          containers:
+            - name: zap
+              image: docker.io/zaproxy/zap-stable:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                runAsUser: 1000          # the image's `zap` user, numeric so PSA can verify it
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 250m, memory: 768Mi}
+                limits: {cpu: "1", memory: 2Gi}
+              volumeMounts:
+                - {name: targets, mountPath: /targets, readOnly: true}
+                - {name: zap-wrk, mountPath: /zap/wrk}   # zap-baseline.py writes here only
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  RC=0
+                  N=0
+                  while read -r host; do
+                    case "$host" in ''|'#'*) continue ;; esac
+                    r=0
+                    # -m 2: two spider minutes. The UA names the scanner in the
+                    # ingress access log (waf-audit), never in alerts.
+                    zap-baseline.py -t "https://$host" -m 2 \
+                      -z "-config connection.defaultUserAgent=mdapi-dast/zap" \
+                      -x "zap-$host.xml" < /dev/null || r=$?
+                    f="/zap/wrk/zap-$host.xml"
+                    # 0 clean, 1 FAIL, 2 WARN: all three are a finished scan.
+                    if [ "$r" -ge 3 ] || [ ! -s "$f" ]; then
+                      echo "zap: no report for $host (zap-baseline.py exit $r)"
+                      RC=1
+                      continue
+                    fi
+                    echo "-----BEGIN DAST REPORT zap $host-----"
+                    gzip -c "$f" | base64
+                    N=$((N + 1))
+                    echo "-----END DAST REPORT zap $host-----"
+                  done < /targets/hosts
+                  # Every target must have a report: a scanner that read the
+                  # loop's stdin once scanned 1 of 22 hosts and exited 0.
+                  WANT=$(grep -cvE '^[[:space:]]*(#|$)' /targets/hosts)
+                  if [ "$N" -ne "$WANT" ]; then
+                    echo "zap: $N reports for $WANT targets"
+                    RC=1
+                  fi
+                  exit $RC
+            - name: nuclei
+              image: docker.io/projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                runAsUser: 65534         # the image runs as root by default
+                runAsGroup: 65534
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              env:
+                # Templates and config live under $HOME; the image's / is
+                # root-owned.
+                - {name: HOME, value: /home/nuclei}
+              resources:
+                # The template download alone peaks at 324-437 MiB (measured
+                # 2026-11-03, v3.11.1).
+                requests: {cpu: 50m, memory: 256Mi}
+                limits: {cpu: 500m, memory: 768Mi}
+              volumeMounts:
+                - {name: targets, mountPath: /targets, readOnly: true}
+                - {name: nuclei-home, mountPath: /home/nuclei}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  # Fetch the template set each run (the emptyDir starts empty).
+                  # Then scan with update checks off, so a run scans with
+                  # exactly what it fetched.
+                  nuclei -ut -silent || { echo "nuclei: template download failed"; exit 1; }
+                  RC=0
+                  N=0
+                  while read -r host; do
+                    case "$host" in ''|'#'*) continue ;; esac
+                    f="$HOME/nuclei-$host.jsonl"
+                    # -ni: no interactsh (no third-party callback server).
+                    # -t ssl/ loads only the 16 TLS templates. `-pt ssl` parses
+                    # the WHOLE tree before filtering (809 MiB peak, OOMKilled).
+                    # -es info: drop the inventory templates (TLS version,
+                    # issuer, SAN listings), which are not findings.
+                    if ! nuclei -target "$host" -t ssl/ -es info -ni -duc -silent -nc \
+                         -H "User-Agent: mdapi-dast/nuclei" -jsonl -o "$f" < /dev/null; then
+                      echo "nuclei: scan of $host failed"
+                      RC=1
+                      continue
+                    fi
+                    # No findings writes no file. DefectDojo rejects an empty
+                    # upload, and "[]" is the Nuclei parser's clean scan.
+                    [ -s "$f" ] || echo "[]" > "$f"
+                    echo "-----BEGIN DAST REPORT nuclei $host-----"
+                    gzip -c "$f" | base64
+                    N=$((N + 1))
+                    echo "-----END DAST REPORT nuclei $host-----"
+                  done < /targets/hosts
+                  # Every target must have a report: a scanner that read the
+                  # loop's stdin once scanned 1 of 22 hosts and exited 0.
+                  WANT=$(grep -cvE '^[[:space:]]*(#|$)' /targets/hosts)
+                  if [ "$N" -ne "$WANT" ]; then
+                    echo "nuclei: $N reports for $WANT targets"
+                    RC=1
+                  fi
+                  exit $RC
+            - name: nuclei-net
+              image: docker.io/projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                runAsUser: 65534
+                runAsGroup: 65534
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              env:
+                - {name: HOME, value: /home/nuclei}
+              resources:
+                # 428 templates over 43 ports took 8 min, 48 req/s (measured
+                # 2026-11-10 on a scratch namespace). Loading the three trees
+                # costs more than ssl/ alone, hence the higher limit.
+                requests: {cpu: 100m, memory: 384Mi}
+                limits: {cpu: "1", memory: 1536Mi}
+              volumeMounts:
+                - {name: targets, mountPath: /targets, readOnly: true}
+                - {name: nuclei-net-home, mountPath: /home/nuclei}
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -u
+                  nuclei -ut -silent || { echo "nuclei-net: template download failed"; exit 1; }
+                  RC=0
+                  N=0
+                  # One line per LoadBalancer Service: <name>.<ns>.svc <ip> <port,...>
+                  while read -r id ip ports; do
+                    [ -n "$id" ] || continue
+                    f="$HOME/nuclei-net-$id.jsonl"
+                    targets=""
+                    for port in $(echo "$ports" | tr ',' ' '); do targets="$targets -u $ip:$port"; done
+                    # -ni: no interactsh callback. -es info: inventory (detect,
+                    # tls-version, banners) is not a finding.
+                    # shellcheck disable=SC2086 # $targets is a word list on purpose
+                    if ! nuclei $targets -t network/ -t ssl/ -t javascript/ \
+                         -etags brute,bruteforce,default-login,intrusive,dos,fuzz \
+                         -es info -ni -duc -silent -nc -jsonl -o "$f" < /dev/null; then
+                      echo "nuclei-net: scan of $id failed"
+                      RC=1
+                      continue
+                    fi
+                    [ -s "$f" ] || echo "[]" > "$f"
+                    echo "-----BEGIN DAST REPORT nuclei-net $id-----"
+                    gzip -c "$f" | base64
+                    N=$((N + 1))
+                    echo "-----END DAST REPORT nuclei-net $id-----"
+                  done < /targets/endpoints
+                  # Every target must have a report: a scanner that read the
+                  # loop's stdin once scanned 1 of 22 hosts and exited 0.
+                  WANT=$(grep -cvE '^[[:space:]]*(#|$)' /targets/endpoints)
+                  if [ "$N" -ne "$WANT" ]; then
+                    echo "nuclei-net: $N reports for $WANT targets"
+                    RC=1
+                  fi
+                  exit $RC

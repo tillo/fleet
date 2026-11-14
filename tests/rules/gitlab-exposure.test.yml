@@ -1,0 +1,90 @@
+# app-batch-jobs.gitlab-exposure (infra-az8.32): f/probe/gitlab_exposure_health measures
+# gitlab.mdapi.ch as an anonymous client. Any re-opened door (a restore puts the DB
+# settings back) pages after 15m; a probe that cannot measure warns after 2h, because its
+# PUT then leaves the exposure gauges ABSENT and the page above would silently resolve.
+rule_files:
+- monitoring-rules/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: locked-down-instance-is-silent-a-reopened-signup-pages
+  interval: 5m
+  input_series:
+  - series: gitlab_exposure_signup_open{job="gitlab_exposure_health"}
+    values: '0x6 1x12'
+  - series: gitlab_exposure_anonymous_explore_open{job="gitlab_exposure_health"}
+    values: '0x18'
+  - series: gitlab_exposure_anonymous_user_lookup_open{job="gitlab_exposure_health"}
+    values: '0x18'
+  - series: gitlab_exposure_public_projects{job="gitlab_exposure_health"}
+    values: '0x18'
+  - series: gitlab_exposure_health_probe_success{job="gitlab_exposure_health"}
+    values: '1x18'
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.gitlab-exposure
+    alertname: GitLabAnonymousExposureReopened
+    exp_alerts: []
+  - eval_time: 55m
+    groupname: app-batch-jobs.gitlab-exposure
+    alertname: GitLabAnonymousExposureReopened
+    exp_alerts:
+    - exp_labels:
+        job: gitlab_exposure_health
+        service: gitlab
+        namespace: bootstrap
+        severity: critical
+        component: Security
+        team: mdapi
+      exp_annotations:
+        summary: "gitlab.mdapi.ch anonymous lock-down lost (signup, explore, user lookup or public projects)"
+        description: "An anonymous client can again register, browse /explore, look up users\nor list public projects on the internet-facing GitLab. Usual cause: a\nrestore or re-seeded ApplicationSetting.\n\nRestore the settings (toolbox pod, gitlab-rails runner):\n  ApplicationSetting.current.update!(signup_enabled: false,\n    restricted_visibility_levels: [20])\nThen re-run f/probe/gitlab_exposure_health. Bead infra-az8.32.\n"
+  - eval_time: 55m
+    groupname: app-batch-jobs.gitlab-exposure
+    alertname: GitLabExposureProbeFailed
+    exp_alerts: []
+
+- name: public-projects-reappearing-pages
+  interval: 5m
+  input_series:
+  - series: gitlab_exposure_public_projects{job="gitlab_exposure_health"}
+    values: '2x12'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-batch-jobs.gitlab-exposure
+    alertname: GitLabAnonymousExposureReopened
+    exp_alerts:
+    - exp_labels:
+        job: gitlab_exposure_health
+        service: gitlab
+        namespace: bootstrap
+        severity: critical
+        component: Security
+        team: mdapi
+      exp_annotations:
+        summary: "gitlab.mdapi.ch anonymous lock-down lost (signup, explore, user lookup or public projects)"
+        description: "An anonymous client can again register, browse /explore, look up users\nor list public projects on the internet-facing GitLab. Usual cause: a\nrestore or re-seeded ApplicationSetting.\n\nRestore the settings (toolbox pod, gitlab-rails runner):\n  ApplicationSetting.current.update!(signup_enabled: false,\n    restricted_visibility_levels: [20])\nThen re-run f/probe/gitlab_exposure_health. Bead infra-az8.32.\n"
+
+- name: a-probe-that-cannot-measure-warns-after-two-hours
+  interval: 5m
+  input_series:
+  - series: gitlab_exposure_health_probe_success{job="gitlab_exposure_health"}
+    values: '0x36'
+  alert_rule_test:
+  - eval_time: 1h
+    groupname: app-batch-jobs.gitlab-exposure
+    alertname: GitLabExposureProbeFailed
+    exp_alerts: []
+  - eval_time: 2h30m
+    groupname: app-batch-jobs.gitlab-exposure
+    alertname: GitLabExposureProbeFailed
+    exp_alerts:
+    - exp_labels:
+        job: gitlab_exposure_health
+        service: gitlab
+        namespace: bootstrap
+        severity: warning
+        component: Security
+        team: mdapi
+      exp_annotations:
+        summary: "gitlab_exposure_health cannot determine GitLab's anonymous exposure"
+        description: "Exposure is UNKNOWN, not closed. GitLab was unreachable or answered in a\nshape the probe does not recognise (anything other than 200, 401, 403 or\na redirect to /users/sign_in). The FAIL line in the job log names it.\n"

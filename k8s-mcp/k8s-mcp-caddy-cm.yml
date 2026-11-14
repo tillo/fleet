@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-mcp-caddy
+data:
+  # Auth is the `Authorization: Bearer <AUTH_TOKEN>` request header, never the
+  # URL. Until 2026-10-28 the gate was `?token=` in the query string, and the
+  # ingress access log records the full request URI into the log pipeline, so
+  # every call left the credential at rest there.
+  #
+  # Neither auth header may reach the server: kubernetes-mcp-server treats an
+  # incoming `Authorization: Bearer …` (or `kubernetes-authorization`) as a
+  # Kubernetes token and uses it INSTEAD of its own ServiceAccount, so passing
+  # them through would let a caller pick the identity the server acts as.
+  Caddyfile: |
+    :8080 {
+      @authed header Authorization "Bearer {$AUTH_TOKEN}"
+      handle @authed {
+        reverse_proxy localhost:9090 {
+          header_up -Authorization
+          header_up -Kubernetes-Authorization
+          header_up Host "localhost"
+          header_up Origin "http://localhost"
+          header_up -Sec-Fetch-Site
+          header_up -Sec-Fetch-Mode
+          header_up -Sec-Fetch-Dest
+        }
+      }
+      respond "Unauthorized" 401
+    }

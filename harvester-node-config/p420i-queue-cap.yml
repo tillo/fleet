@@ -1,0 +1,62 @@
+# P420i Ceph logical drives: cap in-flight requests at 32, every boot AND every hot-add
+# (infra-r9mzd.25 / .9, user decision 2026-11-05 after a 2 h A/B on qui).
+#
+# Every P420i logical drive ran with nr_requests 1013 = the controller's whole command budget
+# (hpsa can_queue), so ONE stalled TRIM-less consumer SSD (a Ceph OSD) could hold every slot.
+# The RAID 5 OS disk sda then starved; the virt-launcher emptyDir on it blocked QEMU, libvirt
+# dropped its keepalive after 36 s, and KubeVirt power-cycled the running rancher-mgmt VMs
+# (mgmt-3 12x in 16 h; mgmt-1 + mgmt-3 together = the 11-04 22:34Z Rancher outage).
+# Measured on qui, 2 h each, with an OSD backfill running:
+#   sda write await > 1 s: 18/241 samples -> 0/241; sda p99 write 3368 ms -> 450 ms;
+#   worst OSD commit stall 29.5 s -> 6.2 s; mgmt-3 power-cycles: ~every 80 min -> none.
+#
+# ⛔ hpsa silently IGNORES writes to /sys/block/sdX/device/queue_depth (it stays 1013, rc 0).
+#    The working knob is the block layer: with scheduler `none`, queue/nr_requests is the
+#    driver tag depth, i.e. the in-flight cap. So the rule sets scheduler first, then the cap.
+#
+# The match is a POSITIVE hardware property, never a wwn list: hpsa reports raid_level
+# "RAID 0" for every Ceph LD and "RAID 5" for every OS LD (measured qua/qui/quo). A rebuilt
+# OSD's new LD (infra-r9mzd.20) is covered on hot-add with no edit — the hot-added osd.4 LD came
+# up with mq-deadline / nr_requests 256 because 94_io_scheduler.yaml only runs at boot.
+# vendor/model/raid_level sit on the same parent (the scsi_device), which udev requires for
+# ATTRS keys in one rule; udev ignores the attributes' trailing padding. quarto's P408i-a
+# (smartpqi) reports vendor "HPE" and raid_level "RAID-5", so it can never match, which is
+# why the selector can be every managed node like the other CRs here.
+# Test: tests/test_p420i_queue_cap_selects_only_ceph_lds.py (records the measured inventory).
+#
+# Effect: /etc is an overlay on /run, so the boot stage writes the rule on EVERY boot and then
+# re-plays a change event on the matching LDs. Until each node's next planned boot the cap is
+# only the runtime value set by hand on 2026-11-05 (reset by a reboot) — the parity probe shows
+# this file as boot_pending until then. Rollback: delete this CR's file from git; a reboot
+# drops the rule, and `echo 1013 > /sys/block/<dev>/queue/nr_requests` undoes it live.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-p420i-queue-cap
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 95d_p420i_queue_cap.yaml
+  contents: |
+    # Managed by CloudInit mdapi-p420i-queue-cap (fleet harvester-node-config/p420i-queue-cap.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "io: cap in-flight requests at 32 on P420i RAID 0 (Ceph) logical drives so one stalled consumer SSD cannot take the controller's whole budget and starve the RAID 5 OS disk (infra-r9mzd.25). A udev rule, so hot-added LDs from OSD rebuilds are covered too."
+    stages:
+      boot:
+        - name: "P420i RAID 0 logical drives: scheduler none + nr_requests 32"
+          files:
+            - path: /etc/udev/rules.d/60-mdapi-p420i-queue-cap.rules
+              permissions: 420
+              owner: 0
+              group: 0
+              content: |
+                # fleet harvester-node-config/p420i-queue-cap.yml: P420i (hpsa) RAID 0 LDs = Ceph OSDs only, never the RAID 5 OS disk.
+                ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd*", ATTRS{vendor}=="HP", ATTRS{model}=="LOGICAL VOLUME", ATTRS{raid_level}=="RAID 0", ATTR{queue/scheduler}="none", ATTR{queue/nr_requests}="32"
+          commands:
+            - udevadm control --reload || true
+            - |
+              for d in /sys/block/sd*; do
+                [ "$(cat "$d/device/raid_level" 2>/dev/null)" = "RAID 0" ] || continue
+                udevadm trigger --action=change "$d" || true
+              done
+              udevadm settle --timeout=30 || true

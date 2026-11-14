@@ -1,0 +1,81 @@
+# Open WebUI SyntheticProbeFailing: silent for 10 min after an openwebui pod creation
+# (infra-acu29). The Deployment is 1 replica, Recreate (RWO volume + SQLite), so every
+# Renovate image bump is a 6-9 min 503 while the new image pulls and boots on a busy
+# node disk (11-08 15:20, 11-09 03:22 both paged). Same shape as the Mail mute
+# (mail-probe-planned-rollout). The mute is scoped to probe="openwebui": another probe
+# failing at the same moment still pages.
+# Clock origin is 2000-01-01: kube_pod_created 946685400 = a pod created at t=10m.
+rule_files:
+- monitoring-rules/11-blackbox-alerts.yml
+evaluation_interval: 30s
+tests:
+- name: rollout-muted-other-probe-still-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Chat",team="mdapi",instance="https://chat.mdapi.ch",probe="openwebui"}
+    values: 1x19 0x15 1x40
+  - series: probe_success{component="Platform",team="mdapi",instance="https://start.mdapi.ch",probe="portal"}
+    values: 1x19 0x15 1x40
+  - series: kube_pod_created{namespace="openwebui",pod="openwebui-abc"}
+    values: 946685400x80
+  alert_rule_test:
+  - eval_time: 19m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels:
+        component: Platform
+        team: mdapi
+        instance: https://start.mdapi.ch
+        probe: portal
+        service: https://start.mdapi.ch
+        severity: critical
+        statuspage: include
+      exp_annotations:
+        summary: 'Platform: probe portal failing'
+        description: "Blackbox probe `https://start.mdapi.ch` (module: )\nhas had <80% success\
+          \ over the last 5m for >8m.\nComponent Platform on statuspage will go to major_outage.\n\
+          Investigate from a workstation:\n  curl -v https://start.mdapi.ch    (for HTTP\
+          \ probes)\n  dig @https://start.mdapi.ch mdapi.ch  (for DNS)\n"
+- name: unplanned-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Chat",team="mdapi",instance="https://chat.mdapi.ch",probe="openwebui"}
+    values: 1x19 0x15 1x40
+  alert_rule_test:
+  - eval_time: 19m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels: &chat
+        component: Chat
+        team: mdapi
+        instance: https://chat.mdapi.ch
+        probe: openwebui
+        service: https://chat.mdapi.ch
+        severity: critical
+        statuspage: include
+      exp_annotations: &chat_ann
+        summary: 'Chat: probe openwebui failing'
+        description: "Blackbox probe `https://chat.mdapi.ch` (module: )\nhas had <80% success\
+          \ over the last 5m for >8m.\nComponent Chat on statuspage will go to major_outage.\n\
+          Investigate from a workstation:\n  curl -v https://chat.mdapi.ch    (for HTTP\
+          \ probes)\n  dig @https://chat.mdapi.ch mdapi.ch  (for DNS)\n"
+- name: long-failure-after-restart-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Chat",team="mdapi",instance="https://chat.mdapi.ch",probe="openwebui"}
+    values: 1x19 0x60
+  - series: kube_pod_created{namespace="openwebui",pod="openwebui-abc"}
+    values: 946685400x80
+  alert_rule_test:
+  - eval_time: 20m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels: *chat
+      exp_annotations: *chat_ann
