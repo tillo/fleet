@@ -1,0 +1,25 @@
+defaultNamespace: bussola
+namespace: bussola
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  # TLS per bussola.mdapi.ch; stessa guardia di ogni bundle che possiede un ingress.
+  - name: mdapi-prod-cert-manager
+  # Le credenziali del database e gli elenchi delle persone arrivano da Akeyless.
+  - name: mdapi-prod-external-secrets
+## DELIBERATAMENTE senza dependsOn su mdapi-prod-zot-pull-secrets, benché il
+## Secret di pull venga da lì: quel bundle non può creare il proprio
+## ExternalSecret finché il namespace `bussola` non esiste, e il namespace lo
+## crea questo bundle. Metterlo in dependsOn sarebbe uno stallo. Al primo
+## deploy il pod resta in ImagePullBackOff per un giro di riconciliazione e poi
+## riparte da solo — non è un guasto e non va "sistemato" invertendo l'ordine.
+helm:
+  maxHistory: 25

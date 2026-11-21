@@ -1,0 +1,30 @@
+## Let's Encrypt certificate for santillo's DSM (LAN use only).
+##
+## santillo used to be published through this namespace: an Ingress for
+## santillo.tillo.ch -> Service -> Endpoints 192.168.1.5:5000. That put its EOL
+## DSM 6.2 on the internet, with no allow-list (infra-az8.47). The route and the
+## public A record are gone. LAN clients still resolve santillo.tillo.ch -> .5
+## through split-horizon unbound (static local-data).
+##
+## The certificate stays because Windmill f/infra_certs/santillo_cert_sync pushes
+## secret transit/santillo-cert onto the NAS every day. Issuance is DNS-01
+## (letsencrypt-prod -> RFC2136 on BIND), so it needs neither the Ingress nor a
+## public A record. Until now ingress-shim owned the Certificate, under the same
+## name as the secret. Deleting the Ingress garbage-collects that object, which is
+## why this one has its own name and adopts the existing secret.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: santillo-dsm
+  namespace: transit
+spec:
+  secretName: santillo-cert
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+  dnsNames:
+    - santillo.tillo.ch
+  usages:
+    - digital signature
+    - key encipherment

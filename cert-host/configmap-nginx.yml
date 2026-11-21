@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-host-nginx
+  namespace: windmill
+  labels:
+    app: cert-host
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+      root /staging;
+      autoindex off;            # never list the staging dir
+      server_tokens off;
+
+      # Source-IP allowlist of pull-only devices. Requires the Service to
+      # run externalTrafficPolicy: Local so the real client IP reaches us
+      # (MetalLB preserves it; with Cluster policy it would be SNAT'd).
+      # Add further device IPs here as they are onboarded.
+      location / {
+        allow 192.168.1.217;    # apin0325 (AOS-6 IAP, download-cert pull)
+        deny all;
+        try_files $uri =404;
+      }
+
+      # unauthenticated health endpoint for the readiness probe only
+      location = /healthz {
+        allow all;
+        access_log off;
+        return 200 "ok\n";
+      }
+    }

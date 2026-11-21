@@ -1,0 +1,27 @@
+# Declarative slice of realm tilloch, applied by keycloak-config-cli
+# (keycloak-config-cli-cronjob.yml). The rest of the realm stays imperative.
+#
+# oauth2-proxy-portal: start.mdapi.ch's sign-out ends at Keycloak end-session with
+# post_logout_redirect_uri=https://start.mdapi.ch/; without it in
+# post.logout.redirect.uris the last hop answers 400 "Invalid redirect uri" after
+# the oauth2-proxy cookies are already gone (infra-u3cv). "+" keeps the client's
+# valid redirect URIs allowed as well.
+#
+# ⛔ Every client listed here MUST also list its authenticationFlowBindingOverrides
+# (flow by ALIAS). kcc REMOVES an override the file does not declare: listing the
+# portal with only `attributes` dropped its kc-gate flow "browser gated" and opened
+# it to every realm user, with no error (measured 2026-11-11).
+# tests/test_keycloak_config_cli_imports_keep_client_gates.py enforces it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-config-cli-realm
+data:
+  tilloch.yaml: |
+    realm: tilloch
+    clients:
+      - clientId: oauth2-proxy-portal
+        attributes:
+          post.logout.redirect.uris: "+##https://start.mdapi.ch/"
+        authenticationFlowBindingOverrides:
+          browser: browser gated

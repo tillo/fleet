@@ -1,0 +1,114 @@
+# FalcoSyscallDrops pages only on SUSTAINED blindness: drops in every 5-min window for
+# 30 min on one Falco pod (infra-r9mzd.15). A 1-5 min burst (Plex maintenance, pod
+# start) must stay silent; FalcoSyscallDropShareHigh is the daily budget for those.
+# Clock origin is 2000-01-01; series are per-pod counters sampled every minute.
+rule_files:
+- monitoring-rules/55-falco.yml
+evaluation_interval: 1m
+tests:
+- name: burst-is-silent
+  interval: 1m
+  input_series:
+  # 5 minutes of drops (t=11m..15m), then flat for 45 min.
+  - series: falcosecurity_scap_n_drops_total{namespace="falco",pod="falco-a"}
+    values: 0x10 1000+1000x4 5000x45
+  alert_rule_test:
+  - eval_time: 14m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDrops
+    exp_alerts: []
+  - eval_time: 45m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDrops
+    exp_alerts: []
+- name: bursts-on-two-pods-do-not-add-up
+  interval: 1m
+  input_series:
+  # Each pod drops for 20 min, back to back: the cluster is never quiet for 30 min,
+  # but no single node is blind for 30 min.
+  - series: falcosecurity_scap_n_drops_total{namespace="falco",pod="falco-a"}
+    values: 1000+1000x20 21000x40
+  - series: falcosecurity_scap_n_drops_total{namespace="falco",pod="falco-b"}
+    values: 0x20 1000+1000x20 21000x20
+  alert_rule_test:
+  - eval_time: 45m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDrops
+    exp_alerts: []
+- name: sustained-pages
+  interval: 1m
+  input_series:
+  # Drops every minute from t=11m on.
+  - series: falcosecurity_scap_n_drops_total{namespace="falco",pod="falco-a"}
+    values: 0x10 1000+1000x50
+  alert_rule_test:
+  - eval_time: 38m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDrops
+    exp_alerts: []
+  - eval_time: 45m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDrops
+    exp_alerts:
+    - exp_labels:
+        pod: falco-a
+        service: falco
+        namespace: falco
+        severity: warning
+        team: mdapi
+        component: Security
+      exp_annotations:
+        summary: Falco pod falco-a has dropped syscalls for 30 min — that node is blind
+        description: |
+          A dropped syscall is a blind window, not a performance statistic:
+          whatever happened in it was never evaluated against any rule. This
+          pod has dropped events in every 5-minute window for 30 minutes.
+          Node: kubectl -n falco get pod falco-a -o wide
+          Rate: sum by (pod) (rate(falcosecurity_scap_n_drops_total[5m]))
+          Cause is usually an event-rate surge on that node (CI burst, Plex
+          maintenance) or CPU starvation of Falco itself. The buffer lever
+          (fleet/falco/values.yml bufSizePreset/cpusForEachBuffer) is spent.
+- name: share-over-budget-warns
+  interval: 1m
+  input_series:
+  # 5% of syscalls dropped, for 3 hours.
+  - series: falcosecurity_scap_n_evts_total{namespace="falco",pod="falco-a"}
+    values: 0+100000x180
+  - series: falcosecurity_scap_n_drops_total{namespace="falco",pod="falco-a"}
+    values: 0+5000x180
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDropShareHigh
+    exp_alerts: []
+  - eval_time: 90m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDropShareHigh
+    exp_alerts:
+    - exp_labels:
+        service: falco
+        namespace: falco
+        severity: warning
+        team: mdapi
+        component: Security
+      exp_annotations:
+        summary: Falco dropped 5% of syscalls over 24 h (budget 2%)
+        description: |
+          Short drop bursts, each too brief to page, have added up to more
+          than 2% of all syscalls in the last 24 h (steady state is
+          0.3-0.6 %/day). Find the node and the hour:
+            sum by (pod) (increase(falcosecurity_scap_n_drops_total[1h]))
+          then the workload driving the event rate on that node at that time.
+- name: share-within-budget-is-silent
+  interval: 1m
+  input_series:
+  # 0.5% dropped: the measured steady state (0.3-0.6 %/day).
+  - series: falcosecurity_scap_n_evts_total{namespace="falco",pod="falco-a"}
+    values: 0+100000x180
+  - series: falcosecurity_scap_n_drops_total{namespace="falco",pod="falco-a"}
+    values: 0+500x180
+  alert_rule_test:
+  - eval_time: 170m
+    groupname: app-security.falco
+    alertname: FalcoSyscallDropShareHigh
+    exp_alerts: []

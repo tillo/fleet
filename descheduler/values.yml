@@ -1,0 +1,106 @@
+# Descheduler — closes the gap that the default kube-scheduler leaves: it
+# schedules on REQUESTS only and never rebalances after the fact. This runs as
+# a CronJob and rebalances on ACTUAL usage (metrics-server) plus enforces
+# topology-spread. Added 2026-06-18 after the "qui under load" investigation.
+#
+# Balances MEMORY and POD COUNT around the cluster MEAN (useDeviationThresholds),
+# not on fixed bands. A node is a source when either one is > mean + 10 points,
+# and a destination when both are < mean - 10. Why:
+#   - Pods that drain off a rebooting node never move back. Every later drain then
+#     starts lopsided and fails its memory-floor pre-flight while the cluster has
+#     the room (2026-10-27).
+#   - The fixed 30/65 bands of the #144 window could not fix that. The 16:17Z run
+#     that day (68% mean memory) found three nodes above 65 and none below 30.
+#     qui, freshly back from its reboot, sat at 52 and counted as "appropriately
+#     utilized", so the run evicted 0 pods.
+#   - Memory, because it is the N-1 wall; CPU is compressible. Listing cpu would
+#     block every destination, because the emptiest node by memory is not the
+#     emptiest by CPU (a destination must be below the mean on EVERY listed
+#     resource).
+#   - Pods, because the pod count is a hard limit (200 per node) that memory
+#     does not show: qua carried 193 that day, so it could take only 7 more pods
+#     from the next drain.
+#   - Source and destination must be >= 20 points apart, so it stops long before
+#     it could oscillate.
+#   - At most 5 evictions per node, 2 per namespace and 10 in total per run. At
+#     1/node + 1/namespace a run moved 2 pods, so the 66 pods out of band after
+#     qui's reboot would have taken >= 33 h; at 10 per run they take ~7 h.
+#   - priorityThreshold mdapi-critical => it never evicts a pod at or above
+#     mdapi-critical (mail, Keycloak, LDAP, DNS, critical tenants). Balancing is
+#     for the default/low tiers; a critical pod restarts only on a real drain.
+#   - hourly (not the chart's 2-minute default).
+#   - PodsWithPVC protection ON => it will NEVER evict a Longhorn/Ceph-backed
+#     pod (no storage churn — that was the Incident-1 trigger). DaemonSets,
+#     mirror pods and system-cluster/node-critical pods are protected by the
+#     evictor automatically (etcd, apiserver, canal, node-exporter, IM, OSDs).
+#   - storage / control-plane / VM namespaces excluded outright as belt-and-suspenders.
+#
+# NOTE: actual-CPU/mem balancing does NOT see network/data-plane churn (the
+# real qui driver). That is what monitoring-rules/25-node-dataplane-balance.yml
+# surfaces; once those series have baked, LowNodeUtilization can be switched to
+# a Prometheus metricsProvider query (node:net_bytes:rate5m etc.) to balance on
+# data-plane load directly. Left on KubernetesMetrics for the safe first pass.
+
+kind: CronJob
+schedule: "17 * * * *"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+cmdOptions:
+  v: 3
+
+deschedulerPolicyAPIVersion: "descheduler/v1alpha2"
+deschedulerPolicy:
+  maxNoOfPodsToEvictPerNode: 5
+  maxNoOfPodsToEvictPerNamespace: 2
+  maxNoOfPodsToEvictTotal: 10
+  metricsProviders:
+    - source: KubernetesMetrics
+  profiles:
+    - name: balance-on-actual-usage
+      pluginConfig:
+        - name: DefaultEvictor
+          args:
+            nodeFit: true
+            priorityThreshold:
+              name: mdapi-critical
+            podProtections:
+              extraEnabled:
+                - "PodsWithPVC"
+        - name: RemovePodsViolatingTopologySpreadConstraint
+          args:
+            constraints:
+              - DoNotSchedule
+        - name: LowNodeUtilization
+          args:
+            metricsUtilization:
+              source: KubernetesMetrics
+            useDeviationThresholds: true
+            thresholds:
+              memory: 10
+              pods: 10
+            targetThresholds:
+              memory: 10
+              pods: 10
+            evictableNamespaces:
+              exclude:
+                - kube-system
+                - longhorn-system
+                - rook-ceph
+                - harvester-system
+                - cattle-fleet-system
+                - cattle-provisioning-capi-system
+                - cattle-system
+                - ciphertrust
+                - kubevirt
+      plugins:
+        balance:
+          enabled:
+            - RemovePodsViolatingTopologySpreadConstraint
+            - LowNodeUtilization

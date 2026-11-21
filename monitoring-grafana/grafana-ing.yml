@@ -1,0 +1,44 @@
+## Owns grafana.mdapi.ch (self-hosted Grafana 12, this bundle). The legacy
+## Rancher-embedded Grafana (rancher-grafana.mdapi.ch / grafana-ingress bundle)
+## was retired 2026-06-29 — self-hosted Grafana is now the only Grafana surface.
+##
+## Grafana's anonymous Viewer lands in the VM-only "Embed" org (infra-o4i3m.6),
+## so a browser that passed oauth2-proxy but holds no grafana_session would see
+## Embed's 10 dashboards instead of Main Org. The snippet sends it to /login,
+## where auto-login completes the OIDC sign-in silently on the Keycloak SSO
+## cookie and returns to the requested page. Exempt: /login (and the OAuth
+## callback under it), /logout, static assets and the API. grafana-embed has
+## no such redirect: kiosks and Ceph iframes are anonymous by design.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-response-headers: Authorization
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/admin/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-admin.oauth2-proxy.svc.cluster.local/admin/oauth2/auth
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      set $grafana_login "";
+      if ($cookie_grafana_session = "") { set $grafana_login "1"; }
+      if ($uri ~ "^/(login|logout|public/|api/|avatar/)") { set $grafana_login ""; }
+      if ($grafana_login = "1") { return 302 /login?redirectTo=$escaped_request_uri; }
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: grafana
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - grafana.mdapi.ch
+      secretName: grafana-cert

@@ -1,0 +1,119 @@
+## Each upstream MCP server's own bearer, read from the path its server bundle
+## already uses (one source of truth: rotate there, the gateway follows).
+## Mounted as FILES into the agentgateway pod (agentgateway-standalone/fleet.yaml,
+## /mcp-upstream/<server>) and referenced from the database-held MCP routes as
+## `backendAuth.key.value.file` — the file is watched, so a rotation reloads
+## without a restart, and no bearer is ever written into Postgres.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mcp-upstream-memsearch
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mcp-upstream-memsearch
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/memsearch/mcp-token
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mcp-upstream-kubernetes
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mcp-upstream-kubernetes
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/k8s-mcp/AUTH_TOKEN
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mcp-upstream-backstage
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mcp-upstream-backstage
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/backstage/backstage/MCP_GATEWAY_TOKEN
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mcp-upstream-notes
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mcp-upstream-notes
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/joplin/joplin-mcp-env-secret/MCP_BEARER_TOKEN
+---
+## Windmill's MCP endpoint (/api/mcp/w/mdapi/mcp) takes a workspace token with the
+## single scope mcp:all, label agentgateway-mcp-upstream (infra-az8.49).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mcp-upstream-windmill
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mcp-upstream-windmill
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/windmill/agentgateway-mcp-upstream/token
+
+---
+## GitLab's built-in MCP server (/api/v4/mcp, GA in 19.5). It accepts only an OAuth token
+## carrying the mcp scope or a fine-grained PAT with the MCP tool, so this is a dedicated
+## PAT minted for the gateway - the admin api-token cannot be used here.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mcp-upstream-gitlab
+  namespace: agentgateway
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mcp-upstream-gitlab
+    creationPolicy: Owner
+  data:
+    - secretKey: token
+      remoteRef:
+        key: /mdapi/gitlab/mcp-token

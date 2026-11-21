@@ -1,0 +1,30 @@
+# app-k8s.loadbalancer-allocation (infra-3rm.12): a LoadBalancer Service without an
+# ingress address for 15 minutes means MetalLB could not allocate one.
+rule_files:
+- monitoring-rules/86-loadbalancer-allocation.yml
+evaluation_interval: 1m
+tests:
+- name: a-pending-loadbalancer-service-warns-after-15m
+  interval: 1m
+  input_series:
+  - series: kube_service_spec_type{namespace="a",service="new",type="LoadBalancer",instance="ksm"}
+    values: '1x30'
+  - series: kube_service_spec_type{namespace="a",service="old",type="LoadBalancer",instance="ksm"}
+    values: '1x30'
+  - series: kube_service_status_load_balancer_ingress{namespace="a",service="old",ip="192.168.1.40",instance="ksm"}
+    values: '1x30'
+  - series: kube_service_spec_type{namespace="a",service="cip",type="ClusterIP",instance="ksm"}
+    values: '1x30'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-k8s.loadbalancer-allocation
+    alertname: LoadBalancerServicePending
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-k8s.loadbalancer-allocation
+    alertname: LoadBalancerServicePending
+    exp_alerts:
+    - exp_labels: {namespace: a, service: new, severity: warning, component: Platform, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "LoadBalancer Service a/new has no address after 15m"
+        description: "MetalLB has not assigned an address to this Service. Either the pool it asks\nfor is exhausted (`kubectl get ipaddresspools -n metallb-system -o\njsonpath='{..status}'`: availableIPv4 0, often from stale allocations), the\nrequested address is taken or outside every pool, or metallb-controller is\ndown. `kubectl -n a describe svc new`\nshows MetalLB's AllocationFailed event with the reason.\n"

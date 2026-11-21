@@ -1,0 +1,41 @@
+# RbacHealStorageExecUncovered (infra-p6q07.2): the heal-storage worker's pods/exec is
+# per namespace, so a Longhorn namespace without a binding is skipped by the EIO
+# auto-heal in silence. One series per uncovered namespace; absent when covered.
+rule_files:
+- monitoring-rules/54-rbac-hygiene.yml
+evaluation_interval: 1m
+tests:
+- name: uncovered-namespace-warns-after-1h
+  interval: 5m
+  input_series:
+  - series: rbac_heal_storage_exec_uncovered{job="rbac_hygiene",namespace="tenant"}
+    values: '1x24'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: app-security.rbac-hygiene
+    alertname: RbacHealStorageExecUncovered
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-security.rbac-hygiene
+    alertname: RbacHealStorageExecUncovered
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        service: rbac
+        component: Security
+        team: mdapi
+        job: rbac_hygiene
+        namespace: tenant
+      exp_annotations:
+        summary: "EIO auto-heal cannot probe Longhorn pods in namespace tenant"
+        description: "A pod in tenant mounts a Longhorn volume, but the\nheal-storage worker has no pods/exec RoleBinding there, so\nlonghorn_eio_autoheal skips that namespace silently. Add it to fleet\nwindmill/rbac/heal-storage-exec.yml (never a platform namespace).\n"
+- name: covered-is-silent
+  interval: 5m
+  input_series:
+  - series: rbac_heal_storage_exec_uncovered_namespaces{job="rbac_hygiene"}
+    values: '0x24'
+  alert_rule_test:
+  - eval_time: 2h
+    groupname: app-security.rbac-hygiene
+    alertname: RbacHealStorageExecUncovered
+    exp_alerts: []

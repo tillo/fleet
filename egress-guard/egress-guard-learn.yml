@@ -1,0 +1,83 @@
+## egress-guard — LEARN MODE: log every new connection to a PUBLIC address, block NOTHING.
+## infra-wk4ux.5 (under infra-az8.4), step 1 of the egress default-deny.
+##
+## WHY EGRESS FIRST, NOT THE FULL LATERAL FLOOR. The threat is malware in a public image
+## (a poisoned package in a base image or a pulled app). Stealing data or taking orders
+## needs the INTERNET; it works whatever the in-cluster policies say, and Falco can be
+## blind to it (the 2025-26 pycache-borne payloads). So the first control is "which
+## namespaces may reach public addresses at all" — one cluster-wide question, not 130
+## hand-written lateral policies. This file only collects the evidence for that answer.
+##
+## HOW IT STAYS HARMLESS — proven on a scratch namespace 2026-11-10, not reasoned about:
+##   * Tier `egress-guard` is evaluated BEFORE the default tier (order 100 < 1,000,000).
+##   * Its only policy LOGs public destinations, then PASSes every packet to the default
+##     tier, where each namespace's own NetworkPolicies decide exactly as before.
+##       scratch pod, no policy           -> 1.1.1.1:443 OK, cluster OK (tier = no-op)
+##       scratch pod, k8s NP denies public -> 1.1.1.1:443 BLOCKED, cluster OK (still enforced)
+##   * ⛔ Never put Allow or Deny here: Allow ends evaluation before the default tier and
+##     would OVERRIDE every namespace's own egress policy; a selected endpoint is denied
+##     at the end of a tier unless something passes it. Hence the trailing Pass AND the
+##     Tier's defaultAction: Pass. tests/test_egress_guard_learn_never_blocks.py.
+##   * Calico checks NEW connections only (established ones are accepted by conntrack
+##     before policy), so a long-lived connection logs once.
+##
+## WHAT IS LOGGED: every new egress connection from a pod (not hostNetwork) whose
+## destination is outside RFC1918, CGNAT, loopback, link-local and multicast. Lines land
+## in OpenObserve stream `netpol_flows` (node, src, dst, spt, dpt, proto) through the
+## existing kernel -> fluentd -> Cribl path. The estate's own public addresses
+## (31.3.128.x) ARE logged on purpose: a pod reaching the public VIP instead of the
+## in-cluster service is worth seeing.
+##
+## ⛔ LOG BUDGET. Calico's Log is an iptables LOG with no rate limit, and journald's
+## burst budget is shared per node. Watched by f/probe/netpol_log_volume (hourly) and
+## the NetworkPolicyLogDataLoss / NetworkPolicyLogBudgetHigh alerts. Excluded below:
+##   * system namespaces (kube-*, cattle-*, fleet-*, cluster-fleet-*, harvester-*,
+##     longhorn-system, metallb-system, local) — platform, not workload;
+##   * services whose JOB is heavy public traffic, which no hostname allowlist could
+##     narrow and whose volume would eat the budget: snowflake-proxy and
+##     webtunnel-bridge (Tor bridges), ntppool + ntppool-agent (NTP pool member),
+##     opennic, nameserver, technitium, split-horizon (DNS servers that query the
+##     internet per request — the BIND lesson in infra-399i).
+##   These stay outside the later enforce step too unless a separate decision brings
+##   them in. A namespace NOT in this list is logged, including future ones.
+##
+## KILL SWITCH: revert the MR. A hand `kubectl delete` would be re-created by Fleet.
+apiVersion: crd.projectcalico.org/v1
+kind: Tier
+metadata:
+  name: egress-guard
+spec:
+  order: 100
+  defaultAction: Pass
+---
+apiVersion: crd.projectcalico.org/v1
+kind: GlobalNetworkPolicy
+metadata:
+  name: egress-guard.learn-public
+spec:
+  tier: egress-guard
+  order: 100
+  namespaceSelector: >-
+    kubernetes.io/metadata.name not in {'kube-system', 'kube-public', 'kube-node-lease',
+    'local', 'harvester-system', 'harvester-public', 'longhorn-system', 'metallb-system',
+    'snowflake-proxy', 'webtunnel-bridge', 'ntppool', 'ntppool-agent', 'opennic',
+    'nameserver', 'technitium', 'split-horizon'}
+    && !(kubernetes.io/metadata.name starts with 'cattle-')
+    && !(kubernetes.io/metadata.name starts with 'fleet-')
+    && !(kubernetes.io/metadata.name starts with 'cluster-fleet-')
+  types:
+    - Egress
+  egress:
+    # Log, then pass. Never reorder, never add Allow/Deny (header).
+    - action: Log
+      destination:
+        notNets:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 100.64.0.0/10
+          - 127.0.0.0/8
+          - 169.254.0.0/16
+          - 224.0.0.0/4
+          - 240.0.0.0/4
+    - action: Pass

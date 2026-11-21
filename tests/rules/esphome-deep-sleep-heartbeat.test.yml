@@ -1,0 +1,70 @@
+# EsphomeDeepSleepNodeMissedHeartbeat: carnotzetdoor's boot counter must ADVANCE (infra-r9mzd.18).
+# The old rule read hass_last_updated_time_seconds, which every Home Assistant restart resets:
+# the node died ~2026-10-01 and the restarts of 10-28, 10-31 and 11-04 replayed boot_count 95,
+# each hiding the dead node for another 8 h. Now: page when the highest boot_count of the last
+# 8 h is not above its value 8 h ago. A restart mints a new pod series with the SAME value, so
+# it can no longer look like a wake. Samples every 30 m; the node wakes every 6 h.
+rule_files:
+- monitoring-rules/08-home.yml
+evaluation_interval: 5m
+tests:
+- name: healthy-node-wakes-every-6h
+  interval: 30m
+  input_series:
+  - series: hass_sensor_state{entity="sensor.carnotzet_carnotzetdoor_carnotzetdoor_boot_count",pod="ha-a"}
+    values: 10x11 11x11 12x11 13x11
+  alert_rule_test:
+  - eval_time: 11h
+    groupname: app-home.workload
+    alertname: EsphomeDeepSleepNodeMissedHeartbeat
+    exp_alerts: []
+  - eval_time: 23h
+    groupname: app-home.workload
+    alertname: EsphomeDeepSleepNodeMissedHeartbeat
+    exp_alerts: []
+- name: dead-node-masked-by-ha-restart-still-pages
+  interval: 30m
+  input_series:
+  # dead at 95; HA restarts at 6 h and replays the stored value under a new pod label
+  - series: hass_sensor_state{entity="sensor.carnotzet_carnotzetdoor_carnotzetdoor_boot_count",pod="ha-a"}
+    values: 95x11 _x12
+  - series: hass_sensor_state{entity="sensor.carnotzet_carnotzetdoor_carnotzetdoor_boot_count",pod="ha-b"}
+    values: _x11 95x12
+  alert_rule_test:
+  - eval_time: 9h
+    groupname: app-home.workload
+    alertname: EsphomeDeepSleepNodeMissedHeartbeat
+    exp_alerts:
+    - exp_labels:
+        service: esphome
+        severity: warning
+        component: Smart Home
+        statuspage: include
+        team: mdapi
+      exp_annotations:
+        summary: "Deep-sleep node carnotzetdoor has missed its heartbeat"
+        description: "carnotzetdoor has not woken for over 8 hours. It wakes every 6h on a\ntimer and on every door edge, so at least two heartbeats are missing\nand its boot counter has not advanced \u2014 the node is not running.\nLikely: flat pack, brownout under the WiFi transmit burst, or it has\nlatched into ESPHome safe mode.\n\u26D4 Do NOT judge this node by reachability \u2014 it is asleep and\nunreachable ~99% of the time by design, which is why it is excluded\nfrom EsphomeNodeOffline.\nCheck the pack voltage first, under load rather than open-circuit.\nSafe mode looks like ICMP and TCP 3232 open but 6053 REFUSED; it\nclears itself after 5 minutes without an OTA.\n"
+- name: two-missed-wakes-page-one-does-not
+  interval: 30m
+  input_series:
+  # last wake at 6 h (11 -> 12), then silence
+  - series: hass_sensor_state{entity="sensor.carnotzet_carnotzetdoor_carnotzetdoor_boot_count",pod="ha-a"}
+    values: 11x11 12x24
+  alert_rule_test:
+  - eval_time: 13h
+    groupname: app-home.workload
+    alertname: EsphomeDeepSleepNodeMissedHeartbeat
+    exp_alerts: []
+  - eval_time: 15h
+    groupname: app-home.workload
+    alertname: EsphomeDeepSleepNodeMissedHeartbeat
+    exp_alerts:
+    - exp_labels:
+        service: esphome
+        severity: warning
+        component: Smart Home
+        statuspage: include
+        team: mdapi
+      exp_annotations:
+        summary: "Deep-sleep node carnotzetdoor has missed its heartbeat"
+        description: "carnotzetdoor has not woken for over 8 hours. It wakes every 6h on a\ntimer and on every door edge, so at least two heartbeats are missing\nand its boot counter has not advanced \u2014 the node is not running.\nLikely: flat pack, brownout under the WiFi transmit burst, or it has\nlatched into ESPHome safe mode.\n\u26D4 Do NOT judge this node by reachability \u2014 it is asleep and\nunreachable ~99% of the time by design, which is why it is excluded\nfrom EsphomeNodeOffline.\nCheck the pack voltage first, under load rather than open-circuit.\nSafe mode looks like ICMP and TCP 3232 open but 6053 REFUSED; it\nclears itself after 5 minutes without an OTA.\n"

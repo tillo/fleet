@@ -1,0 +1,34 @@
+# ENFORCING (isolation programme infra-az8.4; finding infra-o4i3m.10).
+#
+# Why: MeshCentral's trustedProxy covers the pod CIDR, and its only real proxy,
+# rke2-ingress-nginx, has churning pod IPs inside it. So any pod could connect directly
+# (4430 web, 8080 redir) and forge X-Forwarded-For (login throttling, audit log).
+#
+# Written from learn.meshcentral (2026-11-17 19:56Z -> 2026-11-19 ~21:40Z, ~49 h,
+# journald suppression 0 on every node; ~/ha-meshcentral-netpol-analysis-20261119.md).
+# Outside ingress-nginx the window saw only the jump pod's own verification probes:
+# agents and users all arrive via help.mdapi.ch.
+#   1. ingress-nginx / Traefik (dual list on RKE2 1.36, as in tv).
+#   2. Log then Deny: anything else is refused and leaves a netpol_flows row.
+# Kubelet probes are not policed (host -> local workload without a HostEndpoint).
+#
+# Revert: git revert this change (Fleet re-creates the object; a kubectl delete buys ~90 s).
+# Pinned by tests/test_o4i3m_10_enforce_policies.py.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.meshcentral
+  namespace: meshcentral
+spec:
+  order: 500
+  selector: app == "meshcentral"
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name in {"rke2-ingress-nginx", "rke2-traefik"}
+    - action: Log
+    - action: Deny

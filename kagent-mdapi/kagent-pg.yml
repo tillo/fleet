@@ -1,0 +1,162 @@
+## CloudNativePG cluster for kagent, on PostgreSQL 18 (2026-11-20).
+##
+## Replaces the chart's bundled Postgres (kagent-postgresql: one pod, no WAL archive,
+## no backup, the chart's public constant as password), which a major bump could not
+## upgrade. Bootstrap IMPORTS the `kagent` database from it (initdb.import,
+## microservice = logical dump/restore); the owner `kagent` gets a CNPG-generated
+## password, published as kagent-pg-app (key `uri`), which the controller reads via
+## database.postgres.urlFile (kagent/fleet.yaml).
+##
+## The import runs once at creation; the cutover freezes the controller, re-syncs
+## the dump and compares table counts before the controller is switched (memory
+## cnpg_import_is_a_point_in_time_copy_freeze_and_resync_before_cutover_2026_11_13).
+##
+## Shape copied from keycloak/keycloak-pg.yml: 2 instances, switchover, barman to its
+## own RGW bucket over TLS via the Barman Cloud plugin, daily base backup, 14 d.
+## ObjectStore declared BEFORE the Cluster (plugin pre-reconcile hook).
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: kagent-pg
+  namespace: kagent
+spec:
+  configuration:
+    destinationPath: s3://cnpg-kagent-pg
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-kagent-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-kagent-pg
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    data:
+      compression: gzip
+      jobs: 1
+    wal:
+      compression: gzip
+  ## On the STORE, not the Cluster: left off, nothing prunes and nothing says so.
+  retentionPolicy: "14d"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: kagent-pg
+  namespace: kagent
+spec:
+  ## CNPG re-creates instance PVCs on every rebuild; this is the only place the
+  ## backup class survives one (tests/test_cnpg_clusters_declare_backup_class.py).
+  inheritedMetadata:
+    labels:
+      mdapi.ch/backup-class: default
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 2Gi
+
+  postgresql:
+    parameters:
+      max_connections: "50"
+      shared_buffers: 64MB
+      effective_cache_size: 128MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: kagent
+      owner: kagent
+      import:
+        type: microservice
+        databases:
+          - kagent
+        source:
+          externalCluster: legacy-postgres
+
+  ## The chart's bundled Postgres this cluster was imported from. Only read at
+  ## bootstrap; delete this stanza together with `database.postgres.bundled` once
+  ## the soak is over.
+  externalClusters:
+    - name: legacy-postgres
+      connectionParameters:
+        host: kagent-postgresql.kagent.svc.cluster.local
+        user: kagent
+        dbname: kagent
+        sslmode: disable
+      password:
+        name: kagent-postgresql
+        key: POSTGRES_PASSWORD
+
+  ## serverName stated explicitly: barman keys the archive <bucket>/<serverName>/,
+  ## and it is accepted only as a plugin parameter (CEL rejects it on the store).
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: kagent-pg
+        serverName: kagent-pg
+
+  resources:
+    requests:
+      cpu: 20m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: kagent-pg-daily
+  namespace: kagent
+spec:
+  schedule: "0 50 2 * * *"
+  backupOwnerReference: self
+  ## WAL archiving alone is not a backup: take the first base backup at once.
+  immediate: true
+  cluster:
+    name: kagent-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+---
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-kagent-pg
+  namespace: kagent
+spec:
+  bucketName: cnpg-kagent-pg
+  storageClassName: ceph-bucket
+  ## Declare the offsite grant so Rook OWNS it: the OBC reconciler deletes any policy
+  ## not listed here (rgw_bucket_policy_loss_incident_2026_09_29).
+  additionalConfig:
+    bucketPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"OffsiteSweepRead","Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/offsite"]},"Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::cnpg-kagent-pg","arn:aws:s3:::cnpg-kagent-pg/*"]}]}'
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: kagent
+stringData:
+  REGION: us-east-1
+

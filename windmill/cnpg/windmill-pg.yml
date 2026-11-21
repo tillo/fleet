@@ -1,0 +1,234 @@
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: windmill-pg
+  namespace: windmill-pg
+spec:
+  configuration:
+    destinationPath: s3://cnpg-windmill-pg
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-windmill-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-windmill-pg
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    data:
+      compression: gzip
+      jobs: 1
+    wal:
+      compression: gzip
+  ## On the STORE, not the Cluster: left off, nothing prunes and nothing says so.
+  retentionPolicy: "14d"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: windmill-pg
+  namespace: windmill-pg
+spec:
+  ## CNPG re-creates instance PVCs on every rebuild; this is the only place the
+  ## backup class survives one (tests/test_cnpg_clusters_declare_backup_class.py).
+  inheritedMetadata:
+    labels:
+      mdapi.ch/backup-class: default
+  instances: 2
+  ## Windmill connects as the superuser today and its schema is owned by `postgres`
+  ## (361 RLS policies, roles windmill_user / windmill_admin); keeping that model is
+  ## what lets the cutover change only the host. Its password is the one Windmill
+  ## already uses (Akeyless), and enforce.windmill-pg admits only Windmill itself.
+  enableSuperuserAccess: true
+  superuserSecret:
+    name: windmill-pg-superuser
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 10Gi
+
+  postgresql:
+    parameters:
+      ## 67 connections at rest on the old server (app + 4 worker groups); the chart's
+      ## max_connections patch there is 500 (windmill/kustomize).
+      max_connections: "500"
+      shared_buffers: 512MB
+      effective_cache_size: 1536MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## O2 Database Monitoring login, as on the old server (openobserve/o2-dbm-collector.yml).
+  ## Same password item as there; declared because role passwords are not imported.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        inherit: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: windmill-pg-o2dbm
+
+  ## MONOLITH import (not microservice): it carries Windmill's own roles and keeps
+  ## every object's owner and grant, which the RLS policies depend on. Runs once, at
+  ## creation, from the chart's windmill-postgresql; the cutover freezes Windmill and
+  ## re-syncs before DATABASE_URL moves to windmill-pg-rw.
+  bootstrap:
+    initdb:
+      import:
+        type: monolith
+        databases:
+          - windmill
+        roles:
+          - windmill_user
+          - windmill_admin
+          - custom_instance_user
+          - custom_instance_replication_user
+          ## The dump GRANTs to o2_dbm, and managed roles (below) are only created
+          ## after bootstrap: without it here the restore fails on that one GRANT.
+          ## managed.roles then sets its password; passwords are never imported.
+          - o2_dbm
+        source:
+          externalCluster: legacy-postgres
+
+  ## The chart's bundled Postgres. Only read at bootstrap; delete this stanza with
+  ## postgresql.enabled: false in windmill/values.yml once the soak is over.
+  externalClusters:
+    - name: legacy-postgres
+      connectionParameters:
+        host: windmill-postgresql.windmill.svc.cluster.local
+        user: postgres
+        dbname: windmill
+        sslmode: disable
+      password:
+        name: windmill-pg-superuser
+        key: password
+
+  ## serverName stated explicitly: barman keys the archive <bucket>/<serverName>/,
+  ## and it is accepted only as a plugin parameter (CEL rejects it on the store).
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: windmill-pg
+        serverName: windmill-pg
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 1Gi
+    limits:
+      memory: 3Gi
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: windmill-pg-daily
+  namespace: windmill-pg
+spec:
+  schedule: "0 50 2 * * *"
+  backupOwnerReference: self
+  ## WAL archiving alone is not a backup: take the first base backup at once.
+  immediate: true
+  cluster:
+    name: windmill-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+---
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-windmill-pg
+  namespace: windmill-pg
+spec:
+  bucketName: cnpg-windmill-pg
+  storageClassName: ceph-bucket
+  ## Declare the offsite grant so Rook OWNS it: the OBC reconciler deletes any policy
+  ## not listed here (rgw_bucket_policy_loss_incident_2026_09_29).
+  additionalConfig:
+    bucketPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"OffsiteSweepRead","Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/offsite"]},"Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::cnpg-windmill-pg","arn:aws:s3:::cnpg-windmill-pg/*"]}]}'
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: windmill-pg
+stringData:
+  REGION: us-east-1
+---
+## Superuser credential: the password Windmill already uses (the same item
+## windmill/external-secrets/windmill-database-url-es.yml templates into the URL).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: windmill-pg-superuser
+  namespace: windmill-pg
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: windmill-pg-superuser
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: postgres
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/windmill/windmill-postgresql/postgres-password
+      secretKey: password
+---
+## Password for the o2_dbm login; the item the O2 DBM collector already holds.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: windmill-pg-o2dbm
+  namespace: windmill-pg
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: windmill-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/windmill/windmill-postgresql-o2dbm/password
+      secretKey: password

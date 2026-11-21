@@ -1,0 +1,21 @@
+# windmill-pg: the CNPG cluster replacing the chart's bundled Postgres, its
+# secrets and its ingress policy, in its OWN namespace: heal jobs may never read
+# Secrets in ns windmill (tests/test_windmill_heal_reads_secrets_by_name_only.py),
+# yet must read each CNPG bucket's owner Secret; and the superuser credential stays
+# out of the namespace where Windmill jobs run. Namespace-PINNED: namespaced only.
+# A cluster-scoped object committed here would be silently dropped
+# (tests/test_namespaced_bundle_no_cluster_scoped.py).
+defaultNamespace: windmill-pg
+namespace: windmill-pg
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25

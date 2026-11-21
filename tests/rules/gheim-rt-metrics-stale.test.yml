@@ -1,0 +1,118 @@
+# gheim-rt-guard pushes its own counters to vmsingle (infra-o4i3m.5.4, 2026-11-17).
+# The guard FAILS OPEN, so a broken push looks exactly like a quiet guard: these two
+# alerts are the only thing that notices. Measured 11-10..17: 670/672 15-min slots had
+# samples from both replicas; the longest gap was one missed push (30 min).
+rule_files:
+- monitoring-rules/87-gheim-rt-metrics.yml
+evaluation_interval: 1m
+tests:
+- name: all-pushes-stop-pages-after-1h-plus-15m
+  interval: 1m
+  input_series:
+  - series: gheim_rt_calls_total{replica="a",door="x",direction="request",outcome="masked"}
+    values: 1x10
+  - series: kube_deployment_status_replicas_available{namespace="litellm",deployment="litellm",job="kube-state-metrics"}
+    values: 2x120
+  - series: litellm_contract_last_run_timestamp_seconds{job="litellm_contract"}
+    values: 946684800+60x120
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardMetricsStale
+    exp_alerts: []
+  - eval_time: 90m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardMetricsStale
+    exp_alerts:
+    - exp_labels:
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: gheim-rt-guard has pushed no gheim_rt_* metrics to vmsingle for over 1h
+        description: "The round-trip PII guard runs as custom_code inside each litellm pod and pushes\nits counters to vmsingle /api/v1/import/prometheus. None arrived for an hour while\nlitellm is up and the contract probe (which calls the guard every 15 min) runs.\nThe guard FAILS OPEN, so a broken push and a broken guard look the same from\noutside: check that -gheim doors still mask.\n\nUsual causes: vmsingle import refused (auth added, infra-o4i3m.5.4) or the host\nmissing from litellm user_url_allowed_hosts (litellm-cm.yml, SSRF allowlist).\n\n  kubectl -n litellm logs deploy/litellm | grep -i 'http_request blocked'\n  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+- name: one-missed-push-is-silent
+  interval: 15m
+  input_series:
+  - series: gheim_rt_calls_total{replica="a",door="x",direction="request",outcome="masked"}
+    values: 1 1 _ 1 1 1 1 1 1
+  - series: kube_deployment_status_replicas_available{namespace="litellm",deployment="litellm",job="kube-state-metrics"}
+    values: 2x9
+  - series: litellm_contract_last_run_timestamp_seconds{job="litellm_contract"}
+    values: 946684800+900x9
+  alert_rule_test:
+  - eval_time: 120m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardMetricsStale
+    exp_alerts: []
+- name: probe-down-is-batchjobstale-not-this
+  interval: 1m
+  input_series:
+  - series: gheim_rt_calls_total{replica="a",door="x",direction="request",outcome="masked"}
+    values: 1x10
+  - series: kube_deployment_status_replicas_available{namespace="litellm",deployment="litellm",job="kube-state-metrics"}
+    values: 2x120
+  - series: litellm_contract_last_run_timestamp_seconds{job="litellm_contract"}
+    values: 946684800x120
+  alert_rule_test:
+  - eval_time: 100m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardMetricsStale
+    exp_alerts: []
+- name: one-replica-silent-pages
+  interval: 1m
+  input_series:
+  - series: gheim_rt_calls_total{replica="a",door="x",direction="request",outcome="masked"}
+    values: 1x150
+  - series: gheim_rt_calls_total{replica="b",door="x",direction="request",outcome="masked"}
+    values: 1x5
+  - series: kube_deployment_status_replicas_available{namespace="litellm",deployment="litellm",job="kube-state-metrics"}
+    values: 2x150
+  - series: litellm_contract_last_run_timestamp_seconds{job="litellm_contract"}
+    values: 946684800+60x150
+  alert_rule_test:
+  - eval_time: 70m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardReplicaNotPushing
+    exp_alerts: []
+  - eval_time: 100m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardReplicaNotPushing
+    exp_alerts:
+    - exp_labels:
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "gheim-rt-guard: 1 of 2 litellm replicas pushed metrics in the last hour"
+        description: "Each litellm process pushes its own gheim_rt_* counters (label replica). Fewer\nreplicas pushed in the last hour than litellm pods are available, so one pod's\nguard is not reporting. It fails open: check that pod still masks.\n\n  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+  - eval_time: 100m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardMetricsStale
+    exp_alerts: []
+- name: a-rollout-that-renames-replicas-is-silent
+  interval: 1m
+  input_series:
+  - series: gheim_rt_calls_total{replica="old1",door="x",direction="request",outcome="masked"}
+    values: 1x30
+  - series: gheim_rt_calls_total{replica="old2",door="x",direction="request",outcome="masked"}
+    values: 1x30
+  - series: gheim_rt_calls_total{replica="new1",door="x",direction="request",outcome="masked"}
+    values: _x32 1x150
+  - series: gheim_rt_calls_total{replica="new2",door="x",direction="request",outcome="masked"}
+    values: _x32 1x150
+  - series: kube_deployment_status_replicas_available{namespace="litellm",deployment="litellm",job="kube-state-metrics"}
+    values: 2x180
+  - series: litellm_contract_last_run_timestamp_seconds{job="litellm_contract"}
+    values: 946684800+60x180
+  alert_rule_test:
+  - eval_time: 150m
+    groupname: app-gheim-rt-metrics.rules
+    alertname: GheimRtGuardReplicaNotPushing
+    exp_alerts: []

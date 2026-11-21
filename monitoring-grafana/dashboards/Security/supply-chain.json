@@ -1,0 +1,1073 @@
+{
+  "uid": "supply-chain",
+  "title": "Supply chain — what is running, and what is known about it",
+  "tags": [
+    "security",
+    "supply-chain",
+    "cve",
+    "mdapi"
+  ],
+  "editable": true,
+  "links": [
+    {
+      "title": "DefectDojo",
+      "type": "link",
+      "url": "https://defectdojo.mdapi.ch/finding/open",
+      "targetBlank": true,
+      "icon": "external link",
+      "tooltip": "The findings record"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 36,
+  "timezone": "browser",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Two layers, and neither is sufficient alone.** Build-time scanning covers what you make; runtime scanning covers what you *pull* — third-party images never went through your pipeline. These figures are the runtime layer: every image actually running, rescanned four times a day in rotating batches.\n\n⭐ **Read the *fixable* count, not the total.** A critical CVE with no upstream fix is a risk to accept and document; a critical CVE with a fix available is a rebuild you have not done. Only the second is actionable, and only the second belongs on a dashboard.\n\n⚠️ Measured 2026-09-22: Grype and Trivy agree on only **81%** of findings for the same Debian image, and on an Alpine image one reported 7 vulnerabilities where the other reported *Clean*. A single scanner is not coverage.\n\n*Scope: only **critical** and **high** are tracked. Medium and low on 146 running images is a number nobody acts on, and a dashboard nobody acts on trains people to ignore the ones that matter. Source: `f/probe/pod_image_cve_scan`.*"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Images scanned",
+      "description": "Distinct images actually running and rescanned on rotation.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "pod_image_cve_scan_images_total",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Critical, fix available",
+      "description": "The actionable number: a fix exists upstream and has not been pulled in.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"critical\",fix_state=\"fixed\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "High, fix available",
+      "description": "Same reading as critical, one severity down.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"high\",fix_state=\"fixed\"})",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Components with an upgrade waiting",
+      "description": "Platform components behind their latest release. Distinct from CVEs: this is cadence, not exposure.",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(component_upgrade_available)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Fixable vulnerabilities over time — rebuild cadence made visible",
+      "description": "A sawtooth on the fixable lines is healthy: it means rebuilds land. A rising flat line means the daily patch layer has stopped reaching the registry. The third line is a different conversation entirely — nothing to rebuild, so it belongs in the risk register, not in a backlog.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"critical\",fix_state=\"fixed\"})",
+          "refId": "A",
+          "legendFormat": "critical, fixable"
+        },
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"high\",fix_state=\"fixed\"})",
+          "refId": "B",
+          "legendFormat": "high, fixable"
+        },
+        {
+          "expr": "sum(pod_image_cve_count{severity=\"critical\",fix_state=\"unfixed\"})",
+          "refId": "C",
+          "legendFormat": "critical, NO fix available"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Images carrying fixable critical or high findings",
+      "description": "Ranked by what can actually be fixed today. Rebuild from the top; an image with only unfixable findings belongs in the risk register, not here.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "topk(20, sum by (image) (pod_image_cve_count{severity=~\"critical|high\",fix_state=\"fixed\"}))",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "prometheus": true,
+              "service": true,
+              "instance": true,
+              "namespace": true,
+              "endpoint": true,
+              "container": true,
+              "pod": true
+            },
+            "renameByName": {
+              "image": "Image",
+              "Value": "Fixable critical + high"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Fixable critical + high",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "row",
+      "title": "DefectDojo — the findings record",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**DefectDojo is the record; the scanners only report into it.** The CI `scan` / `secret-scan` jobs, the runtime image scan and kube-bench all import into DefectDojo, which deduplicates, tracks each finding's life, and holds every won't-fix decision as a risk acceptance with an owner and an expiry. The panels above are the runtime scanner's own view (critical/high, per image); the ones below are DefectDojo's, across CI, runtime and secrets — click through to act. *Product type `mdapi` = what we build (CI), `mdapi-runtime` = what runs. Source: `f/security/defectdojo_metrics`, hourly; alerts: `78-defectdojo.yml`.*"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Open, fixable critical",
+      "description": "Critical findings with a fix upstream, in code we build or images we run. Each one is a rebuild or a bump not done yet.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(defectdojo_findings{state=\"open_fixable\",severity=\"critical\"}) or vector(0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "links": [
+        {
+          "title": "Open in DefectDojo",
+          "url": "https://defectdojo.mdapi.ch/finding/open",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Open, fixable high",
+      "description": "High findings with a fix upstream.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(defectdojo_findings{state=\"open_fixable\",severity=\"high\"}) or vector(0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "links": [
+        {
+          "title": "Open in DefectDojo",
+          "url": "https://defectdojo.mdapi.ch/finding/open",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Known exploited, open",
+      "description": "Open findings on CISA's Known Exploited Vulnerabilities list: exploited in the wild. Fix these first.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(defectdojo_findings_known_exploited) or vector(0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "links": [
+        {
+          "title": "Open in DefectDojo",
+          "url": "https://defectdojo.mdapi.ch/finding/open",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Past SLA",
+      "description": "Open fixable findings past DefectDojo's SLA (critical 7 d, high 30 d, medium 90 d, low 120 d).",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(defectdojo_findings_sla_breached) or vector(0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "links": [
+        {
+          "title": "Open in DefectDojo",
+          "url": "https://defectdojo.mdapi.ch/finding/open",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Accepted (won't-fix)",
+      "description": "Findings held by a risk acceptance. Auto acceptances are renewed daily while their reason holds; human ones expire and come back as work.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum(defectdojo_findings_accepted) or vector(0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "links": [
+        {
+          "title": "Open in DefectDojo",
+          "url": "https://defectdojo.mdapi.ch/finding/accepted",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Human decisions due ≤ 14 d",
+      "description": "Risk acceptances made by a person that expire within two weeks: renew with a reason, or let the findings reopen.",
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 30
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "count(defectdojo_risk_acceptance_expiry_timestamp_seconds{origin=\"human\"} - time() < 14 * 86400) or vector(0)",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "links": [
+        {
+          "title": "Open in DefectDojo",
+          "url": "https://defectdojo.mdapi.ch/finding/accepted",
+          "targetBlank": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Open fixable critical + high in DefectDojo, by product type",
+      "description": "Falls when a rebuild or bump lands and the next import closes the findings. A step up after an import is new upstream advisories, not new code.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "sum by (product_type, severity) (defectdojo_findings{state=\"open_fixable\",severity=~\"critical|high\"})",
+          "refId": "A",
+          "legendFormat": "{{product_type}} · {{severity}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Hours since each feed last imported",
+      "description": "Newest import into each engagement kind, over all products. Every feed is reimported daily at 07:30; over 50 h fires DefectDojoFeedStale.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "(time() - max by (engagement) (defectdojo_engagement_last_import_timestamp_seconds)) / 3600",
+          "refId": "A",
+          "instant": true,
+          "legendFormat": "{{engagement}}"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 26
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "title": "Products with open fixable critical or high findings — click a product to open it in DefectDojo",
+      "description": "Ranked by what can be fixed today. A CI product is a repository; a runtime product is an image.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "topk(25, sum by (product_type, product, product_id) (defectdojo_findings{state=\"open_fixable\",severity=~\"critical|high\"}))",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "prometheus": true,
+              "service": true,
+              "instance": true,
+              "namespace": true,
+              "endpoint": true,
+              "container": true,
+              "pod": true
+            },
+            "renameByName": {
+              "product_type": "Product type",
+              "product": "Product",
+              "Value": "Fixable critical + high"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Fixable critical + high",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "product_id"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Product"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open findings in DefectDojo",
+                    "url": "https://defectdojo.mdapi.ch/product/${__data.fields.product_id}/finding/open",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "table",
+      "title": "Risk acceptances, soonest expiry first",
+      "description": "origin auto = held by f/security/defectdojo_grype_sync and renewed daily (under 25 d left fires DefectDojoAutoRiskAcceptanceNotRenewed). origin human = a decision with an end date (under 7 d fires DefectDojoRiskAcceptanceDecisionDue).",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "targets": [
+        {
+          "expr": "(defectdojo_risk_acceptance_expiry_timestamp_seconds - time()) / 86400",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "expr": "defectdojo_risk_acceptance_findings",
+          "refId": "B",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "prometheus": true,
+              "service": true,
+              "instance": true,
+              "namespace": true,
+              "endpoint": true,
+              "container": true,
+              "pod": true
+            },
+            "renameByName": {
+              "risk_acceptance": "Risk acceptance",
+              "origin": "Origin",
+              "product_type": "Product type",
+              "product": "Product",
+              "Value #A": "Days left",
+              "Value #B": "Findings held"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Days left",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "product_id"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Days left"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Risk acceptance"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Accepted findings of this product in DefectDojo",
+                    "url": "https://defectdojo.mdapi.ch/product/${__data.fields.product_id}/finding/accepted",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}

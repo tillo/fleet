@@ -1,0 +1,43 @@
+# K8sJobJanitorForbidden (infra-r9mzd.71): k8s_job_janitor prunes ownerless Failed pods,
+# but the heal account may delete pods only in namespaces fleet windmill/rbac binds it
+# in (infra-az8.19.11). A pod elsewhere is skipped and counted, never fatal; without
+# this alert that count is only visible in the job log, and the corpses pile up again
+# until K8sFailedPodCorpses fires weeks later.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: a-skipped-pod-is-reported-after-an-hour
+  interval: 5m
+  input_series:
+  - series: k8s_job_janitor_failed_pods_forbidden{job="k8s_job_janitor"}
+    values: '1x24'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-batch-jobs.k8s-job-janitor
+    alertname: K8sJobJanitorForbidden
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-batch-jobs.k8s-job-janitor
+    alertname: K8sJobJanitorForbidden
+    exp_alerts:
+    - exp_labels:
+        job: k8s_job_janitor
+        service: kubernetes
+        severity: info
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "k8s_job_janitor skipped 1 Failed pod(s) it may not delete"
+        description: "The heal account has no windmill-worker-heal-pod-delete RoleBinding in their namespace, so these ownerless Failed pods will never be pruned. The namespaces are in the janitor's last run log (lines 'forbidden: ... in <ns>'). Add a RoleBinding in fleet windmill/rbac/rbac.yml, or delete a one-off pod by hand. Never grant pod delete cluster-wide (infra-az8.19.11)."
+- name: zero-never-fires
+  interval: 5m
+  input_series:
+  - series: k8s_job_janitor_failed_pods_forbidden{job="k8s_job_janitor"}
+    values: '0x24'
+  alert_rule_test:
+  - eval_time: 2h
+    groupname: app-batch-jobs.k8s-job-janitor
+    alertname: K8sJobJanitorForbidden
+    exp_alerts: []

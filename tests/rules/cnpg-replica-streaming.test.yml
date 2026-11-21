@@ -1,0 +1,232 @@
+# CnpgReplicaNotStreaming / CnpgStandbyNotReceivingWal (infra-3rm.32): on 2026-11-08
+# bussola-pg-1 stopped streaming and stayed so for 4 days while the Cluster read
+# healthy; writes on the synchronous primary could hang and every prefer-standby
+# Backup completed at the same frozen LSN. Series are shaped like the live ones:
+# only cnpg_collector_up carries `cluster`, streaming_replicas is >0 on the primary
+# only, sync_replicas{value="expected"} is 1 on a synchronous cluster, 0 on guac-pg.
+rule_files:
+- monitoring-rules/52b-cnpg-replication.yml
+evaluation_interval: 1m
+tests:
+- name: bussola-2026-11-08-sync-standby-stops-streaming-pages-after-15m
+  interval: 1m
+  input_series:
+  - series: cnpg_collector_up{namespace="bussola",pod="bussola-pg-1",job="bussola/bussola-pg",cluster="bussola-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="bussola",pod="bussola-pg-1",job="bussola/bussola-pg",value="expected"}
+    values: 1x40
+  - series: cnpg_collector_replica_mode{namespace="bussola",pod="bussola-pg-1",job="bussola/bussola-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="bussola",pod="bussola-pg-1",job="bussola/bussola-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_streaming_replicas{namespace="bussola",pod="bussola-pg-1",job="bussola/bussola-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="bussola",pod="bussola-pg-1",job="bussola/bussola-pg"}
+    values: 1x4 0x35
+  - series: cnpg_collector_up{namespace="bussola",pod="bussola-pg-2",job="bussola/bussola-pg",cluster="bussola-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="bussola",pod="bussola-pg-2",job="bussola/bussola-pg",value="expected"}
+    values: 1x40
+  - series: cnpg_collector_replica_mode{namespace="bussola",pod="bussola-pg-2",job="bussola/bussola-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="bussola",pod="bussola-pg-2",job="bussola/bussola-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_streaming_replicas{namespace="bussola",pod="bussola-pg-2",job="bussola/bussola-pg"}
+    values: 1x4 0x35
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="bussola",pod="bussola-pg-2",job="bussola/bussola-pg"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts: []
+  - eval_time: 25m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts:
+    - exp_labels:
+        namespace: bussola
+        cluster: bussola-pg
+        service: bussola-pg
+        severity: critical
+        component: Storage
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'CNPG bussola/bussola-pg: the primary streams to 0 standby(s), fewer than the cluster has'
+        description: "The primary of bussola/bussola-pg streams WAL to fewer standbys\nthan the cluster has, while the Cluster phase can still read healthy. With synchronous\nreplication configured, writes\
+          \ on the primary can hang waiting for the missing standby;\nbackups with target prefer-standby run on the stuck standby and stop at a frozen LSN.\nSee which standby is missing on the primary:\n\
+          \  kubectl -n bussola exec <primary> -c postgres -- psql -c \"select application_name, state, replay_lsn from pg_stat_replication\"\nCnpgStandbyNotReceivingWal names the stuck pod. Fix: re-clone\
+          \ it (delete its PVC with\n--wait=false, then the pod; memory cnpg_replica_checkpoint_record_corrupt_reclone_2026_10_26).\nBefore that, take a backup with target: primary.\n"
+  - eval_time: 15m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgStandbyNotReceivingWal
+    exp_alerts: []
+  - eval_time: 25m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgStandbyNotReceivingWal
+    exp_alerts:
+    - exp_labels:
+        namespace: bussola
+        cluster: bussola-pg
+        pod: bussola-pg-1
+        service: bussola-pg
+        severity: warning
+        component: Backups
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'CNPG bussola/bussola-pg-1: standby has no WAL receiver, its data and its backups are frozen'
+        description: "bussola/bussola-pg-1 is in recovery but has no WAL receiver, so it\nreplays nothing new. Every backup that runs on it (backup.target prefer-standby, the\ndefault) completes at the\
+          \ same LSN day after day while lastSuccessfulBackupTime stays\nfresh. Compare beginLSN across the last Backups:\n  kubectl -n bussola get backups.postgresql.cnpg.io -o custom-columns=NAME:.metadata.name,POD:.status.instanceID.podName,BEGIN:.status.beginLSN\n\
+          and read why it does not stream:\n  kubectl -n bussola logs bussola-pg-1 -c postgres --since=1h\nFix: re-clone the standby (memory cnpg_replica_checkpoint_record_corrupt_reclone_2026_10_26).\n"
+- name: async-cluster-standby-not-streaming-is-a-warning
+  interval: 1m
+  input_series:
+  - series: cnpg_collector_up{namespace="jump",pod="guac-pg-1",job="jump/guac-pg",cluster="guac-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="jump",pod="guac-pg-1",job="jump/guac-pg",value="expected"}
+    values: '0x40'
+  - series: cnpg_collector_replica_mode{namespace="jump",pod="guac-pg-1",job="jump/guac-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="jump",pod="guac-pg-1",job="jump/guac-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_streaming_replicas{namespace="jump",pod="guac-pg-1",job="jump/guac-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="jump",pod="guac-pg-1",job="jump/guac-pg"}
+    values: '0x40'
+  - series: cnpg_collector_up{namespace="jump",pod="guac-pg-2",job="jump/guac-pg",cluster="guac-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="jump",pod="guac-pg-2",job="jump/guac-pg",value="expected"}
+    values: '0x40'
+  - series: cnpg_collector_replica_mode{namespace="jump",pod="guac-pg-2",job="jump/guac-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="jump",pod="guac-pg-2",job="jump/guac-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_streaming_replicas{namespace="jump",pod="guac-pg-2",job="jump/guac-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="jump",pod="guac-pg-2",job="jump/guac-pg"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts: []
+  - eval_time: 25m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts:
+    - exp_labels:
+        namespace: jump
+        cluster: guac-pg
+        service: guac-pg
+        severity: warning
+        component: Storage
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'CNPG jump/guac-pg: the primary streams to 0 standby(s), fewer than the cluster has'
+        description: "The primary of jump/guac-pg streams WAL to fewer standbys\nthan the cluster has, while the Cluster phase can still read healthy. With synchronous\nreplication configured, writes on\
+          \ the primary can hang waiting for the missing standby;\nbackups with target prefer-standby run on the stuck standby and stop at a frozen LSN.\nSee which standby is missing on the primary:\n \
+          \ kubectl -n jump exec <primary> -c postgres -- psql -c \"select application_name, state, replay_lsn from pg_stat_replication\"\nCnpgStandbyNotReceivingWal names the stuck pod. Fix: re-clone it\
+          \ (delete its PVC with\n--wait=false, then the pod; memory cnpg_replica_checkpoint_record_corrupt_reclone_2026_10_26).\nBefore that, take a backup with target: primary.\n"
+- name: healthy-single-instance-and-replica-mode-clusters-stay-silent
+  interval: 1m
+  input_series:
+  - series: cnpg_collector_up{namespace="litellm",pod="litellm-pg-1",job="litellm/litellm-pg",cluster="litellm-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="litellm",pod="litellm-pg-1",job="litellm/litellm-pg",value="expected"}
+    values: 1x40
+  - series: cnpg_collector_replica_mode{namespace="litellm",pod="litellm-pg-1",job="litellm/litellm-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="litellm",pod="litellm-pg-1",job="litellm/litellm-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_streaming_replicas{namespace="litellm",pod="litellm-pg-1",job="litellm/litellm-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="litellm",pod="litellm-pg-1",job="litellm/litellm-pg"}
+    values: 1x40
+  - series: cnpg_collector_up{namespace="litellm",pod="litellm-pg-2",job="litellm/litellm-pg",cluster="litellm-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="litellm",pod="litellm-pg-2",job="litellm/litellm-pg",value="expected"}
+    values: 1x40
+  - series: cnpg_collector_replica_mode{namespace="litellm",pod="litellm-pg-2",job="litellm/litellm-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="litellm",pod="litellm-pg-2",job="litellm/litellm-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_streaming_replicas{namespace="litellm",pod="litellm-pg-2",job="litellm/litellm-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="litellm",pod="litellm-pg-2",job="litellm/litellm-pg"}
+    values: '0x40'
+  - series: cnpg_collector_up{namespace="solo",pod="solo-pg-1",job="solo/solo-pg",cluster="solo-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="solo",pod="solo-pg-1",job="solo/solo-pg",value="expected"}
+    values: '0x40'
+  - series: cnpg_collector_replica_mode{namespace="solo",pod="solo-pg-1",job="solo/solo-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="solo",pod="solo-pg-1",job="solo/solo-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_streaming_replicas{namespace="solo",pod="solo-pg-1",job="solo/solo-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="solo",pod="solo-pg-1",job="solo/solo-pg"}
+    values: '0x40'
+  - series: cnpg_collector_up{namespace="dr",pod="dr-pg-1",job="dr/dr-pg",cluster="dr-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="dr",pod="dr-pg-1",job="dr/dr-pg",value="expected"}
+    values: '0x40'
+  - series: cnpg_collector_replica_mode{namespace="dr",pod="dr-pg-1",job="dr/dr-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_in_recovery{namespace="dr",pod="dr-pg-1",job="dr/dr-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_streaming_replicas{namespace="dr",pod="dr-pg-1",job="dr/dr-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="dr",pod="dr-pg-1",job="dr/dr-pg"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 30m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgStandbyNotReceivingWal
+    exp_alerts: []
+- name: a-7-minute-roll-does-not-fire
+  interval: 1m
+  input_series:
+  - series: cnpg_collector_up{namespace="openfga",pod="openfga-pg-1",job="openfga/openfga-pg",cluster="openfga-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="openfga",pod="openfga-pg-1",job="openfga/openfga-pg",value="expected"}
+    values: 1x40
+  - series: cnpg_collector_replica_mode{namespace="openfga",pod="openfga-pg-1",job="openfga/openfga-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="openfga",pod="openfga-pg-1",job="openfga/openfga-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_streaming_replicas{namespace="openfga",pod="openfga-pg-1",job="openfga/openfga-pg"}
+    values: 1x9 0x6 1x24
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="openfga",pod="openfga-pg-1",job="openfga/openfga-pg"}
+    values: '0x40'
+  - series: cnpg_collector_up{namespace="openfga",pod="openfga-pg-2",job="openfga/openfga-pg",cluster="openfga-pg"}
+    values: 1x40
+  - series: cnpg_collector_sync_replicas{namespace="openfga",pod="openfga-pg-2",job="openfga/openfga-pg",value="expected"}
+    values: 1x40
+  - series: cnpg_collector_replica_mode{namespace="openfga",pod="openfga-pg-2",job="openfga/openfga-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_in_recovery{namespace="openfga",pod="openfga-pg-2",job="openfga/openfga-pg"}
+    values: 1x40
+  - series: cnpg_pg_replication_streaming_replicas{namespace="openfga",pod="openfga-pg-2",job="openfga/openfga-pg"}
+    values: '0x40'
+  - series: cnpg_pg_replication_is_wal_receiver_up{namespace="openfga",pod="openfga-pg-2",job="openfga/openfga-pg"}
+    values: 1x9 0x6 1x24
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgReplicaNotStreaming
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: cnpg-replication.streaming
+    alertname: CnpgStandbyNotReceivingWal
+    exp_alerts: []

@@ -1,0 +1,19 @@
+# The rspamd controller (11334) and the metrics exporter (9102) are NOT on the
+# LoadBalancer (infra-o4i3m.3). The chart hardcodes both on its one Service, which is
+# type LoadBalancer on 192.168.1.48, so every LAN host reached the controller directly
+# and bypassed the oauth2 ingress in front of rspamd.mdapi.ch. Both ports now live on
+# the ClusterIP Service docker-mailserver-internal (../values.yml extraDeploy), which
+# the Ingress (ingress-rspamd-internal.yaml) and the ServiceMonitor (port name
+# `metrics`) use instead. Strategic merge on `ports` (merge key `port`).
+# ⛔ Listed BEFORE service-lan-plain-smtp.yaml in kustomization.yaml (see there).
+# Pinned by tests/test_mail_rspamd_controller_requires_a_password.py.
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-mailserver
+spec:
+  ports:
+    - port: 11334
+      $patch: delete
+    - port: 9102
+      $patch: delete

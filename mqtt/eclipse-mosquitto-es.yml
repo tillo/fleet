@@ -1,0 +1,29 @@
+## One MQTT user per client (infra-az8.24). The broker's init container hashes
+## these into its password file; the clients read their own entry:
+##   frigate        -> frigate/frigate-es.yml (FRIGATE_MQTT_PASSWORD)
+##   findmy         -> findmy/findmy-es.yml (findmy-mqtt)
+##   homeassistant  -> HA's MQTT config entry (set through its reconfigure flow)
+## (ruuvi-gateway: retired 2026-11-10, the gateway's MQTT output is off; HA
+## reads it over HTTP. Its Akeyless item is left in place, unused.)
+## Rotating one: edit its Akeyless item; ESO refreshes, Reloader rolls the
+## broker, then update the client.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: mqtt-users
+  namespace: mqtt
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: mqtt-users
+    creationPolicy: Owner
+  data:
+    - remoteRef: {key: /mdapi/mqtt/users/homeassistant}
+      secretKey: homeassistant
+    - remoteRef: {key: /mdapi/mqtt/users/frigate}
+      secretKey: frigate
+    - remoteRef: {key: /mdapi/mqtt/users/findmy}
+      secretKey: findmy

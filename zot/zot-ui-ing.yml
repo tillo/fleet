@@ -1,0 +1,64 @@
+## Everything on zot.mdapi.ch except /v2, behind the estate's SSO (infra-8f4.56).
+##
+## WHY A SEPARATE INGRESS. zot-ing.yml serves /v2 UN-GATED because every
+## workload pulls/pushes with its own htpasswd credential; putting oauth2-proxy
+## there would redirect those to Keycloak and take the cluster's image source
+## down. So the gate lives here, on `/`, and the longer `/v2` prefix in
+## zot-ing.yml wins for the API. Ingress paths are the only lever that works
+## here: zot decides auth per endpoint, not per host.
+##
+## ⛔ WHY `/` AND NOT just /home. With the UI enabled zot registers a
+## FileServer as its LAST route, so any unmatched GET (/, /home, /explore,
+## /image, /user, /login, or any invented path) returns the SPA index.html —
+## anonymously. Gating only the named UI routes would have left the shell
+## reachable at `/` and at any typo'd URL, which is exactly the class of gap
+## this Ingress exists to close. It also means a future UI route needs no edit
+## here.
+##
+## Which gate: oauth2-proxy-admin (Keycloak, role mdapi-admin) — the same admin
+## gate backstage.mdapi.ch uses, so no new Keycloak client, no new cookie secret
+## and no new redis. zot's own `openid` extension would remove the second login
+## but needs a dedicated client + Akeyless item + accessControl group policies;
+## not worth it for a browse surface. ⚠️ Double login is therefore BY DESIGN:
+## Keycloak admits you to the shell, then zot's UI asks for the htpasswd
+## credential its data endpoints require (/v2 is zot-authenticated, not
+## SSO-authenticated).
+##
+## Read scope, decided: the shell is admin-only, and the data it renders is
+## readable by any holder of a zot read credential (all authenticated users per
+## D1). Repo names, tags, digests and layer lists are not secrets — they mirror
+## public upstreams plus our own project names — but the shell renders the whole
+## internal project inventory in one screen, so it does not belong on the open
+## internet behind only a shared htpasswd.
+##
+## /metrics is inside this path too (zot answers 401 there before the WAF even
+## matters); in-cluster scraping never touches the ingress — VMPodScrape hits
+## the pod IP directly.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zot-ui
+  namespace: zot
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/admin/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-admin.oauth2-proxy.svc.cluster.local/admin/oauth2/auth
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - zot.mdapi.ch
+      ## Same certificate as zot-ing.yml. Both Ingresses name it, so the cert is
+      ## renewed once and neither can be left on a stale secret.
+      secretName: zot-cert
+  rules:
+    - host: zot.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zot
+                port:
+                  number: 5000

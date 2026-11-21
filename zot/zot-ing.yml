@@ -1,0 +1,43 @@
+## The registry API (infra-8f4.56 split this from the UI ingress).
+##
+## ⛔ THIS INGRESS MUST STAY UN-GATED. `/v2` is pulled and pushed by every
+## workload with its own htpasswd credential (Secrets zot-pull / zot-registry,
+## and ci-push/dev-push in CI). Adding oauth2-proxy here would redirect those
+## requests to Keycloak and take the cluster's image source down.
+##
+## Everything else on this host is now served by zot-ui-ing.yml (path `/`),
+## which IS gated by oauth2-proxy-admin. Two Ingresses on one host merge and
+## the longest matching path wins, so /v2* lands here and every other path —
+## including the UI shell at `/`, which zot serves for ANY unmatched GET — goes
+## through the SSO gate there. ⚠️ The `/` path is why the split is needed:
+## before the UI existed the catch-all answered 401, but with the UI enabled
+## zot's last route is a FileServer, so `/` (and /foo) returns index.html
+## anonymously. Gating only /home would have left the shell public at `/`.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zot
+  namespace: zot
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # required — nginx 1m default breaks image layer pushes
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: zot.mdapi.ch
+      http:
+        paths:
+          - path: /v2
+            pathType: Prefix
+            backend:
+              service:
+                name: zot
+                port:
+                  number: 5000
+  tls:
+    - hosts:
+        - zot.mdapi.ch
+      secretName: zot-cert

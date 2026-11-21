@@ -1,0 +1,46 @@
+## search.mdapi.ch — the estate SearXNG as a browser-default metasearch, SSO-gated
+## by oauth2-proxy-portal (any tilloch-realm account), the same instance that fronts
+## chat.mdapi.ch and start.mdapi.ch. The in-cluster consumers (Open WebUI, litellm,
+## bussola) keep calling the ClusterIP Service directly and never pass through here.
+##
+## No whitelist-source-range: a browser default has to work off the LAN. The gate is
+## Keycloak, not the source address, and an unauthenticated request never reaches
+## SearXNG (the auth subrequest answers 401 first), so the instance is not an open
+## metasearch proxy for the internet.
+##
+## DNS: none to add. search.mdapi.ch is served by the public *.mdapi.ch wildcard, and
+## the split-horizon answer is generated from this Ingress by external-dns.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: searxng
+  namespace: openwebui
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    ## auth-url is the in-cluster Service (the public name would hairpin every
+    ## subrequest through the ingress); auth-signin is public because the browser
+    ## follows it.
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-portal.oauth2-proxy.svc.cluster.local/portal/oauth2/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/portal/oauth2/start?rd=https://$host$escaped_request_uri
+    ## WAF carve-out, per Ingress: ModSec OFF. The whole payload of this host is a
+    ## free-text query string, which is exactly what CRS false-positives on (a search
+    ## for a SQL snippet, a shell one-liner or an XSS write-up is a 403). Same call as
+    ## chat.mdapi.ch (openwebui-ingress.yml) and the portal: the surface is SSO-gated.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: search.mdapi.ch
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: searxng
+            port:
+              number: 8080
+  tls:
+  - hosts:
+    - search.mdapi.ch
+    secretName: searxng-cert

@@ -1,0 +1,91 @@
+# Shared clamd (ns clamav, infra-8f4.50). Mail's rspamd TEMPFAILS while clamd is
+# unreachable (force_actions on CLAM_VIRUS_FAIL), so "down" is a mail outage and
+# pages. The signature-age rule exists because the clamd that used to live inside the
+# mail pod ran on a 15-day-old daily.cld (28162, 2026-10-23) with nothing alerting:
+# its freshclam had silently stopped. The probe's VERSION answer carries the daily
+# build number as a label; a current series older than 3 days means freshclam is not
+# landing updates (upstream publishes several dailies a day).
+rule_files:
+- monitoring-rules/83-clamav.yml
+evaluation_interval: 1m
+tests:
+- name: clamd-down-pages-after-5m
+  interval: 1m
+  input_series:
+  - series: probe_success{job="clamav",probe="clamav"}
+    values: 1 1 0 0 0 0 0 0 0 0 0 0
+  alert_rule_test:
+  - eval_time: 5m
+    groupname: app-clamav.rules
+    alertname: ClamdDown
+    exp_alerts: []
+  - eval_time: 9m
+    groupname: app-clamav.rules
+    alertname: ClamdDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        service: clamd
+        component: Mail
+        statuspage: include
+        team: mdapi
+        namespace: clamav
+        job: clamav
+        probe: clamav
+      exp_annotations:
+        summary: "clamd (ns clamav) does not answer VERSION on :3310"
+        description: "Inbound mail is being DEFERRED (rspamd soft-rejects on\nCLAM_VIRUS_FAIL) and authenticated submission returns 4xx until\nclamd answers again. Nextcloud uploads are not scanned meanwhile.\n  kubectl --context mdapi-prod-direct -n clamav get pods\n  kubectl --context mdapi-prod-direct -n clamav logs deploy/clamav -c clamd\nA fresh pod needs ~1-2 min to load the database (startupProbe);\nan empty PVC first downloads ~170 MB in the init container.\nEmergency fail-open (delivers mail UNSCANNED): remove the\nCLAM_VIRUS_FAIL rule from force_actions in\nmail/docker-mailserver/values.yml user-patches.sh.\n"
+- name: clamd-up-is-silent
+  interval: 1m
+  input_series:
+  - series: probe_success{job="clamav",probe="clamav"}
+    values: 1x12
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-clamav.rules
+    alertname: ClamdDown
+    exp_alerts: []
+- name: daily-unchanged-for-3d-warns
+  # 1m spacing like the rule evaluation: a sparser series drops out of the instant
+  # lookback between samples and keeps resetting `for:` (production scrapes every 30 s).
+  interval: 1m
+  input_series:
+  - series: probe_expect_info{job="clamav",probe="clamav",engine="1.5.4",daily="28176"}
+    values: 1x4900
+  alert_rule_test:
+  - eval_time: 60h
+    groupname: app-clamav.rules
+    alertname: ClamavSignaturesStale
+    exp_alerts: []
+  - eval_time: 80h
+    groupname: app-clamav.rules
+    alertname: ClamavSignaturesStale
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        service: clamd
+        component: Mail
+        statuspage: exclude
+        team: mdapi
+        namespace: clamav
+        job: clamav
+        probe: clamav
+        engine: "1.5.4"
+        daily: "28176"
+      exp_annotations:
+        summary: "ClamAV daily signatures 28176 have not changed for 3 days"
+        description: "freshclam is not updating the shared clamd. Mail and Nextcloud are\nstill scanned, against an old database.\n  kubectl --context mdapi-prod-direct -n clamav logs deploy/clamav -c freshclam --tail=50\nA 429 from database.clamav.net is a CDN cool-down: freshclam backs off\nby itself; do NOT restart it in a loop.\n"
+- name: fresh-daily-after-old-one-is-silent
+  # The OLD series (28176) was seen 4 days ago and must not fire once it is gone;
+  # the current one (28177) is only a day old.
+  interval: 1m
+  input_series:
+  - series: probe_expect_info{job="clamav",probe="clamav",engine="1.5.4",daily="28176"}
+    values: 1x4320 _x1620
+  - series: probe_expect_info{job="clamav",probe="clamav",engine="1.5.4",daily="28177"}
+    values: _x4320 1x1620
+  alert_rule_test:
+  - eval_time: 99h
+    groupname: app-clamav.rules
+    alertname: ClamavSignaturesStale
+    exp_alerts: []

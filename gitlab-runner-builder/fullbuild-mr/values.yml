@@ -1,0 +1,147 @@
+## Fourth GitLab runner: the openwrt full-build lane for UNPROTECTED refs
+## (job `make` in mdapi/openwrt .gitlab-ci.yml on any branch or merge request
+## that is not protected, tag `builder-full-mr`). A twin of ../fullbuild, with
+## its own workspace PVC. The two must never share one.
+##
+## Why it exists (infra-5luo). A branch pipeline runs the PUSHED branch's own
+## .gitlab-ci.yml, so anyone who can push a branch to the project (Developer+,
+## the group bot tokens included) controls every job of that pipeline. That
+## includes GIT_CLEAN_FLAGS, so such a job could:
+##   * read the production apk signing key (private-key.pem). A production build
+##     leaves it in the workspace, and every flashed bpi-r4 trusts that key;
+##   * plant objects in .ccache/ or dl/ that the next production build would
+##     link into a signed image.
+## So the trust boundary is the WORKSPACE, not the job. The ../fullbuild runner
+## is access_level ref_protected (production refs only, set on the runner in
+## GitLab, not here) and its PVC never sees an unprotected job. This runner
+## takes the rest and builds with a throwaway key. The production key cannot
+## reach it: the AKEYLESS_ACCESS_* CI variables are protected.
+##
+## The node, CPU cap and serialisation are the same as ../fullbuild: both
+## runners carry the same `make` job, so resource_group openwrt-full-build
+## lets only one of them build at a time. Two of them on quarto never
+## oversubscribe it.
+
+image:
+  registry: registry.gitlab.com
+  image: gitlab-org/gitlab-runner
+  tag: alpine-v18.11.3
+
+gitlabUrl: https://gitlab.mdapi.ch/
+
+## Global config.toml settings are chart values; `runners.config` is only the
+## [[runners]] template and ignores them (see ../values.yml).
+concurrent: 1
+checkInterval: 3
+
+## Graceful stop (infra-4h19), as in ../fullbuild/values.yml.
+deploymentLifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "kill -QUIT 1; while kill -0 1 2>/dev/null; do sleep 5; done"]
+terminationGracePeriodSeconds: 10800
+
+runners:
+  secret: gitlab-runner-fullbuild-mr-token
+  config: |
+    [[runners]]
+      ## The workspace itself. /builds is the PVC mount below.
+      builds_dir = "/builds"
+      environment = ["FF_USE_FASTZIP=true"]
+      [runners.kubernetes]
+        image = "alpine"
+        namespace = "gitlab-runner-builder"
+        privileged = false
+        cpu_request = "4"
+        cpu_limit = "14"
+        memory_request = "8Gi"
+        memory_limit = "16Gi"
+        ephemeral_storage_request = "2Gi"
+        ephemeral_storage_limit = "20Gi"
+        helper_cpu_limit = "1"
+        helper_memory_limit = "512Mi"
+        node_selector_overwrite_allowed = ""
+        poll_timeout = 900
+        [runners.kubernetes.node_selector]
+          "kubernetes.io/hostname" = "quarto"
+        [runners.kubernetes.pod_annotations]
+          "container.apparmor.security.beta.kubernetes.io/build" = "unconfined"
+        [runners.kubernetes.pod_labels]
+          "monitoring.mdapi.ch/cpu-throttle-exempt" = "true"
+        [[runners.kubernetes.volumes.pvc]]
+          name = "openwrt-mr-workspace"
+          mount_path = "/builds"
+
+  ## Token-based registration (glrt-…) from the ExternalSecret below. Runner
+  ## 1014 was pre-created on project 33 with tag `builder-full-mr`,
+  ## run_untagged=false.
+  tags: "builder-full-mr"
+  runUntagged: false
+  privileged: false
+
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "pods/exec", "pods/attach", "secrets", "configmaps", "services"]
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get", "list", "watch"]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector:
+  kubernetes.io/hostname: quarto
+
+metrics:
+  enabled: true
+
+## --- Supporting resources. NOTE: this chart renders extraObjects as
+##     `tpl (toYaml .)`, so entries must be MAPPINGS (not string blocks)
+##     and any ESO/Go-template braces must be tpl-escaped as below.
+extraObjects:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: openwrt-mr-workspace
+      namespace: gitlab-runner-builder
+      labels:
+        ## Backup class `none`, the same label set as openwrt-full-workspace.
+        mdapi.ch/backup-class: none
+        recurring-job.longhorn.io/source: enabled
+        recurring-job-group.longhorn.io/nobackup: enabled
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: harvester-longhorn-1replica
+      resources:
+        requests:
+          storage: 80Gi
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: gitlab-runner-fullbuild-mr-token
+      namespace: gitlab-runner-builder
+    spec:
+      refreshInterval: 5m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: gitlab-runner-fullbuild-mr-token
+        creationPolicy: Owner
+        template:
+          engineVersion: v2
+          data:
+            runner-registration-token: ''
+            runner-token: '{{ "{{ .token }}" }}'
+      data:
+      - remoteRef:
+          key: /mdapi/gitlab/runner-fullbuild-mr-token
+        secretKey: token

@@ -1,0 +1,36 @@
+# Longhorn on the LARGE FusionIO disks only — for volumes whose real fill is a
+# sizeable fraction of a disk (first user: the Time Machine target, infra-hnbe.4).
+#
+# WHY A SECOND CLASS. Longhorn schedules a replica against the disk's
+# OVER-PROVISIONED size (storage-over-provisioning-percentage = 200), not its
+# physical free space. A 1.5 TiB replica therefore "fits" on qua's ~1 TB
+# fio2a/fio2b disks, and a thin volume that later fills up would then exhaust
+# them. `longhorn-iomemory` cannot express "big disks only", so this class adds
+# a second tag: diskSelector is an AND, so a replica lands only on a disk tagged
+# BOTH `iomemory` and `large`.
+#
+# ⚠️ The `large` tag is set BY HAND on the Longhorn Node CRs (same as `fio` and
+# `iomemory`; nothing in git owns disk tags). Tagged 2026-10-28, >= 2 TB fio disks:
+#   qua/fio-hot  qui/fio-hot  qui/fio2-qui  quo/fio2-quo
+# quo/fio-hot is deliberately NOT tagged: worn card, run to failure, reserve 1875G.
+# A new big card (quarto, infra-m42.4) needs the tag before it takes any of these.
+# Check:
+#   kubectl -n longhorn-system get nodes.longhorn.io -o json | jq -r '.items[] | .metadata.name as $n
+#     | .spec.disks | to_entries[] | select(.value.tags | index("large")) | "\($n)/\(.key)"'
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-iomemory-large
+  annotations:
+    storageclass.mdapi.ch/purpose: "FusionIO, >= 2 TB disks only (Time Machine and other large volumes)"
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+# Retain: the data is a backup history; a deleted PVC must not take it along.
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "2"          # two nodes; the fio cards are second-hand and run to failure
+  staleReplicaTimeout: "30"
+  diskSelector: "iomemory,large" # AND: both tags required
+  dataLocality: "disabled"       # a 1+ TiB local copy would follow the pod around on every reschedule
+  fsType: "ext4"

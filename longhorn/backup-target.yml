@@ -1,0 +1,120 @@
+## The Longhorn backup target, moved off the salt/pepper Garage to the
+## in-cluster Ceph RGW as those two hosts are decommissioned.
+##
+## WHAT WAS THERE
+## `s3://harvester-backup@garage/` -- 923.6 GiB across 666,663 objects, the
+## largest single tenant on salt. Measured before touching anything: the
+## `harvester/` prefix inside it holds 3 objects totalling 1.2 KiB (VM *images*)
+## and there is no `vmbackups/` prefix at all, so despite the bucket's name
+## essentially all of it is `backupstore/` -- this cluster's own Longhorn.
+##
+## ⛔⛔ THE HISTORY DOES NOT COME ALONG, AND THAT IS THE DECISION
+## Pointing Longhorn at a new target makes the old BackupVolumes invisible: they
+## live in the old store and Longhorn only ever shows the current one. 105
+## BackupVolumes are abandoned with the hardware, the same call already made for
+## the barman archives. What is actually lost is bounded -- the recurring jobs
+## retain 2, so this was at most ~2 months of rollback points, and much of the
+## 923 GiB is orphaned volumes that no longer exist. What is NOT lost: the PVCs
+## that matter are independently in B2 as restic repositories via VolSync.
+##
+## ⚠️ The new store is EMPTY until a backup runs, and the two recurring jobs are
+## `weekly` (Fridays 01:00, next 2026-09-26) and `default` (monthly, next
+## 2026-10-01). That is a 7-day hole. A one-shot run is triggered immediately
+## after this lands and verified by outcome, not by the target reporting
+## available -- a BackupTarget goes `available` as soon as it can LIST the
+## bucket, which an empty bucket satisfies perfectly.
+##
+## ⭐ Why RGW and not the NAS: this cluster IS Harvester -- Rook, Longhorn and
+## the VMs all run on qui/quo/qua bare metal -- so backing up to RGW is not the
+## circular "backup stored on the VMs it protects" it would be in a guest
+## cluster. It does share disks with the source, which is the honest cost: this
+## is the LOCAL tier for short-window granular restore, and disaster coverage is
+## the offsite restic channel. santillo (3.6 TiB free, NFS available but its
+## nfsd not running) is the alternative if Ceph pressure ever makes this a
+## problem.
+##
+## ⚠️ Fresh footprint is ~231 GiB, not 923: 85 volumes carry the `default` or
+## `weekly` group, and the 22 volumes in `nobackup` (268.7 GiB) are excluded by
+## design.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: harvester-backup-target-secret
+  namespace: longhorn-system
+spec:
+  ## Short on purpose: this secret is the ONLY place the working backup-target
+  ## configuration lives, and it is the thing an edit in the Harvester UI
+  ## silently rewrites. A 1h drift window would be a day of failed backups.
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: harvester-backup-target-secret
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## ⛔ https, NOT the :80 listener. Longhorn's backupstore format is not
+        ## encrypted, so on plain http every VM volume would cross the physical
+        ## LAN between qui/quo/qua in the clear over the VXLAN overlay -- exactly
+        ## what the Garage nginx terminator on :30288 existed to prevent. RGW got
+        ## its own house-PKI leaf for this (rook-ceph-objectstore-users/rgw-tls-cert.yml).
+        AWS_ENDPOINTS: "https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443"
+        AWS_ACCESS_KEY_ID: "{{ .access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ .secret_key }}"
+        ## ⭐ BOTH halves of the trust are load-bearing and fail differently.
+        ## AWS_CERT is what longhorn-manager uses; the ENGINE binary runs on the
+        ## node and uses the NODE's CA bundle instead. Removing the house CAs
+        ## from Harvester's `additional-ca` setting broke the backup target
+        ## within seconds on 2026-09-05 (x509 unknown authority) even though
+        ## AWS_CERT was untouched. Keep both.
+        AWS_CERT: |
+          -----BEGIN CERTIFICATE-----
+          MIICDDCCAZGgAwIBAgIQc7+JgwH+dvxbrq/xr/l6KjAKBggqhkjOPQQDAzA1MQsw
+          CQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3Qg
+          Q0EwHhcNMjYwNjE5MDQ1OTAxWhcNMzYwNjE2MDQ1OTAxWjA1MQswCQYDVQQGEwJD
+          SDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3QgQ0EwdjAQBgcq
+          hkjOPQIBBgUrgQQAIgNiAAR1xDazV3lhbxfV8ihouX9s7jekFCEzFGL9gTV1gOQ6
+          n97AfwjfIjTyz13KvyQv6mdmQDacQPciOBZcaeA2vztfE83MFXeZbXnyFsMqvld2
+          Mzsue+vEYF5I6b+68CAMMoajZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwHQYDVR0O
+          BBYEFJWzdaiI1rxzo/W1sHyTKrykHLSqMB8GA1UdIwQYMBaAFJWzdaiI1rxzo/W1
+          sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNpADBmAjEAqnm2
+          InKpu+JijKJjgegwgP97tqMyJtqBtQ7XiO5gLrAYBbF5ODvLmqvCfrOYDOYJAjEA
+          t5nFrJb4nFUefDRZ4GybHOSb6GO0PpjFoF/xrwlX4t6kTjuLOZxz9CpgdjzHlriJ
+          -----END CERTIFICATE-----
+          -----BEGIN CERTIFICATE-----
+          MIICETCCAZegAwIBAgIQJWLvVrFzdklVpPqeC4qvYDAKBggqhkjOPQQDAzA1MQsw
+          CQYDVQQGEwJDSDEOMAwGA1UECgwFbWRhcGkxFjAUBgNVBAMMDU1EQVBJIFJvb3Qg
+          Q0EwHhcNMjYwNjE5MDQ1OTI1WhcNMzEwNjE4MDQ1OTI1WjA7MQswCQYDVQQGEwJD
+          SDEOMAwGA1UECgwFbWRhcGkxHDAaBgNVBAMME01EQVBJIElzc3VpbmcgQ0EgMDEw
+          djAQBgcqhkjOPQIBBgUrgQQAIgNiAARFXWes3TPhHOXNibWS38lRScGnjAdA1NvJ
+          m21taiFGVudRc+y2geWgER3o1wPfEvA+S7xYaL3COlS5QP0VUHMbbjDzcryzSlTT
+          RfRYcQ9HHdXi7Kyqr0P8J/tSIux2cYejZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQAw
+          HQYDVR0OBBYEFOzQOTnCJbvJJ1t9uVJvDut3CZ56MB8GA1UdIwQYMBaAFJWzdaiI
+          1rxzo/W1sHyTKrykHLSqMA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAwNoADBl
+          AjACZQeOtpTxpyJTlir1cvlxGjRm75ACHJX84d9O4YKX04INQ6U3R9l6HeEku468
+          MIsCMQD6Fbcn8aDEout53w03HipxjGnrmh35dKYbvAa8+dVvk2mCq+fTU6FZgxfA
+          RW7FY04=
+          -----END CERTIFICATE-----
+  data:
+    - secretKey: access_key
+      remoteRef:
+        key: /mdapi/longhorn/rgw/access-key
+    - secretKey: secret_key
+      remoteRef:
+        key: /mdapi/longhorn/rgw/secret-key
+---
+## ⭐ `@us-east-1` is RGW's default zonegroup, not a guess: it is the region the
+## SigV4 signature must be scoped to, and it was proven by a real put/get/delete
+## round-trip against this bucket with this user's credentials before the target
+## was pointed here. The Garage URL used `@garage` for the same reason.
+apiVersion: longhorn.io/v1beta2
+kind: BackupTarget
+metadata:
+  name: default
+  namespace: longhorn-system
+spec:
+  backupTargetURL: s3://longhorn-backup@us-east-1/
+  credentialSecret: harvester-backup-target-secret
+  pollInterval: 5m0s

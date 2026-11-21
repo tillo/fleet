@@ -1,0 +1,22 @@
+# Singleton config the ceph-csi-operator reconciles (name + ns are fixed: it watches
+# `ceph-csi-operator-config` in OPERATOR_NAMESPACE). driverSpecDefaults is inherited by
+# every Driver CR, so per-driver specs stay empty.
+apiVersion: csi.ceph.io/v1
+kind: OperatorConfig
+metadata:
+  name: ceph-csi-operator-config
+  namespace: rook-ceph
+spec:
+  driverSpecDefaults:
+    # ⛔ NOT the rook-ceph chart's `rook-csi-operator-image-set-configmap`: Rook v1.21.0
+    # blanks that one whenever `plugin` starts with `quay.io/cephcsi/cephcsi:v3.17`,
+    # which is exactly what our x86-64-v2 pin is, so chart and operator never converge
+    # (rook-ceph bundle stuck Modified → rook-ceph-cluster held by dependsOn).
+    # csi-image-set.yml carries the pin instead; Rook does not manage that name.
+    imageSet:
+      name: rook-ceph-csi-image-set
+    controllerPlugin:
+      priorityClassName: system-cluster-critical
+      replicas: 2                       # HA provisioners on the 3-node cluster
+    nodePlugin:
+      priorityClassName: system-node-critical

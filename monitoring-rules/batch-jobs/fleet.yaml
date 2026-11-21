@@ -1,0 +1,27 @@
+## monitoring-rules/batch-jobs: its own bundle, split out of monitoring-rules/
+## (infra-3rm.33, 2026-11-20).
+##
+## Why. Fleet stores every bundle as a Helm release, and Helm keeps each revision
+## in ONE Secret, which the API server caps at 1,048,576 bytes. monitoring-rules
+## v712 was 1,047,252 B; v713 (fleet!2614) was refused, the bundle went
+## ErrApplied, and every later rule change silently stayed undeployed. This one
+## file was 408 KB of the bundle's 1,454 KB. Guard: FleetHelmReleaseNearSecretLimit.
+##
+## Nested bundle: Fleet picks this directory up through the parent's GitRepo path
+## (fleet-paths.txt lists only `monitoring-rules`), and the parent's bundle does
+## not deploy a nested fleet.yaml's files. Same pattern as
+## rke2-ingress-nginx-config/catchall-404.
+##
+## Handover of PrometheusRule app-batch-jobs from release mdapi-prod-monitoring-rules
+## (done 2026-11-20, fleet!2636): takeOwnership adopted the live object, the parent
+## dependsOn'd this bundle so adoption came first, and a temporary
+## `helm.sh/resource-policy: keep` on the object (Helm reads it from the LIVE object
+## before deleting a resource a release dropped) kept the parent's upgrade from
+## deleting it. Reuse that recipe for the next split.
+defaultNamespace: monitoring
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+  takeOwnership: true

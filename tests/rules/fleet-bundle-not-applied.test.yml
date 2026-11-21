@@ -1,0 +1,60 @@
+# FleetBundleNotApplied (infra-3rm.34). Source series: daily_infra_health, one PUT
+# per hour, so a value holds for the hour (see fleet-bundles-not-ready.test.yml for
+# why one push must never be enough). vmalert-tool's clock starts at 0 = first push.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+# A rollout caught mid-flight by one push: desired != applied for that hour only.
+- name: one-push-mid-rollout-is-not-an-incident
+  interval: 1m
+  input_series:
+  - series: fleet_bundle_not_applied_info{cluster="mdapi",bundle="mdapi-prod-gitlab"}
+    values: '1x60'
+  alert_rule_test:
+  - eval_time: 59m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundleNotApplied
+    exp_alerts: []
+  - eval_time: 90m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundleNotApplied
+    exp_alerts: []
+# The 2026-11-19 shape: ErrApplied, still unapplied at the next push -> critical.
+- name: refused-apply-across-two-pushes-is-critical
+  interval: 1m
+  input_series:
+  - series: fleet_bundle_not_applied_info{cluster="mdapi",bundle="mdapi-prod-monitoring-rules"}
+    values: '1x300'
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundleNotApplied
+    exp_alerts: []
+  - eval_time: 78m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundleNotApplied
+    exp_alerts:
+    - exp_labels:
+        service: fleet
+        namespace: cattle-fleet-system
+        severity: critical
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+        cluster: mdapi
+        bundle: mdapi-prod-monitoring-rules
+      exp_annotations:
+        summary: "Fleet bundle mdapi-prod-monitoring-rules cannot apply its current git content on mdapi"
+        description: "mdapi-prod-monitoring-rules has a desired deploymentID that the agent has not applied in two consecutive hourly pushes: merged changes to it are NOT on the cluster, and every later merge to it will also merge green and deploy nothing. Read the error with `kubectl --context mdapi-rancher -n fleet-default get bundle mdapi-prod-monitoring-rules -o jsonpath='{.status.summary.nonReadyResources}'`. Known cause: helm release Secret over 1 MiB (`Too long: may not be more than 1048576 bytes`) - split the bundle as in monitoring-rules/batch-jobs/fleet.yaml."
+# Remote-cluster fleet agents are WaitApplied by design (2026-10-30): muted.
+- name: remote-fleet-agent-bundles-stay-muted
+  interval: 1m
+  input_series:
+  - series: fleet_bundle_not_applied_info{cluster="c-6pgh5",bundle="fleet-agent-c-6pgh5"}
+    values: '1x300'
+  alert_rule_test:
+  - eval_time: 78m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetBundleNotApplied
+    exp_alerts: []

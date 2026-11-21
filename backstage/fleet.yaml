@@ -1,0 +1,31 @@
+# Backstage — the estate's developer portal at backstage.mdapi.ch (epic
+# infra-7rog.5): software catalog, TechDocs, Scaffolder and a read-only
+# Kubernetes view of mdapi-prod.
+#
+#  - Code, image and CI: gitlab.mdapi.ch/mdapi/backstage. The image carries
+#    app-config.production.yaml; this bundle supplies only secrets, the
+#    database and the wiring.
+#  - Catalog CONTENT comes from the private mdapi/backstage-catalog repo, not
+#    from here: this repo is mirrored publicly, and the catalog names tenants.
+#  - Access: oauth2-proxy-admin (Keycloak, role mdapi-admin) in front; its
+#    auth response carries X-Auth-Request-Preferred-Username, which the
+#    Backstage oauth2Proxy provider signs in (no second login).
+#  - Plain manifests, no chart.
+#  - defaultNamespace only, deliberately NOT `namespace:` — that would force the
+#    ClusterRole/Binding in backstage-rbac.yml into the namespace, and Fleet drops
+#    them silently (tests/test_namespaced_bundle_no_cluster_scoped.py).
+defaultNamespace: backstage
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-external-secrets
+## Deliberately NO dependsOn on mdapi-prod-zot-pull-secrets although the pull
+## Secret comes from there: that bundle cannot create its ExternalSecret until
+## this bundle has created the namespace (same reasoning as memsearch/fleet.yaml).
+helm:
+  maxHistory: 25

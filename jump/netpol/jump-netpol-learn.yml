@@ -1,0 +1,58 @@
+# LEARN MODE: logs every new OUTBOUND flow from ns jump, blocks NOTHING
+# (infra-zrct, user decision 2026-11-04 option A: egress fencing of ns jump first,
+# learn now, enforce later with the user on hand — jump is the access path of last
+# resort). Analyse with /netpol-learn-analyse jump after >= 24 h.
+#
+# ⛔ THIS POLICY MUST NOT BLOCK ANYTHING. Keep the shape `Log` then `Allow`: Calico's
+# Log does not terminate, the trailing Allow accepts everything. A policy that
+# selects an endpoint default-denies every direction in `types`, so deleting the
+# Allow cuts the bastion's egress (kubectl, git, LLM doors) off. Egress only:
+# ingress (sslh, Guacamole, OpenVPN) is a later slice.
+#
+# Selector all(): the whole namespace (jump-bastion, guacamole, guacd, guac-pg,
+# openvpn, volsync movers), since the fence is per namespace.
+#
+# SIZE: the 2026-11-05 estimate (~5-15k lines/h) was 2-6x low. MEASURED on quo
+# 21:58-23:50Z: ~9 lines/s = ~32k/h (59,625 in under 2 h, 96% of the node's journal),
+# 86% of them DNS (infra-kd3t forensics). DNS to kube-dns and the router resolver is
+# therefore allowed BEFORE the Log rule (2026-11-06): those destinations are known and
+# netpol-learn-analyse excludes DNS anyway. Everything else is still logged.
+# Test: tests/test_jump_learn_policy_never_blocks.py
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: learn.jump-egress
+  namespace: jump
+spec:
+  order: 500
+  selector: all()
+  types:
+    - Egress
+  egress:
+    # DNS first, unlogged: the pod resolv.conf is 10.53.0.10 (rke2-coredns, DNATed to the
+    # k8s-app=kube-dns pods, which is what egress policy sees) then 192.168.1.254.
+    - action: Allow
+      protocol: UDP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+    - action: Allow
+      protocol: UDP
+      destination:
+        nets: [192.168.1.254/32]
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        nets: [192.168.1.254/32]
+        ports: [53]
+    # Then log, then allow unconditionally. Never reorder these two.
+    - action: Log
+    - action: Allow

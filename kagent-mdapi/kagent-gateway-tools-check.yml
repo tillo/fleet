@@ -1,0 +1,241 @@
+# Live check: every tool a kagent Agent names is really served to the `kagent`
+# key at the MCP front door (bead infra-7rog.32.2).
+#
+# The gateway's routes and their tool/key policies live in its database since
+# fleet !1776, so git cannot say what the key may call. A filtered tool or a
+# missing grant is SILENT: tools/list answers `[]` or 403 inside the agent pod
+# while the Agent CR stays Accepted (the !1711 incident). This job asks the
+# gateway the way the agent does — MCP initialize + tools/list with the
+# kagent-mcp Authorization header — on every RemoteMCPServer behind it, compares
+# with each Agent's toolNames and pushes the result to the Pushgateway (job
+# kagent_gateway_tools_check). Alerts: KagentGatewayToolMissing and
+# KagentGatewayToolsCheckStale (monitoring-rules/77a-kagent-gateway-tools.yml). The comparison
+# is pinned offline by tests/test_kagent_gateway_tools_check.py.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kagent-gateway-tools-check
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: kagent-gateway-tools-check
+data:
+  check.py: |
+    """tools/list with the kagent key on every gateway-backed RemoteMCPServer."""
+    import json
+    import os
+    import ssl
+    import urllib.error
+    import urllib.request
+    from typing import NamedTuple
+    from urllib.parse import urlparse
+
+    GATEWAY_HOST = "mcp.agentgateway.svc.cluster.local"
+    PUSH = "http://pushgateway.monitoring.svc.cluster.local:9091/metrics/job/kagent_gateway_tools_check"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    CRDS = "/apis/kagent.dev/v1alpha2/namespaces/kagent"
+
+
+    class Want(NamedTuple):
+        agent: str
+        server: str
+        url: str
+        tools: tuple
+
+
+    def remote_refs(agent):
+        """The RemoteMCPServer references of one Agent's McpServer tools."""
+        tools = (agent["spec"].get("declarative") or {}).get("tools") or []
+        refs = [t.get("mcpServer") or {} for t in tools if t.get("type") == "McpServer"]
+        return [r for r in refs if r.get("kind") == "RemoteMCPServer"]
+
+
+    def expectations(agents, servers):
+        """Each Agent's McpServer tool list on a RemoteMCPServer behind the gateway."""
+        urls = {s["metadata"]["name"]: s["spec"]["url"] for s in servers}
+        out = []
+        for a in agents:
+            name = a["metadata"]["name"]
+            for ref in remote_refs(a):
+                if ref["name"] not in urls:
+                    raise ValueError(f"{name}: RemoteMCPServer {ref['name']!r} does not exist")
+                url = urls[ref["name"]]
+                if urlparse(url).hostname == GATEWAY_HOST:
+                    out.append(Want(name, ref["name"], url, tuple(sorted(ref.get("toolNames") or []))))
+        return out
+
+
+    def missing(wants, listed):
+        """(agent, server, tool) for every expected tool the gateway did not list."""
+        return sorted((w.agent, w.server, t) for w in wants for t in w.tools
+                      if t not in listed.get(w.url, set()))
+
+
+    def exposition(wants, gaps, ok):
+        lines = [f"kagent_gateway_tools_checked {sum(len(w.tools) for w in wants)}",
+                 f"kagent_gateway_tools_missing_total {len(gaps)}"]
+        lines += [f'kagent_gateway_tool_missing{{agent="{a}",server="{s}",tool="{t}"}} 1'
+                  for a, s, t in gaps]
+        lines += [f'kagent_gateway_tools_list_ok{{server="{s}"}} {int(v)}' for s, v in sorted(ok.items())]
+        return "\n".join(lines) + "\n"
+
+
+    def rpc_result(body, content_type, rpc_id):
+        """The JSON-RPC result for rpc_id from a JSON or an event-stream answer."""
+        if content_type.startswith("text/event-stream"):
+            msgs = [json.loads(ln[5:]) for ln in body.splitlines() if ln.startswith("data:")]
+        else:
+            msgs = [json.loads(body)]
+        for m in msgs:
+            if m.get("id") == rpc_id:
+                if "error" in m:
+                    raise RuntimeError(f"rpc {rpc_id}: {m['error'].get('message')}")
+                return m["result"]
+        raise RuntimeError(f"no answer to id {rpc_id}")
+
+
+    # -- boundary ---------------------------------------------------------------
+
+    def kube(path):
+        token = open(SA + "/token").read().strip()
+        ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+        host, port = os.environ["KUBERNETES_SERVICE_HOST"], os.environ["KUBERNETES_SERVICE_PORT"]
+        req = urllib.request.Request(f"https://{host}:{port}{path}",
+                                     headers={"Authorization": "Bearer " + token})
+        return json.load(urllib.request.urlopen(req, context=ctx, timeout=20))["items"]
+
+
+    def post(url, auth, payload, session=None):
+        headers = {"Authorization": auth, "Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream"}
+        if session:
+            headers["Mcp-Session-Id"] = session
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode(), r.headers.get("Content-Type", ""), r.headers.get("Mcp-Session-Id")
+
+
+    def tools_list(url, auth):
+        init = {"protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "kagent-gateway-tools-check", "version": "1"}}
+        body, kind, session = post(url, auth, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": init})
+        rpc_result(body, kind, 1)
+        post(url, auth, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
+        body, kind, _ = post(url, auth, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session)
+        return {t["name"] for t in rpc_result(body, kind, 2).get("tools") or []}
+
+
+    def listings(wants, lister):
+        """tools/list once per gateway URL; a failed call lists nothing and is marked not ok."""
+        listed, ok = {}, {}
+        for w in {w.url: w for w in wants}.values():
+            try:
+                listed[w.url], ok[w.server] = lister(w.url), True
+            except (urllib.error.URLError, RuntimeError, ValueError, OSError) as e:
+                print(f"{w.server}: tools/list failed: {e}")
+                listed[w.url], ok[w.server] = set(), False
+        return listed, ok
+
+
+    def main():
+        auth = open("/kagent-mcp/Authorization").read().strip()
+        wants = expectations(kube(CRDS + "/agents"), kube(CRDS + "/remotemcpservers"))
+        listed, ok = listings(wants, lambda url: tools_list(url, auth))
+        text = exposition(wants, missing(wants, listed), ok)
+        print(text, end="")
+        urllib.request.urlopen(urllib.request.Request(PUSH, data=text.encode(), method="PUT"), timeout=20)
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kagent-gateway-tools-check
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: kagent-gateway-tools-check
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kagent-gateway-tools-check
+  namespace: kagent
+rules:
+  - apiGroups: ["kagent.dev"]
+    resources: ["agents", "remotemcpservers"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kagent-gateway-tools-check
+  namespace: kagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kagent-gateway-tools-check
+subjects:
+  - kind: ServiceAccount
+    name: kagent-gateway-tools-check
+    namespace: kagent
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kagent-gateway-tools-check
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: kagent-gateway-tools-check
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 180
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: kagent-gateway-tools-check
+        spec:
+          serviceAccountName: kagent-gateway-tools-check
+          restartPolicy: Never
+          enableServiceLinks: false
+          priorityClassName: mdapi-low
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: check
+              # The image agentgateway-catalog-export pins: standard library only.
+              image: docker.io/library/python:3.15-alpine@sha256:0f9552bb28711333da16915ec146f5e6bb44a7fdac9ced15dc17c2e0206346dd
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/check/check.py"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits: {memory: 128Mi}
+              volumeMounts:
+                - name: check
+                  mountPath: /check
+                  readOnly: true
+                - name: kagent-mcp
+                  mountPath: /kagent-mcp
+                  readOnly: true
+          volumes:
+            - name: check
+              configMap: {name: kagent-gateway-tools-check}
+            - name: kagent-mcp
+              secret:
+                secretName: kagent-mcp
+                items: [{key: Authorization, path: Authorization}]

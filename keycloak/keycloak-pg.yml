@@ -1,0 +1,243 @@
+## CloudNativePG cluster for Keycloak, on PostgreSQL 18 (2026-11-13).
+##
+## Replaces the standalone `postgres` Deployment (postgres-deploy.yml, PG 17), which
+## had no WAL archive and no second instance, and which a bare 17 -> 18 image bump
+## (Renovate !2295) could not upgrade: an 18 server refuses a 17 data directory.
+##
+## Bootstrap IMPORTS the live `keycloak` database from that Deployment
+## (`initdb.import`, type microservice = logical dump/restore). That is also the
+## major-version jump: the dump is read from 17 and restored into 18. The import
+## runs once, when this Cluster is first created; writes Keycloak makes to the old
+## database after that are NOT carried over, so the cutover compares row counts of
+## the core tables before Keycloak's KC_DB_URL is switched.
+##
+## The owner role and password are the SAME as before: `keycloak-pg-app` is built
+## from the Akeyless item Keycloak already reads (KC_DB_PASSWORD), so the cutover
+## only changes the JDBC host to keycloak-pg-rw.
+##
+## Shape copied from openfga/openfga-pg.yml: 2 instances, switchover, barman to its
+## own RGW bucket over TLS via the Barman Cloud plugin, daily base backup, 14 d.
+##
+## ⭐ ObjectStore is declared BEFORE the Cluster on purpose: the plugin's pre-reconcile
+## hook stops a Cluster's reconcile (with no requeue) when its ObjectStore is not yet
+## in the plugin cache, leaving archiving half-wired (memory
+## cnpg_plugin_pre_reconcile_hook_half_migration_2026_10_07).
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: keycloak-pg
+  namespace: keycloak
+spec:
+  configuration:
+    destinationPath: s3://cnpg-keycloak-pg
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-keycloak-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-keycloak-pg
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    data:
+      compression: gzip
+      jobs: 1
+    wal:
+      compression: gzip
+  ## On the STORE, not the Cluster: left off, nothing prunes and nothing says so.
+  retentionPolicy: "14d"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: keycloak-pg
+  namespace: keycloak
+spec:
+  ## CNPG re-creates instance PVCs on every rebuild; this is the only place the
+  ## backup class survives one (tests/test_cnpg_clusters_declare_backup_class.py).
+  inheritedMetadata:
+    labels:
+      mdapi.ch/backup-class: default
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 5Gi
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: 128MB
+      effective_cache_size: 256MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  ## O2 Database Monitoring login (sqlquery + postgresql receivers in
+  ## openobserve/o2-dbm-collector.yml). The import copies the database, not the
+  ## cluster's roles, so the PG17 Deployment's hand-made o2_dbm is declared here,
+  ## with the same Akeyless password the collector already holds.
+  managed:
+    roles:
+      - name: o2_dbm
+        ensure: present
+        login: true
+        inherit: true
+        inRoles: [pg_monitor]
+        connectionLimit: 8
+        passwordSecret:
+          name: keycloak-pg-o2dbm
+
+  bootstrap:
+    initdb:
+      database: keycloak
+      owner: keycloak
+      secret:
+        name: keycloak-pg-app
+      import:
+        type: microservice
+        databases:
+          - keycloak
+        source:
+          externalCluster: legacy-postgres
+
+  ## The PG 17 Deployment this cluster was imported from. Only read at bootstrap;
+  ## delete this stanza together with postgres-deploy.yml once the soak is over.
+  externalClusters:
+    - name: legacy-postgres
+      connectionParameters:
+        host: postgres.keycloak.svc.cluster.local
+        user: keycloak
+        dbname: keycloak
+        sslmode: disable
+      password:
+        name: postgres-env-secret
+        key: POSTGRES_PASSWORD
+
+  ## serverName stated explicitly: barman keys the archive <bucket>/<serverName>/,
+  ## and it is accepted only as a plugin parameter (CEL rejects it on the store).
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: keycloak-pg
+        serverName: keycloak-pg
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: keycloak-pg-daily
+  namespace: keycloak
+spec:
+  schedule: "0 50 2 * * *"
+  backupOwnerReference: self
+  ## WAL archiving alone is not a backup: take the first base backup at once.
+  immediate: true
+  cluster:
+    name: keycloak-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+---
+## Owner credential: the password Keycloak already uses, so KC_DB_PASSWORD needs no change.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: keycloak-pg-app
+  namespace: keycloak
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: keycloak-pg-app
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          ## CNPG only re-reads a password secret it watches; without this a rotated
+          ## password is never applied.
+          cnpg.io/reload: "true"
+      data:
+        username: keycloak
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/keycloak/keycloak-env-secret/KC_DB_PASSWORD
+      secretKey: password
+---
+## Password for the o2_dbm login; CNPG wants a basic-auth secret whose username is the role.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: keycloak-pg-o2dbm
+  namespace: keycloak
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: keycloak-pg-o2dbm
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      type: kubernetes.io/basic-auth
+      metadata:
+        labels:
+          cnpg.io/reload: "true"
+      data:
+        username: o2_dbm
+        password: "{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/keycloak/postgres-o2dbm/password
+      secretKey: password
+---
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-keycloak-pg
+  namespace: keycloak
+spec:
+  bucketName: cnpg-keycloak-pg
+  storageClassName: ceph-bucket
+  ## Declare the offsite grant so Rook OWNS it: the OBC reconciler deletes any policy
+  ## not listed here (rgw_bucket_policy_loss_incident_2026_09_29).
+  additionalConfig:
+    bucketPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"OffsiteSweepRead","Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/offsite"]},"Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::cnpg-keycloak-pg","arn:aws:s3:::cnpg-keycloak-pg/*"]}]}'
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: keycloak
+stringData:
+  REGION: us-east-1

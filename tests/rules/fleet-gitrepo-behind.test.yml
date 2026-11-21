@@ -1,0 +1,50 @@
+# FleetGitRepoBehind (infra-3rm.37). Source: daily_infra_health, one PUT per hour;
+# a value holds for the hour (see fleet-bundles-not-ready.test.yml). t=0 = first push.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+# A commit caught mid-render by one push: render lag for that hour only.
+- name: one-push-mid-render-is-not-an-incident
+  interval: 1m
+  input_series:
+  - series: fleet_gitrepo_behind_info{repo="fleet-default/mdapi-prod",reason="render"}
+    values: '1x60'
+  alert_rule_test:
+  - eval_time: 59m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetGitRepoBehind
+    exp_alerts: []
+  - eval_time: 90m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetGitRepoBehind
+    exp_alerts: []
+# The 2026-09-09 shape: Stalled, plus bundles left behind, across two pushes ->
+# ONE critical alert per repo, whatever the number of reasons.
+- name: stalled-repo-across-two-pushes-is-one-critical
+  interval: 1m
+  input_series:
+  - series: fleet_gitrepo_behind_info{repo="fleet-default/mdapi-prod",reason="stalled"}
+    values: '1x300'
+  - series: fleet_gitrepo_behind_info{repo="fleet-default/mdapi-prod",reason="bundles"}
+    values: '1x300'
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetGitRepoBehind
+    exp_alerts: []
+  - eval_time: 78m
+    groupname: app-batch-jobs.infra-health
+    alertname: FleetGitRepoBehind
+    exp_alerts:
+    - exp_labels:
+        service: fleet
+        namespace: cattle-fleet-system
+        severity: critical
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+        repo: fleet-default/mdapi-prod
+      exp_annotations:
+        summary: "Fleet is not deploying current git content of fleet-default/mdapi-prod"
+        description: "GitRepo fleet-default/mdapi-prod has been behind git for two consecutive hourly pushes: no bundle in it can update, so every merge lands green and deploys nothing. The `reason` label of fleet_gitrepo_behind_info says which step is stuck (stalled / polling / render / bundles). Start with `kubectl --context mdapi-rancher -n fleet-default get gitrepo mdapi-prod -o jsonpath='{.status.conditions}'` and the fleet-gitrepo-stall-diag skill."

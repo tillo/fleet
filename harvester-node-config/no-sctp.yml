@@ -1,0 +1,34 @@
+# Block the SCTP kernel module on every node (nginx2root, 2026-11-18).
+#
+# The nginx2root chain turns an nginx worker RCE into host root through a use-after-free in
+# the SCTP send path (Linux >= 4.15, no CVE id or fixed kernel at publication). The module
+# ships in the node image and the kernel autoloads it on the first socket(..., IPPROTO_SCTP),
+# so any compromised container could pull it in. No Service or NetworkPolicy on the estate
+# uses SCTP.
+#
+# `install sctp /bin/false` makes every load attempt fail, including autoload. It does
+# not unload a module that is already loaded (none was, 2026-11-18), and it does nothing
+# against a built-in sctp. Written in initramfs so it is in place before userspace runs.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-no-sctp
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 99_mdapi_no_sctp.yaml
+  contents: |
+    # Managed by CloudInit mdapi-no-sctp (fleet harvester-node-config/no-sctp.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "Block the SCTP kernel module (nginx2root kernel stage)."
+    stages:
+      initramfs:
+        - name: "modprobe.d: sctp -> /bin/false"
+          files:
+            - path: /etc/modprobe.d/50-mdapi-no-sctp.conf
+              permissions: 0644
+              owner: 0
+              group: 0
+              content: |
+                install sctp /bin/false
+                install sctp_diag /bin/false

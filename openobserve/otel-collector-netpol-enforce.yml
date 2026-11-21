@@ -1,0 +1,55 @@
+# ENFORCING (isolation programme infra-az8.4; finding infra-o4i3m.9).
+#
+# Why: OTLP 4317/4318 has no auth, because ingress-nginx cannot send an auth header, so
+# without this any pod could inject fake spans into O2 traces (user decision 2026-11-16:
+# NetworkPolicy, learn first).
+#
+# Written from learn.otel-collector (2026-11-16 22:17Z -> 2026-11-18, ~33 h, journald
+# suppression 0 on every node). Outside the five emitters below the window saw two
+# one-off connections from short-lived job pods within a minute of the policy's creation,
+# and nothing after. The emitters configured in fleet (otel endpoints) are exactly:
+#   ingress-nginx (kube-system), keycloak, openwebui, spicedb (formbricks-kustodyan),
+#   grafana (monitoring). A NEW emitter needs its own rule here, or its spans are dropped
+#   (the Log rule leaves a netpol_flows row naming it).
+# Kubelet probes on :13133 are not policed (host -> local workload without a HostEndpoint).
+#
+# Revert: git revert this change (Fleet re-creates the object; a kubectl delete buys ~90 s).
+# Pinned by tests/test_otel_collector_enforce_policy.py.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.otel-collector
+  namespace: openobserve
+spec:
+  order: 500
+  selector: app == "otel-collector"
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name == "rke2-ingress-nginx"
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "keycloak"
+        selector: app == "keycloak"
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "openwebui"
+        selector: app == "openwebui"
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "formbricks-kustodyan"
+        selector: app == "spicedb"
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "monitoring"
+        selector: app == "grafana"
+    - action: Log
+    - action: Deny

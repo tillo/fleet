@@ -1,0 +1,27 @@
+# LEARN MODE (isolation programme infra-az8.4): Log + Allow on every connection
+# INTO the AIO apache pod. Nothing is blocked; each new connection becomes a
+# row in the OpenObserve netpol_flows stream, which is the evidence the
+# hand-written enforcing policy is drafted from (skill netpol-learn-analyse).
+#
+# Why apache: Nextcloud trusts the whole pod CIDR 10.52.0.0/16 as reverse
+# proxies (trusted_proxies 4), so any pod reaching apache DIRECTLY (not via
+# ingress-nginx, which overwrites X-Forwarded-For) can forge the client IP that
+# brute-force throttling and the audit log rely on. The enforcing policy will
+# admit only the observed callers (expected: ingress-nginx, notify-push, the
+# nextcloud pod's run-exec-commands wait loop) on TCP 11000.
+#
+# ⛔ Delete this file in the SAME change that adds the enforcing policy: its
+# blanket Allow would otherwise defeat the enforcement.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: learn.nextcloud-aio-apache
+  namespace: nextcloud
+spec:
+  order: 500
+  selector: io.kompose.service == "nextcloud-aio-apache"
+  types:
+    - Ingress
+  ingress:
+    - action: Log
+    - action: Allow

@@ -1,0 +1,26 @@
+## Alertmanager credential for the statuspage adapter (infra-o4i3m.5.1, 2026-11-16).
+## vmalertmanager-mdapi requires Basic auth; each client has its own user so one
+## leak is rotated alone. Password in Akeyless, never in git; its bcrypt hash sits
+## beside it and is assembled into the server's web.yml (vmalertmanager-web-es.yml).
+## Rotation: write BOTH /mdapi/monitoring/vmalertmanager/statuspage/{password,hash}.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmalertmanager-client-statuspage
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmalertmanager-client-statuspage
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      mergePolicy: Merge
+      data:
+        AM_USERNAME: statuspage
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/statuspage/password }
+    secretKey: AM_PASSWORD

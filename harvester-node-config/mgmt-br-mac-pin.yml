@@ -1,0 +1,56 @@
+# Pin mgmt-br's MAC to the mgmt-bo bond (infra-nqfj).
+#
+# A Linux bridge with no explicit MAC floats to the lowest MAC among its ports. Harvester
+# bridges VM veths into mgmt-br, so a VM start/stop/migrate can drag mgmt-br's MAC onto a veth;
+# MetalLB's L2 responder keeps announcing the dead MAC and every LoadBalancer VIP black-holes.
+# This installs a NetworkManager dispatcher that re-pins the bridge to the bond MAC.
+#
+# ADOPTED, not new: the script below is byte-identical to the hand-placed
+# /oem/91-pin-mgmt-br-mac.yaml found on qua/qui/quo/quarto on 2026-10-27 (sha256 3c75eca4...).
+# Only the two "Managed by" lines are added, so node-manager rewrites the file once and the
+# boot behaviour is unchanged. Same filename, so the CR takes the hand copy over in place.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-mgmt-br-mac-pin
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 91-pin-mgmt-br-mac.yaml
+  contents: |
+    # Managed by CloudInit mdapi-mgmt-br-mac-pin (fleet harvester-node-config/mgmt-br-mac-pin.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: Pin mgmt-br MAC to bond
+    stages:
+        initramfs:
+            - name: pin-mgmt-br-mac
+              files:
+                - path: /etc/NetworkManager/dispatcher.d/90-pin-mgmt-br-mac
+                  permissions: 493
+                  owner: 0
+                  group: 0
+                  content: |
+                    #!/bin/sh
+                    # Pin mgmt-br's MAC to the mgmt-bo bond MAC.
+                    #
+                    # A Linux bridge with no explicitly-set MAC floats its address
+                    # to the lowest MAC among enslaved ports. Harvester bridges VM
+                    # veths into mgmt-br (the lan/dmz/adlan NADs use bridge:mgmt-br),
+                    # so a VM start/stop/migrate can drag mgmt-br's MAC onto a veth.
+                    # MetalLB's L2 ARP responder caches the announce-interface MAC
+                    # and then keeps advertising that (now dead) address -> all
+                    # LoadBalancer VIPs black-hole.
+                    #
+                    # This is the NetworkManager-era replacement for the wicked
+                    # /etc/wicked/scripts/setup_bond.sh post-up hook, which is dead
+                    # code since the wicked->NetworkManager migration.
+                    [ -f /sys/class/net/mgmt-bo/address ] || exit 0
+                    [ -f /sys/class/net/mgmt-br/address ] || exit 0
+                    BOND_MAC=$(cat /sys/class/net/mgmt-bo/address)
+                    BR_MAC=$(cat /sys/class/net/mgmt-br/address)
+                    if [ -n "$BOND_MAC" ] && [ "$BOND_MAC" != "$BR_MAC" ]; then
+                        logger -t pin-mgmt-br-mac "mgmt-br MAC $BR_MAC != bond $BOND_MAC; re-pinning"
+                        ip link set dev mgmt-br address "$BOND_MAC"
+                    fi
+                  encoding: ""
+                  ownerstring: ""

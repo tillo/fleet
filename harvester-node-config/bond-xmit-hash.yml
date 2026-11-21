@@ -1,0 +1,35 @@
+# mgmt-bo LACP transmit hash -> layer3+4 (infra-nqfj).
+#
+# The kernel default (layer2) hashes on the peer MAC only, so all of a node's TX toward one
+# destination rides one LACP member. layer3+4 spreads flows across the members. Pairs with the
+# switch-side global 'port-channel load-balance src-dst-mixed-ip-port'. TX hashing only: no
+# link impact.
+#
+# ADOPTED from the hand-placed /oem/94_bond_xmit_hash.yaml (qua/qui/quo sha256 187c6caa...,
+# quarto 123c10cf...). The two copies ran the same script and differed only in their `name:`
+# text, which here names both bond shapes. Every node gets the file rewritten once; the boot
+# behaviour is unchanged.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-bond-xmit-hash
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 94_bond_xmit_hash.yaml
+  contents: |
+    # Managed by CloudInit mdapi-bond-xmit-hash (fleet harvester-node-config/bond-xmit-hash.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "net tuning: mgmt-bo LACP xmit_hash_policy -> layer3+4 every boot (first added 2026-08-05). Kernel default layer2 hashes on peer MAC only, pinning ALL of this node's TX toward one LACP member per destination; layer3+4 spreads flows across the members (2x10G Po20-22 on the Gen8s, 4x1GbE Po23 on quarto). Pairs with the Cisco-side global 'port-channel load-balance src-dst-mixed-ip-port'. TX hashing only - safe to change live, no link impact."
+    stages:
+      network:
+        - name: "set mgmt-bo transmit hash policy to layer3+4"
+          commands:
+            - |
+              for i in 1 2 3 4 5; do
+                if [ -f /sys/class/net/mgmt-bo/bonding/xmit_hash_policy ]; then
+                  echo layer3+4 > /sys/class/net/mgmt-bo/bonding/xmit_hash_policy || true
+                  break
+                fi
+                sleep 2
+              done

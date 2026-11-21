@@ -1,0 +1,31 @@
+# Lets the k8s-mcp server (k8s-mcp/k8s-mcp-rbac.yml) exec into the pods of THIS
+# namespace — the one place its clients were measured needing exec (55 of 75
+# pods_exec calls, 2026-10-28: Open WebUI sqlite and config debugging).
+#
+# It lives here, not in the k8s-mcp bundle, so whoever changes this namespace
+# sees the grant. The grant is only as safe as the weakest pod in openwebui: exec
+# runs as that pod, with its token and its env. Today every pod here runs as
+# `default`, which has no API rights. ⛔ If a workload here ever gets a
+# ServiceAccount with API rights, or mounts host or cluster credentials, drop
+# this file first.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-mcp-exec
+rules:
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-mcp-exec
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k8s-mcp-exec
+subjects:
+  - kind: ServiceAccount
+    name: k8s-mcp
+    namespace: k8s-mcp

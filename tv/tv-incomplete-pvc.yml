@@ -1,0 +1,30 @@
+## Transmission's incomplete-dir on FusionIO Longhorn (2026-11-04, infra-r9mzd.9).
+## Piece writes are small random churn, the worst write pattern for the 8
+## TRIM-less consumer-SSD Ceph OSDs, whose read latency collapses as the Ceph
+## client write rate rises (P(stall) 7% <2 MB/s -> 83% at 10-20 MB/s), and
+## transmission was the biggest single Ceph writer (3-6 MB/s).
+## longhorn-iomemory = diskSelector iomemory (fio disks only, never quarto's
+## untagged default disk), 2 replicas; there is no 1-replica scratch class on fio.
+## Size: 30 d peak 32.8 GiB, 90 d peak 71.6 GiB (kubelet_volume_stats_used_bytes);
+## 2x the 13.4 GiB in use on 11-04 would already have filled at the 90 d peak.
+## Longhorn is thin, so the unused part costs nothing.
+## Backup class `none` (scratch): MEMBERSHIP of the `nobackup` group, since an
+## unlabelled Longhorn PVC is auto-joined to `default` (see longhorn/recurringjob-nobackup.yml).
+## The old tv-incomplete-ceph PVC was removed 2026-11-04 after owner confirmation.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tv-incomplete-fio
+  labels:
+    mdapi.ch/backup-class: none
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/nobackup: enabled
+  annotations:
+    mdapi.ch/backup-exempt: "transmission incomplete-dir scratch; partial pieces re-download, not a backup source"
+spec:
+  storageClassName: longhorn-iomemory
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 80Gi

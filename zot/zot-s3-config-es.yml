@@ -1,0 +1,452 @@
+## ExternalSecret templating the full zot config.json + sync credentials
+## file. Two keys produced in the target Secret:
+##   - config.json     -> mounted at /etc/zot/config.json
+##   - sync-creds.json -> mounted at /etc/zot/sync-creds.json
+##
+## Source secrets in Akeyless under /mdapi/zot/:
+##   - ceph-s3-{access-key, secret-key, bucket, endpoint}
+##   (gitlab-sync-{username, token} — the read_registry deploy token zot used to
+##    pull-through registry.mdapi.ch — are no longer referenced since
+##    2026-11-07, infra-8f4.54; left in Akeyless until GitLab's registry is retired.)
+##
+## 2026-09-17: storage moved from the external Garage on salt+pepper to the
+## IN-CLUSTER Ceph RGW (see zot-obc.yml for why the old bootstrap argument did
+## not hold, and where the bootstrap guarantee went instead). The old
+## garage-s3-* keys are left in Akeyless untouched for rollback; these are new
+## ceph-s3-* keys rather than reused names, because a key called "garage" that
+## points at Ceph is exactly the kind of lie that costs an hour later.
+##
+## ⛔ config.json below is JSON — it CANNOT carry comments. Explanations for the
+## storageDriver block live here instead:
+##   region us-east-1  — what the ceph-bucket StorageClass declares
+##                       (parameters.region). RGW rejects a mismatched SigV4
+##                       credential scope.
+##   secure  false     — the RGW ClusterIP Service listens on plain :80;
+##                       CephObjectStore `ceph-objectstore` has no
+##                       SECUREENDPOINT. Deliberate and bounded: the traffic is
+##                       pod -> ClusterIP -> RGW pod inside the cluster network
+##                       and never touches the LAN; SigV4 sends a derived
+##                       signature, never the secret key, so plaintext does not
+##                       expose the credential; and the payload is public
+##                       container images.
+##                       ⛔ NOT a precedent for backup traffic — there the rule
+##                       (see memory garage_s3_client_tls_dividing_line) is that
+##                       only already-ciphertext payloads may skip TLS.
+## Verified before cutover with a signed round-trip against this endpoint:
+## HEAD 200, PUT 200, GET 200, DELETE 204.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: zot-s3-config
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: zot-s3-config
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## ─────────────────────────────────────────────────────────────
+        ## sync-creds.json: per-upstream-registry credentials, keyed by
+        ## the registry URL Zot uses (just host, no scheme). Anonymous
+        ## registries (ghcr.io / docker.io / lscr.io / quay.io) are
+        ## omitted — Zot falls back to anonymous pulls. Empty since the
+        ## registry.mdapi.ch upstream was removed (see below).
+        ## ⛔ registry.mdapi.ch sync REMOVED 2026-11-07 (infra-8f4.54 stage 5).
+        ##   zot is now where mdapi/** images are PUBLISHED (ci-templates push
+        ##   to zot only; GitLab's registry is read-only). On-demand sync
+        ##   re-fetches a MUTABLE tag such as :latest from the upstream even
+        ##   when zot already holds it (seen for mdapi/backstage:latest), so
+        ##   keeping GitLab as an upstream would overwrite every fresh :latest
+        ##   with GitLab's frozen one — a silent downgrade Renovate would then
+        ##   propose. Consequence: a tag that exists ONLY on GitLab (the 5,718
+        ##   not copied in stage 2, NOT-COPIED.tsv) is no longer reachable
+        ##   through zot; pull it from registry.mdapi.ch (read-only, data kept).
+        ## ─────────────────────────────────────────────────────────────
+        sync-creds.json: |
+          {}
+        ## ─────────────────────────────────────────────────────────────
+        ## config.json
+        ## storage: S3 (Garage external) + emptyDir cache + GC, no dedupe
+        ##   (dedupe needs a shared metadata DB which we don't run)
+        ## extensions.sync: on-demand pull-through + periodic refresh per
+        ##   registry. Tag regex filters: latest/stable/main/master + any
+        ##   semver-ish tag (v1, v1.2, 1.2.3, 1.2.3-suffix). Prevents
+        ##   accidentally mirroring 1000+ tags from things like nginx.
+        ##
+        ## ⚠️ The shared regex's trailing `(-suffix)?` group is LOAD-BEARING and
+        ##   must not be tightened globally: `library/python:3.12-alpine` (the
+        ##   openbao-mirror job image) and `cloudnative-pg/postgresql:16.4-1`
+        ##   both match ONLY via that group. Dropping it would make those tags
+        ##   unfetchable. An image whose upstream tag shape needs a STRICTER
+        ##   filter gets its own entry with its own regex instead — see
+        ##   berriai/litellm below.
+        ##
+        ## berriai/litellm (added 2026-10-01): clean RELEASE tags only.
+        ##   Upstream's 2701 tags are dominated by non-release shapes —
+        ##   main-vN.N.N (517), -nightly (138), -stable (134), .devN (114) —
+        ##   and the shared regex would let the -dev/-rc ones through via its
+        ##   optional suffix group. That is not hypothetical: a scan over these
+        ##   tags once substring-matched `1.105.0-dev.1` and reported "latest
+        ##   1.105.0", when the newest actual release was v1.103.2. This image
+        ##   is the estate's LLM gateway, so the anchor `^v?\d+\.\d+\.\d+$` is
+        ##   deliberate: it admits v1.103.2 and 1.103.2, and refuses every
+        ##   prerelease. ⚠️ It stays ANCHORED — an unanchored \d+\.\d+\.\d+
+        ##   is exactly what produced the false positive.
+        ##
+        ##   ⛔ This prefix does NOT make new versions appear on its own: zot's
+        ##   tags/list returns only LOCALLY CACHED tags (verified 2026-10-01 —
+        ##   a synced repo with one pulled tag reports exactly one tag, not
+        ##   upstream's hundreds). It makes a KNOWN tag fetchable. Enumerating
+        ##   upstream is Renovate's job, and it does that at the SOURCE
+        ##   (`registryAliases` → ghcr.io in renovate.json), never by reading
+        ##   this mirror — precisely because tags/list here can only ever
+        ##   report what has already been pulled.
+        ## http.readTimeout/writeTimeout: zot's CLI defaults both to 60s
+        ##   when unset (pkg/cli/server/root.go), and Go's timeouts cover
+        ##   the WHOLE request/response body — any blob layer taking >60s
+        ##   to transfer is killed mid-stream ("i/o timeout", client 502).
+        ##   The 423 MiB horizon-ciphertrust layer reproducibly died at
+        ##   exactly 1m0s (2026-07-10), on ingress AND direct paths.
+        ## http.compat ["docker2s2"] (2026-11-07, infra-8f4.54): without it zot
+        ##   REFUSES any Docker v2 schema-2 manifest — a push answers
+        ##   "manifest invalid" and an on-demand sync logs "docker media type
+        ##   requires http.compat docker2s2". Older GitLab-built mdapi images
+        ##   are Docker v2s2, and copying them with their digests preserved
+        ##   (so existing pins stay valid) is impossible without conversion,
+        ##   which changes the digest. Measured: every mdapi/apt-cacher-ng copy
+        ##   failed this way. It only ADMITS the media type; OCI images are
+        ##   stored exactly as before.
+        ## http.accessControl (2026-11-07, infra-8f4.54, user decision D1):
+        ##   until now zot had ONE htpasswd user (`zot`) and no accessControl, so
+        ##   every authenticated user could read AND write — and that credential
+        ##   sits in 25 "read-only" pull Secrets (zot-pull, zot-registry) and
+        ##   Renovate's host rule. Proven: a push with zot-pull's credential
+        ##   succeeded. With zot now the source of truth for our own images,
+        ##   that is a supply-chain hole. Now: every authenticated user gets
+        ##   `read` (defaultPolicy); only `ci-push` (Akeyless
+        ##   /mdapi/zot/ci-push/*, GitLab group vars ZOT_USER/ZOT_PASSWORD,
+        ##   protected) may create/update. Nobody may delete through the API.
+        ##   Anonymous access stays OFF (no anonymousPolicy), as before.
+        ##   On-demand sync is internal and is not gated by the reader's rights.
+        ## mdapi-dev/** (2026-11-07, infra-8f4.54 stage 5, user option 2b):
+        ##   branch, MR and tag-pipeline builds publish HERE
+        ##   (zot.mdapi.ch/mdapi-dev/<project>:<sha>, plus their buildkit cache)
+        ##   instead of GitLab's registry, so GitLab's registry can go read-only.
+        ##   Written by `dev-push` (Akeyless /mdapi/zot/dev-push/*, GitLab group
+        ##   vars ZOT_DEV_USER/ZOT_DEV_PASSWORD, deliberately UNPROTECTED because
+        ##   unprotected-branch pipelines must push). That is why it is its own
+        ##   user: any branch pipeline can read the credential, so it may write
+        ##   ONLY mdapi-dev/**. zot picks the LONGEST matching pattern
+        ##   (pkg/api/authz.go), so `mdapi-dev/**` governs mdapi-dev repos and
+        ##   `**` still governs mdapi/** — where dev-push gets only the read
+        ##   default. ⛔ Nothing may deploy from mdapi-dev (fleet test
+        ##   tests/test_no_mdapi_dev_images.py, Renovate rule disables it).
+        ##   No sync upstream covers mdapi-dev, so a missing dev tag is a plain
+        ##   404, never a pull from anywhere.
+        ## storage.retention (same change): ONLY `mdapi-dev/**` has a policy.
+        ##   Tags older than 14 days (pushedWithin 336h; push time survives a
+        ##   restart — a metaDB rebuild takes the manifest blob's mtime) are
+        ##   removed by the GC task (gcInterval 24h). Why it cannot touch
+        ##   mdapi/** or any mirror: zot applies tag retention only to a repo that
+        ##   MATCHES a policy (`removeTagsPerRetentionPolicy` returns early when
+        ##   `HasTagRetention` is false), the match is a doublestar glob, and
+        ##   "a repository that matches no policy keeps all its tags". Untagged
+        ##   manifests elsewhere are collected exactly as before (deleteUntagged
+        ##   defaults true for unmatched repos; retention.delay defaults to
+        ##   gcDelay). Source checked: zot v2.1.23 pkg/retention/retention.go,
+        ##   pkg/storage/gc/gc.go.
+        ##
+        ## ═══ 2026-11-08, infra-8f4.56: metrics, UI+search, weekly scrub, audit ═══
+        ## extensions.search + ui: the browse UI at /home. The UI is NOT
+        ##   decoration: it calls /v2/_zot/ext/search (search) for repo/tag/
+        ##   digest/layer lists and /v2/_zot/ext/mgmt for auth discovery.
+        ##   ⛔ NO `search.cve` block — that is what would pull Trivy's DB
+        ##   (0.5-1 GiB per replica, re-downloaded on every restart). CVEs are
+        ##   covered by f/security/pod_image_cve_scan; zot's job here is memory,
+        ##   not scanning. Adding the `cve` key later is a deliberate act.
+        ##   userprefs is NOT a config key: it turns on automatically when
+        ##   search+ui are both enabled (pkg/extensions/config/config.go
+        ##   AreUserPrefsEnabled). Stars/bookmarks live in the per-replica boltdb
+        ##   on the emptyDir, so they are per-pod and lost on restart — cosmetic,
+        ##   accepted.
+        ##   Reaching the UI: zot-ing.yml now serves ONLY /v2, no auth
+        ##   annotations, so every workload's authenticated pull/push path is
+        ##   byte-identical to before. zot-ui-ing.yml serves `/` gated by
+        ##   oauth2-proxy-admin (Keycloak role mdapi-admin), which is the same
+        ##   admin gate backstage uses. `/`, not just /home, because the UI turns
+        ##   zot's last route into a FileServer: any unmatched GET returns
+        ##   index.html anonymously. The browser still logs into zot itself for
+        ##   data (basic auth), because zot's authz is what governs reads — the
+        ##   ingress gate decides who may load the shell, not what the API
+        ##   returns.
+        ## extensions.metrics: Prometheus at :5000/metrics (same port, same
+        ##   process). Scraped in-cluster by VMPodScrape zot (zot-scrape.yml).
+        ##   The route runs through authn+authz, so it is NOT anonymous: the
+        ##   `zot` user is named in accessControl.metrics and the scrape uses
+        ##   that user's basic auth. Without the metrics block, MetricsAuthzHandler
+        ##   denies BOTH anonymous and every authenticated user (empty users list).
+        ## extensions.scrub: integrity check every 168h (weekly). ⚠️ zot's
+        ##   scheduler runs a generator IMMEDIATELY on start and then every
+        ##   interval (pkg/scheduler scheduler.go: lastRun zero => Ready), so
+        ##   EVERY zot pod start runs a full scrub. That is not a bug here: a
+        ##   restart-repair is exactly when a silent blob-store problem should be
+        ##   re-checked. It reads every blob (~27 GiB from the Ceph RGW) at
+        ##   LowPriority.
+        ## scheduler.numWorkers 4: default is NumCPU*4 (≥128 on a prod node) and
+        ##   scrub submits one task PER REPO, so the default would open ~78
+        ##   concurrent S3 downloads against a 1Gi container. 4 keeps that bounded
+        ##   (GC and sync daily-ish tasks are nowhere near that).
+        ## log.audit "/dev/stdout": every SUCCESSFUL POST/PUT/PATCH/DELETE is
+        ##   logged by SessionAuditLogger with clientIP, subject, action, object
+        ##   and status (pkg/api/session.go). Failed writes are NOT audited (they
+        ##   are visible as 4xx/5xx in the session log and in zot's alert rules).
+        ##   Writes to /dev/stdout keep it in the pod's log stream, so the
+        ##   existing fluent-bit -> Cribl path ships it with no new plumbing;
+        ##   Cribl carves these lines into the O2 stream `zot_audit`.
+        ##   ⚠️ Audit and session lines share fd 1. Below PIPE_BUF (4 KiB) a write
+        ##   is atomic on a pipe; a session line carrying a >4 KiB cookie could in
+        ##   principle interleave with an audit line. Audit records are ~250 B and
+        ##   pushes are not browser traffic, so this is a narrow window, not a
+        ##   design. If the Cribl parse-error count ever rises, move the audit file
+        ##   to the cache volume and add a `tail -F` sidecar instead.
+        ## http.auth.sessionKeysFile: the UI's login session is a gorilla
+        ##   CookieStore (the S3 driver has no _sessions dir; pkg/api/cookiestore.go
+        ##   localSessionStoreInit). Without this file each replica generates its
+        ##   OWN random hash key at start (controller.go initCookieStore), so a
+        ##   cookie issued by one pod fails "securecookie: the value is not valid"
+        ##   on the other and the UI logs out — with replicas: 2, every second
+        ##   request. The keys (session-keys.json, below) are shared by both pods.
+        ## ─────────────────────────────────────────────────────────────
+        ## session-keys.json -> mounted at /etc/zot/session-keys.json.
+        ##   hashKey 64 bytes (HMAC), encryptKey 32 bytes (AES-256); the strings
+        ##   are used as raw bytes. Akeyless /mdapi/zot/session-{hash,encrypt}-key.
+        ##   Rotating them logs every UI user out, nothing else.
+        session-keys.json: |
+          {"hashKey": "{{ .sessionhashkey }}", "encryptKey": "{{ .sessionencryptkey }}"}
+        ## ─────────────────────────────────────────────────────────────
+        config.json: |
+          {
+            "storage": {
+              "rootDirectory": "/var/lib/registry",
+              "dedupe": false,
+              "gc": true,
+              "gcDelay": "1h",
+              "gcInterval": "24h",
+              "retention": {
+                "dryRun": false,
+                "policies": [
+                  {
+                    "repositories": ["mdapi-dev/**"],
+                    "deleteReferrers": true,
+                    "deleteUntagged": true,
+                    "keepTags": [{ "patterns": [".*"], "pushedWithin": "336h" }]
+                  }
+                ]
+              },
+              "storageDriver": {
+                "name": "s3",
+                "bucket": "{{ .bucket }}",
+                "region": "us-east-1",
+                "regionendpoint": "{{ .endpoint }}",
+                "accesskey": "{{ .accesskey }}",
+                "secretkey": "{{ .secretkey }}",
+                "secure": false,
+                "skipverify": false,
+                "forcepathstyle": true
+              }
+            },
+            "http": {
+              "address": "0.0.0.0",
+              "port": "5000",
+              "readTimeout": "30m",
+              "writeTimeout": "30m",
+              "compat": ["docker2s2"],
+              "auth": {
+                "htpasswd": {
+                  "path": "/etc/zot/htpasswd"
+                },
+                "sessionKeysFile": "/etc/zot/session-keys.json"
+              },
+              "accessControl": {
+                "repositories": {
+                  "mdapi-dev/**": {
+                    "policies": [
+                      { "users": ["dev-push"], "actions": ["read", "create", "update"] }
+                    ],
+                    "defaultPolicy": ["read"]
+                  },
+                  "**": {
+                    "policies": [
+                      { "users": ["ci-push"], "actions": ["read", "create", "update"] }
+                    ],
+                    "defaultPolicy": ["read"]
+                  }
+                },
+                "metrics": {
+                  "users": ["zot"],
+                  "anonymousPolicy": []
+                }
+              }
+            },
+            "log": {
+              "level": "info",
+              "audit": "/dev/stdout"
+            },
+            "scheduler": {
+              "numWorkers": 4
+            },
+            "extensions": {
+              "sync": {
+                "enable": true,
+                "credentialsFile": "/etc/zot/sync-creds.json",
+                "downloadDir": "/var/lib/registry/_sync",
+                "registries": [
+                  {
+                    "urls": ["https://ghcr.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "anantis-security/trapeye", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "autobrr/autobrr", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "berriai/litellm", "tags": { "regex": "^v?\\d+\\.\\d+\\.\\d+$" } },
+                      { "prefix": "blakeblackshear/frigate", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "brioche-works/technitium-dns-prometheus-exporter", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "cloudnative-pg/cloudnative-pg", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "cloudnative-pg/postgresql", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "democratic-csi/csi-grpc-proxy", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "democratic-csi/democratic-csi", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "external-secrets/external-secrets", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "flaresolverr/flaresolverr", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "haveagitgat/tdarr", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "home-assistant/home-assistant", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "infomaniak/cert-manager-webhook-infomaniak", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "k8snetworkplumbingwg/whereabouts", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "ldapaccountmanager/lam", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "nextcloud-releases/**", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "open-telemetry/opentelemetry-collector-releases/**", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "paperless-ngx/paperless-ngx", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "project-zot/zot-linux-amd64", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "seerr-team/seerr", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "stakater/reloader", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "windmill-labs/windmill", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } }
+                    ]
+                  },
+                  {
+                    "urls": ["https://docker.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "library/alpine", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/busybox", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/python", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "prom/alertmanager", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "prom/prometheus", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "victoriametrics/operator", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "victoriametrics/vmagent", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "victoriametrics/vmalert", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "victoriametrics/victoria-metrics", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/caddy", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/debian", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/eclipse-mosquitto", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/mariadb", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/memcached", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/nginx", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/postgres", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "library/redis", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "acockburn/appdaemon", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "alpine/curl", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "alpine/socat", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "apache/tika", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "bitnamilegacy/elasticsearch", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "bitnamilegacy/os-shell", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "bitnamilegacy/postgresql", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "cribl/cribl", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "drakkan/sftpgo", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "dxflrs/garage", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "esphome/esphome", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "gotenberg/gotenberg", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "grafana/grafana", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "instantlinux/nut-upsd", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "joplin/server", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "longhornio/**", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "nfrastack/openldap", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "nicolaka/netshoot", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "plexinc/pms-docker", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "rancher/**", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "rclone/rclone", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } }
+                    ]
+                  },
+                  {
+                    "urls": ["https://lscr.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "linuxserver/**", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } }
+                    ]
+                  },
+                  {
+                    "urls": ["https://quay.io"],
+                    "onDemand": true,
+                    "pollInterval": "24h",
+                    "tlsVerify": true,
+                    "content": [
+                      { "prefix": "jetstack/cert-manager-cainjector", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "jetstack/cert-manager-controller", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "jetstack/cert-manager-webhook", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "keycloak/keycloak", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "metallb/controller", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "metallb/speaker", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "oauth2-proxy/oauth2-proxy", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "openbao/openbao", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "prometheus/blackbox-exporter", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "prometheus-operator/prometheus-config-reloader", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "prometheus/prometheus", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } },
+                      { "prefix": "prometheus/pushgateway", "tags": { "regex": "^(latest|stable|main|master|v?\\d+(\\.\\d+){0,3}(-[a-zA-Z0-9.-]+)?)$" } }
+                    ]
+                  }
+                ]
+              },
+              "search": {
+                "enable": true
+              },
+              "ui": {
+                "enable": true
+              },
+              "metrics": {
+                "enable": true,
+                "prometheus": {
+                  "path": "/metrics"
+                }
+              },
+              "scrub": {
+                "enable": true,
+                "interval": "168h"
+              }
+            }
+          }
+  data:
+    - remoteRef:
+        key: /mdapi/zot/ceph-s3-access-key
+      secretKey: accesskey
+    - remoteRef:
+        key: /mdapi/zot/ceph-s3-secret-key
+      secretKey: secretkey
+    - remoteRef:
+        key: /mdapi/zot/ceph-s3-bucket
+      secretKey: bucket
+    - remoteRef:
+        key: /mdapi/zot/ceph-s3-endpoint
+      secretKey: endpoint
+    - remoteRef:
+        key: /mdapi/zot/session-hash-key
+      secretKey: sessionhashkey
+    - remoteRef:
+        key: /mdapi/zot/session-encrypt-key
+      secretKey: sessionencryptkey

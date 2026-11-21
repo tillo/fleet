@@ -1,0 +1,42 @@
+# Backstage answers only:
+#  - rke2-ingress-nginx, for backstage.mdapi.ch (SSO-gated there, and the only
+#    path that carries a trusted X-Auth-Request-* identity);
+#  - the blackbox exporter, for the in-cluster readiness probe;
+#  - agentgateway's MCP proxy (ns `agentgateway`). It speaks MCP to the one path
+#    /api/mcp-actions/v1/catalog-read with its own bearer, so a caller cannot
+#    steer it to the sign-in route that trusts the identity header.
+# Anything else reaching :7007 could set the identity header itself.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backstage-from-known-callers
+  namespace: backstage
+spec:
+  podSelector:
+    matchLabels:
+      app: backstage
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agentgateway
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agentgateway-standalone
+              app.kubernetes.io/instance: agentgateway
+      ports:
+        - protocol: TCP
+          port: 7007

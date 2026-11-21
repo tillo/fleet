@@ -1,0 +1,155 @@
+# The edge DAST target list, discovered at run time (infra-7rog.31.6). The
+# edge-dast init container runs this with a read-only token (rbac.yml): it
+# lists every Ingress in the cluster and writes today's share of their hosts
+# to /targets/hosts, which the zap and nuclei containers read.
+#
+# So a NEW application is onboarded the moment its Ingress exists, and no
+# hostname is ever written into this public repo (tenant names, CLAUDE.md).
+# The only way out is an annotation that states why:
+#     dast.mdapi.ch/skip: "<reason>"
+# Hosts that no Ingress serves (haproxy fronts on the router) are listed in
+# targets.yml and join the same share.
+#
+# Each host lands on one of SHARDS days by sha256, so each one is scanned
+# every SHARDS days and the run stays inside its deadline as hosts grow.
+#
+# The non-HTTP side (infra-7rog.31.7): every TCP port of every LoadBalancer
+# Service goes to /targets/endpoints, one line per Service
+# (`<name>.<ns>.svc <ip> <port,...>`), all of them every night, for the
+# nuclei-net container. The same annotation opts a Service out.
+# Tests: tests/test_dast_discovers_every_ingress_host.py.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dast-discover
+  namespace: dast
+data:
+  discover.py: |
+    """Write the edge DAST targets: Ingress hosts and LoadBalancer endpoints."""
+    import datetime
+    import hashlib
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/dast"
+    STATIC = "/static/hosts"
+    OUT = "/targets/hosts"
+    ENDPOINTS = "/targets/endpoints"
+    INGRESSES = "/apis/networking.k8s.io/v1/ingresses"
+    SERVICES = "/api/v1/services"
+    SKIP = "dast.mdapi.ch/skip"
+    SHARDS = 4
+
+
+    def skipped(item):
+        notes = item.get("metadata", {}).get("annotations") or {}
+        if SKIP not in notes:
+            return False
+        if not notes[SKIP].strip():
+            meta = item["metadata"]
+            raise ValueError(f"{meta.get('namespace')}/{meta.get('name')}: {SKIP} needs a reason")
+        return True
+
+
+    def ingress_hosts(items):
+        hosts = set()
+        for item in items:
+            if skipped(item):
+                continue
+            for rule in item.get("spec", {}).get("rules") or []:
+                host = rule.get("host")
+                if host and not host.startswith("*"):
+                    hosts.add(host)
+        return sorted(hosts)
+
+
+    def tcp_ports(spec):
+        return sorted({p["port"] for p in spec.get("ports") or [] if p.get("protocol", "TCP") == "TCP"})
+
+
+    def lb_endpoints(items):
+        lines = []
+        for item in items:
+            spec = item.get("spec", {})
+            if spec.get("type") != "LoadBalancer" or skipped(item):
+                continue
+            ips = [i["ip"] for i in item.get("status", {}).get("loadBalancer", {}).get("ingress") or [] if i.get("ip")]
+            ports = tcp_ports(spec)
+            if ips and ports:
+                meta = item["metadata"]
+                lines.append(f"{meta['name']}.{meta['namespace']}.svc {ips[0]} {','.join(map(str, ports))}")
+        return sorted(lines)
+
+
+    def static_hosts(text):
+        lines = (line.strip() for line in text.splitlines())
+        return [line for line in lines if line and not line.startswith("#")]
+
+
+    def shard_of(host):
+        return int(hashlib.sha256(host.encode()).hexdigest()[:8], 16) % SHARDS
+
+
+    def todays_share(hosts, day):
+        return [h for h in hosts if shard_of(h) == day % SHARDS]
+
+
+    def epoch_day(date):
+        return (date - datetime.date(1970, 1, 1)).days
+
+
+    def today():
+        # DAST_DAY pins the share for a manual run (kubectl create job --from,
+        # then set the env): scan shard N now instead of today's.
+        if os.environ.get("DAST_DAY"):
+            return int(os.environ["DAST_DAY"])
+        return epoch_day(datetime.datetime.now(datetime.timezone.utc).date())
+
+
+    def token():
+        with open(f"{SA}/token") as f:
+            return f.read().strip()
+
+
+    def tls_context():
+        return ssl.create_default_context(cafile=f"{SA}/ca.crt")
+
+
+    def list_items(path):
+        req = urllib.request.Request(f"{API}{path}",
+                                     headers={"Authorization": f"Bearer {token()}"})
+        with urllib.request.urlopen(req, context=tls_context(), timeout=30) as resp:
+            return json.loads(resp.read())["items"]
+
+
+    def read_static():
+        with open(STATIC) as f:
+            return f.read()
+
+
+    def write_lines(path, lines):
+        with open(path, "w") as f:
+            f.write("".join(f"{line}\n" for line in lines))
+
+
+    def run():
+        hosts = sorted(set(ingress_hosts(list_items(INGRESSES))) | set(static_hosts(read_static())))
+        endpoints = lb_endpoints(list_items(SERVICES))
+        if not hosts or not endpoints:
+            print(f"discover: {len(hosts)} hosts, {len(endpoints)} endpoints -- refusing to scan nothing")
+            return 1
+        day = today()
+        share = todays_share(hosts, day)
+        write_lines(OUT, share)
+        write_lines(ENDPOINTS, endpoints)
+        print(f"discover: {len(hosts)} hosts, {len(share)} today (shard {day % SHARDS}/{SHARDS}); "
+              f"{len(endpoints)} LoadBalancer Services")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(run())

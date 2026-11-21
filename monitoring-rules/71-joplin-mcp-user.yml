@@ -1,0 +1,70 @@
+## joplin-mcp-user — the per-user notes connector for chat.mdapi.ch.
+##
+## Nothing here is visitor-facing: the connector is reached only from the Chat
+## pods, and its failure degrades one chat tool, never Joplin itself
+## (notes.mdapi.ch, the apps' sync, and the bearer joplin-mcp behind
+## notes-mcp.mdapi.ch do not go through it). Hence warning + `statuspage: exclude` — component
+## Files & Documents is PUBLIC (05-notes.yml), and an internal connector must not
+## degrade it on mdapi.statuspage.io (66-nextcloud-mcp does the same).
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract): every
+## workload later added to ns joplin-mcp-user is then born covered.
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and load-bearing
+## for f/probe/alert_coverage_check: without them a namespace-only selector
+## claims coverage of a kind it can never fire on. ⚠️ The `joplin` namespace's
+## rules do NOT cover this one: PromQL label matchers are fully anchored.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-joplin-mcp-user
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-joplin-mcp-user.rules
+      rules:
+        - alert: JoplinMcpUserWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="joplin-mcp-user", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="joplin-mcp-user", deployment=~".+"}
+            ) > 0
+          ## 15m: one replica with Recreate is briefly at 0 on every rollout.
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "joplin-mcp-user" }}'
+            severity: warning
+            component: Files & Documents
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "joplin-mcp-user/{{ $labels.deployment }} has {{ $value }} unavailable replica(s)"
+            description: |
+              The per-user notes connector of chat.mdapi.ch is down for every
+              user. Chat and Joplin itself keep working; asking Chat about notes
+              returns a tool error instead.
+                kubectl --context mdapi-prod-direct -n joplin-mcp-user get pods,pvc
+                kubectl --context mdapi-prod-direct -n joplin-mcp-user logs deploy/{{ $labels.deployment }}
+              CreateContainerConfigError usually means the ExternalSecret
+              `joplin-mcp-user-env` has not materialised (Akeyless path
+              /mdapi/joplin-mcp-user/joplin-mcp-user-env/STORE_KEY). A pod that
+              exits at start with "STORE_KEY" in the log has an empty key.
+              Pending with a Multi-Attach error: the RWO PVC is still held by
+              the old pod's node (the strategy is Recreate; wait or check the
+              VolumeAttachment).
+
+        - alert: JoplinMcpUserStatefulSetUnavailable
+          ## Empty today — the arm exists so the namespace-wide claim above stays
+          ## true if a StatefulSet is ever added here.
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="joplin-mcp-user", statefulset=~".+"}
+              < kube_statefulset_status_replicas{namespace="joplin-mcp-user", statefulset=~".+"}
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "joplin-mcp-user" }}'
+            severity: warning
+            component: Files & Documents
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "joplin-mcp-user/{{ $labels.statefulset }} has unavailable replicas"

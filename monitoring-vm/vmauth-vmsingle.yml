@@ -1,0 +1,394 @@
+## Authenticated WRITE front for VictoriaMetrics (infra-o4i3m.5.4, 2026-11-17).
+##
+## Problem: vmsingle-mdapi:8428 takes /api/v1/import* and /api/v1/write from any
+## pod with no credential (no per-endpoint key exists), so a compromised pod can
+## forge or overwrite any series, including the ones alerts and dashboards key on.
+##
+## Shape of the fix, the .5.2 Pushgateway pattern (vmauth-pushgateway.yml):
+##   1. THIS FILE: vmauth `vmsingle` (Service vmauth-vmsingle:8427), one VMUser
+##      per writer, each routed to ONLY the path that writer uses. The direct
+##      :8428 path stays open meanwhile.
+##   2. Writers move here one by one: litellm gheim-rt-guard (done 2026-11-17,
+##      DB-row code, METRICS_URL + Basic header), then vmagent-writer and
+##      vmalert-writer (users here first, the clients' remoteWrite in a later MR).
+##   3. Direct writes = vm_http_requests_total{path=~"/api/v1/(import.*|write)"}
+##      minus vmauth_user_requests_total for this front; wait for 0. (0 since
+##      2026-11-18 06:35Z.)
+##   4. vmsingle -httpAuth cannot protect writes alone: it locks EVERY path. So
+##      readers move here too (Option 1, user decision 2026-11-18), each with a
+##      read-only user, and every route carries vmauth's own login to vmsingle
+##      (targetRefBasicAuth, Secret vmsingle-httpauth). vmsingle ignores that
+##      header until -httpAuth is switched on, which is the last step.
+##
+## gheim-rt-guard: 71 gheim_rt_* series x 2 replicas, pushed on every guarded
+## call; GheimRtGuardMetricsStale / GheimRtGuardReplicaNotPushing
+## (monitoring-rules/87-gheim-rt-metrics.yml) page if the move breaks it.
+##
+## Credential: Akeyless /mdapi/monitoring/vmauth/gheim-rt-guard-password, user
+## gheim-rt-guard. The guard holds it as a literal in its DB-row custom_code (no
+## env in its sandbox), so rotation = write Akeyless AND edit the row, then
+## reload the row on both replicas.
+## vmauth's own login TO vmsingle (username vmauth), carried on every route below.
+## Also mounted into vmsingle for -httpAuth.* in the last step.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmsingle-httpauth
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmsingle-httpauth
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "vmauth"
+        password: "{{ .password }}"
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmsingle/httpauth-password }
+    secretKey: password
+---
+## gheim-rt-guard: litellm gheim-rt-guard (DB-row code holds the password as a literal).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-gheim-rt-guard
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-gheim-rt-guard
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/gheim-rt-guard-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: gheim-rt-guard
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: gheim-rt-guard
+  passwordRef: { name: vmauth-gheim-rt-guard, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/import/prometheus"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## Users whose client is a Kubernetes object (vmagent, vmalert, Grafana) get ONE Secret
+## holding username AND password, read by both the VMUser and the client, so the two
+## cannot drift after a rotation. Rotation: write Akeyless; ESO refreshes, the operator
+## re-renders vmauth and the client's config.
+## vmagent-writer: vmagent remoteWrite[0].
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-vmagent-writer
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-vmagent-writer
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "vmagent-writer"
+        password: "{{ .password }}"
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/vmagent-writer-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: vmagent-writer
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: vmagent-writer
+  passwordRef: { name: vmauth-vmagent-writer, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/write"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## vmalert-writer: vmalert remoteWrite.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-vmalert-writer
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-vmalert-writer
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "vmalert-writer"
+        password: "{{ .password }}"
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/vmalert-writer-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: vmalert-writer
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: vmalert-writer
+  passwordRef: { name: vmauth-vmalert-writer, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/write"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## grafana-reader: Grafana's two VictoriaMetrics datasources.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-grafana-reader
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-grafana-reader
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "grafana-reader"
+        password: "{{ .password }}"
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/grafana-reader-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: grafana-reader
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: grafana-reader
+  passwordRef: { name: vmauth-grafana-reader, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
+              "/api/v1/label/.+/values", "/api/v1/metadata", "/api/v1/status/buildinfo",
+              "/api/v1/buildinfo", "/api/v1/query_exemplars"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## vmalert-reader: vmalert datasource + remoteRead.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-vmalert-reader
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-vmalert-reader
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "vmalert-reader"
+        password: "{{ .password }}"
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/vmalert-reader-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: vmalert-reader
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: vmalert-reader
+  passwordRef: { name: vmauth-vmalert-reader, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
+              "/api/v1/label/.+/values", "/api/v1/metadata", "/api/v1/status/buildinfo",
+              "/api/v1/buildinfo", "/api/v1/query_exemplars"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## windmill-reader: Windmill scripts (password in a Windmill variable).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-windmill-reader
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-windmill-reader
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/windmill-reader-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: windmill-reader
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: windmill-reader
+  passwordRef: { name: vmauth-windmill-reader, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
+              "/api/v1/label/.+/values", "/api/v1/metadata", "/api/v1/status/buildinfo",
+              "/api/v1/buildinfo", "/api/v1/query_exemplars"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## seat-reader: the jump seat's scripts (read from Akeyless at run time).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-seat-reader
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-seat-reader
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/seat-reader-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: seat-reader
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: seat-reader
+  passwordRef: { name: vmauth-seat-reader, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
+              "/api/v1/label/.+/values", "/api/v1/metadata", "/api/v1/status/buildinfo",
+              "/api/v1/buildinfo", "/api/v1/query_exemplars"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+## ha-reader: Home Assistant's REST sensors (password in HA secrets.yaml, live on its PVC).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-ha-reader
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-ha-reader
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/ha-reader-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: ha-reader
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: vmsingle
+spec:
+  username: ha-reader
+  passwordRef: { name: vmauth-ha-reader, key: password }
+  targetRefs:
+    - static: { url: "http://vmsingle-mdapi.monitoring.svc.cluster.local:8428" }
+      paths: ["/api/v1/query", "/api/v1/query_range", "/api/v1/series", "/api/v1/labels",
+              "/api/v1/label/.+/values", "/api/v1/metadata", "/api/v1/status/buildinfo",
+              "/api/v1/buildinfo", "/api/v1/query_exemplars"]
+      targetRefBasicAuth:
+        username: { name: vmsingle-httpauth, key: username }
+        password: { name: vmsingle-httpauth, key: password }
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAuth
+metadata:
+  name: vmsingle
+  namespace: monitoring
+spec:
+  selectAllByDefault: false
+  userSelector:
+    matchLabels:
+      mdapi.ch/vmauth: vmsingle
+  userNamespaceSelector: {}
+  ## Docker Hub, as vmauth-pushgateway.yml explains (zot does not sync it).
+  image:
+    repository: victoriametrics/vmauth
+  ## Two replicas: vmagent/vmalert buffer and retry through one pod's roll, but
+  ## not through both. Sized for all remoteWrite (~640 KB/s, ~50 req/s in
+  ## 2026-11-18): vmauth streams bodies, so CPU, not memory, is what grows.
+  replicaCount: 2
+  podDisruptionBudget:
+    maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

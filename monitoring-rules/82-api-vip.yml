@@ -1,0 +1,77 @@
+## API VIP 192.168.1.191:6443 vs the in-cluster API (infra-8f4.37, from infra-me82).
+##
+## harvester-system/kube-vip runs svc_enable=true, cp_enable=false: ONE lease
+## (harvester-system/plndr-svcs-lock) gives one control-plane node every service VIP,
+## 192.168.1.191 included. .191:6443 answers only because that holder's OWN
+## kube-apiserver listens on 0.0.0.0:6443. kube-vip renews the lease through the
+## ClusterIP (any healthy apiserver), so a holder whose apiserver is down KEEPS the
+## VIP: .191:6443 is refused while :443 and the in-cluster API are fine. Every
+## -direct kubeconfig and every LAN script dies with it; on 2026-10-25 that went
+## ~12 h unnoticed (kube-apiserver-quo, 148 restarts).
+##
+## Two probes, both judged as "an apiserver answered" (401 to an anonymous /readyz
+## is an answer; the failure mode is a refused connection):
+##   api-vip-6443   https://192.168.1.191:6443/readyz  -> no kube-proxy rule for
+##                  .191:6443, so the packet always lands on the lease holder
+##   api-clusterip  https://10.53.0.1/readyz           -> kube-proxy, any apiserver
+## No `component` label on purpose: SyntheticProbeFailing must not double-page.
+## The two Probe objects live in 10-blackbox-probes.yml (API VIP section).
+##
+## FIX when it fires: move the lease off the holder (delete that node's kube-vip pod;
+## it moved in ~5 s on 10-25 without an API drop), then find why its apiserver is down.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-vip
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: platform.api-vip
+    rules:
+    - alert: ApiVipRefusedWhileApiHealthy
+      ## 5 min of refusals on the VIP while the ClusterIP answered the whole time.
+      ## Lease flaps (5 s, hundreds of transitions) cannot hold max_over_time at 0.
+      expr: |
+        (max_over_time(probe_success{probe="api-vip-6443"}[5m]) == 0)
+        and on ()
+        (min_over_time(probe_success{probe="api-clusterip"}[5m]) == 1)
+      for: 1m
+      labels:
+        severity: critical
+        service: kube-apiserver
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+        namespace: harvester-system
+      annotations:
+        summary: "192.168.1.191:6443 refuses while the in-cluster API is healthy"
+        description: |
+          The kube-vip services lease holder ({{ with query "kube_lease_owner{lease=\"plndr-svcs-lock\"}" }}{{ (index . 0).Labels.lease_holder }}{{ else }}unknown{{ end }})
+          owns 192.168.1.191 but its own kube-apiserver does not answer on :6443.
+          Every -direct kubeconfig and LAN script that dials .191:6443 is down.
+          Move the VIP: delete that node's kube-vip pod in harvester-system
+          (the lease moves in ~5 s), then find why its apiserver is down
+          (kubectl -n kube-system get pod kube-apiserver-<node>).
+    - alert: KubeApiserverRestarting
+      ## The 10-25 incident's other half: kube-apiserver-quo restarted 148 times and
+      ## NO rule fired (measured 2026-11-04: no crash-loop alert covers kube-system
+      ## static pods). A healthy apiserver restarts only on an rke2 restart.
+      expr: |
+        increase(kube_pod_container_status_restarts_total{namespace="kube-system", pod=~"kube-apiserver-.+"}[1h]) > 3
+      for: 10m
+      labels:
+        severity: warning
+        service: kube-apiserver
+        component: Platform
+        team: mdapi
+        statuspage: exclude
+        namespace: kube-system
+      annotations:
+        summary: "{{ $labels.pod }} restarted {{ $value | printf \"%.0f\" }} times in 1 h"
+        description: |
+          A control-plane apiserver is crash-looping. If its node holds the kube-vip
+          services lease (kubectl -n harvester-system get lease plndr-svcs-lock),
+          192.168.1.191:6443 is refused for every -direct kubeconfig - see
+          ApiVipRefusedWhileApiHealthy. Logs: kubectl -n kube-system logs {{ $labels.pod }} --previous.

@@ -1,0 +1,307 @@
+## Falco runtime-security dashboard.
+##
+## Lives in THIS bundle rather than a new falco-dashboards/ directory on purpose:
+## gitrepo/mdapi-prod enumerates its bundle dirs in spec.paths, so a new
+## directory is invisible to Fleet until that list is patched on the mgmt
+## cluster. Adding a file to an already-listed bundle needs no such step.
+##
+## Every query here was evaluated against live VictoriaMetrics before commit.
+## ⚠️ `priority` is SYSLOG-NUMERIC (2=Critical, 4=Warning, 5=Notice); the value
+## mappings below cover all eight levels, not just the three observed so far, so
+## the panel stays honest when a new priority first appears.
+##
+## ⛔ What this dashboard CANNOT show: which workload caused an event. Falco's
+## metrics carry rule_name and priority but their only k8s labels are Falco's own
+## pod. Attribution lives in the events — OpenObserve, stream `pod_logs`, filter
+## k8s_namespace = 'falco', body in `_raw` (no full-text index, so use LIKE).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-dashboard
+  namespace: cattle-dashboards
+  labels:
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: Security
+data:
+  falco-runtime-security.json: |
+    {
+      "title": "Runtime detection — what ran, and whether every node was watching",
+      "uid": "sec-falco-runtime",
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "refresh": "1m",
+      "time": { "from": "now-24h", "to": "now" },
+      "tags": ["security", "falco", "runtime"],
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Node coverage",
+          "description": "Falco scrape targets up, divided by node count. Derived from kube_node_info, never hardcoded: a DaemonSet that silently covers fewer nodes still reports its own pods Ready.",
+          "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "(count(up{job=\"falco-metrics\"} == 1) or vector(0)) / (count(kube_node_info) or vector(0))",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "decimals": 0,
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "graphMode": "none"
+          }
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Distinct rules firing",
+          "description": "How many different rules have matched in the dashboard window. Novelty matters more than volume here: a NEW rule is the signal worth reading, and FalcoNewRuleFired alerts on exactly that.",
+          "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "count(count by (rule_name) (falcosecurity_falco_rules_matches_total))",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [ { "color": "text", "value": null } ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "none",
+            "graphMode": "none"
+          }
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Events / hour",
+          "description": "Cluster-wide match rate. Measured floor on 2026-09-22 was ~4,800/h across three nodes, so a reading of zero means the probe detached rather than that the estate went quiet.",
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(falcosecurity_falco_rules_matches_total[$__rate_interval])) * 3600",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "area"
+          }
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "Dropped syscalls / sec",
+          "description": "A dropped syscall is a BLIND WINDOW, not a performance statistic. Normal value is exactly 0; the cumulative counter is ~141k purely from per-pod buffer warm-up at startup, which is why this panel shows rate and not total.",
+          "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(falcosecurity_scap_n_drops_total[$__rate_interval]))",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 2,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 0.01 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "graphMode": "none"
+          }
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Events / hour by rule",
+          "description": "The trend line. A rule appearing here for the first time is what FalcoNewRuleFired pages on; a rule DISAPPEARING after an exception is added is how you check the exception was not too broad.",
+          "gridPos": { "x": 0, "y": 4, "w": 14, "h": 10 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (rule_name) (rate(falcosecurity_falco_rules_matches_total[$__rate_interval])) * 3600",
+              "legendFormat": "{{rule_name}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "Events / hour by priority",
+          "description": "Syslog-numeric priority. All eight levels are mapped, not just the three seen so far, so a first-ever Emergency or Error renders with its real name instead of a bare number.",
+          "gridPos": { "x": 14, "y": 4, "w": 10, "h": 10 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (priority) (rate(falcosecurity_falco_rules_matches_total[$__rate_interval])) * 3600",
+              "legendFormat": "{{priority}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 0,
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" },
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": { "text": "0 Emergency", "index": 0 },
+                    "1": { "text": "1 Alert", "index": 1 },
+                    "2": { "text": "2 Critical", "index": 2 },
+                    "3": { "text": "3 Error", "index": 3 },
+                    "4": { "text": "4 Warning", "index": 4 },
+                    "5": { "text": "5 Notice", "index": 5 },
+                    "6": { "text": "6 Informational", "index": 6 },
+                    "7": { "text": "7 Debug", "index": 7 }
+                  }
+                }
+              ]
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean"] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        },
+        {
+          "id": 7,
+          "type": "table",
+          "title": "Loaded ruleset per node — exclusion integrity",
+          "description": "The hash of falco_rules.yaml as each node actually loaded it. falcoctl 'follow' is disabled on purpose, so this must only change when a deploy lands. It is the fingerprint of your exceptions: if these three disagree, an exception you believe is live is live on two nodes out of three.",
+          "gridPos": { "x": 0, "y": 14, "w": 14, "h": 7 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "falcosecurity_falco_sha256_rules_files_info",
+              "instant": true,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true, "Value": true, "__name__": true, "container": true,
+                  "endpoint": true, "job": true, "namespace": true, "prometheus": true,
+                  "service": true
+                },
+                "renameByName": { "pod": "Falco pod", "instance": "Endpoint", "file_name": "Rules file", "sha256": "SHA-256" }
+              }
+            }
+          ],
+          "fieldConfig": { "defaults": { "custom": { "align": "left" } }, "overrides": [] },
+          "options": { "showHeader": true }
+        },
+        {
+          "id": 8,
+          "type": "timeseries",
+          "title": "Falco resident memory per node",
+          "description": "Booked cost: 512Mi requested / 1Gi limit per node, against a cluster at 70-80% memory with a standing ~10 GiB N-1 shortfall. Watch this against the 1Gi ceiling.",
+          "gridPos": { "x": 14, "y": 14, "w": 10, "h": 7 },
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "falcosecurity_falco_memory_rss_bytes",
+              "legendFormat": "{{pod}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "decimals": 0,
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "never" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1073741824 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi" }
+          }
+        }
+      ]
+    }

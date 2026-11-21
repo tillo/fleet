@@ -1,0 +1,97 @@
+# KagentGatewayToolMissing (infra-7rog.32.2): the live check pushes one series per
+# Agent tool the gateway did not list to the kagent key. It pages after 45 min, so a
+# single failed run (30 min cadence) does not. KagentGatewayToolsCheckStale covers the
+# check itself not pushing.
+# KagentGatewayToolsCheckedNone: a run that checks nothing is not a clean run.
+rule_files:
+- monitoring-rules/77a-kagent-gateway-tools.yml
+evaluation_interval: 1m
+tests:
+- name: a-missing-tool-pages-after-45m
+  interval: 1m
+  input_series:
+  - series: kagent_gateway_tool_missing{job="kagent_gateway_tools_check",agent="mdapi-ops",server="mdapi-backstage",tool="catalog.get-catalog-entity"}
+    values: 1x90
+  - series: push_time_seconds{job="kagent_gateway_tools_check"}
+    values: 946684800+60x90
+  - series: kagent_gateway_tools_checked{job="kagent_gateway_tools_check"}
+    values: 17x90
+  alert_rule_test:
+  - eval_time: 40m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolMissing
+    exp_alerts: []
+  - eval_time: 50m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolMissing
+    exp_alerts:
+    - exp_labels:
+        agent: mdapi-ops
+        server: mdapi-backstage
+        tool: catalog.get-catalog-entity
+        service: kagent
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: kagent agent mdapi-ops cannot call mdapi-backstage/catalog.get-catalog-entity at the MCP gateway
+        description: "tools/list with the `kagent` key on the RemoteMCPServer's gateway URL\ndoes not return this tool (filtered by the route's tool policy, no\n`servers` grant on the key \u2014 a 403 lists\
+          \ nothing \u2014 or the upstream\nrenamed it, as Backstage's catalog.* did in fleet !1711). The\nroutes and policies are rows in the agentgateway database:\n  kubectl --context mdapi-prod-direct\
+          \ -n kagent logs -l app.kubernetes.io/name=kagent-gateway-tools-check --tail=50\n"
+  - eval_time: 50m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolsCheckStale
+    exp_alerts: []
+  - eval_time: 80m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolsCheckedNone
+    exp_alerts: []
+- name: a-silent-check-is-stale
+  interval: 1m
+  input_series:
+  - series: push_time_seconds{job="kagent_gateway_tools_check"}
+    values: 946684800x200
+  alert_rule_test:
+  - eval_time: 140m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolsCheckStale
+    exp_alerts: []
+  - eval_time: 160m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolsCheckStale
+    exp_alerts:
+    - exp_labels:
+        service: kagent
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: The kagent MCP gateway tool check has not pushed for over 2h
+        description: "CronJob kagent/kagent-gateway-tools-check runs every 30 min and pushes\nonly after reading every Agent and RemoteMCPServer, so a stale push\nmeans the job fails (RBAC, the kagent-mcp\
+          \ Secret, the Pushgateway) or\nis not scheduled. KagentGatewayToolMissing is blind meanwhile.\n  kubectl --context mdapi-prod-direct -n kagent get cronjob,job -l app.kubernetes.io/name=kagent-gateway-tools-check\n"
+- name: a-run-of-nothing-pages-after-1h
+  interval: 1m
+  input_series:
+  - series: kagent_gateway_tools_checked{job="kagent_gateway_tools_check"}
+    values: '0x90'
+  - series: push_time_seconds{job="kagent_gateway_tools_check"}
+    values: 946684800+60x90
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolsCheckedNone
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-kagent-gateway-tools.rules
+    alertname: KagentGatewayToolsCheckedNone
+    exp_alerts:
+    - exp_labels:
+        service: kagent
+        severity: warning
+        component: Automation
+        team: mdapi
+      exp_annotations:
+        summary: The kagent MCP gateway tool check found no Agent tool to check
+        description: "kagent-gateway-tools-check read every Agent and RemoteMCPServer and\nfound no McpServer tool on mcp.agentgateway.svc.cluster.local, so\nKagentGatewayToolMissing has nothing to say.\
+          \ Either the agents\nreally lost their gateway tools, or GATEWAY_HOST in\nkagent-mdapi/kagent-gateway-tools-check.yml no longer matches the\nRemoteMCPServer URLs.\n  kubectl --context mdapi-prod-direct\
+          \ -n kagent get remotemcpserver,agent -o wide\n"

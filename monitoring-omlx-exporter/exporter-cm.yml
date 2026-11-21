@@ -1,0 +1,207 @@
+## oMLX -> Prometheus exporter (2026-10-20).
+##
+## oMLX (the MLX inference server on mbp-mda behind the local-brain doors) has NO
+## Prometheus endpoint: /metrics, /api/metrics, /v1/metrics and /admin/api/metrics
+## all 404. What it has is two key-gated JSON documents:
+##   /api/status       ~2 ms   server totals, loaded models, model memory
+##   /admin/api/stats  ~10 ms  per-model queues, memory pressure, SSD KV-cache
+## Both are reached DIRECTLY at the Mac's WireGuard address (bpi-r4 wg_iot peer,
+## always-on tunnel since 2026-10-21), taken from Akeyless like the gateway's own
+## base URL. The ssh bridge through the jump pod that used to forward this retired
+## with the inbound firewall block that motivated it.
+##
+## ⛔ /admin/api/stats returns the oMLX API key IN PLAINTEXT (`api_key`), next to
+## `host` and `cli_prefix`. So this is a WHITELIST: only the fields named below
+## become series, every value goes through float(), and no string from either
+## document is ever emitted except a model id and the server version as labels.
+## A generic JSON exporter would publish the key to VictoriaMetrics and O2.
+##
+## Authenticated GETs to both endpoints write no line to oMLX's server.log, so a
+## 30s scrape adds nothing to the log stream that monitoring-omlx logs ship.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omlx-exporter
+  namespace: monitoring
+data:
+  exporter.py: |
+    #!/usr/bin/env python3
+    import json, os, sys, threading, time, urllib.request, urllib.error
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    # Same Akeyless item as the gateway's LMSTUDIO_WG_URL, so it is OpenAI-style
+    # (`.../v1`) while /api/status and /admin/api/stats hang off the bare root.
+    # ⛔ No default: a missing address must fail loudly, never scrape a stale one.
+    BASE      = os.environ["OMLX_URL"].rstrip("/")
+    BASE      = BASE[:-3] if BASE.endswith("/v1") else BASE
+    API_KEY   = os.environ["OMLX_API_KEY"]
+    BIND_PORT = int(os.environ.get("BIND_PORT", "9877"))
+    TIMEOUT   = float(os.environ.get("OMLX_TIMEOUT_SEC", "5"))
+
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    def fetch(path):
+        req = urllib.request.Request(BASE + path, headers={"Authorization": "Bearer " + API_KEY})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return json.loads(r.read())
+
+    def num(v):
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        return None
+
+    def esc(v):
+        return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")[:200]
+
+    class Out:
+        def __init__(self):
+            self.meta, self.rows = {}, []
+        def add(self, name, kind, help_, value, **labels):
+            v = num(value)
+            if v is None:
+                return
+            self.meta.setdefault(name, (kind, help_))
+            self.rows.append((name, labels, v))
+        def render(self):
+            by = {}
+            for name, labels, v in self.rows:
+                by.setdefault(name, []).append((labels, v))
+            out = []
+            for name, (kind, help_) in self.meta.items():
+                out.append("# HELP %s %s" % (name, help_))
+                out.append("# TYPE %s %s" % (name, kind))
+                for labels, v in by[name]:
+                    lab = ",".join('%s="%s"' % (k, esc(x)) for k, x in sorted(labels.items()))
+                    out.append("%s{%s} %r" % (name, lab, v) if lab else "%s %r" % (name, v))
+            return "\n".join(out) + "\n"
+
+    ## (json key, metric suffix, type, help) — the WHOLE surface of /api/status.
+    STATUS = [
+        ("uptime_seconds",          "uptime_seconds",               "gauge",   "Seconds since omlx-server started"),
+        ("models_discovered",       "models_discovered",            "gauge",   "Models found in the model directory"),
+        ("models_loaded",           "models_loaded",                "gauge",   "Models resident in memory"),
+        ("models_loading",          "models_loading",               "gauge",   "Models currently loading"),
+        ("total_requests",          "requests_total",               "counter", "Requests served since start"),
+        ("active_requests",         "active_requests",              "gauge",   "Requests in prefill or generation"),
+        ("waiting_requests",        "waiting_requests",             "gauge",   "Requests queued behind active ones"),
+        ("total_prompt_tokens",     "prompt_tokens_total",          "counter", "Prompt tokens since start"),
+        ("total_completion_tokens", "completion_tokens_total",      "counter", "Completion tokens since start"),
+        ("total_cached_tokens",     "cached_tokens_total",          "counter", "Prompt tokens served from the KV cache since start"),
+        ("cache_efficiency",        "cache_efficiency_percent",     "gauge",   "Cached share of prompt tokens since start, percent"),
+        ("avg_prefill_tps",         "avg_prefill_tokens_per_second",   "gauge", "Average prefill speed since start"),
+        ("avg_generation_tps",      "avg_generation_tokens_per_second", "gauge", "Average generation speed since start"),
+        ("model_memory_used",       "model_memory_used_bytes",      "gauge",   "Memory held by loaded models"),
+        ("model_memory_max",        "model_memory_max_bytes",       "gauge",   "Model memory budget"),
+    ]
+
+    ## active_models.models[] -> per-model gauges.
+    MODEL = [
+        ("actual_size",      "model_size_bytes",       "Resident size of the model"),
+        ("pinned",           "model_pinned",           "1 when the model is pinned in memory"),
+        ("is_loading",       "model_loading",          "1 while the model is loading"),
+        ("active_requests",  "model_active_requests",  "Requests in prefill or generation on this model"),
+        ("waiting_requests", "model_waiting_requests", "Requests queued on this model"),
+        ("idle_seconds",     "model_idle_seconds",     "Seconds since the model last served a request"),
+    ]
+
+    ## runtime_cache.models[] -> per-model SSD KV-cache counters/gauges.
+    CACHE = [
+        ("hits",                 "cache_block_hits_total",          "counter", "KV block cache hits"),
+        ("misses",               "cache_block_misses_total",        "counter", "KV block cache misses"),
+        ("evictions",            "cache_evictions_total",           "counter", "KV blocks evicted"),
+        ("saves",                "cache_ssd_saves_total",           "counter", "KV blocks saved to SSD"),
+        ("loads",                "cache_ssd_loads_total",           "counter", "KV blocks loaded from SSD"),
+        ("errors",               "cache_errors_total",              "counter", "KV cache errors"),
+        ("ssd_write_drops",      "cache_ssd_write_drops_total",     "counter", "KV blocks dropped instead of written to SSD"),
+        ("gdn_checkpoint_loads", "cache_checkpoint_loads_total",    "counter", "Linear-attention state checkpoints restored"),
+        ("num_files",            "cache_files",                     "gauge",   "KV cache files on SSD"),
+        ("total_size_bytes",     "cache_size_bytes",                "gauge",   "KV cache size on SSD"),
+        ("max_size_bytes",       "cache_max_size_bytes",            "gauge",   "KV cache size limit on SSD"),
+    ]
+    CUMULATIVE = [
+        ("prefix_hits",         "cache_prefix_hits_total",         "counter", "Requests whose prompt prefix was found in the cache"),
+        ("prefix_misses",       "cache_prefix_misses_total",       "counter", "Requests whose prompt prefix was not in the cache"),
+        ("prefix_tokens_saved", "cache_prefix_tokens_saved_total", "counter", "Prompt tokens not re-prefilled thanks to the cache"),
+    ]
+
+    PRESSURE_LEVELS = ("ok", "soft", "hard")
+
+    def collect():
+        o, t0 = Out(), time.monotonic()
+        ok_status = ok_stats = 0
+        try:
+            s = fetch("/api/status")
+            ok_status = 1
+            for key, suffix, kind, help_ in STATUS:
+                o.add("omlx_" + suffix, kind, help_, s.get(key))
+            o.add("omlx_info", "gauge", "Server version", 1, version=s.get("version", ""))
+            for m in s.get("loaded_models") or []:
+                o.add("omlx_model_loaded", "gauge", "1 for each model resident in memory", 1, model=m)
+        except Exception as e:
+            log("status scrape failed: %s" % type(e).__name__)
+        try:
+            a = fetch("/admin/api/stats")
+            ok_stats = 1
+            am = a.get("active_models") or {}
+            for m in am.get("models") or []:
+                mid = m.get("id", "")
+                for key, suffix, help_ in MODEL:
+                    o.add("omlx_" + suffix, "gauge", help_, m.get(key), model=mid)
+                pre = m.get("prefilling") or []
+                o.add("omlx_model_prefilling_requests", "gauge", "Requests in prefill", len(pre), model=mid)
+                o.add("omlx_model_generating_requests", "gauge", "Requests generating", len(m.get("generating") or []), model=mid)
+                o.add("omlx_model_prefill_tokens_per_second", "gauge", "Sum of live prefill speeds",
+                      sum(num(p.get("speed")) or 0.0 for p in pre), model=mid)
+                o.add("omlx_model_prefill_pending_tokens", "gauge", "Prompt tokens still to prefill",
+                      sum(max(0.0, (num(p.get("total")) or 0.0) - (num(p.get("processed")) or 0.0)) for p in pre), model=mid)
+                waiting = m.get("waiting") or []
+                o.add("omlx_model_queue_oldest_seconds", "gauge", "Age of the oldest queued request",
+                      max([num(w.get("elapsed_seconds")) or 0.0 for w in waiting] or [0.0]), model=mid)
+            mp = am.get("memory_pressure") or {}
+            o.add("omlx_memory_process_bytes", "gauge", "Process memory the enforcer measures", mp.get("current_bytes"))
+            o.add("omlx_memory_soft_limit_bytes", "gauge", "Soft memory-pressure threshold", mp.get("soft_bytes"))
+            o.add("omlx_memory_hard_limit_bytes", "gauge", "Hard memory-pressure threshold", mp.get("hard_bytes"))
+            level = mp.get("pressure_level")
+            for lv in PRESSURE_LEVELS:
+                o.add("omlx_memory_pressure", "gauge", "1 for the current memory-pressure level",
+                      1 if level == lv else 0, level=lv)
+            rc = a.get("runtime_cache") or {}
+            for m in rc.get("models") or []:
+                mid = m.get("id", "")
+                for key, suffix, kind, help_ in CACHE:
+                    o.add("omlx_" + suffix, kind, help_, m.get(key), model=mid)
+                cum = (m.get("cache_rates") or {}).get("cumulative") or {}
+                for key, suffix, kind, help_ in CUMULATIVE:
+                    o.add("omlx_" + suffix, kind, help_, cum.get(key), model=mid)
+            o.add("omlx_cache_disk_max_bytes", "gauge", "SSD budget for the KV cache, all models", rc.get("disk_max_bytes"))
+            o.add("omlx_tokens_served_total", "counter", "Prompt plus completion tokens since start", a.get("total_tokens_served"))
+        except Exception as e:
+            log("stats scrape failed: %s" % type(e).__name__)
+        o.add("omlx_up", "gauge", "1 when oMLX answered /api/status", ok_status)
+        # 'source', not 'endpoint': the scrape adds endpoint=<port name> and would rename ours
+        o.add("omlx_scrape_success", "gauge", "1 when the oMLX endpoint answered", ok_status, source="status")
+        o.add("omlx_scrape_success", "gauge", "1 when the oMLX endpoint answered", ok_stats, source="stats")
+        o.add("omlx_scrape_duration_seconds", "gauge", "Time to read both endpoints", time.monotonic() - t0)
+        return o.render()
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/healthz":
+                body, code = b"ok\n", 200
+            elif self.path == "/metrics":
+                body, code = collect().encode(), 200
+            else:
+                body, code = b"not found\n", 404
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+
+    log("omlx-exporter on :%d -> %s" % (BIND_PORT, BASE))
+    ThreadingHTTPServer(("", BIND_PORT), H).serve_forever()

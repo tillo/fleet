@@ -1,0 +1,28 @@
+## Tdarr API key (infra-o4i3m.4).
+##
+## One tapi_ key, three consumers:
+##   - tdarr server: seededApiKey (created at start if absent; with no users it
+##     also seeds the UI user `admin` with this key as its password) + apiKey
+##     for its internal node;
+##   - tdarr-node-quarto: apiKey;
+##   - Home Assistant's Tdarr integration (x-api-key, set in its config entry,
+##     not in git). Rotating it here without updating HA breaks the sensors.
+##
+## Akeyless: /mdapi/tv/tdarr/api-key
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: tdarr-auth
+  namespace: tv
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: tdarr-auth
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/tv/tdarr/api-key
+      secretKey: apiKey

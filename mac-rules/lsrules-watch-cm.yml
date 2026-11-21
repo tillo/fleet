@@ -1,0 +1,267 @@
+## The content watch run by lsrules-watch-cron.yml (same directory).
+##
+## Kept as a ConfigMap rather than baked into an image or squeezed into a shell
+## heredoc because the probe needs three things a shell makes unreadable: query a
+## NAMED resolver (the Mac's, not the pod's), open TLS with SNI pinned to the
+## hostname while connecting to a chosen address, and hash the body. The Python
+## stdlib covers all three, so there is no image of our own to build and pin.
+##
+## ⚠️ Keep this file and the CronJob's mount paths in step: TOKEN_FILE, RULES_FILE
+## and /opt/watch are the contract between the two files. lint.py cannot see
+## Python, so the negative controls in the README are this script's test.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lsrules-watch-script
+  namespace: mac-rules
+  labels:
+    app.kubernetes.io/name: lsrules-watch
+    app.kubernetes.io/part-of: mac-rules
+data:
+  lsrules_watch.py: |
+    #!/usr/bin/env python3
+    """Out-of-band content watch for the Little Snitch remote rule group.
+
+    Little Snitch subscribes to https://rules.mdapi.ch/s/<token>/household.lsrules and
+    pins NOTHING: no signature, no hash, no certificate expectation beyond "publicly
+    trusted". A valid certificate says nothing about WHO served the bytes, because a
+    zone owner who repoints the record can obtain one from the same CA we use. So the
+    Mac cannot tell our file from an attacker's, and nothing on the Mac can be made to.
+
+    This probes the serving chain from outside it and compares what comes back with the
+    ConfigMap the cluster is actually serving. Three legs, because three resolvers
+    decide where a client lands:
+
+      cluster : the in-cluster resolver (CoreDNS -> split-horizon Unbound)
+      lan     : 192.168.1.254, the bpi-r4 dnsmasq that mbp-mda asks first
+      public  : 1.1.1.1, the answer the rest of the world gets
+
+    Each leg resolves independently, then fetches with SNI pinned to the hostname, and
+    the body is hashed against the mounted ConfigMap. A mismatch on ANY leg means some
+    client can be handed firewall policy that git never reviewed.
+
+    Deliberately NOT compared against git: Fleet owns git -> cluster, and its bundle
+    status is the signal for that hop. This watch owns cluster -> wire, which is the hop
+    Fleet cannot see.
+
+    Exit status is about the PROBE, not the content: 0 whenever a run completed and its
+    metrics were pushed, because a non-zero exit here would only duplicate the alert
+    that the pushed gauge already raises. The one exception is a probe that cannot run
+    at all (no token, no pushgateway): it pushes last_run_success 0 where it can, then
+    exits 1.
+    """
+
+    import hashlib
+    import http.client
+    import os
+    import socket
+    import ssl
+    import struct
+    import sys
+    import time
+    import urllib.request
+
+    HOST = os.environ.get("LS_HOST", "rules.mdapi.ch")
+    TOKEN_FILE = os.environ.get("LS_TOKEN_FILE", "/etc/lsrules-token/token")
+    RULES_FILE = os.environ.get("LS_RULES_FILE", "/etc/lsrules-src/household.lsrules")
+    PUSHGATEWAY = os.environ.get("PUSHGATEWAY", "http://pushgateway.monitoring.svc.cluster.local:9091")
+    JOB = os.environ.get("LS_JOB", "lsrules_watch")
+    TIMEOUT = float(os.environ.get("LS_TIMEOUT", "8"))
+
+    LEGS = [
+        # (label, resolver address or None for the system resolver)
+        ("cluster", None),
+        ("lan", os.environ.get("LS_LAN_RESOLVER", "192.168.1.254")),
+        ("public", os.environ.get("LS_PUBLIC_RESOLVER", "1.1.1.1")),
+    ]
+
+
+    def dns_a(name, server, timeout=TIMEOUT):
+        """Minimal A-record query. No dependency on dig, and it lets a leg name the
+        resolver to ask instead of inheriting whatever the pod happens to use."""
+        qid = struct.unpack("!H", os.urandom(2))[0]
+        q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+        for label in name.split(".") + [""]:
+            q += bytes([len(label)]) + label.encode()
+        q += struct.pack("!HH", 1, 1)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(q, (server, 53))
+            resp, _ = s.recvfrom(4096)
+
+        rid, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", resp[:12])
+        if rid != qid:
+            raise RuntimeError("dns: transaction id mismatch")
+        if flags & 0x000F:
+            raise RuntimeError("dns: rcode %d" % (flags & 0x000F))
+
+        off = 12
+        for _ in range(qd):  # skip question section
+            while resp[off]:
+                off += resp[off] + 1
+            off += 5
+
+        found = []
+        for _ in range(an):
+            if resp[off] & 0xC0 == 0xC0:
+                off += 2
+            else:
+                while resp[off]:
+                    off += resp[off] + 1
+                off += 1
+            rtype, rclass, _ttl, rdlen = struct.unpack("!HHIH", resp[off:off + 10])
+            off += 10
+            rdata = resp[off:off + rdlen]
+            off += rdlen
+            if rtype == 1 and rclass == 1 and rdlen == 4:  # A, IN
+                found.append(socket.inet_ntoa(rdata))
+        return found
+
+
+    def resolve(leg):
+        if leg is None:
+            addrs = socket.getaddrinfo(HOST, 443, socket.AF_INET, socket.SOCK_STREAM)
+            return sorted({a[4][0] for a in addrs})
+        return dns_a(HOST, leg)
+
+
+    class _Pinned(http.client.HTTPSConnection):
+        """HTTPS to a chosen address with SNI and certificate checks for the HOSTNAME.
+
+        This is the point of the exercise: it asks "does the machine at THIS address
+        serve OUR bytes under OUR name", which is the only question a DNS hijack fails.
+        """
+
+        def __init__(self, host, ip, **kw):
+            super().__init__(host, 443, **kw)
+            self._ip = ip
+
+        def connect(self):
+            raw = socket.create_connection((self._ip, self.port), self.timeout)
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+
+    def fetch(path, ip=None, context=None):
+        if ip is None:
+            conn = http.client.HTTPSConnection(HOST, 443, timeout=TIMEOUT, context=context)
+        else:
+            conn = _Pinned(HOST, ip, timeout=TIMEOUT, context=context)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "mdapi-lsrules-watch/1"})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+
+    def probe(path, expected_sha, context):
+        """Returns one result dict per leg."""
+        results = []
+        for label, resolver in LEGS:
+            r = {"leg": label, "ips": [], "status": 0, "match": 0, "ok": 0, "err": ""}
+            try:
+                ips = resolve(resolver)
+                r["ips"] = ips
+                if not ips:
+                    raise RuntimeError("no A record")
+            except Exception as exc:  # noqa: BLE001 - a leg failure is data, not a crash
+                r["err"] = "resolve: %s" % exc
+                results.append(r)
+                continue
+
+            last = None
+            for ip in ips:
+                try:
+                    status, body = fetch(path, ip, context)
+                except Exception as exc:  # noqa: BLE001
+                    last = "%s: %s" % (ip, exc)
+                    continue
+                r["ok"] = 1
+                r["status"] = status
+                if status == 200:
+                    r["match"] = int(hashlib.sha256(body).hexdigest() == expected_sha)
+                    last = None
+                    break
+                last = "%s: http %d" % (ip, status)
+            if not r["ok"]:
+                r["err"] = last or "no address answered"
+            results.append(r)
+        return results
+
+
+    def push(body):
+        data = (body.rstrip("\n") + "\n").encode()
+        req = urllib.request.Request(
+            "%s/metrics/job/%s" % (PUSHGATEWAY.rstrip("/"), JOB), data=data, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status >= 300:
+                raise RuntimeError("pushgateway returned %d" % resp.status)
+
+
+    def main():
+        try:
+            with open(TOKEN_FILE) as fh:
+                token = fh.read().strip()
+            if not token:
+                raise RuntimeError("%s is empty" % TOKEN_FILE)
+            with open(RULES_FILE, "rb") as fh:
+                expected = fh.read()
+        except Exception as exc:  # noqa: BLE001
+            # Without these the probe cannot answer anything. Publish the failure so a
+            # dead watch and a quiet watch are distinguishable, then fail the Job.
+            print("cannot start: %s" % exc, file=sys.stderr)
+            try:
+                push("lsrules_watch_last_run_timestamp_seconds %d\n"
+                     "lsrules_watch_last_run_success 0" % int(time.time()))
+            except Exception as push_exc:  # noqa: BLE001
+                print("pushgateway push failed too: %s" % push_exc, file=sys.stderr)
+            return 1
+
+        path = "/s/%s/household.lsrules" % token
+        expected_sha = hashlib.sha256(expected).hexdigest()
+        context = ssl.create_default_context()
+
+        results = probe(path, expected_sha, context)
+        for r in results:
+            print("%-7s ok=%d http=%d match=%d ips=%s%s"
+                  % (r["leg"], r["ok"], r["status"], r["match"], ",".join(r["ips"]),
+                     (" err=" + r["err"]) if r["err"] else ""))
+
+        lines = [
+            "lsrules_watch_last_run_timestamp_seconds %d" % int(time.time()),
+            # 1 = the probe reached the endpoint at all. Content is carried by the
+            # per-leg gauge; this one keeps a total outage on the estate-wide
+            # BatchJobLastRunFailed path instead of inventing a second alert for it.
+            "lsrules_watch_last_run_success %d" % int(any(r["ok"] for r in results)),
+            "lsrules_watch_expected_bytes %d" % len(expected),
+        ]
+        for r in results:
+            lines.append('lsrules_watch_fetch_ok{leg="%s"} %d' % (r["leg"], r["ok"]))
+            lines.append('lsrules_watch_http_status{leg="%s"} %d' % (r["leg"], r["status"]))
+            lines.append('lsrules_watch_content_matches{leg="%s"} %d' % (r["leg"], r["match"]))
+
+        body = "\n".join(lines)
+        # Two different failures, named separately: a leg that ANSWERED with other
+        # bytes is the hijack-shaped one, a leg that never answered is a broken path.
+        # Collapsing them into one "mismatch" line would send the reader hunting for
+        # a hijack that the metrics say did not happen.
+        differs = [r["leg"] for r in results if r["ok"] and not r["match"]]
+        silent = [r["leg"] for r in results if not r["ok"]]
+        if differs:
+            print("MISMATCH: served bytes differ from the ConfigMap on: %s"
+                  % ",".join(differs), file=sys.stderr)
+        if silent:
+            print("UNREACHABLE: no answer on: %s" % ",".join(silent), file=sys.stderr)
+        try:
+            push(body)
+        except Exception as exc:  # noqa: BLE001
+            print("pushgateway push failed: %s" % exc, file=sys.stderr)
+            return 1
+        print("pushed %d series to %s/metrics/job/%s" % (len(lines), PUSHGATEWAY, JOB))
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())

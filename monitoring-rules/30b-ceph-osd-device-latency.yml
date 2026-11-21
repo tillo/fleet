@@ -1,0 +1,66 @@
+## Ceph OSD device read latency (infra-r9mzd.21, 2026-11-04).
+##
+## The cluster-wide IO stalls of 10-29 / 10-31 / 11-01 (mirror SyntheticProbeFailing,
+## IO PSI in mirror/tv/cribl/atlas/openbao/jump, Ceph SLOW_OPS) were caused by the READ
+## latency collapse of the 8 DRAM-less consumer SSD OSDs: qui INTENSO osd.0/2/4/7 and
+## quo EMTEC X150 osd.1/3/6/9 (infra-r9mzd.9). Nothing named them: "busy 1.0" showed
+## up on the rbdN CLIENT devices, which queue behind the slow OSDs (victims).
+##
+## This rule names the physical device: mean read latency per sd* device
+## (rate(read_time)/rate(reads_completed)), joined to node_uname_info (instance IP ->
+## nodename) and to ceph_disk_occupation (nodename + device -> osd id). The join keeps
+## ONLY Ceph OSD devices, so rbdN, iSCSI sd* and the OS sda never match. If the ceph
+## mgr exporter is down the rule is silent (CephMgr/PrometheusJobMissing cover that).
+##
+## Threshold from 14 d of 1-min samples (2026-10-21..11-04, backtest in infra-r9mzd.21):
+##   TEAM/SanDisk OSDs: p99 8-28 ms, max 291 ms, never > 100 ms for 10 min.
+##   INTENSO/EMTEC OSDs: p50 3-6 ms, p99 120-1070 ms.
+##   > 100 ms for 10m: 18 incidents / 66 device episodes, all 18 corroborated by mirror
+##   IO PSI > 0.5 or Ceph SLOW_OPS; fires 10-29 08:51, 10-31 15:35, 11-01 05:13, i.e.
+##   12-19 min BEFORE each mirror probe failure (09:03, 15:51, 05:32).
+## keep_firing_for joins the flaps of one stall into one notification.
+##
+## Severity warning (quiet Pushover): a capacity signal for a known hardware problem,
+## not a page. Expect it until infra-r9mzd.19 / .20 land; after that, a firing means
+## the fix did not hold or a new drive is failing.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ceph-osd-device-latency
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-ceph-osd-device-latency
+    rules:
+    - alert: CephOSDDeviceReadLatencyHigh
+      expr: |
+        (
+          (
+            rate(node_disk_read_time_seconds_total{job="node-exporter",device=~"sd[a-z]+"}[5m])
+            / rate(node_disk_reads_completed_total{job="node-exporter",device=~"sd[a-z]+"}[5m])
+          )
+          * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          * on (nodename, device) group_left (ceph_daemon)
+            max by (nodename, device, ceph_daemon) (
+              label_replace(label_replace(ceph_disk_occupation{devices=~"sd[a-z]+"},
+                "nodename", "$1", "instance", "(.+)"), "device", "$1", "devices", "(.+)")
+            )
+        ) > 0.1
+      for: 10m
+      keep_firing_for: 10m
+      labels:
+        service: '{{ $labels.nodename }}'
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: 'Ceph {{ $labels.ceph_daemon }} read latency {{ $value | humanizeDuration }} on {{ $labels.nodename }}/{{ $labels.device }}'
+        description: |
+          Ceph {{ $labels.ceph_daemon }} ({{ $labels.nodename }} /dev/{{ $labels.device }}) has averaged {{ $value | humanizeDuration }} per read for 10 minutes (healthy TEAM OSDs: 2-8 ms).
+          This is the cause of a cluster-wide IO stall, not a victim: every RBD/CephFS client that hits a PG with this OSD as primary waits on it, so rbdN devices, mirror/tv/cribl IO PSI and Ceph SLOW_OPS follow.
+          Known hardware problem: the 8 DRAM-less consumer SSDs (qui INTENSO osd.0/2/4/7, quo EMTEC osd.1/3/6/9) collapse on reads once Ceph client writes pass ~5 MB/s. Capacity signal, not a page.
+          Fix: infra-r9mzd.19 (primary-affinity 0 on those 8) / infra-r9mzd.20 (replace them). Diagnosis: infra-r9mzd.9, disk-io-diag skill.
+          If this names a TEAM/SanDisk OSD or a qua device, it is a NEW problem: check SMART (smartctl -d cciss,N) and ssacli.

@@ -1,0 +1,181 @@
+## Override the rke2-coredns chart values to:
+##
+##   1. Resolve everything through the internal resolver FIRST: 192.168.1.1
+##      is the IN-CLUSTER split-horizon Unbound (fleet/split-horizon/, ns
+##      split-horizon, MetalLB single-address pool — NOT the bpi-r4, which
+##      sits at .254; verified 2026-07-26). Only .1 serves the full
+##      split-horizon view: 14 transparent local-zones (mdapi.ch, tillo.ch,
+##      dellambrogio.*, …) with the mdapi.ch ingress records auto-generated
+##      by external-dns, plus home.tillo.ch and 168.192.in-addr.arpa
+##      forwarded to Technitium (.54). Technitium itself serves the PUBLIC
+##      mdapi.ch view even to LAN sources — never test split horizon with
+##      `dig @.54`. in-addr.arpa/ip6.arpa fall through the kubernetes
+##      plugin into the default forward, so LAN PTRs resolve via .1 too.
+##      Being in-cluster, this first hop adds NO router dependency.
+##
+##   2. Fallbacks, strictly in order: bpi-r4 dnsmasq (.254), the NextDNS
+##      pair (45.90.28.16/.30.16), Quad9 last. .254 is the cluster-
+##      independent resolver: its own ladder is .54 → NextDNS ×2 → Quad9,
+##      it pins home.tillo.ch to .54/.1, and it holds an emergency copy of
+##      home.tillo.ch for when both are down. .1's default recursion path is
+##      Technitium (.54) → DoT to NextDNS (egress verified via
+##      whoami.akamai.net + o-o.myaddr.l.google.com + test.nextdns.io
+##      edge = dns.nextdns.io), so the paid filtering profile (Linked-IP
+##      on the WAN block) stays in-path on BOTH primary and fallback routes.
+##      No loop: .254 sends only cluster.local back here, and the kubernetes
+##      plugin answers cluster.local itself.
+##
+##   3. The 2026-05-25 cascade (router DNS hiccup 08:51–10:01 UTC → cribl
+##      image pulls, statuspage-adapter, gitlab-runner clones all failed)
+##      happened because the then-config had NO fallback past the router.
+##      `policy sequential` + `health_check 5s` + `max_fails 2` now flips
+##      queries to NextDNS within seconds of a .1 outage. Fallback answers
+##      lose the internal view (public records only) — acceptable
+##      degradation vs SERVFAIL for non-pinned names.
+##
+##   See [[SESSION_REVIEW_20260517_DNSSEC_ROOT_CAUSE_CF_DESIGN_NEXTDNS.md]]
+##   for the prior NextDNS-vs-DNSSEC analysis. CoreDNS here is a non-
+##   validating stub (no `dnssec` plugin), so NextDNS's lack of DNSSEC
+##   chain doesn't matter at this layer; Technitium remains the only
+##   would-be-validator, and it's already on UDP / dnssecValidation=false
+##   per that session's decision.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-coredns
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ## Override chart defaults of req==lim=100m (Guaranteed QoS, zero
+    ## headroom). CoreDNS spikes during cluster events (pod-create
+    ## flurries, ServiceMonitor scrape bursts) and was throttling ~5% of
+    ## CFS periods. Bumping the limit to 500m keeps the resolver
+    ## responsive without changing the request floor.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    ## The cluster-proportional-autoscaler sidecar deployment ships with a
+    ## 100m CPU limit and CFS-throttles ~5% of periods on its poll bursts
+    ## (ContainerCpuThrottling 2026-07-06). Same treatment as coredns above:
+    ## keep the request floor, lift the limit out of throttle range.
+    ## min 3: the linear params (nodesPerReplica 16) plus
+    ## preventSinglePointFailure give only 2 replicas on 4 nodes. On
+    ## 2026-10-25 both sat on the two nodes whose pod network was broken
+    ## mid-upgrade (qua, quarto) and in-cluster DNS went fully down. The
+    ## required per-hostname anti-affinity puts the third on another node.
+    autoscaler:
+      min: 3
+      resources:
+        requests:
+          cpu: 25m
+          memory: 16Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+    servers:
+    ## mdapi.ch — keep going through the router so internal-only records
+    ## (cluster IPs, LAN DHCP names, technitium split-horizon answers)
+    ## stay reachable. Deliberately NO .254 fallback: bpi-r4's emergency zone
+    ## holds no mdapi.ch names, so with .1 down it answers from .54's PUBLIC
+    ## view — wrong-not-degraded.
+    - port: 53
+      zones:
+      - zone: mdapi.ch
+      plugins:
+      - name: errors
+      - name: cache
+        parameters: 30
+      - name: forward
+        parameters: . 192.168.1.1
+        configBlock: |-
+          health_check 5s
+          max_fails 2
+    ## home.tillo.ch — the internal split-horizon zone (api.garage, LAN DHCP
+    ## names, technitium answers). Must forward to the router/Unbound (.1) like
+    ## mdapi.ch; otherwise it falls through to the public forwarders and
+    ## SERVFAILs, which broke in-cluster api.garage.home.tillo.ch resolution
+    ## (zot -> Garage S3) during the 2026-06-07 recovery. .254 is the fallback:
+    ## it answers home.tillo.ch from .54 (authoritative) or its emergency zone,
+    ## never from a public view. `policy sequential` because the forward
+    ## default is random, which would load-share .1 and .254.
+    ##
+    ## `failover SERVFAIL REFUSED`: by default forward advances to the next
+    ## upstream only when one gives NO response (timeout). On 2026-10-25
+    ## Technitium (.54) died while Unbound (.1) stayed up and ANSWERED
+    ## SERVFAIL, so forward never moved to .254 and the zone failed cluster-
+    ## wide. failover makes forward treat a SERVFAIL/REFUSED answer like a
+    ## dead upstream and try .254. If .254 also SERVFAILs the last answer is
+    ## returned — no public fallback here, which is correct.
+    - port: 53
+      zones:
+      - zone: home.tillo.ch
+      plugins:
+      - name: errors
+      - name: cache
+        parameters: 30
+      - name: forward
+        parameters: . 192.168.1.1 192.168.1.254
+        configBlock: |-
+          policy sequential
+          failover SERVFAIL REFUSED
+          health_check 5s
+          max_fails 2
+    ## Default zone — cluster.local handling (unchanged) + internal-first
+    ## upstream chain: .1 (full split-horizon view; its own upstream is
+    ## NextDNS), bpi-r4 .254 (independent of the cluster; keeps LAN PTRs and
+    ## the Technitium path when .1 is down), NextDNS direct, then Quad9 as a
+    ## last resort. The mdapi.ch / home.tillo.ch pins above deliberately keep
+    ## NO public fallback: a public answer there is wrong-not-degraded, so
+    ## fail loudly instead.
+    ##
+    ## `failover SERVFAIL REFUSED` is the fix for the 2026-10-25 outage: by
+    ## default forward only advances to the next upstream on NO response
+    ## (timeout). Unbound (.1) stayed up but answered SERVFAIL for every
+    ## public name (its own upstream Technitium .54 was dead), so forward
+    ## never fell through to the fallbacks and EVERY pod got SERVFAIL for
+    ## internet names. With failover + `policy sequential` a SERVFAIL/REFUSED
+    ## from .1 is treated like a dead upstream: try .254, then each NextDNS,
+    ## then Quad9, in order, until one returns NOERROR/NXDOMAIN. NXDOMAIN is
+    ## NOT in the list, so a real "no such name" still stops the chain.
+    ##
+    ## Quad9 added 2026-10-08, after a LAN-DNS outage in which the NextDNS
+    ## pair refused the estate's DNS egress source address. Every public leg
+    ## of this cluster's resolution ended at those two IPs, so "the provider
+    ## refuses us" and "DNS is down" were the same event. A resolver that
+    ## cannot answer at all is worse than one that answers unfiltered, so a
+    ## last-resort tier is the right trade — see the Quad9 exception in the
+    ## DNS-resolver policy memory. `policy sequential` keeps it strictly
+    ## last, never a load-sharing peer.
+    - port: 53
+      zones:
+      - use_tcp: true
+        zone: .
+      plugins:
+      - name: errors
+      - name: health
+        configBlock: lameduck 10s
+      - name: ready
+      - name: kubernetes
+        parameters: cluster.local in-addr.arpa ip6.arpa
+        configBlock: |-
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+          ttl 30
+      - name: prometheus
+        parameters: 0.0.0.0:9153
+      - name: forward
+        parameters: . 192.168.1.1 192.168.1.254 45.90.28.16 45.90.30.16 9.9.9.9
+        configBlock: |-
+          policy sequential
+          failover SERVFAIL REFUSED
+          health_check 5s
+          max_fails 2
+      - name: cache
+        parameters: 30
+      - name: loop
+      - name: reload
+      - name: loadbalance

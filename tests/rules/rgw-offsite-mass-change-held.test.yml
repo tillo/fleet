@@ -1,0 +1,49 @@
+# RgwOffsiteMassChangeHeld — the off-site sync saw a large share of an RGW bucket
+# rewritten or deleted and HELD that bucket's o2switch pair (bead infra-wk4ux.4).
+#
+# WHY THESE CASES: o2switch SFTP keeps no versions, and B2 keeps hidden versions
+# for 30 days only, so the alert is worth something only if it is loud at once.
+#   * one held bucket fires on the first evaluation (no `for:` dampening: the
+#     30h of RgwOffsiteBackupFailing is exactly the delay this must not have);
+#   * nothing held stays silent;
+#   * the hold is sticky in the job, so the gauge stays > 0 on later nights
+#     and the alert keeps firing until an operator releases it.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: a-held-bucket-fires-at-once
+  interval: 1m
+  input_series:
+  - series: rgw_offsite_backup_mass_change_held
+    values: '1x10'
+  alert_rule_test:
+  - groupname: app-batch-jobs.rgw-offsite-backup
+    eval_time: 1m
+    alertname: RgwOffsiteMassChangeHeld
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        team: mdapi
+        component: Backups
+        statuspage: exclude
+        service: ceph-rgw
+      exp_annotations:
+        summary: "RGW offsite backup HELD 1 bucket(s): mass rewrite/delete seen on L1 — possible ransomware"
+        description: >-
+          f/config_backup/rgw_offsite_backup saw its B2 pair rewrite or delete a
+          large share of an RGW bucket and did NOT sync that bucket to o2switch,
+          which keeps no versions. The B2 copy keeps the old versions for 30
+          days. Read the latest run (HOLD/HELD lines), inspect the bucket on Ceph
+          RGW, and only once the change is understood re-run the job with
+          allow_mass_change=<bucket>.
+- name: nothing-held-is-silent
+  interval: 1m
+  input_series:
+  - series: rgw_offsite_backup_mass_change_held
+    values: '0x10'
+  alert_rule_test:
+  - groupname: app-batch-jobs.rgw-offsite-backup
+    eval_time: 5m
+    alertname: RgwOffsiteMassChangeHeld
+    exp_alerts: []

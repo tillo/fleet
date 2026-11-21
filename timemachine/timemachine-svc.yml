@@ -1,0 +1,21 @@
+## LAN-only SMB endpoint. 192.168.1.65 has no router DNAT and no ingress, and
+## the NetworkPolicy admits 192.168.1.0/24 only. externalTrafficPolicy: Local
+## keeps the client's source address, which is what lets that policy work.
+##
+## There is no Bonjour: mDNS does not cross into the pod network, so the Mac
+## adds the destination explicitly:
+##   sudo tmutil setdestination -a smb://timemachine@192.168.1.65/mbp-mda
+apiVersion: v1
+kind: Service
+metadata:
+  name: timemachine
+  namespace: timemachine
+spec:
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.65
+  externalTrafficPolicy: Local
+  selector:
+    app: timemachine
+  ports:
+    - { name: smb, port: 445, targetPort: 445, protocol: TCP }

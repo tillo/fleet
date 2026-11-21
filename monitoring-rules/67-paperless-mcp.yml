@@ -1,0 +1,70 @@
+## paperless-mcp — the read-only household-archive connector for chat.mdapi.ch.
+##
+## Nothing here is visitor-facing: the connector is reached only from the Chat
+## pods, and its failure degrades one chat tool rather than any published site.
+## Same contract as 66-nextcloud-mcp.yml (warning + `statuspage: exclude`, since
+## `Files & Documents` is a public component).
+##
+## Why it needs its own rule at all: ClusterIP only, no ingress, no blackbox
+## probe, and a silent failure mode — chat.mdapi.ch keeps working and only the
+## model notices. The 421 that broke tool discovery on 2026-10-22 fired nothing.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract): every
+## workload later added to ns paperless-mcp is born covered. `deployment=~".+"` /
+## `statefulset=~".+"` are no-ops in PromQL and load-bearing for
+## f/probe/alert_coverage_check — without them a namespace-only selector claims
+## coverage of a kind it can never fire on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-paperless-mcp
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-paperless-mcp.rules
+      rules:
+        - alert: PaperlessMcpWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="paperless-mcp", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="paperless-mcp", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "paperless-mcp" }}'
+            severity: warning
+            component: Files & Documents
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "paperless-mcp/{{ $labels.deployment }} has {{ $value }} unavailable replica(s)"
+            description: |
+              The Paperless connector is down for the household. Chat keeps
+              working; asking about archived documents returns a tool error.
+                kubectl --context mdapi-prod-direct -n paperless-mcp get pods
+                kubectl --context mdapi-prod-direct -n paperless-mcp logs deploy/{{ $labels.deployment }} --tail=50
+              Read the log line, because the three failures look different:
+                CreateContainerConfigError  ExternalSecret `paperless-mcp-env` has
+                                            not materialised (Akeyless path
+                                            /mdapi/paperless-mcp/paperless-mcp-env/PAPERLESS_TOKEN)
+                auth failed ...            401s from the DMS gate — that is a CALLER
+                                            problem (a user outside the group), not this pod
+                paperless_5xx / Timeout    the Paperless API or its database is down:
+                                            check ns paperless before touching this one
+
+        - alert: PaperlessMcpStatefulSetUnavailable
+          ## Empty today — the arm exists so the namespace-wide claim above stays
+          ## true if a StatefulSet is ever added here.
+          expr: |
+            kube_statefulset_status_replicas_ready{namespace="paperless-mcp", statefulset=~".+"}
+              < kube_statefulset_status_replicas{namespace="paperless-mcp", statefulset=~".+"}
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "paperless-mcp" }}'
+            severity: warning
+            component: Files & Documents
+            team: mdapi
+            statuspage: exclude
+          annotations:
+            summary: "paperless-mcp/{{ $labels.statefulset }} has unavailable replicas"

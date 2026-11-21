@@ -1,0 +1,42 @@
+## Chi può parlare con Bussola.
+##
+## PERCHÉ ESISTE. L'identità arriva da un'intestazione HTTP che oauth2-proxy
+## mette dopo aver verificato la sessione. Dentro il cluster quell'intestazione
+## la può mettere chiunque: verificato il 2026-08-30 da un pod qualsiasi dello
+## stesso namespace —
+##     curl -H "X-Auth-Request-Email: <qualcuno>" http://bussola.bussola:8080/
+## — e la risposta era la sua pagina, con le sue cifre. Qualunque carico di
+## lavoro compromesso nel cluster poteva leggere e scrivere i conti di
+## chiunque. La difesa non può stare nell'applicazione: se l'intestazione è
+## l'identità, bisogna che nessun altro possa mandarla.
+##
+## Due sorgenti ammesse, e servono tutte e due:
+##   * il namespace kube-system, dove gira il controller ingress (verificato:
+##     hostNetwork è FALSO, quindi arriva con un IP di pod e il
+##     namespaceSelector lo prende);
+##   * la rete dei nodi, da cui arrivano le sonde del kubelet — senza questa
+##     riga readiness e liveness fallirebbero e i pod si riavvierebbero in
+##     continuazione, che è il modo più comune di rompersi un piede con una
+##     NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bussola-solo-dal-proxy
+  namespace: bussola
+spec:
+  podSelector:
+    matchLabels:
+      app: bussola
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        ## le sonde del kubelet, che arrivano dall'IP del nodo
+        - ipBlock:
+            cidr: 192.168.1.0/24
+        ## il controller ingress
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8080

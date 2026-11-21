@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: rancher
+  namespace: transit
+subsets:
+  - addresses:
+      # ─── 2026-09-15: one VIP, not three raw node IPs ───────────────────────
+      #
+      # This used to list rancher-mgmt-1/2/3 directly (192.168.1.31/.32/.33).
+      # That looked like HA and was not: the `rancher` Service has NO SELECTOR,
+      # so these Endpoints are a hand-written list that Kubernetes never
+      # health-checks. Nothing removes a dead address, ever — three nodes gave
+      # three ADDRESSES, not three healthy ones. ingress-nginx partly hid it
+      # (`proxy_next_upstream error timeout`, 3 tries), which is why a dead
+      # member showed up as "random failures" rather than a clean outage; that
+      # masking does not cover 5xx from a sick-but-listening node and does
+      # nothing for established websockets, which is what Rancher agents use.
+      #
+      # 192.168.1.30 is the kube-vip VIP on the mgmt cluster (cp_enable, ARP,
+      # leader election). It only ever lives on a node that holds the lease, so
+      # a dead node takes the VIP with it within the lease window instead of
+      # staying in rotation. Verified before the switch:
+      #   curl -H "Host: rancher.mdapi.ch" https://192.168.1.30/ping  -> 200
+      # identical to all three node IPs.
+      #
+      # ⚠️ Prerequisite, done first in the same change set: kube-vip's lease
+      # timings were relaxed from 5/3/1 to 15/10/2. At 3 s renew deadline it was
+      # losing leadership ~twice a day per node on slow API responses and
+      # exiting fatally, moving the VIP each time — pointing the only path to
+      # Rancher at a VIP that flaps would have been worse than what it replaced.
+      #
+      # mbptillo (192.168.1.246) is retired; there is no standby to fail back to.
+      - ip: 192.168.1.30
+    ports:
+      - port: 443

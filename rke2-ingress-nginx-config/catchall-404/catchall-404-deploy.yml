@@ -1,0 +1,68 @@
+# Serves nothing but 404. Deliberately a real backend rather than an ingress
+# server-snippet: it can be probed, and it does not depend on the controller's
+# Critical-risk snippet annotations staying enabled (same reasoning as
+# mail/mta-sts-deploy.yml).
+#
+# No priorityClass on purpose: if both replicas are down, the wildcard Ingress
+# answers 503 instead of 404, which still keeps unknown names away from Rancher.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catchall-404
+  namespace: ingress-catchall
+spec:
+  selector:
+    matchLabels:
+      app: catchall-404
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: catchall-404
+    spec:
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: catchall-404
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:1.31-alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+          limits:
+            cpu: 200m
+            memory: 64Mi
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 20
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: site
+          mountPath: /etc/nginx/conf.d
+          readOnly: true
+      volumes:
+      - name: site
+        configMap:
+          name: catchall-404
+          items:
+          - key: default.conf
+            path: default.conf

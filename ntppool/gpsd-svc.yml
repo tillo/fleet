@@ -1,0 +1,29 @@
+## Internal-only endpoint for gpsd's JSON API, so the GPS can actually be
+## observed rather than merely trusted.
+##
+## chrony already disciplines to the GPS via `refclock SHM 0/1` — the NMEA and
+## PPS shared-memory segments gpsd writes — so a broken constellation shows up
+## only indirectly, as drift, long after the fact. gpsd itself knows how many
+## satellites are in the fix and what the dilution of precision is; nothing was
+## reading it. f/probe/gps_health does now.
+##
+## ⛔ Deliberately a SEPARATE ClusterIP rather than another port on the `chrony`
+## Service: that one is the LoadBalancer serving the public NTP pool, and gpsd's
+## control API has no business on a public listener. gpsd runs with -G (binds
+## all addresses) inside the same pod, so it needs no deployment change.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpsd
+  namespace: ntppool
+  labels:
+    app: chrony
+spec:
+  type: ClusterIP
+  selector:
+    app: chrony
+  ports:
+    - name: gpsd
+      port: 2947
+      protocol: TCP
+      targetPort: 2947

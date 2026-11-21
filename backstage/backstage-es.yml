@@ -1,0 +1,68 @@
+# The secrets Backstage needs that are not generated in-cluster:
+#  - GITLAB_TOKEN: GROUP access token on `mdapi`, backstage-scaffolder-maintainer
+#    (Maintainer, api, expires 2027-10-31). It drives catalog discovery, the
+#    URL reader (backstage-catalog's all.yaml), TechDocs and the Scaffolder's
+#    publish:gitlab (a Developer token cannot run the first pipeline on a
+#    protected main).
+#  - KEYCLOAK_CLIENT_SECRET: Keycloak realm tilloch, client backstage-org, a
+#    service account with realm-management view-users only. The catalog's
+#    keycloakGroups provider reads the members of /MDAPI/Admin with it.
+#  - DEFECTDOJO_API_TOKEN: DefectDojo user `backstage` (not staff, not
+#    superuser, authorized on product types mdapi and mdapi-runtime). The
+#    /api/proxy/defectdojo route forwards GETs only; the entity page's
+#    findings card reads counts through it.
+#  - MCP_GATEWAY_TOKEN: the static externalAccess token agentgateway presents
+#    for the read-only MCP server /api/mcp-actions/v1/catalog-read
+#    (agentgateway-standalone-wiring/mcp-upstreams-es.yml reads the same item).
+#  - O2_USER / O2_TOKEN: OpenObserve service account backstage@mdapi.ch, role
+#    backstage_readonly = Get+List on the k8s_events stream and nothing else
+#    (pod_logs, roles, MCP and SA creation answer 403). The backend's
+#    /api/openobserve route runs fixed, bounded queries with it for the
+#    entity page's OpenObserve card.
+#  - WINDMILL_TOKEN: Windmill token `backstage-jobs-read`, scope
+#    jobs:read:f/* only (variables, resources, scripts, schedules, tokens and
+#    running a job answer 403). The backend's /api/windmill route lists the
+#    last completed runs of an entity's windmill.dev/path with it.
+#  - GITLAB_READ_TOKEN: GROUP access token on `mdapi`, backstage-renovate-card
+#    (Reporter, read_api only, expires 2099-01-01; writes answer 403). The
+#    backend's /api/renovate route reads a project's open Renovate MRs and
+#    "Action Required" issues with it — never GITLAB_TOKEN, which can write.
+# The database password is NOT here: CNPG generates it (backstage-pg-app).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: backstage
+  namespace: backstage
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: backstage
+    creationPolicy: Owner
+  data:
+    - secretKey: GITLAB_TOKEN
+      remoteRef:
+        key: /mdapi/backstage/backstage/GITLAB_TOKEN
+    - secretKey: KEYCLOAK_CLIENT_SECRET
+      remoteRef:
+        key: /mdapi/backstage/backstage/KEYCLOAK_CLIENT_SECRET
+    - secretKey: DEFECTDOJO_API_TOKEN
+      remoteRef:
+        key: /mdapi/backstage/backstage/DEFECTDOJO_API_TOKEN
+    - secretKey: MCP_GATEWAY_TOKEN
+      remoteRef:
+        key: /mdapi/backstage/backstage/MCP_GATEWAY_TOKEN
+    - secretKey: O2_USER
+      remoteRef:
+        key: /mdapi/backstage/backstage/O2_USER
+    - secretKey: O2_TOKEN
+      remoteRef:
+        key: /mdapi/backstage/backstage/O2_TOKEN
+    - secretKey: WINDMILL_TOKEN
+      remoteRef:
+        key: /mdapi/backstage/backstage/WINDMILL_TOKEN
+    - secretKey: GITLAB_READ_TOKEN
+      remoteRef:
+        key: /mdapi/backstage/backstage/GITLAB_READ_TOKEN

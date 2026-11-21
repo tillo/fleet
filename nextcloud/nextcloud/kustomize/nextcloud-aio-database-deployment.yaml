@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-database
+  namespace: nextcloud
+spec:
+  template:
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+        - name: nextcloud-aio-database
+          # A2 (infra-ka2): explicit request floors sized from the VPA
+          # recommender's targets — VPA Auto does NOT mutate envuassu pods
+          # (works in other namespaces; tracked separately). No limits.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 300Mi
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_PASSWORD
+              $patch: delete
+          envFrom:
+            - secretRef:
+                name: nextcloud-aio-env-secret
+      volumes:
+        - name: nextcloud-aio-database-dump
+          persistentVolumeClaim:
+            claimName: nextcloud-aio-database-dump-ceph

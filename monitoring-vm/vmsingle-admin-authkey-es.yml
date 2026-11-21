@@ -1,0 +1,32 @@
+## Auth key for vmsingle's ADMIN endpoints (infra-o4i3m.5, 2026-11-16).
+##
+## Before this, any pod could GET /snapshot/create, /snapshot/delete,
+## /api/v1/admin/tsdb/delete_series, /internal/force_merge,
+## /internal/resetRollupResultCache, /-/reload, /flags and /debug/pprof on
+## vmsingle-mdapi:8429 with no credential. That lets a compromised pod delete
+## series or fill the disk with snapshots, i.e. blind detection.
+##
+## Mounted into the pod by VMSingle.spec.secrets at
+## /etc/vm/secrets/vmsingle-admin-authkey/authkey and read by the -*AuthKey
+## flags as file:///... (vmsingle.yml). Nothing on the estate calls these
+## endpoints (grep of fleet, windmill and bin, 2026-11-16), so no client needs
+## the key. To call one by hand, pass it as ?authKey=<value>.
+##
+## Rotation: write the Akeyless item; ESO refreshes the Secret and Reloader
+## rolls vmsingle (a short metrics-DB restart; vmagent buffers meanwhile).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmsingle-admin-authkey
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmsingle-admin-authkey
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmsingle/admin-authkey }
+    secretKey: authkey

@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backlog-ui
+  namespace: backlog
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Public exposure approved 2026-08-13 (user choice: public + auth):
+    # basic-auth (creds: user tillo, password in Akeyless
+    # /mdapi/backlog/basicauth-password) in front of the community UI,
+    # which has no auth of its own. WAF stays on.
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: backlog-basicauth
+    nginx.ingress.kubernetes.io/auth-realm: "backlog"
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+    # websocket live updates
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: backlog.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backlog-ui
+                port:
+                  number: 3000
+  tls:
+    - hosts:
+        - backlog.mdapi.ch
+      secretName: backlog-ui-cert

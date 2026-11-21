@@ -1,0 +1,39 @@
+# msmtp for PHP mail() on spider3: submission on 587 with STARTTLS and a sender login
+# (infra-o4i3m.1). It used to be port 25 with auth off, relaying only because the mail
+# server trusted every pod's address (mynetworks), which is being removed.
+# The login spider3@smtp.mdapi.ch is SMTP-only (no mailbox, no IMAP). Its password is
+# Akeyless /mdapi/mail/smtp-senders/spider3, so the whole msmtprc is a Secret now.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: msmtp-config
+  namespace: spider3
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: msmtp-config
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        msmtprc: |
+          defaults
+          auth on
+          tls on
+          tls_starttls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          syslog on
+
+          account default
+          host mail.mdapi.ch
+          port 587
+          user spider3@smtp.mdapi.ch
+          password {{ .password }}
+          from noreply@spider3.ch
+  data:
+    - remoteRef:
+        key: /mdapi/mail/smtp-senders/spider3
+      secretKey: password

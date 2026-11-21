@@ -1,0 +1,70 @@
+# K8sFailedPodStorm vs K8sFailedPodCorpses (infra-r9mzd.71, 2026-11-18).
+# The corpse rule (> 10 in total) cannot tell a storm from slow build-up: it kept
+# firing on 8-11 ownerless pods that had sat for weeks (infra-a1sne). Measured over
+# 90 days, a routine day adds at most 11 Failed pods on prod; the two real storms
+# added 68 (10-09) and 33 (10-26), and mgmt never rose by more than 1. So a rise
+# of more than 25 in a day is the WARNING, and the total stays as INFO.
+# The gauge comes from the daily k8s_orphan_audit run, so it moves in daily steps.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: a-storm-warns-slow-build-up-only-informs
+  interval: 5m
+  input_series:
+  # prod: 9 for a day, then a storm to 77
+  - series: k8s_orphan_audit_failed_pods{job="k8s_orphan_audit",cluster="prod"}
+    values: '9x288 77x360'
+  # mgmt: slow build-up 12 -> 20 over two days (above 10, no storm)
+  - series: k8s_orphan_audit_failed_pods{job="k8s_orphan_audit",cluster="mgmt"}
+    values: '12x288 16x288 20x72'
+  alert_rule_test:
+  - eval_time: 24h
+    groupname: app-batch-jobs.k8s-orphan-audit
+    alertname: K8sFailedPodStorm
+    exp_alerts: []
+  - eval_time: 25h
+    groupname: app-batch-jobs.k8s-orphan-audit
+    alertname: K8sFailedPodStorm
+    exp_alerts:
+    - exp_labels:
+        job: k8s_orphan_audit
+        cluster: prod
+        service: kubernetes
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "prod: 68 more Failed pods than a day ago"
+        description: "A burst of Failed pods on prod (more than 25 in a day; a routine day adds at most ~11) means active node trouble: check node conditions (DiskPressure, memory, a reboot) before cleaning. Names: kubectl get pods -A --field-selector=status.phase=Failed"
+  - eval_time: 50h
+    groupname: app-batch-jobs.k8s-orphan-audit
+    alertname: K8sFailedPodCorpses
+    exp_alerts:
+    - exp_labels:
+        job: k8s_orphan_audit
+        cluster: mgmt
+        service: kubernetes
+        severity: info
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "mgmt: 20 Failed-phase pod corpses"
+        description: "Failed pods are piling up on mgmt. k8s_job_janitor (weekly, prod only) prunes ownerless ones after 7 d and Job-owned ones with their Job; if this holds, look for a namespace it may not touch (K8sJobJanitorForbidden) or a CronJob that keeps failing. Clean by hand with: kubectl delete pods -A --field-selector=status.phase=Failed"
+    - exp_labels:
+        job: k8s_orphan_audit
+        cluster: prod
+        service: kubernetes
+        severity: info
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "prod: 77 Failed-phase pod corpses"
+        description: "Failed pods are piling up on prod. k8s_job_janitor (weekly, prod only) prunes ownerless ones after 7 d and Job-owned ones with their Job; if this holds, look for a namespace it may not touch (K8sJobJanitorForbidden) or a CronJob that keeps failing. Clean by hand with: kubectl delete pods -A --field-selector=status.phase=Failed"
+  - eval_time: 50h
+    groupname: app-batch-jobs.k8s-orphan-audit
+    alertname: K8sFailedPodStorm
+    exp_alerts: []

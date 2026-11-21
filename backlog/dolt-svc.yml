@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dolt
+  namespace: backlog
+spec:
+  selector:
+    app: dolt
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+---
+# LAN access for the bd CLI / MCP on mbptillo (server-mode client).
+# LAN-only by network position (MetalLB L2 on mgmt-br); auth = dolt root
+# password from Akeyless. Never exposed beyond the LAN.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dolt-lb
+  namespace: backlog
+spec:
+  selector:
+    app: dolt
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+  type: LoadBalancer
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.63
+  externalTrafficPolicy: Cluster

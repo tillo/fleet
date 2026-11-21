@@ -1,0 +1,82 @@
+## Authenticated WRITE front for the Pushgateway (infra-o4i3m.5.2, 2026-11-16).
+##
+## Problem: pushgateway.monitoring:9091 takes PUT/POST/DELETE from any pod with
+## no credential, so a compromised pod can fake or delete the heartbeats that
+## BatchJobStale and the deadman alerts key on, i.e. blind detection.
+##
+## Shape of the fix, in steps that never drop a writer:
+##   1. THIS FILE: vmauth `pushgateway` (Service vmauth-pushgateway:8427) accepts
+##      pushes only with the `pg-writer` credential and forwards them to the
+##      Pushgateway. The direct :9091 path stays open meanwhile.
+##   2. Writers move to http://vmauth-pushgateway.monitoring.svc.cluster.local:8427
+##      + basic auth (Windmill f/lib/mdapi.pushgw first, then the rest).
+##   3. Direct pushes = rate(pushgateway_http_requests_total{handler=~"push|delete"})
+##      minus rate(vmauth_user_requests_total{username="pg-writer"}); wait for 0.
+##   4. Only then put web.config auth on the Pushgateway itself, so the direct
+##      path is closed and only vmauth (and the vmagent scrape) hold a credential.
+##
+## Paths: only /metrics/job/... (push, POST, DELETE). Reads (GET /metrics, the
+## scrape, /api/v1/*) are not routed here and stay on :9091.
+##
+## Image: straight from Docker Hub like the operator's config-reloader. Zot does
+## not sync victoriametrics/vmauth (no prefix in zot-s3-config-es.yml), so the
+## zot.mdapi.ch path the other VM components use returns not-found.
+##
+## Credential: Akeyless /mdapi/monitoring/vmauth/pg-writer-password, username
+## pg-writer. Rotation: write Akeyless; ESO refreshes the Secret, the operator
+## re-renders the vmauth config, and every writer must get the new value.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmauth-pg-writer
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmauth-pg-writer
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmauth/pg-writer-password }
+    secretKey: password
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMUser
+metadata:
+  name: pg-writer
+  namespace: monitoring
+  labels:
+    mdapi.ch/vmauth: pushgateway
+spec:
+  username: pg-writer
+  passwordRef: { name: vmauth-pg-writer, key: password }
+  targetRefs:
+    - static: { url: "http://pushgateway.monitoring.svc.cluster.local:9091" }
+      paths: ["/metrics/job/.+"]
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAuth
+metadata:
+  name: pushgateway
+  namespace: monitoring
+spec:
+  selectAllByDefault: false
+  userSelector:
+    matchLabels:
+      mdapi.ch/vmauth: pushgateway
+  userNamespaceSelector: {}
+  image:
+    repository: victoriametrics/vmauth
+  ## Two replicas: a push that fails fails its job (raise_for_status), so a
+  ## single pod would turn every vmauth roll into a burst of failed jobs.
+  replicaCount: 2
+  podDisruptionBudget:
+    maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi

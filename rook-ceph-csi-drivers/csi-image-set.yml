@@ -1,0 +1,30 @@
+# ceph-csi-operator IMAGE SET — the one place the cephcsi plugin image is pinned.
+#
+# Why not the rook-ceph chart (`csi.cephcsi.{repository,tag}`, where it used to live)?
+# Rook v1.21.0's operator runs resetStaleCSIImageSetConfigMap()
+# (pkg/operator/ceph/csi/controller.go) on EVERY reconcile: if the chart's
+# `rook-csi-operator-image-set-configmap` holds a `plugin` value whose string merely
+# STARTS WITH `quay.io/cephcsi/cephcsi:v3.17`, it assumes a leftover v1.20 default and
+# blanks every key. A v3.17.1 pin matches that prefix, so the two layers fought in a
+# loop — Fleet wrote v3.17.1 at 06:40:02Z, Rook cleared it at 06:41:22Z on 2026-10-22 —
+# mdapi-prod-rook-ceph stayed `Modified`, which held rook-ceph-cluster behind
+# dependsOn, so the merged CephCluster image v19.2.7 never reached the cluster.
+#
+# Rook resets that configmap by literal name only. The OperatorConfig points
+# `driverSpecDefaults.imageSet` HERE instead, which the operator never touches.
+#
+# ⛔ v3.17.1 is the last x86-64-v2 build and that is not optional: qui/quo/qua are
+# Xeon E5-2667 v2 (Ivy Bridge: AVX, no AVX2) and cephcsi v3.18.x is Rocky Linux 10
+# glibc -> "Fatal glibc error: CPU does not support x86-64-v3" (exit 127). Lift it only
+# to a build that starts on an Ivy Bridge node, and lift the rook-ceph chart with it.
+#
+# Missing/empty keys fall through to ceph-csi-operator v1.1.0's own defaults
+# (internal/utils/core.go CopyNonEmptyValues ignores ""), so only `plugin` is pinned
+# here; the sidecars keep tracking the operator version.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rook-ceph-csi-image-set
+  namespace: rook-ceph
+data:
+  plugin: quay.io/cephcsi/cephcsi:v3.17.1

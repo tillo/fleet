@@ -1,0 +1,44 @@
+## LoadBalancer address allocation (infra-3rm.12, MetalLB).
+##
+## The loud MetalLB failure — VIPs dark — is caught by the blackbox probes in minutes.
+## The silent one is ALLOCATION: a pool quietly exhausted (stale allocations left by a
+## Service moved LB -> ClusterIP, memory metallb_stale_allocation_*) or a dead controller
+## shows up only when the NEXT LoadBalancer Service pends forever. That is measured here
+## directly from kube-state-metrics, so it needs no MetalLB scrape (the controller's
+## metrics are HTTPS behind kube-rbac-proxy and are not collected).
+##
+## Baseline 2026-11-11: 28 LoadBalancer Services, all 28 with an ingress address; 0
+## pending at any 5-minute step over the previous 30 days. prod-pool 25 of 59 assigned.
+## Test: tests/rules/loadbalancer-service-pending.test.yml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: loadbalancer-allocation
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-k8s.loadbalancer-allocation
+    rules:
+    - alert: LoadBalancerServicePending
+      expr: |
+        max by (namespace, service) (kube_service_spec_type{type="LoadBalancer"})
+        unless on (namespace, service) kube_service_status_load_balancer_ingress
+      for: 15m
+      labels:
+        ## The pending Service itself (kube-state-metrics' own `service` label).
+        service: '{{ $labels.service }}'
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "LoadBalancer Service {{ $labels.namespace }}/{{ $labels.service }} has no address after 15m"
+        description: |
+          MetalLB has not assigned an address to this Service. Either the pool it asks
+          for is exhausted (`kubectl get ipaddresspools -n metallb-system -o
+          jsonpath='{..status}'`: availableIPv4 0, often from stale allocations), the
+          requested address is taken or outside every pool, or metallb-controller is
+          down. `kubectl -n {{ $labels.namespace }} describe svc {{ $labels.service }}`
+          shows MetalLB's AllocationFailed event with the reason.
