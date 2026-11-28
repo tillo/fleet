@@ -1,0 +1,128 @@
+# ZotRegistryOffsite{Stale,Failed,Unrestorable} — the off-site copy of the zot
+# registry (bead infra-8f4.59).
+#
+# WHY THESE CASES: the three rules answer three different questions and each has
+# a negative twin that must stay quiet, because the failure mode that costs the
+# most is a light that is permanently on.
+#   * a cycle that failed fires; a healthy cycle does not;
+#   * the monthly promise is 40 days, not the driver's weekly cadence — 40 is
+#     inside it, 45 is not (the alert must not page for the week between the
+#     1st of the month and the first Sunday after it);
+#   * a copy that does not restore to the live bytes is CRITICAL, and a copy that
+#     does is silent.
+#
+# The series are what f/config_backup/zot_registry_offsite pushes through
+# Pushgateway (a PUT replaces the whole group, so these gauges always arrive
+# together or not at all).
+rule_files:
+- monitoring-rules/85-zot-registry-offsite.yml
+evaluation_interval: 1m
+tests:
+- name: failed-cycle-fires-after-an-hour
+  interval: 1m
+  input_series:
+  - series: zot_registry_offsite_last_run_success
+    values: '0x130'
+  alert_rule_test:
+  - groupname: app-batch-jobs.zot-registry-offsite
+    eval_time: 2h
+    alertname: ZotRegistryOffsiteFailed
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        team: mdapi
+        component: Backups
+        statuspage: exclude
+        service: zot-registry-offsite
+      exp_annotations:
+        summary: "zot registry off-site copy: the last cycle did not verify"
+        description: >-
+          The driver found the cycle incomplete, overdue, or the restore drill
+          disagreeing with the live bucket. Check the seat:
+          `~/zot-registry-offsite/run.sh status` and `logs/cycle-*.log`. A pod
+          roll mid-cycle is the usual cause and the next weekly run resumes it;
+          anything else (Akeyless, B2, o2switch, RGW) needs a look at the log's
+          last failing repository.
+- name: healthy-cycle-is-silent
+  interval: 1m
+  input_series:
+  - series: zot_registry_offsite_last_run_success
+    values: '1x130'
+  alert_rule_test:
+  - groupname: app-batch-jobs.zot-registry-offsite
+    eval_time: 2h
+    alertname: ZotRegistryOffsiteFailed
+    exp_alerts: []
+- name: overdue-cycle-fires
+  interval: 1m
+  input_series:
+  - series: zot_registry_offsite_success_age_days
+    values: '45x130'
+  alert_rule_test:
+  - groupname: app-batch-jobs.zot-registry-offsite
+    eval_time: 2h
+    alertname: ZotRegistryOffsiteCycleOverdue
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        team: mdapi
+        component: Backups
+        statuspage: exclude
+        service: zot-registry-offsite
+      exp_annotations:
+        # $value is DAYS here; humanize renders 45, and a humanizeDuration would
+        # have printed "45s" — the trap this expectation pins.
+        summary: "No complete zot registry off-site cycle for 45 days"
+        description: >-
+          The monthly off-site snapshot of the zot registry has not completed for
+          more than 40 days. Either the driver stopped, the seat is not
+          reachable, or a repository keeps failing. Run
+          `~/zot-registry-offsite/run.sh status` on the jump seat and read
+          `logs/cycle-*.log`; `restic snapshots --tag cycle:<YYYY-MM>` in either
+          repository says how far the cycle actually got.
+- name: forty-days-is-still-inside-the-promise
+  interval: 1m
+  input_series:
+  - series: zot_registry_offsite_success_age_days
+    values: '40x130'
+  alert_rule_test:
+  - groupname: app-batch-jobs.zot-registry-offsite
+    eval_time: 2h
+    alertname: ZotRegistryOffsiteCycleOverdue
+    exp_alerts: []
+- name: unrestorable-copy-is-critical
+  interval: 1m
+  input_series:
+  - series: zot_registry_offsite_restore_ok
+    values: '0x130'
+  alert_rule_test:
+  - groupname: app-batch-jobs.zot-registry-offsite
+    eval_time: 1h
+    alertname: ZotRegistryOffsiteUnrestorable
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        team: mdapi
+        component: Backups
+        statuspage: include
+        service: zot-registry-offsite
+      exp_annotations:
+        summary: "The zot registry off-site copy does not restore to the live bytes"
+        description: >-
+          The restore drill streamed an archived repository back out of the
+          o2switch copy and compared every object with the live Ceph RGW bucket;
+          at least one differed, or an object was missing from the snapshot. Run
+          `~/zot-registry-offsite/run.sh drill` on the jump seat for the JSON and
+          `logs/drill.log` for the detail. Do not delete anything in the zot
+          bucket until the next cycle's drill is green — this is the only copy
+          the vendor images have.
+- name: restorable-copy-is-silent
+  interval: 1m
+  input_series:
+  - series: zot_registry_offsite_restore_ok
+    values: '1x130'
+  alert_rule_test:
+  - groupname: app-batch-jobs.zot-registry-offsite
+    eval_time: 1h
+    alertname: ZotRegistryOffsiteUnrestorable
+    exp_alerts: []

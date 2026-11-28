@@ -1,0 +1,123 @@
+# The home spot fallback (runner 1048) being active is the failover working: info
+# after 30 min, warning after 6 h. A failing watchdog is a warning after 15 min,
+# because nothing would unpause the fallback during a Spot outage.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: fallback-active-is-info-after-30m
+  interval: 1m
+  input_series:
+  - series: ci_spot_fallback_active{job="spot_fallback"}
+    values: 1+0x40
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackActive
+    exp_alerts: []
+  - eval_time: 35m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackActive
+    exp_alerts:
+    - exp_labels:
+        job: spot_fallback
+        service: windmill
+        namespace: windmill
+        severity: info
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: spot CI jobs are running on the HOME fallback runner (Spot runner 1047 unavailable)
+        description: 'f/heal/spot_fallback unpaused group runner 1048 because runner 1047 in Rackspace
+
+          Spot cloudspace mdapi-ci is offline, silent for > 5 min, or a spot job waited
+
+          > 5 min. Jobs are running at home, so nothing is dropped. It re-pauses on its own
+
+          after 15 healthy minutes. Check SpotQaCloudspaceNotReady / SpotQaBidsUnfilled for
+
+          the cause; runbook ~/src/spot-ci/README.md.
+
+          '
+  - eval_time: 35m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackActiveLong
+    exp_alerts: []
+- name: fallback-active-6h-is-warning
+  interval: 1m
+  input_series:
+  - series: ci_spot_fallback_active{job="spot_fallback"}
+    values: 1+0x400
+  alert_rule_test:
+  - eval_time: 355m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackActiveLong
+    exp_alerts: []
+  - eval_time: 370m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackActiveLong
+    exp_alerts:
+    - exp_labels:
+        job: spot_fallback
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'spot CI jobs have run on the home fallback for 6 h: the Spot runner is not coming back
+          by itself'
+        description: 'Runner 1047 (mdapi-ci) has not been healthy for 15 continuous minutes in 6 h.
+
+          Fleet CI is on the home cluster again (runner 1048), which is the load the Spot
+
+          runner was built to remove. Look at the cloudspace and its pool (bid below the
+
+          class minimum, pool reclaimed, cloudspace deleted): ~/src/spot-ci/README.md.
+
+          '
+- name: paused-fallback-is-quiet
+  interval: 1m
+  input_series:
+  - series: ci_spot_fallback_active{job="spot_fallback"}
+    values: 0+0x40
+  alert_rule_test:
+  - eval_time: 40m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackActive
+    exp_alerts: []
+- name: watchdog-failing-warns-after-15m
+  interval: 1m
+  input_series:
+  - series: ci_spot_fallback_probe_success{job="spot_fallback"}
+    values: 0+0x20
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackProbeFailing
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-batch-jobs.spot_fallback
+    alertname: CiSpotFallbackProbeFailing
+    exp_alerts:
+    - exp_labels:
+        job: spot_fallback
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: 'spot fallback watchdog failing: a Spot outage would drop fleet CI jobs again'
+        description: 'f/heal/spot_fallback could not read runner 1047, find exactly one runner named
+
+          ''spot-fallback (home, mdapi-prod)'', list pending spot jobs, or flip the pause.
+
+          While it fails nothing unpauses the home fallback. Read the summary line of its
+
+          last Windmill run (error=...). Token: Windmill g/all/GITLAB_TOKEN.
+
+          '

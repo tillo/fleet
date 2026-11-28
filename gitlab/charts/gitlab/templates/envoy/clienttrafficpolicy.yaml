@@ -1,0 +1,27 @@
+{{- if eq "true" (include "gitlab.gatewayApi.envoy.installPolicies" .) -}}
+{{-   $spec := deepCopy (.Values.gatewayApiResources.envoy.clientTrafficPolicySpec | default dict) }}
+{{- /*
+With external TLS termination, the Webservice and KAS section-scoped policies are skipped,
+so their defaults apply gateway-wide. The HTTP/2 windows still apply, because the load
+balancer forwards h2c.
+*/}}
+{{-   if eq "true" (include "gitlab.gatewayApi.externalTlsTermination" .) }}
+{{-     $defaults := dict "path" (dict "escapedSlashesAction" "KeepUnchanged") "headers" (dict "host" (dict "stripTrailingHostDot" true)) "http2" (dict "initialStreamWindowSize" "8Mi" "initialConnectionWindowSize" "16Mi") }}
+{{-     $spec = mergeOverwrite $defaults $spec }}
+{{-   end }}
+{{-   if $spec }}
+{{-     if not $spec.targetRefs }}
+{{-       $_ := set $spec "targetRefs" (include "gitlab.gatewayApi.gatewayRef.local" . | fromYamlArray) -}}
+{{-     end }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: {{ .Release.Name }}-policy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+spec:
+  {{- $spec | toYaml | nindent 2 }}
+{{-   end }}
+{{- end }}

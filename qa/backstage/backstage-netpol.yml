@@ -1,0 +1,79 @@
+## QA Backstage's fence: DNS and the IAST sink, nothing else -- no GitLab, no
+## Keycloak, no Datadog intake, no internet (proof in the bead). Ingress: only the QA
+## traffic pods (made-up sign-in + ZAP, label mdapi.ch/qa-traffic).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: backstage
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backstage
+  namespace: backstage
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [backstage, backstage-off]}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              mdapi.ch/qa-traffic: "true"
+      ports:
+        - protocol: TCP
+          port: 7007
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iast
+          podSelector:
+            matchLabels:
+              app: iast-sink
+      ports:
+        - {protocol: TCP, port: 8126}
+---
+## The QA traffic (sign-in, ZAP active scan): DNS and the app, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: qa-traffic
+  namespace: backstage
+spec:
+  podSelector:
+    matchLabels:
+      mdapi.ch/qa-traffic: "true"
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [backstage, backstage-off]}
+      ports:
+        - {protocol: TCP, port: 7007}

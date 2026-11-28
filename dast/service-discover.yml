@@ -1,0 +1,165 @@
+# The ACTIVE scan's target list, discovered at run time (infra-7rog.31.17).
+# The service-dast init container runs this before the scanners. It replaces the
+# hand list service-targets.yml (0 apps enrolled in two weeks): every Ingress
+# backend Service is an app, scanned at the SERVICE -- behind the WAF on purpose,
+# since an active scan through ingress-nginx floods ModSecurity false positives.
+#
+# Output: /targets/targets, one `<svc>.<ns> <url>` per app the pod can connect to.
+#
+# What is attacked is decided in two places:
+#   1. here -- out by default: a Keycloak Service (login forms) and the
+#      stateful-form namespaces in EXCLUDED_NAMESPACES, each with its reason; out
+#      by choice: `dast.mdapi.ch/skip: "<reason>"` on the Ingress (also edge-dast's
+#      opt-out) or `dast.mdapi.ch/active-skip: "<reason>"` (active scan only);
+#   2. the egress fence, service-dast-egress in netpol.yml -- an app the pod cannot
+#      connect to is logged `unreachable <svc>.<ns>` and not scanned. Enrolling an
+#      app is one egress rule there (plus an ingress allowance in its namespace if
+#      that is default-deny). ⛔ A hosted tenant never gets one: tenants did not
+#      agree to be attacked, and this repo is public.
+#
+# The log ends with `coverage: N apps enumerated, M reachable; excluded K`.
+# Fails closed: nothing enumerated (API broken) or nothing reachable (fence
+# broken) exits 1, so the CronJob alerts instead of importing a clean week.
+# Tests: tests/test_service_dast_discovers_every_app.py.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dast-service-discover
+  namespace: dast
+data:
+  service-discover.py: |
+    """Write the active DAST targets: every Ingress backend Service the pod can reach."""
+    import collections
+    import concurrent.futures
+    import json
+    import socket
+    import ssl
+    import sys
+    import urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/dast"
+    OUT = "/targets/targets"
+    INGRESSES = "/apis/networking.k8s.io/v1/ingresses"
+    SERVICES = "/api/v1/services"
+    OPT_OUT = ("dast.mdapi.ch/skip", "dast.mdapi.ch/active-skip")
+    PROTOCOL = "nginx.ingress.kubernetes.io/backend-protocol"
+    # Out by default until a safe policy exists for them (an active scan POSTs to
+    # every form it finds).
+    EXCLUDED_SERVICES = {
+        "keycloak": "IdP login, registration and reset forms (any tenant's Keycloak too)",
+    }
+    EXCLUDED_NAMESPACES = {
+        "keycloak": "IdP login, registration and reset forms",
+        "bootstrap": "GitLab: issue, MR, user and runner forms write rows",
+        "nextcloud": "file, share and form writes",
+        "mail": "webmail and mail forms send real mail",
+    }
+
+    Target = collections.namedtuple("Target", "name url")
+
+
+    def opted_out(item):
+        notes = item.get("metadata", {}).get("annotations") or {}
+        for key in OPT_OUT:
+            if key in notes:
+                if not notes[key].strip():
+                    meta = item["metadata"]
+                    raise ValueError(f"{meta.get('namespace')}/{meta.get('name')}: {key} needs a reason")
+                return True
+        return False
+
+
+    def backends(ingress):
+        spec = ingress.get("spec", {})
+        found = [spec["defaultBackend"]] if spec.get("defaultBackend") else []
+        for rule in spec.get("rules") or []:
+            found += [p.get("backend") or {} for p in (rule.get("http") or {}).get("paths") or []]
+        return [b["service"] for b in found if b.get("service")]
+
+
+    def excluded(ns, name):
+        return ns in EXCLUDED_NAMESPACES or name in EXCLUDED_SERVICES
+
+
+    def port_of(service, ref):
+        """The Service port number an Ingress backend refers to, or None."""
+        for p in service.get("spec", {}).get("ports") or []:
+            if ref.get("number") == p.get("port") or (ref.get("name") and ref.get("name") == p.get("name")):
+                return p["port"]
+        return None
+
+
+    def targets(ingresses, services):
+        by_key = {(s["metadata"]["namespace"], s["metadata"]["name"]): s for s in services
+                  if s.get("spec", {}).get("type") != "ExternalName"}
+        out = set()
+        for item in ingresses:
+            if opted_out(item):
+                continue
+            ns = item["metadata"]["namespace"]
+            notes = item["metadata"].get("annotations") or {}
+            scheme = "https" if notes.get(PROTOCOL, "").upper() in ("HTTPS", "GRPCS") else "http"
+            for b in backends(item):
+                service = by_key.get((ns, b.get("name")))
+                port = port_of(service, b.get("port") or {}) if service else None
+                if port is None or excluded(ns, b["name"]):
+                    continue
+                out.add(Target(f"{b['name']}.{ns}", f"{scheme}://{b['name']}.{ns}.svc.cluster.local:{port}"))
+        return sorted(out)
+
+
+    def authority(target):
+        return target.url.split("://", 1)[1]
+
+
+    def reachable(addresses, timeout=3):
+        def ok(a):
+            host, port = a.rsplit(":", 1)
+            try:
+                with socket.create_connection((host, int(port)), timeout=timeout):
+                    return a
+            except OSError:
+                return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+            return {a for a in pool.map(ok, sorted(set(addresses))) if a}
+
+
+    def token():
+        with open(f"{SA}/token") as f:
+            return f.read().strip()
+
+
+    def list_items(path):
+        req = urllib.request.Request(f"{API}{path}", headers={"Authorization": f"Bearer {token()}"})
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            return json.loads(resp.read())["items"]
+
+
+    def write_lines(path, lines):
+        with open(path, "w") as f:
+            f.write("".join(f"{line}\n" for line in lines))
+
+
+    def run():
+        ingresses = list_items(INGRESSES)
+        apps = targets(ingresses, list_items(SERVICES))
+        up = reachable(authority(t) for t in apps)
+        scan = [t for t in apps if authority(t) in up]
+        for t in apps:
+            if t not in scan:
+                print(f"unreachable {t.name} {t.url}")
+        print(f"coverage: {len(apps)} apps enumerated, {len(scan)} reachable; "
+              f"excluded by default: {', '.join(sorted(EXCLUDED_NAMESPACES))} + every {', '.join(EXCLUDED_SERVICES)} Service")
+        if not scan:
+            print("service-discover: nothing reachable -- refusing to scan nothing")
+            return 1
+        write_lines(OUT, [f"{t.name} {t.url}" for t in scan])
+        for t in scan:
+            print(f"scan {t.name} {t.url}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(run())

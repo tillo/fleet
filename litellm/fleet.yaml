@@ -1,0 +1,29 @@
+defaultNamespace: litellm
+namespace: litellm
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  # infra-8f4.46 trial (2026-11-07): canary at 5 while every other bundle stays
+  # at 25. Fleet v0.16.3 reads only N and N-1. Never drop the key: unset = 2.
+  # Rollback = 25. See ~/studies/helm-history-trim-2026-11-07/STUDY.md.
+  maxHistory: 5
+# VPA (mode=Auto) writes resources.requests/limits onto running pods after
+# start. Strip from the diff so Fleet stops flagging Modified.
+diff:
+  comparePatches:
+  - apiVersion: apps/v1
+    kind: Deployment
+    name: litellm
+    namespace: litellm
+    jsonPointers:
+    - "/spec/template/spec/containers/0/resources"

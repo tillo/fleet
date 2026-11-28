@@ -1,0 +1,80 @@
+# f/probe/dovecot_oauth2_guard after the v1 claim login is retired (infra-47nq.2.4,
+# infra-hn5aw.5). Dovecot 2.4 checks every XOAUTH2 token against ONE global
+# username_attribute, so the token door serves only the mailbox picker
+# (<mailbox>*<uid>). The probe's old positive v1 checks canary_login /
+# canary_box_readonly become a refusal check, claim_login_refused: the canary's
+# own token as a bare <mailbox> login must NOT open anything any more.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: claim-login-accepted-is-a-breach
+  interval: 1m
+  input_series:
+  - series: dovecot_oauth2_guard_ok{check="claim_login_refused",job="dovecot_oauth2_guard"}
+    values: 0+0x10
+  - series: dovecot_oauth2_guard_ok{check="picker_master_login",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  - series: dovecot_oauth2_guard_ok{check="picker_box_readonly",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  alert_rule_test:
+  - eval_time: 8m
+    groupname: app-batch-jobs.dovecot-oauth2-guard
+    alertname: DovecotOAuth2BoundaryBreached
+    exp_alerts:
+    - exp_labels:
+        check: claim_login_refused
+        job: dovecot_oauth2_guard
+        service: docker-mailserver
+        namespace: mail
+        severity: critical
+        component: Security
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: 'Dovecot XOAUTH2 door: claim_login_refused no longer holds — a token reaches more mail than it should'
+        description: "The check `claim_login_refused` failed on mail.mdapi.ch's XOAUTH2\ndoor. The probe's `FAIL check=claim_login_refused` line has Dovecot's\nreply and the state it read back:\n\n  https://windmill.mdapi.ch/runs?path=f/probe/dovecot_oauth2_guard\n\n• sso_token_refused — the canary's Chat SSO token (aud mail-mcp, no\n  dovecot-mail scope) opened its mailbox. Dovecot's `scope =\n  dovecot-mail` line is gone (an image on Dovecot 2.4 drops the 2.3\n  lines: T6), so every realm token may open its owner's box.\n• submission_no_oauth — 587 offers XOAUTH2/OAUTHBEARER: Postfix\n  left saslauthd for Dovecot SASL, and a mail token could SEND.\n  v1 has no send path by design.\n• claim_login_refused — the retired v1 form (a bare <mailbox> token\n  login, infra-47nq.2.4) opened a box again: the v1 oauth2 passdb is\n  back (OAUTH_CLAIM_LOGIN=1 on 2.3) or a DMS default re-enabled it.\n  Since 2026-11-23 the picker is the only token door.\n• picker_foreign_master_refused — the canary's mail token logged in\n  as `<canary box>*oauth-canary-b`: the master passdb no longer\n  binds the master name to the token's own user.\n• picker_unowned_box_refused — the canary's mail token opened\n  canary B's box through the master form: the owner passdb no\n  longer requires the box to be an entry under the caller's own\n  LDAP entry (its base or filter changed).\n• picker_box_readonly — the master-form session changed its box\n  (flags, a new message, or SELECT not READ-ONLY): `acl_user` is\n  lost or the read-only ACL no longer reaches token sessions.\n• ldap_self_write_refused — canary B rewrote its own `mail`\n  attribute (infra-az8.50): anyone could rename their mailbox claim\n  and so their token's reach. A rebuild from the image defaults\n  restores `by self write` in the mdb database's olcAccess {1};\n  the fix and its reverse LDIF are on the bead.\n\nContain first: for a picker check, MAIL_PICKER off in\nmail/docker-mailserver; otherwise revert the Dovecot oauth2 change\n(fleet !1477 / !2766). The Recreate drops mail for 1–2 min, and\npassword auth never changes. Then read\n~/mail-dovecot-oauth2-proposal-20261027.md §5–§6 and\n~/mail-oauth2-20261027/JOURNAL.md (rollback lines).\n"
+- name: picker-only-door-is-silent
+  interval: 1m
+  input_series:
+  - series: dovecot_oauth2_guard_ok{check="claim_login_refused",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  - series: dovecot_oauth2_guard_ok{check="picker_master_login",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  - series: dovecot_oauth2_guard_ok{check="picker_box_readonly",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  - series: dovecot_oauth2_guard_ok{check="conf_mode",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  alert_rule_test:
+  - eval_time: 8m
+    groupname: app-batch-jobs.dovecot-oauth2-guard
+    alertname: DovecotOAuth2BoundaryBreached
+    exp_alerts: []
+  - eval_time: 8m
+    groupname: app-batch-jobs.dovecot-oauth2-guard
+    alertname: DovecotOAuth2GuardFailed
+    exp_alerts: []
+- name: picker-box-writable-is-a-breach
+  interval: 1m
+  input_series:
+  - series: dovecot_oauth2_guard_ok{check="picker_master_login",job="dovecot_oauth2_guard"}
+    values: 1+0x10
+  - series: dovecot_oauth2_guard_ok{check="picker_box_readonly",job="dovecot_oauth2_guard"}
+    values: 0+0x10
+  alert_rule_test:
+  - eval_time: 8m
+    groupname: app-batch-jobs.dovecot-oauth2-guard
+    alertname: DovecotOAuth2BoundaryBreached
+    exp_alerts:
+    - exp_labels:
+        check: picker_box_readonly
+        job: dovecot_oauth2_guard
+        service: docker-mailserver
+        namespace: mail
+        severity: critical
+        component: Security
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: 'Dovecot XOAUTH2 door: picker_box_readonly no longer holds — a token reaches more mail than it should'
+        description: "The check `picker_box_readonly` failed on mail.mdapi.ch's XOAUTH2\ndoor. The probe's `FAIL check=picker_box_readonly` line has Dovecot's\nreply and the state it read back:\n\n  https://windmill.mdapi.ch/runs?path=f/probe/dovecot_oauth2_guard\n\n• sso_token_refused — the canary's Chat SSO token (aud mail-mcp, no\n  dovecot-mail scope) opened its mailbox. Dovecot's `scope =\n  dovecot-mail` line is gone (an image on Dovecot 2.4 drops the 2.3\n  lines: T6), so every realm token may open its owner's box.\n• submission_no_oauth — 587 offers XOAUTH2/OAUTHBEARER: Postfix\n  left saslauthd for Dovecot SASL, and a mail token could SEND.\n  v1 has no send path by design.\n• claim_login_refused — the retired v1 form (a bare <mailbox> token\n  login, infra-47nq.2.4) opened a box again: the v1 oauth2 passdb is\n  back (OAUTH_CLAIM_LOGIN=1 on 2.3) or a DMS default re-enabled it.\n  Since 2026-11-23 the picker is the only token door.\n• picker_foreign_master_refused — the canary's mail token logged in\n  as `<canary box>*oauth-canary-b`: the master passdb no longer\n  binds the master name to the token's own user.\n• picker_unowned_box_refused — the canary's mail token opened\n  canary B's box through the master form: the owner passdb no\n  longer requires the box to be an entry under the caller's own\n  LDAP entry (its base or filter changed).\n• picker_box_readonly — the master-form session changed its box\n  (flags, a new message, or SELECT not READ-ONLY): `acl_user` is\n  lost or the read-only ACL no longer reaches token sessions.\n• ldap_self_write_refused — canary B rewrote its own `mail`\n  attribute (infra-az8.50): anyone could rename their mailbox claim\n  and so their token's reach. A rebuild from the image defaults\n  restores `by self write` in the mdb database's olcAccess {1};\n  the fix and its reverse LDIF are on the bead.\n\nContain first: for a picker check, MAIL_PICKER off in\nmail/docker-mailserver; otherwise revert the Dovecot oauth2 change\n(fleet !1477 / !2766). The Recreate drops mail for 1–2 min, and\npassword auth never changes. Then read\n~/mail-dovecot-oauth2-proposal-20261027.md §5–§6 and\n~/mail-oauth2-20261027/JOURNAL.md (rollback lines).\n"

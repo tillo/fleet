@@ -1,0 +1,40 @@
+## Transmission RPC credential (infra-o4i3m.4).
+##
+## USER + PASS: the linuxserver image sets rpc-authentication-required true
+## and writes rpc-username/rpc-password into settings.json on every start
+## when both are set. TR_AUTH ("user:pass"): read by `transmission-remote -ne`
+## in the port-manager sidecar.
+##
+## The same credential is set by hand in the sonarr and radarr download
+## clients (Settings -> Download Clients -> Transmission; it lives in their
+## DBs, not in git). Rotating it here without updating them stops imports.
+##
+## Akeyless layout (same convention as transmission-probe-ssh-es.yml):
+##   /mdapi/tv/transmission/rpc-username
+##   /mdapi/tv/transmission/rpc-password
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: transmission-rpc
+  namespace: tv
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: transmission-rpc
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        USER: "{{ .username }}"
+        PASS: "{{ .password }}"
+        TR_AUTH: "{{ .username }}:{{ .password }}"
+  data:
+    - remoteRef:
+        key: /mdapi/tv/transmission/rpc-username
+      secretKey: username
+    - remoteRef:
+        key: /mdapi/tv/transmission/rpc-password
+      secretKey: password

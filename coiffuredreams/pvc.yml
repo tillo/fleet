@@ -1,0 +1,52 @@
+## Backup tiers (2026-10-21, bead infra-h01k).
+##
+## Until now both PVCs carried no declaration, so f/heal/backup_label_enforcer
+## fell back to class `default` — the monthly job (`0 5 1 * *`, retain 2). That
+## is not a stopped job: the last monthly run completed 2026-10-01 and the next
+## is 2026-11-01, so the WordPress RESTORE POINT can legitimately be 31 days
+## old. For a MariaDB that the site writes to daily, that is the same argument
+## that put mail and openwebui on the weekly tier.
+##
+## weekly  — Fridays 01:00, retain 2. The tier for state that exists nowhere
+##           else; a lost day still leaves the previous two Fridays.
+## daily   — 03:40, retain 5 (longhorn/recurringjob-daily.yml, infra-j45a.1).
+##           Max 24h of loss at ~zero cost: these are 2 GiB volumes and the
+##           backupstore dedupes blocks across runs.
+## Monthly (`default`) stays on as the long tail — class `weekly` keeps it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads
+  namespace: coiffuredreams
+  labels:
+    mdapi.ch/backup-class: weekly
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/default: enabled
+    recurring-job-group.longhorn.io/weekly: enabled
+    recurring-job-group.longhorn.io/daily: enabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-data
+  namespace: coiffuredreams
+  labels:
+    mdapi.ch/backup-class: weekly
+    recurring-job.longhorn.io/source: enabled
+    recurring-job-group.longhorn.io/default: enabled
+    recurring-job-group.longhorn.io/weekly: enabled
+    recurring-job-group.longhorn.io/daily: enabled
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 2Gi

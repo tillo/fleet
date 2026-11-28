@@ -1,0 +1,36 @@
+## mcp.mdapi.ch — the MCP front door for the LAN seats (bpi-r4, mbp-mda on the LAN).
+## Certificate mcp-cert is its own manifest (mcp-cert.yml), so no cert-manager
+## annotation here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp
+  namespace: agentgateway
+  annotations:
+    ## Same stance as llm.mdapi.ch: MCP JSON-RPC bodies carry code, logs and
+    ## shell commands, so CRS would score them constantly. Protection is the
+    ## client API key (route apiKey policies, mode strict) plus the LAN source range.
+    nginx.ingress.kubernetes.io/enable-modsecurity: "false"
+    ## Streamable HTTP / SSE: no buffering, long-lived responses.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    ## LAN only (+ the Jool NAT64 LAN source .3 — never the /24, `.2` is the
+    ## public IPv6 source). Off-LAN seats use the jump tunnel to the Service.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.1.0/24,192.168.164.3/32"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mcp.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - mcp.mdapi.ch
+      secretName: mcp-cert

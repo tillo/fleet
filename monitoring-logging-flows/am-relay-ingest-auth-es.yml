@@ -1,0 +1,27 @@
+## Basic-auth password fluentd sends to cribl-am-relay /ingest (infra-o4i3m.5.3).
+##
+## Read by ClusterOutput am-relay (output-am-relay.yml), which can only take
+## Secrets from the logging control namespace, hence this copy here; the relay's
+## own copy is monitoring-cribl-am-relay/relay-ingest-auth-es.yml. Both read the
+## SAME Akeyless item, tests/test_am_relay_ingest_requires_the_fluentd_login.py
+## pins that.
+##
+## Rotation: write the Akeyless item. ESO refreshes both Secrets within 1 h; the
+## logging operator re-renders fluentd, Reloader rolls the relay. Alerts posted
+## between the two moments get 401 and fluentd retries them.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: am-relay-ingest-auth
+  namespace: cattle-logging-system
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: am-relay-ingest-auth
+    creationPolicy: Owner
+  data:
+  - remoteRef: { key: /mdapi/monitoring/am-relay/ingest-password }
+    secretKey: password

@@ -1,0 +1,76 @@
+## One wildcard certificate for every PoC host. DNS-01 through the cluster issuer
+## (its rfc2136 solver covers mdapi.ch). The challenge TXT at
+## _acme-challenge.kgw.mdapi.ch is transient and harmless to the public
+## *.mdapi.ch wildcard: kgw.mdapi.ch only exists as an empty non-terminal while
+## it is there.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kgw-wildcard
+  namespace: kgw-poc
+spec:
+  secretName: kgw-wildcard-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+  dnsNames:
+    - "*.kgw.mdapi.ch"
+  renewBefore: 720h0m0s                # canonical Go-duration form so Fleet sees no drift
+---
+## How kgateway shapes the Envoy Deployment/Service it generates for the Gateway.
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: GatewayParameters
+metadata:
+  name: kgw-proxy
+  namespace: kgw-poc
+spec:
+  kube:
+    service:
+      type: LoadBalancer
+      ## ⛔ MetalLB is OPT-IN here (controller --lb-class=metallb, metallb/values.yml):
+      ## without this class the Service sits at EXTERNAL-IP <pending> forever and
+      ## the metallb.io/loadBalancerIPs annotation below is never read (measured
+      ## 2026-11-24 on the first rollout).
+      loadBalancerClass: metallb
+      ## Local keeps the CLIENT source address (needed by the acl row and by any
+      ## future WAF): with Cluster, a request entering on another node is SNATed
+      ## to that node's IP. MetalLB L2 then announces .66 from the node that runs
+      ## the Envoy pod.
+      externalTrafficPolicy: Local
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: kgw
+  namespace: kgw-poc
+spec:
+  gatewayClassName: kgateway
+  infrastructure:
+    ## Copied onto the generated Service. A free prod-pool address (2026-11-24:
+    ## in no Service, fleet file or doc; no ARP answer; outside DHCP .100-.249).
+    annotations:
+      metallb.io/loadBalancerIPs: 192.168.1.66
+    parametersRef:
+      group: gateway.kgateway.dev
+      kind: GatewayParameters
+      name: kgw-proxy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.kgw.mdapi.ch"
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.kgw.mdapi.ch"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: kgw-wildcard-tls
+      allowedRoutes:
+        namespaces:
+          from: Same

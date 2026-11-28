@@ -1,0 +1,80 @@
+## kagent ↔ agentgateway: every tool a kagent Agent names is really listed to
+## the `kagent` key at the MCP front door (bead infra-7rog.32.2).
+##
+## Fed by CronJob kagent/kagent-gateway-tools-check
+## (kagent-mdapi/kagent-gateway-tools-check.yml, Pushgateway job
+## kagent_gateway_tools_check, every 30 min). The gateway's routes and tool/key
+## policies are rows in its database since fleet !1776, so no git test can see
+## them; a filtered tool or a missing grant is silent everywhere else (the
+## Agent CR stays Accepted). Unit tests: tests/rules/kagent-gateway-tools.test.yml.
+## KagentGatewayToolsCheckedNone catches a run that checks nothing.
+## Internal tooling: warning tier, component `Automation`.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-kagent-gateway-tools
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-kagent-gateway-tools.rules
+      rules:
+        - alert: KagentGatewayToolMissing
+          expr: max by (agent, server, tool) (kagent_gateway_tool_missing{job="kagent_gateway_tools_check"}) > 0
+          for: 45m
+          labels:
+            service: kagent
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "kagent agent {{ $labels.agent }} cannot call {{ $labels.server }}/{{ $labels.tool }} at the MCP gateway"
+            description: |
+              tools/list with the `kagent` key on the RemoteMCPServer's gateway URL
+              does not return this tool (filtered by the route's tool policy, no
+              `servers` grant on the key — a 403 lists nothing — or the upstream
+              renamed it, as Backstage's catalog.* did in fleet !1711). The
+              routes and policies are rows in the agentgateway database:
+                kubectl --context mdapi-prod-direct -n kagent logs -l app.kubernetes.io/name=kagent-gateway-tools-check --tail=50
+
+        ## A run that found NO gateway-backed tool is a clean run of nothing (the
+        ## shape of the 2026-11-04 catalog loss): an Agent renamed its server
+        ## kind, or the RemoteMCPServers moved off the gateway host.
+        - alert: KagentGatewayToolsCheckedNone
+          expr: max(kagent_gateway_tools_checked{job="kagent_gateway_tools_check"}) == 0
+          for: 1h
+          labels:
+            service: kagent
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "The kagent MCP gateway tool check found no Agent tool to check"
+            description: |
+              kagent-gateway-tools-check read every Agent and RemoteMCPServer and
+              found no McpServer tool on mcp.agentgateway.svc.cluster.local, so
+              KagentGatewayToolMissing has nothing to say. Either the agents
+              really lost their gateway tools, or GATEWAY_HOST in
+              kagent-mdapi/kagent-gateway-tools-check.yml no longer matches the
+              RemoteMCPServer URLs.
+                kubectl --context mdapi-prod-direct -n kagent get remotemcpserver,agent -o wide
+
+        - alert: KagentGatewayToolsCheckStale
+          expr: |
+            time() - max(push_time_seconds{job="kagent_gateway_tools_check"}) > 7200
+            or absent(push_time_seconds{job="kagent_gateway_tools_check"})
+          for: 30m
+          labels:
+            service: kagent
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "The kagent MCP gateway tool check has not pushed for over 2h"
+            description: |
+              CronJob kagent/kagent-gateway-tools-check runs every 30 min and pushes
+              only after reading every Agent and RemoteMCPServer, so a stale push
+              means the job fails (RBAC, the kagent-mcp Secret, the Pushgateway) or
+              is not scheduled. KagentGatewayToolMissing is blind meanwhile.
+                kubectl --context mdapi-prod-direct -n kagent get cronjob,job -l app.kubernetes.io/name=kagent-gateway-tools-check

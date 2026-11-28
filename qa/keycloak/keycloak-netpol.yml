@@ -1,0 +1,105 @@
+## QA Keycloak's fence: the app reaches DNS, its throwaway Postgres and the IAST sink, and
+## nothing else -- no Datadog intake, no internet, no prod IdP (proof in the bead).
+## Ingress: only the QA traffic pods (seed + ZAP, label mdapi.ch/qa-traffic).
+## Postgres is reachable from the app alone, which is what makes trust auth safe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: keycloak
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  ## both the instrumented app and its tracer-off control (keycloak-off)
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [keycloak, keycloak-off]}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              mdapi.ch/qa-traffic: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels:
+              app: keycloak-pg
+      ports:
+        - {protocol: TCP, port: 5432}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iast
+          podSelector:
+            matchLabels:
+              app: iast-sink
+      ports:
+        - {protocol: TCP, port: 8126}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-pg
+  namespace: keycloak
+spec:
+  podSelector:
+    matchLabels:
+      app: keycloak-pg
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [keycloak, keycloak-off]}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+## The QA traffic (seed requests, ZAP active scan): DNS and the app, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: qa-traffic
+  namespace: keycloak
+spec:
+  podSelector:
+    matchLabels:
+      mdapi.ch/qa-traffic: "true"
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [keycloak, keycloak-off]}
+      ports:
+        - {protocol: TCP, port: 8080}

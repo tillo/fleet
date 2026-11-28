@@ -1,0 +1,235 @@
+## QA paperless with the IAST tracer ON (infra-7rog.41.10) plus `paperless-off`, the same
+## image and settings without DD_IAST_ENABLED (= prod) as the overhead control. Not a copy
+## of prod's Deployment: prod's carries the RPS client credentials and the real data PVC.
+## Root inside the container as prod (s6 drops to `paperless` for the services), hence
+## PSA baseline for this namespace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperless
+  namespace: paperless-kustodyan
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: paperless
+  template:
+    metadata:
+      labels:
+        app: paperless
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: paperless
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest@sha256:408b4ffbd3cfe9fe02b3f8f683dc5b47dc148e1b4be2023611580299c888c1f0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8000}
+          env:
+            - name: PAPERLESS_URL
+              value: "http://paperless:8000"
+            - name: PAPERLESS_ALLOWED_HOSTS
+              value: "paperless,paperless.paperless-kustodyan.svc"
+            - name: PAPERLESS_CSRF_TRUSTED_ORIGINS
+              value: "http://paperless:8000"
+            ## its own Valkey database index, so the two copies never share a task queue
+            - name: PAPERLESS_REDIS
+              value: "redis://paperless-qa-valkey:6379/0"
+            - name: PAPERLESS_TIME_ZONE
+              value: Europe/Zurich
+            - name: PAPERLESS_OCR_LANGUAGE
+              value: eng
+            - name: PAPERLESS_DBENGINE
+              value: sqlite
+            - name: PAPERLESS_ADMIN_USER
+              value: qa-admin
+            - name: PAPERLESS_ADMIN_MAIL
+              value: qa-admin@example.invalid
+            ## the add-on as prod loads it, every protection OFF: it never calls the RPS
+            - name: PAPERLESS_APPS
+              value: paperless_kustodyan.apps.PaperlessKustodyanConfig
+            - name: KUSTODYAN_PROTECT_DOCUMENT_CONTENT
+              value: "false"
+            - name: KUSTODYAN_PROTECT_TITLE
+              value: "false"
+            - name: KUSTODYAN_PROTECT_CORRESPONDENTS
+              value: "false"
+            - name: KUSTODYAN_PROTECT_CUSTOM_FIELDS
+              value: "false"
+            - name: KUSTODYAN_SEARCHABLE_CONTENT
+              value: "false"
+            - name: KUSTODYAN_SENSITIVE_TAGS
+              value: ""
+            ## --- IAST ------------------------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: "http://iast-sink.iast.svc:8126"
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            - name: DD_RUNTIME_METRICS_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: paperless-kustodyan
+            - name: DD_ENV
+              value: qa
+          envFrom:
+            ## PAPERLESS_ADMIN_PASSWORD + PAPERLESS_SECRET_KEY, random, QA cluster only
+            - secretRef:
+                name: paperless-qa-admin
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 200m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          ## TCP, not HTTP: the kubelet probes the pod IP, which Django rejects as a
+          ## DisallowedHost (400) since ALLOWED_HOSTS names the Service only (measured 2026-11-24)
+          startupProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /usr/src/paperless/data}
+            - {name: media, mountPath: /usr/src/paperless/media}
+            - {name: consume, mountPath: /usr/src/paperless/consume}
+      volumes:
+        - {name: data, emptyDir: {}}
+        - {name: media, emptyDir: {}}
+        - {name: consume, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperless
+  namespace: paperless-kustodyan
+spec:
+  selector:
+    app: paperless
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paperless-off
+  namespace: paperless-kustodyan
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: paperless-off
+  template:
+    metadata:
+      labels:
+        app: paperless-off
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: paperless
+          image: zot.mdapi.ch/mdapi/paperless-kustodyan:latest@sha256:408b4ffbd3cfe9fe02b3f8f683dc5b47dc148e1b4be2023611580299c888c1f0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8000}
+          env:
+            - name: PAPERLESS_URL
+              value: "http://paperless-off:8000"
+            - name: PAPERLESS_ALLOWED_HOSTS
+              value: "paperless-off,paperless-off.paperless-kustodyan.svc"
+            - name: PAPERLESS_CSRF_TRUSTED_ORIGINS
+              value: "http://paperless-off:8000"
+            ## its own Valkey database index, so the two copies never share a task queue
+            - name: PAPERLESS_REDIS
+              value: "redis://paperless-qa-valkey:6379/1"
+            - name: PAPERLESS_TIME_ZONE
+              value: Europe/Zurich
+            - name: PAPERLESS_OCR_LANGUAGE
+              value: eng
+            - name: PAPERLESS_DBENGINE
+              value: sqlite
+            - name: PAPERLESS_ADMIN_USER
+              value: qa-admin
+            - name: PAPERLESS_ADMIN_MAIL
+              value: qa-admin@example.invalid
+            ## the add-on as prod loads it, every protection OFF: it never calls the RPS
+            - name: PAPERLESS_APPS
+              value: paperless_kustodyan.apps.PaperlessKustodyanConfig
+            - name: KUSTODYAN_PROTECT_DOCUMENT_CONTENT
+              value: "false"
+            - name: KUSTODYAN_PROTECT_TITLE
+              value: "false"
+            - name: KUSTODYAN_PROTECT_CORRESPONDENTS
+              value: "false"
+            - name: KUSTODYAN_PROTECT_CUSTOM_FIELDS
+              value: "false"
+            - name: KUSTODYAN_SEARCHABLE_CONTENT
+              value: "false"
+            - name: KUSTODYAN_SENSITIVE_TAGS
+              value: ""
+          envFrom:
+            ## PAPERLESS_ADMIN_PASSWORD + PAPERLESS_SECRET_KEY, random, QA cluster only
+            - secretRef:
+                name: paperless-qa-admin
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 200m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          ## TCP, not HTTP: the kubelet probes the pod IP, which Django rejects as a
+          ## DisallowedHost (400) since ALLOWED_HOSTS names the Service only (measured 2026-11-24)
+          startupProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /usr/src/paperless/data}
+            - {name: media, mountPath: /usr/src/paperless/media}
+            - {name: consume, mountPath: /usr/src/paperless/consume}
+      volumes:
+        - {name: data, emptyDir: {}}
+        - {name: media, emptyDir: {}}
+        - {name: consume, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paperless-off
+  namespace: paperless-kustodyan
+spec:
+  selector:
+    app: paperless-off
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}

@@ -1,0 +1,261 @@
+# app-batch-jobs.litellm-budget (infra-ipx4u, follow-up to fleet !2077). Pinned both ways:
+# a budget light that is permanently on costs as much as one that never lights.
+# The series are what f/probe/litellm_budget_health pushes: job litellm_budget_health
+# through the Pushgateway, so they arrive with namespace=monitoring/service=pushgateway.
+# Baseline 2026-11-08: openobserve-ai cash 36.99, counted 3.45, cap 30.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: uncounted-fires-and-says-what-was-spent
+  interval: 5m
+  input_series:
+  - series: litellm_budget_key_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="openobserve-ai"}
+    values: '30x24'
+  - series: litellm_budget_key_spend_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="openobserve-ai"}
+    values: '36.99x24'
+  - series: litellm_budget_key_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="openobserve-ai"}
+    values: '3.45x24'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetUncounted
+    exp_alerts: []
+  - eval_time: 65m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetUncounted
+    exp_alerts:
+    - exp_labels:
+        key: openobserve-ai
+        job: litellm_budget_health
+        service: litellm
+        namespace: litellm
+        exported_namespace: monitoring
+        exported_service: pushgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "key openobserve-ai is over its cash budget but litellm has not counted it — the cap is not enforced"
+        description: |
+          openobserve-ai has spent 36.99 in its cap
+          window, at or above its budget, yet litellm's own counter for the key
+          is still below the cap — so no request is being refused and the key
+          will keep spending past its budget indefinitely.
+
+          The cash and the counter are different numbers, and only the counter
+          refuses anything. This is NOT "requests are 429ing"; it is the
+          opposite: a budget that is decorative.
+
+          Diagnose with: ~/bin/litellm-budget-doctor   (reports it as `uncounted`)
+          Inspect the two numbers directly:
+            SELECT key_alias, spend, max_budget FROM "LiteLLM_VerificationToken"
+             WHERE key_alias = 'openobserve-ai';
+          versus SpendLogs for the same window.
+
+          Live hypothesis (infra bead "key budgets are enforced against a counter
+          that under-tracks"): the counter misses router-mediated calls, so keys
+          scoped to auto-heuristic-local-cn or cn-deepseek-flash inherit the hole.
+          Until it is fixed, GROUP caps are the layer that still enforces.
+  - eval_time: 65m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetKeyExhausted
+    exp_alerts: []
+- name: counter-at-cap-fires-exhausted-and-uncounted-stays-silent
+  interval: 5m
+  input_series:
+  - series: litellm_budget_key_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="seat-jump"}
+    values: '30x24'
+  - series: litellm_budget_key_spend_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="seat-jump"}
+    # 50 > 1.5 x 30: only `counted < cap` keeps Uncounted silent here
+    values: '50x24'
+  - series: litellm_budget_key_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="seat-jump"}
+    values: '30x24'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetKeyExhausted
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetKeyExhausted
+    exp_alerts:
+    - exp_labels:
+        key: seat-jump
+        job: litellm_budget_health
+        service: litellm
+        namespace: litellm
+        exported_namespace: monitoring
+        exported_service: pushgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "litellm key seat-jump has reached its budget — its clients are being refused or falling back"
+        description: |
+          litellm's own counter for seat-jump has reached the key budget,
+          so every request on that key now either receives a 429 or is served by
+          its budget_fallbacks (if any). This one IS a real throttle.
+
+          Raise the budget, or point the client at a key with headroom. Check what
+          the key is scoped to before raising it — a large key budget can let one
+          client exhaust a whole model group.
+  - eval_time: 115m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetUncounted
+    exp_alerts: []
+- name: healthy-and-uncapped-keys-are-silent
+  interval: 5m
+  input_series:
+  - series: litellm_budget_key_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="healthy"}
+    values: '30x30'
+  - series: litellm_budget_key_spend_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="healthy"}
+    values: '5x30'
+  - series: litellm_budget_key_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="healthy"}
+    values: '5x30'
+  # cap 0 = no budget on the key: spend past it must never read as over-budget
+  - series: litellm_budget_key_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="uncapped"}
+    values: '0x30'
+  - series: litellm_budget_key_spend_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="uncapped"}
+    values: '50x30'
+  - series: litellm_budget_key_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="uncapped"}
+    values: '1x30'
+  # counter lagging cash by a little right at the cap is normal, not uncounted
+  - series: litellm_budget_key_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="near-cap"}
+    values: '30x30'
+  - series: litellm_budget_key_spend_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="near-cap"}
+    values: '31x30'
+  - series: litellm_budget_key_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",key="near-cap"}
+    values: '29x30'
+  - series: litellm_budget_group_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-sonnet"}
+    values: '25x30'
+  - series: litellm_budget_group_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-sonnet"}
+    values: '24.99x30'
+  - series: litellm_budget_probe_success{job="litellm_budget_health",namespace="monitoring",service="pushgateway"}
+    values: '1x30'
+  alert_rule_test:
+  - eval_time: 150m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetUncounted
+    exp_alerts: []
+  - eval_time: 150m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetKeyExhausted
+    exp_alerts: []
+  - eval_time: 150m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetGroupExhausted
+    exp_alerts: []
+  - eval_time: 150m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetProbeFailing
+    exp_alerts: []
+- name: group-over-fires-on-the-counter-not-on-cash
+  interval: 5m
+  input_series:
+  - series: litellm_budget_group_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-opus"}
+    values: '15x24'
+  - series: litellm_budget_group_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-opus"}
+    values: '25.39x24'
+  # 2026-11-13 shape: the calendar month's cash reads 0 while the router refuses
+  - series: litellm_budget_group_spend_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-opus"}
+    values: '0x24'
+  # exactly at the cap is exhausted too (bead case: cap 30 / counted 30)
+  - series: litellm_budget_group_cap_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-sonnet"}
+    values: '30x24'
+  - series: litellm_budget_group_counted_usd{job="litellm_budget_health",namespace="monitoring",service="pushgateway",group="api-sonnet"}
+    values: '30x24'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetGroupExhausted
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetGroupExhausted
+    exp_alerts:
+    - exp_labels:
+        group: api-sonnet
+        job: litellm_budget_health
+        service: litellm
+        namespace: litellm
+        exported_namespace: monitoring
+        exported_service: pushgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "model group api-sonnet has spent its cap — it is serving its fallback now"
+        description: |
+          The router has counted 30.00 for api-sonnet
+          against its max_budget in its rolling window (it opened at the first spend
+          and lasts the budget_duration; litellm_budget_group_resets_at_seconds says
+          when it frees up). The group is now answering from its fallback row — typically
+          cn-deepseek-flash — so traffic has silently changed model, and any
+          quality difference will look like a regression with no deploy behind it.
+
+          Either the cap is genuinely too small for the workload, or something is
+          spending more than intended. Compare with the per-key gauges of the same
+          job to see which client is responsible.
+    - exp_labels:
+        group: api-opus
+        job: litellm_budget_health
+        service: litellm
+        namespace: litellm
+        exported_namespace: monitoring
+        exported_service: pushgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "model group api-opus has spent its cap — it is serving its fallback now"
+        description: |
+          The router has counted 25.39 for api-opus
+          against its max_budget in its rolling window (it opened at the first spend
+          and lasts the budget_duration; litellm_budget_group_resets_at_seconds says
+          when it frees up). The group is now answering from its fallback row — typically
+          cn-deepseek-flash — so traffic has silently changed model, and any
+          quality difference will look like a regression with no deploy behind it.
+
+          Either the cap is genuinely too small for the workload, or something is
+          spending more than intended. Compare with the per-key gauges of the same
+          job to see which client is responsible.
+- name: probe-failing-fires-after-30m
+  interval: 5m
+  input_series:
+  - series: litellm_budget_probe_success{job="litellm_budget_health",namespace="monitoring",service="pushgateway"}
+    values: '0x24'
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetProbeFailing
+    exp_alerts: []
+  - eval_time: 35m
+    groupname: app-batch-jobs.litellm-budget
+    alertname: LitellmBudgetProbeFailing
+    exp_alerts:
+    - exp_labels:
+        job: litellm_budget_health
+        service: litellm
+        namespace: litellm
+        exported_namespace: monitoring
+        exported_service: pushgateway
+        severity: warning
+        component: Automation
+        team: mdapi
+        statuspage: exclude
+      exp_annotations:
+        summary: "litellm budget probe could not measure — every spend/budget series is absent"
+        description: |
+          f/probe/litellm_budget_health could not read litellm's Postgres or its
+          admin API, so it published litellm_budget_probe_success 0 and dropped
+          every other series on purpose: a stale "all within budget" must not
+          outlive the reading that produced it.
+
+          While this fires, no budget alert can fire. The run's error names the
+          cause:
+            https://windmill.mdapi.ch/runs?path=f%2Fprobe%2Flitellm_budget_health

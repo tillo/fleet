@@ -1,0 +1,123 @@
+## The WAF engine: Coraza + OWASP CRS on the Envoy ext_proc protocol (gRPC 9001).
+## Built and pinned in mdapi/coraza-extproc; the rules and exclusions are baked
+## into the image (exclusions.conf: per-host, Host-keyed ctl:ruleRemoveById).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coraza
+  namespace: kgw-poc
+spec:
+  replicas: 1
+  # ⛔ Recreate, not RollingUpdate: a rolling update briefly has TWO engines and
+  # Envoy round-robins the two halves of an ext_proc stream to different ones.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: coraza
+  template:
+    metadata:
+      labels:
+        app: coraza
+    spec:
+      automountServiceAccountToken: false
+      ## zot.mdapi.ch is htpasswd-protected; the pull secret comes from the
+      ## shared zot-pull-secrets bundle (one ExternalSecret per namespace).
+      imagePullSecrets:
+        - name: zot-pull
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: coraza
+          image: zot.mdapi.ch/mdapi/coraza-extproc:4.31.0-mdapi.15@sha256:1128664351c558794718fc9545a0fbd269ee419c8c536285d31c2342ba06b2dd
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 9001
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+          # Rule reload logs a line per change; a WAF whose rules stopped
+          # reloading is invisible otherwise.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ## The engine's footprint follows REQUEST RATE, not body size
+          ## (measured 2026-11-25/26: 16 concurrent clients peaked ~816Mi with
+          ## 64 KB bodies and ~744Mi with 1 KB at ~1.1k rps). Untuned, the Go GC
+          ## let the heap run to the container limit and the kernel OOMKilled it
+          ## at 384Mi. ⚠️ 448Mi + GOMEMLIMIT 400MiB did NOT hold either —
+          ## restarts and 500s: GOMEMLIMIT bounds the Go heap only, and the
+          ## re2-in-Go module (go-re2) plus stacks live outside it. 1Gi with a
+          ## 900MiB hint ran both load profiles clean (0 restarts); a lower
+          ## ceiling needs its own measurement, not arithmetic.
+          env:
+            - name: GOMEMLIMIT
+              value: 900MiB
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 1Gi
+          # Coraza spills request bodies over SecRequestBodyInMemoryLimit to a
+          # temp file; an emptyDir keeps that off the read-only root.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coraza
+  namespace: kgw-poc
+spec:
+  selector:
+    app: coraza
+  ports:
+    - name: grpc
+      port: 9001
+      targetPort: grpc
+      appProtocol: grpc
+---
+## Who may talk to the engine: the Envoy data plane of Gateway kgw, and nothing
+## else. A wrongly-blocked caller shows as 403 by failOpen:false (below), so the
+## first place to look when every request 403s is this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coraza-from-gateway
+  namespace: kgw-poc
+spec:
+  podSelector:
+    matchLabels:
+      app: coraza
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              gateway.networking.k8s.io/gateway-name: kgw
+      ports:
+        - protocol: TCP
+          port: 9001
+    ## kubelet readiness/liveness probe (from the node IP)
+    - from:
+        - ipBlock:
+            cidr: 192.168.1.0/24
+      ports:
+        - protocol: TCP
+          port: 9001

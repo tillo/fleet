@@ -1,0 +1,25 @@
+# The key encryption key for DT's database secret management
+# (secretManagement.provider=database, mode `config`: a base64 32-byte AES key).
+# Every secret DT stores -- the advisory mirror token, any notification
+# credential -- is encrypted with it in Postgres; losing it makes them
+# unreadable, which is why it lives in Akeyless and not in a chart-generated
+# Secret that a re-install would re-randomise. Mode `config` cannot be rotated
+# in place: a rotation = new KEK + re-enter the few stored secrets.
+# The database password is NOT here: CNPG generates it (dependency-track-pg-app).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: dependency-track-kek
+  namespace: dependency-track
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: dependency-track-kek
+    creationPolicy: Owner
+  data:
+    - secretKey: kek
+      remoteRef:
+        key: /mdapi/dependency-track/dependency-track-kek/kek

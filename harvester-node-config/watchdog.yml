@@ -1,0 +1,41 @@
+# systemd drives the hardware watchdog (infra-nqfj).
+#
+# RuntimeWatchdogSec=120: a hung kernel is hardware-reset within ~2 min instead of sitting frozen
+# (the panic-on-ERST hang that froze qua 2026-06-07). On a node without /dev/watchdog0 systemd
+# logs and carries on. 95b_lockup_panic.yaml (lockup-panic.yml) turns soft hangs into panics so
+# this watchdog actually fires.
+#
+# NO pretimeout (RuntimeWatchdogPreSec), on purpose (infra-m42.10, 2026-11-21). hpwdt accepts a
+# 9 s pretimeout at runtime (proven on quarto, reverted), but with hpwdt.kdumptimeout=-1 (the
+# default; read-only, boot-time) its NMI handler calls hpwdt_stop() before panicking (v6.12
+# drivers/watchdog/hpwdt.c). A panic that then hangs writing ERST leaves the node frozen with no
+# hardware reset: qui and quo, 2026-09-03, ~55 min. Arming it needs `hpwdt.kdumptimeout=0` in
+# /oem/grubenv first (the reset then still lands 9 s after the NMI), a reboot, and an update of
+# NodeBootBaselineDrift (68-node-boot-baseline.yml). tests/test_freeze_capture_leaves_the_box.py.
+#
+# ADOPTED, not new: byte-identical to the hand-placed /oem/95_watchdog.yaml found on all four
+# nodes on 2026-10-27 (sha256 86d81b82...), plus the two "Managed by" lines.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-watchdog
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 95_watchdog.yaml
+  contents: |
+    # Managed by CloudInit mdapi-watchdog (fleet harvester-node-config/watchdog.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "hardware watchdog: systemd drives hpwdt /dev/watchdog0 so a hung kernel (e.g. the panic-on-ERST hang that froze qua 2026-06-07) is hardware-reset within ~2min instead of frozen indefinitely. RuntimeWatchdogSec=120."
+    stages:
+      boot:
+        - name: "enable systemd runtime watchdog (hpwdt)"
+          files:
+            - path: /etc/systemd/system.conf.d/10-watchdog.conf
+              permissions: 0644
+              content: |
+                [Manager]
+                RuntimeWatchdogSec=120
+                RebootWatchdogSec=10min
+          commands:
+            - systemctl daemon-reexec || true

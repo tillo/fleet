@@ -1,0 +1,122 @@
+# FilesDeploymentUnavailable: a planned rollout gets 15 extra minutes, a node loss does not
+# (infra-j6mod). Every Nextcloud AIO deployment is replicas=1, strategy=Recreate, so each
+# chart bump (Renovate automerges minor+patch) is a real 4-14 min gap while the new image
+# pulls and the AIO container runs its upgrade boot. 11-16 (chart 15 + two hand commits)
+# and 11-22 15:40/19:39 (charts 15.1.0, 15.1.1) were all rollouts; 11-22 19:45 paged.
+# A rollout is told apart by kube_deployment_metadata_generation changing (a spec change);
+# a node drain or node loss reschedules the pod without touching the spec, so it keeps
+# paging at 5 min (decision on infra-r9mzd.80: unplanned node loss keeps paging).
+# A rollout that is still down 20 min after the spec change pages too.
+# ⚠️ `0x15` is HEX 21 to vmalert-tool, not "0 repeated 15 times": write `0+0x15`.
+rule_files:
+- monitoring-rules/04-files.yml
+evaluation_interval: 1m
+tests:
+- name: rollout-of-9-minutes-stays-quiet
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="envuassu",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x40
+  - series: kube_deployment_metadata_generation{namespace="envuassu",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 2+0x30
+  - series: kube_deployment_status_replicas_available{namespace="envuassu",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 0+0x8 1+0x21
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts: []
+  - eval_time: 18m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts: []
+- name: rollout-stuck-pages-after-20-minutes
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x40
+  - series: kube_deployment_metadata_generation{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 2+0x30
+  - series: kube_deployment_status_replicas_available{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 0+0x30
+  alert_rule_test:
+  - eval_time: 28m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts: []
+  - eval_time: 31m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts:
+    - exp_labels: &nc
+        namespace: nextcloud
+        deployment: nextcloud-aio-nextcloud
+        service: nextcloud-aio-nextcloud
+        severity: critical
+        component: Files & Documents
+        statuspage: include
+        team: mdapi
+      exp_annotations: &nc_ann
+        summary: 'nextcloud/nextcloud-aio-nextcloud: 1 replicas unavailable'
+        description: |
+          File-storage component is degraded. Affected services:
+            Nextcloud  -> cloud.mdapi.ch (household) / cloud.envuassu.ch (PPE)
+            SFTPGo     -> *.files.mdapi.ch
+            Paperless  -> documents.mdapi.ch (DMS)
+            Mirror     -> mirror.mdapi.ch (public rsync/HTTP mirror: blackarch,
+                          archstrike, ctan, gentoo-portage, gnu, slackware, tails)
+- name: node-loss-without-spec-change-pages-at-5-minutes
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x40
+  - series: kube_deployment_metadata_generation{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 2+0x40
+  - series: kube_deployment_status_replicas_available{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 0+0x30
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts:
+    - exp_labels: *nc
+      exp_annotations: *nc_ann
+- name: rollout-of-one-deployment-does-not-mute-another
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x40
+  - series: kube_deployment_status_replicas_available{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 0+0x30
+  - series: kube_deployment_metadata_generation{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 2+0x40
+  - series: kube_deployment_metadata_generation{namespace="nextcloud",deployment="nextcloud-aio-redis"}
+    values: 1+0x9 2+0x30
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts:
+    - exp_labels: *nc
+      exp_annotations: *nc_ann
+- name: kube-state-metrics-restart-is-not-a-rollout
+  # A KSM restart mints new series (new `pod` label) with the SAME generation. VictoriaMetrics'
+  # changes() counts a series' first sample as a change, so a changes()-based mute would hide a
+  # node loss for 15 min after every KSM restart. The mute must compare values, not count samples.
+  interval: 1m
+  input_series:
+  - series: kube_deployment_spec_replicas{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x40
+  - series: kube_deployment_status_replicas_available{namespace="nextcloud",deployment="nextcloud-aio-nextcloud"}
+    values: 1+0x9 0+0x30
+  - series: kube_deployment_metadata_generation{namespace="nextcloud",deployment="nextcloud-aio-nextcloud",pod="ksm-old"}
+    values: 2+0x8
+  - series: kube_deployment_metadata_generation{namespace="nextcloud",deployment="nextcloud-aio-nextcloud",pod="ksm-new"}
+    values: _x8 2+0x31
+  alert_rule_test:
+  - eval_time: 16m
+    groupname: app-files.workload
+    alertname: FilesDeploymentUnavailable
+    exp_alerts:
+    - exp_labels: *nc
+      exp_annotations: *nc_ann

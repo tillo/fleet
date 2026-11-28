@@ -1,0 +1,27 @@
+# Lane B pin for the mail server image: an IMMUTABLE version tag minted by the
+# image repo's CI (mdapi/docker-mailserver `.version-tag`), <DMS release>-mdapi.<pipeline>,
+# e.g. 17.0.0-mdapi.1566 runs Dovecot 2.4.1. The digest is what git freezes; Renovate
+# reads the tag, compares versions, and offers a new one as a patch/digest MR.
+# ⛔ NOT `:latest@digest` (which is what this was until 2026-11-24): on that morning a
+# Renovate "Update image digests" MR moved the pin BACK from the DMS 17 build to the
+# frozen Dovecot 2.3 build, because both digests had carried :latest within hours and
+# a digest carries no version. The 2.3 build declares no version, so it can never be
+# proposed against a versioned tag again.
+# The soak is deliberately short-circuited for this package (renovate.json no-soak
+# list): mail is rebuilt every 4h and the tag only changes when the digest does.
+# ⚠️ Strategic merge by container name, so the chart's own metrics-exporter
+# sidecar (digest-pinned in the chart's values) is preserved untouched, as are
+# this container's ports/probes. Only `image` and `imagePullPolicy` are set.
+# ⛔ IfNotPresent, not Always: with an explicit digest, Always re-resolves the
+# tag on every pod start and re-opens the drift this pin exists to close.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-mailserver
+spec:
+  template:
+    spec:
+      containers:
+        - name: docker-mailserver
+          image: zot.mdapi.ch/mdapi/docker-mailserver:17.0.0-mdapi.1597@sha256:46c1b12190b074e80fc724303939a9438d16b889d635087b0153d751f30e3b70
+          imagePullPolicy: IfNotPresent

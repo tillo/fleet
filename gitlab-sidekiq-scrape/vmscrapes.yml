@@ -1,0 +1,52 @@
+## Why (infra-os00t, 2026-11-03): after the ~240 s valkey outage in the qua wedge,
+## every Sidekiq pod stayed Ready and kept running jobs, but the sidekiq-cron poller
+## and the scheduled-set poller had both stopped. No scheduled pipeline ran for 1h15m
+## and nothing alerted: GitLabSidekiqDown watches the Deployment, and nothing in
+## VictoriaMetrics knew anything about Sidekiq itself. These scrapes feed the two
+## poller alerts in monitoring-rules/03-gitlab.yml.
+##
+## Both scrapes keep only the series the alerts read.
+---
+## 1. The cron poller, seen by its output. Each Sidekiq pod exports ~7,400
+## gitlab_sli_* series on :3807. We keep only the execution counter of five cron
+## workers that GitLab enqueues every minute. Measured 2026-11-04: each ran about
+## 0.31 times per minute per pod across 3 pods, about once a minute in total. If
+## all five stop together, the cron poller is dead, whatever the pods report.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: gitlab-sidekiq-cron
+  namespace: bootstrap
+spec:
+  selector:
+    matchLabels:
+      app: sidekiq
+      release: gitlab
+  podMetricsEndpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 60s
+      metricRelabelConfigs:
+        - sourceLabels: [__name__, worker]
+          regex: "gitlab_sli_sidekiq_execution_total;(UpdateAllMirrorsWorker|ScheduleMergeRequestCleanupRefsWorker|Authz::ReverifyProjectAuthorizationsCronWorker|Security::ScanExecutionPolicies::ScheduleWorker|SecretsManagement::ProjectSecretsManagerMaintenanceTasksCronWorker)"
+          action: keep
+---
+## 2. The scheduled set, read from valkey by the chart's gitlab-exporter. Its
+## /sidekiq path covers only the Sidekiq prober, about 12 cheap series. Do NOT
+## point this at /metrics: that path also runs the database probers (bloat,
+## tuple stats) on every scrape. sidekiq_jobs_scheduled_size is the size of the
+## `schedule` ZSET. It read 1-2 on 2026-11-04 and held 174 overdue jobs on 11-03.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: gitlab-exporter-sidekiq
+  namespace: bootstrap
+spec:
+  selector:
+    matchLabels:
+      app: gitlab-exporter
+      release: gitlab
+  endpoints:
+    - port: http-metrics
+      path: /sidekiq
+      interval: 60s

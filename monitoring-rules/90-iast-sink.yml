@@ -1,0 +1,104 @@
+## iast-sink — keeps the IAST findings of the open-source dd-trace tracers (ns `iast`,
+## epic infra-7rog.41).
+##
+## Internal security tooling: warning tier, INTERNAL component `Security` (never
+## mapped to mdapi.statuspage.io). An outage loses the findings of the traffic
+## sent while it is down; production serves nothing through it.
+##
+## What covers what:
+##   * workload arms — the Deployment (and any future StatefulSet) is short;
+##   * IastSinkUnreachable — the outside view: Service, NetworkPolicy and
+##     readiness from another namespace, which replica counts cannot see.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and load-bearing
+## for f/probe/alert_coverage_check — without them a namespace-only selector
+## claims coverage of a kind it can never fire on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-iast-sink
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-iast-sink.rules
+      rules:
+        - alert: IastSinkWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="iast", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="iast", deployment=~".+"}
+            ) > 0
+          ## Recreate strategy: every rollout has a gap; 15m rides it out.
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "iast-sink" }}'
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "iast/{{ $labels.deployment }} unavailable"
+            description: |
+              A Deployment in ns iast has no available replica. Instrumented apps
+              keep running; the IAST findings of their traffic are lost until it
+              is back. Check:
+                kubectl --context mdapi-prod-direct -n iast describe pod -l app=iast-sink
+                kubectl --context mdapi-prod-direct -n iast logs deploy/iast-sink --tail=50
+
+        ## ⚠️ Keep this arm even though it matches nothing today: the coverage
+        ## probe treats a namespace-only selector as covering both kinds.
+        - alert: IastStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="iast", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="iast", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "iast" }}'
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "iast/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in ns iast has fewer available replicas than desired.
+
+        - alert: IastSinkUnreachable
+          ## avg_over_time gives hysteresis on both edges (as MemsearchUnreachable).
+          expr: avg_over_time(probe_success{probe="iast-sink"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: iast-sink
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "iast-sink /healthz unreachable from the monitoring namespace"
+            description: |
+              The blackbox probe of http://iast-sink.iast.svc.cluster.local:8126/healthz
+              has been mostly failing for >15m. With the workload Available this
+              points at the Service or iast-sink/iast-netpol.yml rather than the pod.
+                kubectl --context mdapi-prod-direct -n iast get pod,svc,networkpolicy
+---
+## No `component`/`team` on the target, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled. IastSinkUnreachable above
+## selects on `probe` and carries its own warning-tier labels. Plain HTTP inside
+## the cluster, so there is no certificate to watch.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: iast-sink
+  namespace: monitoring
+spec:
+  jobName: iast-sink
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - http://iast-sink.iast.svc.cluster.local:8126/healthz
+      labels:
+        probe: iast-sink

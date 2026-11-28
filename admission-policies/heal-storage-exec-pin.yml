@@ -1,0 +1,63 @@
+## What the heal-storage worker may run through pods/exec (infra-p6q07.2).
+##
+## SA windmill/windmill-worker-heal-storage held pods/exec in EVERY namespace
+## (infra-az8.19.11 option A, 2026-11-05), which reached the privileged hostPID
+## pods: node root on every node. Two layers now: RBAC binds exec only in the
+## namespaces that run a Longhorn-mounting pod (windmill/rbac/heal-storage-exec.yml,
+## 2026-11-19, coverage measured live by f/probe/rbac_hygiene), and this pins the
+## COMMAND in those namespaces. Four of them (frigate, home-assistant, jump, tv)
+## also run privileged pods, so the pin still carries weight.
+##
+## RBAC grants the verb; this pins the COMMAND. The heal-storage SA's only exec
+## caller is longhorn_eio_autoheal.fs_probe, and it always sends one shape:
+##     sh -c "timeout 5 ls -la <mount> <mount>/*/ 2>&1 | head -200"
+## with <mount> through shlex.quote (bare when safe, else single-quoted). Any
+## other exec by this SA is refused: no other argv, no stdin, no tty, and a
+## mount path limited to [A-Za-z0-9_./-] so nothing in it is shell syntax.
+## (Measured 2026-11-19: all 48 live Longhorn mount paths fit that set; one that
+## does not is refused, and fs_probe already treats a failed exec as
+## inconclusive, so the heal skips that pod instead of acting on it.)
+##
+## A pods/exec CONNECT carries a PodExecOptions `object`; stdin/tty are omitted
+## when false, hence has(). CEL matches() is RE2: `$` is end of text, so a
+## trailing newline + second command does not match.
+##
+## Deny, failurePolicy Fail: a security control. The matchCondition confines it
+## to this one SA, so an error can only ever refuse a heal-storage exec.
+## Behaviour test (real execs, impersonated): heal-storage-exec-pin.test.sh.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: heal-storage-exec-pin
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec"]
+  matchConditions:
+    - name: heal-storage-sa-only
+      expression: >-
+        request.userInfo.username ==
+        "system:serviceaccount:windmill:windmill-worker-heal-storage"
+  validations:
+    - expression: >-
+        !(has(object.stdin) && object.stdin) &&
+        !(has(object.tty) && object.tty) &&
+        has(object.command) && size(object.command) == 3 &&
+        object.command[0] == "sh" && object.command[1] == "-c" &&
+        object.command[2].matches(
+        "^timeout 5 ls -la ('[A-Za-z0-9_./-]+'|[A-Za-z0-9_./-]+) ('[A-Za-z0-9_./-]+'|[A-Za-z0-9_./-]+)/\\*/ 2>&1 \\| head -200$")
+      messageExpression: >-
+        "heal-storage-exec-pin: this SA may only exec the longhorn_eio_autoheal ls probe"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: heal-storage-exec-pin
+spec:
+  policyName: heal-storage-exec-pin
+  validationActions: [Deny]

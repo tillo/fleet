@@ -1,0 +1,55 @@
+# Ingress fence for windmill-pg, the CNPG cluster (windmill-pg.yml). Same callers as
+# enforce.windmill-postgresql (windmill/netpol) for the old server, plus what CNPG
+# itself needs. The superuser login is enabled on this cluster, so nothing outside
+# this list may reach 5432.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.windmill-pg
+  namespace: windmill-pg
+spec:
+  order: 500
+  selector: cnpg.io/cluster == "windmill-pg"
+  types:
+    - Ingress
+  ingress:
+    # 1. Windmill itself: the API server and every worker group.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "windmill"
+        selector: app in {"windmill-app", "windmill-workers"}
+      destination:
+        ports: [5432]
+    # 2. The other instance of this cluster: streaming replication and the
+    #    instance manager's status endpoint during switchover.
+    - action: Allow
+      protocol: TCP
+      source:
+        selector: cnpg.io/cluster == "windmill-pg"
+      destination:
+        ports: [5432, 8000]
+    # 3. The CNPG operator: instance manager API, and 5432 for its checks.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "cnpg-system"
+      destination:
+        ports: [5432, 8000]
+    # 4. Metrics (PodMonitor, port 9187) scraped from ns monitoring.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "monitoring"
+      destination:
+        ports: [9187]
+    # 5. OpenObserve DBM.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "openobserve"
+        selector: app.kubernetes.io/name == "o2-dbm-collector"
+      destination:
+        ports: [5432]
+    - action: Log
+    - action: Deny

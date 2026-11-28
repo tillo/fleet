@@ -1,0 +1,47 @@
+## Raise harvester-seeder's memory limit above the chart's 500Mi.
+##
+## Why (measured 2026-11-27, bead infra-9w538): after the 1.8.2 -> 1.9.1
+## upgrade the seeder OOMKills (exit 137) in a tight loop — 67 restarts on one
+## pod, one crash every few minutes, every time a few seconds after "Starting
+## Controller" / "Reconcilling inventory for local cluster objects", i.e. while
+## building the local-cluster inventory (4 machines, 4 BMC objects, their
+## inventories). Node memory was never the constraint (~49 GiB available).
+##
+## The chart ships requests 250Mi / limits 500Mi (values.yaml `resources:`,
+## rendered verbatim into the Deployment), so the limit is what is hit, not the
+## node. The 1Gi first attempt is what produced the measurement below (it died
+## too); 4Gi is now sized against the actual cache, not against a guess.
+##
+## This is the durable lever, not a live edit: the addon controller owns the
+## HelmChart's spec (chart/repo/version/valuesContent) and would revert a hand
+## patch, while a HelmChartConfig is merged at job time and survives addon
+## reconciles — same mechanism as rke2-coredns-config and rke2-traefik-config.
+##
+## Verify: the Deployment rolls once, restarts stop, and `kubectl -n
+## harvester-system top pod -l app.kubernetes.io/name=harvester-seeder` settles
+## flat below the limit for >30 min.
+##
+## ⚠️ 2026-11-27 19:50Z — 1Gi did NOT hold, and how it failed is the diagnosis:
+## the working set went 279Mi -> 374Mi -> OOMKilled inside ~90s, the last log
+## line still "Reconcilling inventory for local cluster objects". A steady
+## climb, not a spike. The seeder's ClusterRole grants cluster-wide
+## list/watch on SECRETS, and this cluster holds 4525 of them — 3711 are Helm
+## release secrets, 223 MiB of payload. The informer cache over that IS the
+## memory. 4Gi is sized for the cache, not for a leak; the smaller lever is the
+## secret count itself (helm history everywhere), a separate estate item.
+## If it still climbs past 4Gi, the cache is not the whole story — stop
+## raising and re-open infra-9w538 with the curve.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: harvester-seeder
+  namespace: harvester-system
+spec:
+  valuesContent: |-
+    resources:
+      requests:
+        cpu: 250m
+        memory: 350Mi
+      limits:
+        cpu: 500m
+        memory: 4Gi

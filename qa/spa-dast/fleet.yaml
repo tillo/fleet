@@ -1,0 +1,16 @@
+## SPA-capable DAST for the QA copies (infra-7rog.31.24, wave 1c).
+##
+## The wave-1 ZAP Jobs used the classic HTML spider and Zap's token header; on a JS SPA
+## that found 22 URLs (keycloak account console) and missed backstage's search API
+## entirely. This bundle carries the replacement as three SUSPENDED CronJobs -- a Job
+## template Fleet can keep in git without ever running by itself (never a TTL'd Job
+## under Fleet: the recreated Job would scan again forever). Run one on demand:
+##
+##   kubectl -n keycloak create job --from=cronjob/spa-dast-keycloak spa-dast-keycloak-$(date +%s)
+##
+## One ZAP daemon per Job; the plans live in ConfigMaps next to the Jobs.
+defaultNamespace: keycloak
+dependsOn:
+  - name: bootstrap-qa-qa-baseline
+helm:
+  maxHistory: 5

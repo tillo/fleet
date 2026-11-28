@@ -1,0 +1,21 @@
+## Keycloak in the QA cluster, INSTRUMENTED for IAST (infra-7rog.41 wave 1).
+##
+## ⛔ Keycloak is the PROD IdP. This copy is NOT it and never talks to it: its own
+## throwaway Postgres (emptyDir), ONE imported test realm `qa-test` with made-up users
+## (*@example.invalid), no bootstrap admin, no link to idp.mdapi.ch -- egress is DNS,
+## its database and the IAST sink only (keycloak-netpol.yml). Nothing in QA uses it as
+## an identity provider.
+##
+## The made-up users' passwords are NOT in this (public) repo: realm-qa-test.json reads
+## them from the Secret `keycloak-qa-users`, created in the QA cluster only by
+## ~/src/spot-qa/keycloak-qa-users.py (random per creation, never stored elsewhere).
+##
+## The tracer loads because DD_IAST_ENABLED=true (the image's /opt/iast/iast-entry.sh);
+## `keycloak-off` is the same image without it -- what prod runs -- for the overhead
+## control. Namespace and labels: qa/qa-baseline.
+defaultNamespace: keycloak
+## the namespace and its labels come from qa-baseline; deploying first would create it bare
+dependsOn:
+  - name: bootstrap-qa-qa-baseline
+helm:
+  maxHistory: 5

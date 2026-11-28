@@ -1,0 +1,40 @@
+## Public face for vmalertmanager at vmalertmanager.mdapi.ch. Standard
+## Alertmanager UI (alerts list, silences, status). Same auth + WAF
+## treatment as the rest of the stack — oauth2-proxy-admin gate, so
+## silences and route inspection require an authenticated admin.
+##
+## Since infra-o4i3m.5.1 AM itself also asks for Basic auth (user `admin`,
+## password in Akeyless /mdapi/monitoring/vmalertmanager/admin/password). There
+## is deliberately NO `auth-response-headers: Authorization` here: it would
+## replace the browser's Basic header with oauth2-proxy-admin's (empty) one and
+## the UI would loop on 401 (same trap as esphome, fleet !1496).
+##
+## Backend Service is headless (operator default for StatefulSet),
+## which nginx-ingress handles via Endpoints directly — fine.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vmalertmanager
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/admin/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-admin.oauth2-proxy.svc.cluster.local/admin/oauth2/auth
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: vmalertmanager.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: vmalertmanager-mdapi
+                port:
+                  number: 9093
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - vmalertmanager.mdapi.ch
+      secretName: vmalertmanager-cert

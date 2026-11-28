@@ -1,0 +1,60 @@
+# TLS for the beads Dolt server (infra-7rog.31.21, user decision 2026-11-23).
+# Edge DAST found 192.168.1.63:3306 answering "MySQL server does not support SSL": the
+# Mac seat (bd + Beadazzle) logged in and read the whole tracker in clear over the LAN.
+#
+# The private CA (horizon-private, MDAPI Root CA) signs a cert naming every address a
+# client dials: the LoadBalancer IP for the LAN, the Service names in-cluster. The
+# server config REQUIRES TLS -- a cert alone only offers it, and a client that never
+# asks would still log in in clear. Clients trust the MDAPI Root CA: in-cluster via
+# trust-manager's mdapi-trust-bundle (SSL_CERT_FILE, app.yml), on the Mac via the
+# System keychain. tests/test_backlog_dolt_requires_tls.py.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dolt-tls
+  namespace: backlog
+spec:
+  secretName: dolt-tls
+  commonName: dolt.backlog.svc
+  dnsNames:
+    - dolt
+    - dolt.home.tillo.ch        # the LAN name (Technitium), for the Mac seat
+    - dolt.backlog.svc
+    - dolt.backlog.svc.cluster.local
+    - dolt-lb.backlog.svc
+  ipAddresses:
+    # Requested, but the private-tls profile issues NO IP SANs (proven 2026-11-23: the
+    # issued cert carries DNS SANs only). Kept for the day the profile supports them;
+    # LAN clients dial dolt.home.tillo.ch instead.
+    - 192.168.1.63
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    group: horizon.evertrust.io
+    kind: ClusterIssuer
+    name: horizon-private
+---
+# dolt-sql-server reads exactly ONE *.yaml from /etc/dolt/servercfg.d (two: it warns and
+# falls back to defaults, i.e. no TLS). Same listener and data dir as the defaults it
+# ran with until now (`dolt sql-server --host=0.0.0.0 --port=3306`, cwd /var/lib/dolt).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dolt-servercfg
+  namespace: backlog
+data:
+  server.yaml: |
+    log_level: info
+    data_dir: /var/lib/dolt
+    listener:
+      host: 0.0.0.0
+      port: 3306
+      # Step 2 (infra-7rog.31.21): REQUIRED. A cert alone only offers TLS; a client that
+      # never asks would still log in in clear. All seats dial TLS since 2026-11-23:
+      # backlog-app (dolt_server_tls + mdapi-trust-bundle), jump (~/.bashrc), Mac
+      # (dolt.home.tillo.ch + dolt_server_tls).
+      require_secure_transport: true
+      tls_cert: /etc/dolt/tls/tls.crt
+      tls_key: /etc/dolt/tls/tls.key

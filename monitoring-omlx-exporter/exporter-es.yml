@@ -1,0 +1,26 @@
+## The oMLX API key and base URL. Both come from the SAME Akeyless items litellm
+## uses for its local-brain doors (the legacy LMSTUDIO_ names predate the
+## LM Studio -> oMLX move): a key rotation or an address change reaches the
+## gateway and the exporter together, and the Mac's address never lands in this
+## (public) repo. /mdapi/litellm/omlx-url holds the OpenAI-style base
+## (http://<host>:1234/v1); exporter.py strips the /v1 suffix.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: omlx-exporter
+  namespace: monitoring
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: omlx-exporter
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/litellm/litellm-env-secret/LMSTUDIO_API_KEY
+      secretKey: OMLX_API_KEY
+    - remoteRef:
+        key: /mdapi/litellm/omlx-url
+      secretKey: OMLX_URL

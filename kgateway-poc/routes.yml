@@ -1,0 +1,277 @@
+## Routes and policies, one host per test-matrix row (see fleet.yaml).
+## Portable Gateway API where it can do the job (redirect, header edits);
+## kgateway TrafficPolicy only where the standard has no field.
+
+## ---- every http:// request → https:// (nginx's ssl-redirect) -------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: https-redirect
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: http
+  hostnames: ["*.kgw.mdapi.ch"]
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+---
+## ---- plain: TLS termination only --------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: plain
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["plain.kgw.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+## ---- hdr: nginx more_clear_input_headers / proxy_set_header, standard API ---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hdr
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["hdr.kgw.mdapi.ch"]
+  rules:
+    - filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove: ["X-Strip-Me"]
+            add:
+              - name: X-Kgw-Poc
+                value: hdr
+      backendRefs:
+        - name: echo
+          port: 8080
+---
+## ---- sso: oauth2-proxy-admin as ext_authz (nginx auth-url) -----------------
+## ⭐ The `?kgw=` suffix is load-bearing. Envoy's HTTP ext_authz APPENDS the
+## original path to pathPrefix. With a bare "/admin/oauth2/auth" the check goes
+## to /admin/oauth2/auth/<path>, which misses oauth2-proxy's auth endpoint
+## (exact match) and lands on its proxy handler instead: 302 with a wrong `rd`
+## when logged out, and the empty upstream when logged in (measured
+## 2026-11-24). Ending the prefix in a query string keeps the path exact.
+## No auth-signin equivalent: a logged-out client gets the bare 401 (phase 2:
+## the native Envoy oauth2 filter, TrafficPolicy.oauth2, for a real 302).
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: GatewayExtension
+metadata:
+  name: oauth2-admin
+  namespace: kgw-poc
+spec:
+  extAuth:
+    httpService:
+      backendRef:
+        name: oauth2-proxy-admin
+        namespace: oauth2-proxy
+        port: 80
+      pathPrefix: "/admin/oauth2/auth?kgw="
+      authorizationResponse:
+        ## nginx auth-response-headers: identity to the app on success.
+        headersToBackend:
+          - x-auth-request-user
+          - x-auth-request-email
+          - x-auth-request-preferred-username
+---
+## A GatewayExtension's backendRef across namespaces needs a grant, as an
+## HTTPRoute's does (krtcollections BackendIndex.GetBackendFromRef).
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: kgw-poc-extauth
+  namespace: oauth2-proxy
+spec:
+  from:
+    - group: gateway.kgateway.dev
+      kind: GatewayExtension
+      namespace: kgw-poc
+  to:
+    - group: ""
+      kind: Service
+      name: oauth2-proxy-admin
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sso
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["sso.kgw.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: sso
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: sso
+  extAuth:
+    extensionRef:
+      name: oauth2-admin
+---
+## ---- acl: nginx whitelist-source-range --------------------------------------
+## Pod CIDR only, so the jump seat (a pod) passes and any LAN host is refused.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: acl
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["acl.kgw.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: acl
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: acl
+  acl:
+    defaultAction: deny
+    denyResponse:
+      statusCode: 403
+    rules:
+      - name: cluster-pods
+        action: allow
+        cidrs: ["10.52.0.0/16"]
+---
+## ---- limits: nginx proxy-body-size + limit-rpm ------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: limits
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["limits.kgw.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: limits
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: limits
+  buffer:
+    maxRequestSize: 1Mi
+    # Ahead of the WAF (kgateway-poc-waf stages ext_proc at the same place
+    # with weight -1): an oversized body is refused with 413 before the
+    # engine spends seconds inspecting it. Placement is listener-wide.
+    filterStage:
+      stage: AuthN
+      predicate: Before
+  rateLimit:
+    local:
+      tokenBucket:
+        maxTokens: 5
+        tokensPerFill: 5
+        fillInterval: 60s
+---
+## ---- ws: websocket upgrade ---------------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ws
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["ws.kgw.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: ws
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: ws
+  httpUpgrade:
+    - type: websocket
+  timeouts:
+    streamIdle: 3600s
+---
+## ---- rum: append a script tag to the response body (nginx's RUM injection) ----
+## kgateway has no Lua; this is its equivalent: the Envoy transformation filter
+## with an Inja template over the buffered body.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rum
+  namespace: kgw-poc
+spec:
+  parentRefs:
+    - name: kgw
+      sectionName: https
+  hostnames: ["rum.kgw.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: rum
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: rum
+  transformation:
+    response:
+      body:
+        parseAs: AsString
+        value: '{{ body }}<script src="/rum-test.js" data-rum="kgw"></script>'

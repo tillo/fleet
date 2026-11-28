@@ -1,0 +1,85 @@
+## Throwaway Postgres for QA Bussola: emptyDir, so every restart starts EMPTY again
+## (synthetic data only; nothing worth keeping, nothing to leak).
+##
+## No password at all (trust auth), on purpose: a password would be a credential
+## to store somewhere, and this repo is mirrored publicly. The guarantee is the
+## network instead -- only the bussola pod may connect (bussola-netpol.yml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bussola-pg
+  namespace: bussola
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bussola-pg
+  template:
+    metadata:
+      labels:
+        app: bussola-pg
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: postgres
+          image: zot.mdapi.ch/library/postgres:17@sha256:97fb53376be3e4fb1a8a61421daa69dcc3bf2fa39bda3259f5245f9a455af1a9
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              value: bussola
+            - name: POSTGRES_USER
+              value: bussola
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: trust
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "bussola", "-h", "127.0.0.1"]
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bussola-pg
+  namespace: bussola
+spec:
+  selector:
+    app: bussola-pg
+  ports:
+    - port: 5432
+      targetPort: 5432

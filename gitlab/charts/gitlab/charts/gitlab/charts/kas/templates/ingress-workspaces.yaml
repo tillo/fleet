@@ -1,0 +1,79 @@
+{{- if and .Values.global.kas.enabled .Values.global.workspaces.enabled -}}
+{{- if eq (include "gitlab.ingress.enabled" $) "true" -}}
+{{- $wildcardHostname := include "gitlab.workspaces.wildcardHostname" . -}}
+{{- $tlsSecret := include "workspaces.tlsSecret" . -}}
+{{- $ingressCfg := dict "global" .Values.global.ingress "local" .Values.ingress "context" . -}}
+apiVersion: {{ template "gitlab.ingress.apiVersion" $ingressCfg }}
+kind: Ingress
+metadata:
+  name: {{ template "fullname" . }}-workspaces
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.provider: "{{ template "gitlab.ingress.provider" $ingressCfg }}"
+    {{- if eq "nginx" .Values.global.ingress.provider }}
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/custom-http-errors: ""
+    {{- end }}
+    {{- include "gitlab.certmanager_annotations" . | nindent 4 }}
+  {{- range $key, $value := merge .Values.ingress.annotations .Values.global.ingress.annotations }}
+    {{ $key }}: {{ $value | quote }}
+  {{- end }}
+spec:
+  {{ include "ingress.class.field" $ingressCfg }}
+  rules:
+    - host: {{ $wildcardHostname | quote }}
+      http:
+        paths:
+          - path: "/"
+            {{- include "gitlab.ingress.pathBackend" (dict "serviceName" (include "kas.workspaces.serviceName" .) "servicePort" .Values.service.workspacesServerPort "pathType" (default "Prefix" $.Values.global.ingress.pathType)) | nindent 12 }}
+  {{- if (and $tlsSecret (eq (include "gitlab.ingress.tls.enabled" $) "true" )) }}
+  tls:
+    - hosts:
+      - {{ $wildcardHostname | quote }}
+      secretName: {{ $tlsSecret }}
+  {{- end }}
+---
+{{- /*
+The workspaces server API on the KAS host. It is a separate Ingress so that the backend TLS annotations of
+the KAS Ingress (nginx.ingress.kubernetes.io/backend-protocol and proxy-ssl-*), which NGINX applies to all of
+its paths, do not apply to the HTTP/1.1 workspaces server. Like the gRPC Ingress, it shares the TLS Secret of
+the KAS Ingress without cert-manager annotations of its own.
+*/}}
+{{- $kasHostname := include "gitlab.kas.hostname" . }}
+{{- $kasTlsSecret := include "kas.tlsSecret" . }}
+apiVersion: {{ template "gitlab.ingress.apiVersion" $ingressCfg }}
+kind: Ingress
+metadata:
+  name: {{ template "fullname" . }}-workspaces-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" . | nindent 4 }}
+    {{- include "gitlab.commonLabels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.provider: "{{ template "gitlab.ingress.provider" $ingressCfg }}"
+    {{- if eq "nginx" .Values.global.ingress.provider }}
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/custom-http-errors: ""
+    {{- end }}
+  {{- range $key, $value := merge .Values.ingress.annotations .Values.global.ingress.annotations }}
+    {{ $key }}: {{ $value | quote }}
+  {{- end }}
+spec:
+  {{ include "ingress.class.field" $ingressCfg }}
+  rules:
+    - host: {{ $kasHostname }}
+      http:
+        paths:
+          - path: "{{ trimSuffix "/" $.Values.ingress.workspacesServerApiPath }}{{ $.Values.global.ingress.path }}"
+            {{- include "gitlab.ingress.pathBackend" (dict "serviceName" (include "kas.workspaces.serviceName" .) "servicePort" .Values.service.workspacesServerPort "pathType" (default "Prefix" $.Values.global.ingress.pathType)) | nindent 12 }}
+  {{- if (and $kasTlsSecret (eq (include "gitlab.ingress.tls.enabled" $) "true" )) }}
+  tls:
+    - hosts:
+      - {{ $kasHostname }}
+      secretName: {{ $kasTlsSecret }}
+  {{- end }}
+{{- end -}}
+{{- end -}}

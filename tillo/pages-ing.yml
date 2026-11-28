@@ -1,0 +1,44 @@
+# Carves /snds-outage out of the `tillo` ingress's blanket LinkedIn redirect:
+# permanent-redirect is location-scoped, and nginx picks the longest prefix.
+# No cert-manager annotation on purpose: tillo-cert is already issued for
+# both hosts via the `tillo` ingress, and a second ingress-shim owner of the
+# same secret would fight it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tillo-pages
+  namespace: tillo
+  annotations:
+    # Backends see plain http and leave Secure off their cookies; every host here is
+    # HTTPS-only, so the edge adds it (edge-dast, infra-7rog.31.12).
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_cookie_flags ~ secure;
+    nginx.ingress.kubernetes.io/modsecurity-transaction-id: "$request_id"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tillo.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: tillo-pages
+                port:
+                  number: 80
+            path: /snds-outage
+            pathType: Prefix
+    - host: www.tillo.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: tillo-pages
+                port:
+                  number: 80
+            path: /snds-outage
+            pathType: Prefix
+  tls:
+    - hosts:
+      - tillo.ch
+      - www.tillo.ch
+      secretName: tillo-cert

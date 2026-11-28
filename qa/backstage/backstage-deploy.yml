@@ -1,0 +1,191 @@
+## QA Backstage with the IAST tracer ON (infra-7rog.41 wave 1), plus `backstage-off`:
+## the same image and settings with DD_IAST_ENABLED unset, which is what prod runs --
+## the control for the overhead measurement (same requests against both Services).
+## Not a copy of prod's Deployment: prod's carries Postgres, GitLab, Keycloak,
+## DefectDojo, OpenObserve and Windmill credentials, none of which may reach this cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backstage
+  namespace: backstage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backstage
+  template:
+    metadata:
+      labels:
+        app: backstage
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: backstage
+          image: zot.mdapi.ch/mdapi/backstage:latest@sha256:9192f432547cfac941101e452dba524f1ee00693923594e4b4f47ff10a0974fe
+          imagePullPolicy: IfNotPresent
+          ## base config + the QA overlay; NOT app-config.production.yaml (prod hosts)
+          args: [node, packages/backend, --config, app-config.yaml, --config, /qa/app-config.qa.yaml]
+          ports:
+            - name: http
+              containerPort: 7007
+          env:
+            ## a fixed dummy so the base config's ${GITLAB_TOKEN} parses; opens nothing
+            - name: GITLAB_TOKEN
+              value: qa-not-a-token
+            - name: NODE_OPTIONS
+              value: --no-node-snapshot --max-old-space-size=1024
+            ## --- IAST ------------------------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            ## every request analysed: QA traffic is the scan, not a sample of it
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: http://iast-sink.iast.svc:8126
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            ## no dogstatsd: the sink speaks traces only
+            - name: DD_RUNTIME_METRICS_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: backstage
+            - name: DD_ENV
+              value: qa
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          startupProbe:
+            httpGet: {path: /.backstage/health/v1/readiness, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /.backstage/health/v1/readiness, port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: qa, mountPath: /qa}
+            - {name: tmp, mountPath: /tmp}
+            - {name: techdocs, mountPath: /var/lib/techdocs}
+      volumes:
+        - name: qa
+          configMap:
+            name: backstage-qa
+        - name: tmp
+          emptyDir: {}
+        - name: techdocs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backstage
+  namespace: backstage
+spec:
+  selector:
+    app: backstage
+  ports:
+    - port: 7007
+      targetPort: 7007
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backstage-off
+  namespace: backstage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backstage-off
+  template:
+    metadata:
+      labels:
+        app: backstage-off
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: backstage
+          image: zot.mdapi.ch/mdapi/backstage:latest@sha256:9192f432547cfac941101e452dba524f1ee00693923594e4b4f47ff10a0974fe
+          imagePullPolicy: IfNotPresent
+          ## base config + the QA overlay; NOT app-config.production.yaml (prod hosts)
+          args: [node, packages/backend, --config, app-config.yaml, --config, /qa/app-config.qa.yaml]
+          ports:
+            - name: http
+              containerPort: 7007
+          env:
+            ## a fixed dummy so the base config's ${GITLAB_TOKEN} parses; opens nothing
+            - name: GITLAB_TOKEN
+              value: qa-not-a-token
+            - name: NODE_OPTIONS
+              value: --no-node-snapshot --max-old-space-size=1024
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          startupProbe:
+            httpGet: {path: /.backstage/health/v1/readiness, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /.backstage/health/v1/readiness, port: http}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: qa, mountPath: /qa}
+            - {name: tmp, mountPath: /tmp}
+            - {name: techdocs, mountPath: /var/lib/techdocs}
+      volumes:
+        - name: qa
+          configMap:
+            name: backstage-qa
+        - name: tmp
+          emptyDir: {}
+        - name: techdocs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backstage-off
+  namespace: backstage
+spec:
+  selector:
+    app: backstage-off
+  ports:
+    - port: 7007
+      targetPort: 7007

@@ -1,0 +1,22 @@
+## iast-sink — keeps the IAST findings of the open-source dd-trace tracers
+## (epic infra-7rog.41). Tracers send Datadog-protocol traces here instead of
+## to any Datadog backend; the sink serves the deduplicated findings as SARIF
+## for DefectDojo and forwards every span to the OpenObserve otel-collector.
+## Source: gitlab.mdapi.ch/mdapi/iast-sink.
+defaultNamespace: iast
+namespace: iast
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  ## Every pod this namespace runs passes `restricted` (non-root, no caps,
+  ## seccomp RuntimeDefault). Warn+audit only; never enforce without a test.
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+## Deliberately NO dependsOn on mdapi-prod-zot-pull-secrets although the pull
+## Secret comes from there: that bundle cannot create its ExternalSecret until
+## this bundle has created the namespace (same reasoning as bussola/fleet.yml).
+## On the first deploy the pod sits in ImagePullBackOff for one reconcile.
+helm:
+  maxHistory: 25

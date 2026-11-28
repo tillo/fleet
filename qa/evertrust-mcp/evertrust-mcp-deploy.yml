@@ -1,0 +1,174 @@
+## QA copies of horizon-mcp and stream-mcp with the IAST tracer ON (infra-7rog.41.11).
+## Prod's run as root in the pod (nginx + start.sh's envsubst into /etc/nginx), so no
+## runAsNonRoot here either, and nginx keeps the runtime's default capabilities (it switches
+## to its worker user). No `-off` twins: the
+## question for these two is what the tracer SEES, not what it costs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: horizon-mcp
+  namespace: evertrust-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: horizon-mcp
+  template:
+    metadata:
+      labels:
+        app: horizon-mcp
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: horizon-mcp
+          image: zot.mdapi.ch/mdapi/horizon-mcp:latest@sha256:6037839b3cf67cb786a92810e7a210d303bff9aa1dacfd5a2e10a24b94f5135e
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: MCP_BEARER_TOKEN}
+            ## the QA Horizon (qa/horizon), never prod's
+            - name: HORIZON_URL
+              value: http://horizon.horizon.svc.cluster.local:9000
+            - name: HORIZON_API_ID
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: HORIZON_API_ID}
+            - name: HORIZON_API_KEY
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: HORIZON_API_KEY}
+            - name: HORIZON_ENABLED_TOOLSETS
+              value: lifecycle,profiles,dashboards,discovery,reports,triggers,docs,assist,config,acme
+            ## --- IAST ------------------------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: http://iast-sink.iast.svc:8126
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            - name: DD_RUNTIME_METRICS_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: horizon-mcp
+            - name: DD_ENV
+              value: qa
+          securityContext:
+            allowPrivilegeEscalation: false
+          startupProbe:
+            tcpSocket: {port: 8080}
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket: {port: 8080}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: horizon-mcp
+  namespace: evertrust-mcp
+spec:
+  selector:
+    app: horizon-mcp
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-mcp
+  namespace: evertrust-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stream-mcp
+  template:
+    metadata:
+      labels:
+        app: stream-mcp
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: stream-mcp
+          image: zot.mdapi.ch/mdapi/stream-mcp:latest@sha256:a395150fc70af953a906a000de9632d8f3e793855cb9066461045216e25c8783
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - name: MCP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: MCP_BEARER_TOKEN}
+            ## the QA Horizon (qa/horizon), never prod's
+            ## and NOT a Stream: QA has no Stream server (see fleet.yaml)
+            - name: STREAM_URL
+              value: http://horizon.horizon.svc.cluster.local:9000
+            - name: STREAM_API_ID
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: STREAM_API_ID}
+            - name: STREAM_API_IDPROV
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: STREAM_API_IDPROV}
+            - name: STREAM_API_KEY
+              valueFrom:
+                secretKeyRef: {name: horizon-mcp-qa, key: STREAM_API_KEY}
+            ## --- IAST ------------------------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: http://iast-sink.iast.svc:8126
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            - name: DD_RUNTIME_METRICS_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: stream-mcp
+            - name: DD_ENV
+              value: qa
+          securityContext:
+            allowPrivilegeEscalation: false
+          startupProbe:
+            tcpSocket: {port: 8080}
+            failureThreshold: 40
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket: {port: 8080}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stream-mcp
+  namespace: evertrust-mcp
+spec:
+  selector:
+    app: stream-mcp
+  ports:
+    - {name: http, port: 8080, targetPort: http}

@@ -1,0 +1,67 @@
+## The plan the spa-dast-keycloak CronJob runs (see keycloak-deploy.yml). Kept as a
+## ConfigMap so it is reviewable in git and re-read by the daemon, not embedded in args.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spa-dast-keycloak-plan
+  namespace: keycloak
+data:
+  kc-plan.yml: |
+    ## keycloak account console (realm qa-test) -- a React SPA. Browser-based
+    ## authentication (authhelper `browser`, headless Firefox shipped in the zap image),
+    ## classic spider + AJAX spider + active scan, then the report. infra-7rog.31.24.
+    env:
+      contexts:
+        - name: kc
+          urls: ["http://keycloak:8080"]
+          includePaths: ["http://keycloak:8080/realms/qa-test/account.*"]
+          authentication:
+            method: browser
+            parameters:
+              loginPageUrl: "http://keycloak:8080/realms/qa-test/account/"
+              loginPageWait: 5
+              browserId: firefox-headless
+            verification:
+              method: response
+              loggedInRegex: "\\Q/realms/qa-test/account/\\E"
+              loggedOutRegex: "\\Q/realms/qa-test/protocol/openid-connect/auth\\E"
+          sessionManagement:
+            method: cookie
+          users:
+            - name: qa-tester
+              credentials:
+                username: qa-tester
+                password: "${QA_TESTER_PASSWORD}"
+      parameters:
+        failOnError: true
+        failOnWarning: false
+        progressToStdout: true
+    jobs:
+      - type: spider
+        parameters:
+          context: kc
+          user: qa-tester
+          url: "http://keycloak:8080/realms/qa-test/account/"
+          maxDuration: 3
+      - type: spiderAjax
+        parameters:
+          context: kc
+          user: qa-tester
+          url: "http://keycloak:8080/realms/qa-test/account/"
+          browserId: firefox-headless
+          numberOfBrowsers: 2
+          maxDuration: 8
+      - type: passiveScan-wait
+        parameters: {maxDuration: 3}
+      - type: activeScan
+        parameters:
+          context: kc
+          user: qa-tester
+          recurse: true
+          maxRuleDurationInMins: 2
+          maxScanDurationInMins: 20
+      - type: report
+        parameters:
+          template: traditional-json-plus
+          reportDir: /zap/wrk
+          reportFile: kc.json

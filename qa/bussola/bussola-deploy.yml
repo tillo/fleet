@@ -1,0 +1,184 @@
+## QA Bussola with the IAST tracer ON (infra-7rog.41.2). Same image as prod
+## (bussola/bussola-deploy.yml, pinned by tag+digest; the tracer is installed in
+## every image but starts only with DD_IAST_ENABLED=true). Not a copy of the prod
+## Deployment: prod's carries the identity provider, mail, Pushover and litellm
+## Secrets, none of which may reach this cluster. Unset, each of those features
+## degrades to its built-in fallback (fixed texts, no notifications, no directory).
+##
+## Identity: as in prod, only the oauth2-proxy headers (X-Auth-Request-*) name the
+## caller. Here there is no proxy: the QA traffic sends a made-up identity itself,
+## which is the point -- it drives the code paths a logged-in person reaches.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bussola
+  namespace: bussola
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bussola
+  template:
+    metadata:
+      labels:
+        app: bussola
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: bussola
+          image: zot.mdapi.ch/mdapi/bussola:1.0.0-mdapi.731@sha256:503bca6d847d8b74c36e986b9df9319a923d667bc00dd79967e6289a06088a43
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: BUSSOLA_DATABASE_URL
+              value: postgresql://bussola@bussola-pg:5432/bussola
+            - name: BUSSOLA_TRUST_PROXY_HEADERS
+              value: "true"
+            - name: BUSSOLA_TZ
+              value: Europe/Zurich
+            - name: BUSSOLA_ORIGINI
+              value: http://bussola.bussola.svc:8080,http://bussola:8080,http://bussola-off:8080
+            ## --- IAST (the pilot) ---------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            ## every request analysed: QA traffic is the scan, not a sample of it
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: http://iast-sink.iast.svc:8126
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: bussola
+            - name: DD_ENV
+              value: qa
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /health/db, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bussola
+  namespace: bussola
+spec:
+  selector:
+    app: bussola
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+## The control for the overhead measurement: the SAME image and settings with the
+## tracer OFF (no DD_* variable, so app/avvio.py runs plain uvicorn -- exactly what
+## prod runs). Measure on vs off with the same requests against both Services.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bussola-off
+  namespace: bussola
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bussola-off
+  template:
+    metadata:
+      labels:
+        app: bussola-off
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: bussola
+          image: zot.mdapi.ch/mdapi/bussola:1.0.0-mdapi.731@sha256:503bca6d847d8b74c36e986b9df9319a923d667bc00dd79967e6289a06088a43
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: BUSSOLA_DATABASE_URL
+              value: postgresql://bussola@bussola-pg:5432/bussola
+            - name: BUSSOLA_TRUST_PROXY_HEADERS
+              value: "true"
+            - name: BUSSOLA_TZ
+              value: Europe/Zurich
+            - name: BUSSOLA_ORIGINI
+              value: http://bussola.bussola.svc:8080,http://bussola:8080,http://bussola-off:8080
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /health/db, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bussola-off
+  namespace: bussola
+spec:
+  selector:
+    app: bussola-off
+  ports:
+    - port: 8080
+      targetPort: 8080

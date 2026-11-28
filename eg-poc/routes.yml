@@ -1,0 +1,253 @@
+## Routes and policies, one host per test-matrix row (see fleet.yaml). The same
+## hosts as kgw-poc under *.eg.mdapi.ch. Portable Gateway API where it can do
+## the job (redirect, header edits); Envoy Gateway policies only where the
+## standard has no field.
+
+## ---- every http:// request → https:// (nginx's ssl-redirect) -------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: https-redirect
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: http
+  hostnames: ["*.eg.mdapi.ch"]
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+---
+## ---- plain: TLS termination only --------------------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: plain
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["plain.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+## ---- hdr: nginx more_clear_input_headers / proxy_set_header, standard API ---
+## The header name stays X-Kgw-Poc: the matrix row checks that exact name.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hdr
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["hdr.eg.mdapi.ch"]
+  rules:
+    - filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove: ["X-Strip-Me"]
+            add:
+              - name: X-Kgw-Poc
+                value: hdr
+      backendRefs:
+        - name: echo
+          port: 8080
+---
+## ---- sso: oauth2-proxy-admin as ext_authz (nginx auth-url) -----------------
+## pathOverride sends every check to exactly /admin/oauth2/auth — the field
+## kgateway lacks (it APPENDS the original path to its prefix, hence the
+## `?kgw=` workaround in kgateway-poc/routes.yml).
+## No auth-signin equivalent here either: a logged-out client gets the bare 401.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sso
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["sso.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: sso
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: sso
+  extAuth:
+    http:
+      backendRefs:
+        - name: oauth2-proxy-admin
+          namespace: oauth2-proxy
+          port: 80
+      pathOverride: /admin/oauth2/auth
+      ## nginx auth-response-headers: identity to the app on success.
+      headersToBackend:
+        - x-auth-request-user
+        - x-auth-request-email
+        - x-auth-request-preferred-username
+---
+## The SecurityPolicy's backendRef crosses namespaces, so it needs a grant.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: eg-poc-extauth
+  namespace: oauth2-proxy
+spec:
+  from:
+    - group: gateway.envoyproxy.io
+      kind: SecurityPolicy
+      namespace: eg-poc
+  to:
+    - group: ""
+      kind: Service
+      name: oauth2-proxy-admin
+---
+## ---- acl: nginx whitelist-source-range --------------------------------------
+## Pod CIDR only, so the jump seat (a pod) passes and any LAN host is refused.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: acl
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["acl.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: acl
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: acl
+  authorization:
+    defaultAction: Deny
+    rules:
+      - name: cluster-pods
+        action: Allow
+        principal:
+          clientCIDRs: ["10.52.0.0/16"]
+---
+## ---- limits: nginx proxy-body-size + limit-rpm ------------------------------
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: limits
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["limits.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: limits
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: limits
+  ## Merge into the Gateway-wide eg-buffers policy (gateway.yml) instead of
+  ## replacing it, so this route keeps the 1 MiB upstream buffer.
+  mergeType: StrategicMerge
+  ## The buffer filter: 413 above 1 MiB. EnvoyProxy.filterOrder puts it ahead
+  ## of the WAF.
+  requestBuffer:
+    limit: 1Mi
+  rateLimit:
+    type: Local
+    local:
+      rules:
+        - limit:
+            requests: 5
+            unit: Minute
+---
+## ---- ws: websocket upgrade ---------------------------------------------------
+## Envoy Gateway accepts websocket upgrades on every route by default; no
+## policy is needed (kgateway needed TrafficPolicy.httpUpgrade).
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ws
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["ws.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+## ---- rum: append a script tag to the response body (nginx's RUM injection) ----
+## Envoy Gateway's direct equivalent of nginx's Lua: the Envoy Lua filter.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: rum
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["rum.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: rum
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: rum
+  lua:
+    - type: Inline
+      inline: |
+        function envoy_on_response(response_handle)
+          local body = response_handle:body()
+          if body ~= nil then
+            local b = body:getBytes(0, body:length())
+            body:setBytes(b .. '<script src="/rum-test.js" data-rum="eg"></script>')
+          end
+        end

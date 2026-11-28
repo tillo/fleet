@@ -1,0 +1,27 @@
+# kgateway CRDs (gateway.kgateway.dev: GatewayParameters, TrafficPolicy,
+# GatewayExtension, ListenerPolicy, Backend, BackendConfigPolicy, DirectResponse).
+# Own bundle so the controller bundle can dependsOn it: a CRD and its first CR in
+# one Helm release race on a fresh install.
+#
+# PoC of an Envoy-based edge beside ingress-nginx (bead infra-qwet.1, LAN-only).
+#
+# ⛔ Gateway API itself (v1.5.1 standard) is OWNED by the RKE2 Helm release
+# rke2-traefik-crd. This chart ships no Gateway API CRDs (only the 7 above,
+# verified at v2.5.2 in install/helm/kgateway-crds/templates/), so there is
+# nothing to collide with — never add a second Gateway API installer here.
+# kgateway v2.5.2 runs nightly e2e against Gateway API v1.5.1 standard.
+defaultNamespace: kgateway-system
+## First bundle to create the namespace: Fleet stamps namespaceLabels only at
+## creation, so the full set lives here too.
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25
+  releaseName: kgateway-crds
+  chart: oci://cr.kgateway.dev/kgateway-dev/charts/kgateway-crds
+  version: v2.5.2

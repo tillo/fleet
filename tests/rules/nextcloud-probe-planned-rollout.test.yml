@@ -1,0 +1,94 @@
+# Nextcloud AIO status.php SyntheticProbeFailing: silent for 10 min after a NEW
+# nextcloud-aio-nextcloud ReplicaSet in the probe's own namespace (infra-o2iln).
+# Every AIO pod-template change (Renovate chart bump: 15.1.0 on 2026-11-22 15:37Z,
+# 15.1.1 at 19:35Z) recreates every AIO Deployment at once (Recreate, RWO) and
+# status.php answers 503/502 for 4-10 min while Nextcloud boots and upgrades.
+# Keyed on the ReplicaSet, not the pod: a node drain or NotReady moves the pod
+# under the SAME ReplicaSet, and by user decision (2026-11-22, infra-r9mzd.80)
+# unplanned node loss keeps paging. Scoped per tenant: envuassu <-> cloud.envuassu.ch,
+# nextcloud <-> cloud.mdapi.ch.
+# Clock origin is 2000-01-01: 946685400 = created at t=10m; 900000000 = long ago.
+rule_files:
+- monitoring-rules/11-blackbox-alerts.yml
+evaluation_interval: 30s
+tests:
+- name: rollout-muted-other-tenant-still-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Files & Documents",team="mdapi",job="files",instance="https://cloud.envuassu.ch/status.php"}
+    values: 1x19 0x19 1x40
+  - series: probe_success{component="Files & Documents",team="mdapi",job="files",instance="https://cloud.mdapi.ch/status.php"}
+    values: 1x19 0x19 1x40
+  - series: kube_replicaset_created{namespace="envuassu",replicaset="nextcloud-aio-nextcloud-new"}
+    values: 946685400x80
+  - series: kube_replicaset_created{namespace="nextcloud",replicaset="nextcloud-aio-nextcloud-old"}
+    values: 900000000x80
+  alert_rule_test:
+  - eval_time: 21m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels:
+        component: Files & Documents
+        team: mdapi
+        job: files
+        instance: https://cloud.mdapi.ch/status.php
+        service: https://cloud.mdapi.ch/status.php
+        severity: critical
+        statuspage: include
+      exp_annotations:
+        summary: 'Files & Documents: probe https://cloud.mdapi.ch/status.php failing'
+        description: "Blackbox probe `https://cloud.mdapi.ch/status.php` (module: )\nhas had <80% success\
+          \ over the last 5m for >8m.\nComponent Files & Documents on statuspage will go to major_outage.\n\
+          Investigate from a workstation:\n  curl -v https://cloud.mdapi.ch/status.php    (for HTTP\
+          \ probes)\n  dig @https://cloud.mdapi.ch/status.php mdapi.ch  (for DNS)\n"
+  - eval_time: 27m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts: []
+- name: node-move-same-replicaset-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Files & Documents",team="mdapi",job="files",instance="https://cloud.envuassu.ch/status.php"}
+    values: 1x19 0x19 1x40
+  - series: kube_replicaset_created{namespace="envuassu",replicaset="nextcloud-aio-nextcloud-old"}
+    values: 900000000x80
+  - series: kube_pod_created{namespace="envuassu",pod="nextcloud-aio-nextcloud-old-moved"}
+    values: 946685400x80
+  alert_rule_test:
+  - eval_time: 21m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels: &envuassu
+        component: Files & Documents
+        team: mdapi
+        job: files
+        instance: https://cloud.envuassu.ch/status.php
+        service: https://cloud.envuassu.ch/status.php
+        severity: critical
+        statuspage: include
+      exp_annotations: &envuassu_ann
+        summary: 'Files & Documents: probe https://cloud.envuassu.ch/status.php failing'
+        description: "Blackbox probe `https://cloud.envuassu.ch/status.php` (module: )\nhas had <80% success\
+          \ over the last 5m for >8m.\nComponent Files & Documents on statuspage will go to major_outage.\n\
+          Investigate from a workstation:\n  curl -v https://cloud.envuassu.ch/status.php    (for HTTP\
+          \ probes)\n  dig @https://cloud.envuassu.ch/status.php mdapi.ch  (for DNS)\n"
+- name: long-failure-after-rollout-pages
+  interval: 30s
+  input_series:
+  - series: probe_success{component="Files & Documents",team="mdapi",job="files",instance="https://cloud.envuassu.ch/status.php"}
+    values: 1x19 0x60
+  - series: kube_replicaset_created{namespace="envuassu",replicaset="nextcloud-aio-nextcloud-new"}
+    values: 946685400x80
+  alert_rule_test:
+  - eval_time: 21m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: app-blackbox.synthetic
+    alertname: SyntheticProbeFailing
+    exp_alerts:
+    - exp_labels: *envuassu
+      exp_annotations: *envuassu_ann

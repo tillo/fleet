@@ -1,0 +1,105 @@
+## QA paperless's fence: the app reaches DNS, its throwaway Valkey and the IAST sink, and
+## nothing else -- no Datadog intake, no internet, no vendor RPS (proof in the bead).
+## Ingress: only the QA traffic pods (seed + ZAP, label mdapi.ch/qa-traffic).
+## Valkey is reachable from the app alone, which is what makes no password safe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: paperless-kustodyan
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: paperless
+  namespace: paperless-kustodyan
+spec:
+  ## both the instrumented app and its tracer-off control (paperless-off)
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [paperless, paperless-off]}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              mdapi.ch/qa-traffic: "true"
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels:
+              app: paperless-qa-valkey
+      ports:
+        - {protocol: TCP, port: 6379}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iast
+          podSelector:
+            matchLabels:
+              app: iast-sink
+      ports:
+        - {protocol: TCP, port: 8126}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: paperless-qa-valkey
+  namespace: paperless-kustodyan
+spec:
+  podSelector:
+    matchLabels:
+      app: paperless-qa-valkey
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [paperless, paperless-off]}
+      ports:
+        - {protocol: TCP, port: 6379}
+---
+## The QA traffic (seed requests, ZAP active scan): DNS and the app, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: qa-traffic
+  namespace: paperless-kustodyan
+spec:
+  podSelector:
+    matchLabels:
+      mdapi.ch/qa-traffic: "true"
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [paperless, paperless-off]}
+      ports:
+        - {protocol: TCP, port: 8000}

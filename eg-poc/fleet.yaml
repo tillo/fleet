@@ -1,0 +1,33 @@
+# Envoy Gateway PoC (bead infra-qwet.1): the side-by-side of kgateway-poc/,
+# one Gateway on its own LAN VIP beside the production ingress-nginx edge.
+#
+#   *.eg.mdapi.ch  →  192.168.1.67 (MetalLB prod-pool, L2)  →  Envoy (Envoy Gateway)
+#
+# ⛔ LAN-ONLY by construction: no router DNAT points at .67, and the name is a
+# split-horizon override only (split-horizon/unbound-cm.yml). Publicly
+# *.eg.mdapi.ch falls to the *.mdapi.ch wildcard → nginx, whose default-deny
+# Host allowlist refuses it.
+#
+# The SAME rows as kgw-poc, run by ~/kgw-poc/matrix.sh with DOM=eg.mdapi.ch
+# VIP=192.168.1.67:
+#   plain   TLS termination + http→https redirect   (standard Gateway API)
+#   hdr     strip/add request headers                (standard RequestHeaderModifier)
+#   sso     oauth2-proxy-admin via ext_authz         (SecurityPolicy.extAuth)
+#   acl     source-CIDR allowlist                    (SecurityPolicy.authorization)
+#   limits  body-size cap + local rate limit         (BackendTrafficPolicy)
+#   ws      websocket upgrade                        (Envoy Gateway default)
+#   waf / wafoff / wafexc   Coraza + OWASP CRS IN the Envoy process
+#                           (EnvoyExtensionPolicy.wasm, coraza-proxy-wasm)
+#
+# Raw bundle: a helm bundle would silently drop these manifests.
+defaultNamespace: eg-poc
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  ## The gateway.envoyproxy.io CRDs and the controller that serves the class.
+  - name: mdapi-prod-envoy-gateway

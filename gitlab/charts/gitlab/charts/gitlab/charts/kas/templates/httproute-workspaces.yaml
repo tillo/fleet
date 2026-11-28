@@ -1,0 +1,75 @@
+{{- if eq "true" (include "gitlab.gatewayApi.route.enabled" .) -}}
+{{- if .Values.global.workspaces.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ template "fullname" . }}-workspaces
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" $ | nindent 4 }}
+    {{- include "gitlab.commonLabels" $ | nindent 4 }}
+  annotations:
+    {{ .Values.gatewayRoute.annotations | toYaml | nindent 4 }}
+spec:
+  parentRefs:
+  {{- include "gitlab.gatewayApi.gatewayRef.section" (dict "context" . "sectionName" .Values.gatewayRoute.workspacesSectionName) | nindent 4 }}
+  hostnames:
+    - {{ include "gitlab.workspaces.wildcardHostname" . | quote }}
+  rules:
+  - backendRefs:
+    - kind: Service
+      name: {{ template "kas.workspaces.serviceName" . }}
+      port: {{ .Values.service.workspacesServerPort }}
+      weight: 1
+    {{- with (include "gitlab.gatewayApi.routeFilters" (dict "filters" .Values.gatewayRoute.filters "context" $)) }}
+    filters:
+      {{- . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.gatewayRoute.timeouts }}
+    timeouts:
+      {{- . | toYaml | nindent 6 }}
+    {{- end }}
+    {{- /* Workspaces are served on all paths of their hosts, like in the workspaces Ingress. */}}
+    matches:
+    - path:
+        type: PathPrefix
+        value: "/"
+---
+{{/*
+The workspaces server API on the KAS host. It is a separate HTTPRoute so that the gitlab-kas
+BackendTrafficPolicy (useClientProtocol: true) does not force h2c onto the HTTP/1.1 workspaces server,
+see httproute-k8s-proxy.yaml.
+*/}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ template "fullname" . }}-workspaces-api
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "gitlab.standardLabels" $ | nindent 4 }}
+    {{- include "gitlab.commonLabels" $ | nindent 4 }}
+  annotations:
+    {{ .Values.gatewayRoute.annotations | toYaml | nindent 4 }}
+spec:
+  parentRefs:
+  {{- include "gitlab.gatewayApi.gatewayRef" . | nindent 4 }}
+  hostnames:
+    - {{ include "gitlab.kas.hostname" . | quote }}
+  rules:
+  - backendRefs:
+    - kind: Service
+      name: {{ template "kas.workspaces.serviceName" . }}
+      port: {{ .Values.service.workspacesServerPort }}
+      weight: 1
+    {{- with (include "gitlab.gatewayApi.routeFilters" (dict "filters" .Values.gatewayRoute.filters "context" $)) }}
+    filters:
+      {{- . | nindent 6 }}
+    {{- end }}
+    matches:
+    - path:
+        type: PathPrefix
+        value: {{ .Values.ingress.workspacesServerApiPath | quote }}
+    timeouts:
+      request: 0s
+{{- end }}
+{{- end }}

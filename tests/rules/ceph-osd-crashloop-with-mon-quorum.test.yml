@@ -1,0 +1,146 @@
+# CephOSDCrashLoopWithMonQuorum (infra-8f4.64): an OSD down with its osd container
+# restarting while a mon quorum exists = the stale-cephx-key trap of 2026-11-21
+# (osd.14/17/19) that f/heal/rook_osd_stale_cephx could not fix. Shapes replayed from
+# VictoriaMetrics: the crashlooping OSDs restart ~2 per 15 min; the other OSDs down in
+# the outage did not restart; quorum was 2/3 until 13:46, which IS a quorum
+# (infra-8f4.64.1): the alert must fire on it, and stay silent on 1/3.
+rule_files:
+- monitoring-rules/30c-ceph-osd-crashloop.yml
+evaluation_interval: 1m
+tests:
+- name: stale-key-crashloop-with-full-quorum-fires
+  interval: 1m
+  input_series:
+  - series: ceph_mon_metadata{ceph_daemon="mon.q"}
+    values: '1x60'
+  - series: ceph_mon_metadata{ceph_daemon="mon.v"}
+    values: '1x60'
+  - series: ceph_mon_metadata{ceph_daemon="mon.w"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.q"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.v"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.w"}
+    values: '1x60'
+  # osd.17: down and restarting every 5 min -> fires
+  - series: ceph_osd_up{ceph_daemon="osd.17",instance="10.52.0.74:9283"}
+    values: '0x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-17-677dfcdb8d-bsp4d",container="osd"}
+    values: '0+0.2x60'
+  # its log-collector sidecar restarting must not count
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-17-677dfcdb8d-bsp4d",container="log-collector"}
+    values: '0+0.2x60'
+  # osd.5: down but NOT restarting (host or device down) -> silent here
+  - series: ceph_osd_up{ceph_daemon="osd.5",instance="10.52.0.74:9283"}
+    values: '0x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-5-599f974c44-nsrd7",container="osd"}
+    values: '1x60'
+  # osd.1: restarting but UP (it recovers between restarts) -> silent
+  - series: ceph_osd_up{ceph_daemon="osd.1",instance="10.52.0.74:9283"}
+    values: '1x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-1-5994854ccf-9c8b5",container="osd"}
+    values: '0+0.2x60'
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-ceph-osd-crashloop
+    alertname: CephOSDCrashLoopWithMonQuorum
+    exp_alerts: []
+  - eval_time: 50m
+    groupname: app-ceph-osd-crashloop
+    alertname: CephOSDCrashLoopWithMonQuorum
+    exp_alerts:
+    - exp_labels:
+        ceph_daemon: osd.17
+        service: ceph
+        namespace: rook-ceph
+        severity: warning
+        component: Storage
+        team: mdapi
+      exp_annotations:
+        summary: 'Ceph osd.17 is down and crashlooping while a mon quorum exists'
+        description: |
+          osd.17 has been down for 30 min, its osd container restarting, although a mon quorum exists (a majority of the mons is in quorum).
+          Most likely cause after a mon outage: the pod's cephx-keyring-update init container ran while the mons were unreachable and kept a STALE cephx key; the log shows `handle_auth_bad_method ... (13) Permission denied`. f/heal/rook_osd_stale_cephx should have deleted the pod: read its last job log (skip reason, or gave up) and the rook_osd_stale_cephx_* gauges.
+          Check: kubectl -n rook-ceph logs <pod> -c osd --previous | grep handle_auth_bad_method. If present: kubectl -n rook-ceph delete pod <pod> (the POD, never the Deployment); a container restart does not re-run init.
+          If absent, the crashloop has another cause (bluestore, device, OOM): read the log; this is not the stale-key trap.
+- name: stale-key-crashloop-with-two-of-three-mons-fires  # 2026-11-21 13:32
+  interval: 1m
+  input_series:
+  - series: ceph_mon_metadata{ceph_daemon="mon.q"}
+    values: '1x60'
+  - series: ceph_mon_metadata{ceph_daemon="mon.v"}
+    values: '1x60'
+  - series: ceph_mon_metadata{ceph_daemon="mon.w"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.q"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.v"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.w"}
+    values: '0x60'
+  # osd.17: down and restarting every 5 min -> fires
+  - series: ceph_osd_up{ceph_daemon="osd.17",instance="10.52.0.74:9283"}
+    values: '0x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-17-677dfcdb8d-bsp4d",container="osd"}
+    values: '0+0.2x60'
+  # its log-collector sidecar restarting must not count
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-17-677dfcdb8d-bsp4d",container="log-collector"}
+    values: '0+0.2x60'
+  # osd.5: down but NOT restarting (host or device down) -> silent here
+  - series: ceph_osd_up{ceph_daemon="osd.5",instance="10.52.0.74:9283"}
+    values: '0x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-5-599f974c44-nsrd7",container="osd"}
+    values: '1x60'
+  # osd.1: restarting but UP (it recovers between restarts) -> silent
+  - series: ceph_osd_up{ceph_daemon="osd.1",instance="10.52.0.74:9283"}
+    values: '1x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-1-5994854ccf-9c8b5",container="osd"}
+    values: '0+0.2x60'
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-ceph-osd-crashloop
+    alertname: CephOSDCrashLoopWithMonQuorum
+    exp_alerts: []
+  - eval_time: 50m
+    groupname: app-ceph-osd-crashloop
+    alertname: CephOSDCrashLoopWithMonQuorum
+    exp_alerts:
+    - exp_labels:
+        ceph_daemon: osd.17
+        service: ceph
+        namespace: rook-ceph
+        severity: warning
+        component: Storage
+        team: mdapi
+      exp_annotations:
+        summary: 'Ceph osd.17 is down and crashlooping while a mon quorum exists'
+        description: |
+          osd.17 has been down for 30 min, its osd container restarting, although a mon quorum exists (a majority of the mons is in quorum).
+          Most likely cause after a mon outage: the pod's cephx-keyring-update init container ran while the mons were unreachable and kept a STALE cephx key; the log shows `handle_auth_bad_method ... (13) Permission denied`. f/heal/rook_osd_stale_cephx should have deleted the pod: read its last job log (skip reason, or gave up) and the rook_osd_stale_cephx_* gauges.
+          Check: kubectl -n rook-ceph logs <pod> -c osd --previous | grep handle_auth_bad_method. If present: kubectl -n rook-ceph delete pod <pod> (the POD, never the Deployment); a container restart does not re-run init.
+          If absent, the crashloop has another cause (bluestore, device, OOM): read the log; this is not the stale-key trap.
+- name: no-mon-quorum-one-of-three-stays-silent
+  interval: 1m
+  input_series:
+  - series: ceph_mon_metadata{ceph_daemon="mon.q"}
+    values: '1x60'
+  - series: ceph_mon_metadata{ceph_daemon="mon.v"}
+    values: '1x60'
+  - series: ceph_mon_metadata{ceph_daemon="mon.w"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.q"}
+    values: '1x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.v"}
+    values: '0x60'
+  - series: ceph_mon_quorum_status{ceph_daemon="mon.w"}
+    values: '0x60'
+  - series: ceph_osd_up{ceph_daemon="osd.14",instance="10.52.0.74:9283"}
+    values: '0x60'
+  - series: kube_pod_container_status_restarts_total{namespace="rook-ceph",pod="rook-ceph-osd-14-74d7847889-588mn",container="osd"}
+    values: '0+0.2x60'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-ceph-osd-crashloop
+    alertname: CephOSDCrashLoopWithMonQuorum
+    exp_alerts: []

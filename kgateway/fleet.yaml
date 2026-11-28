@@ -1,0 +1,48 @@
+# kgateway control plane (bead infra-qwet.1) — PoC of an Envoy-based edge
+# beside ingress-nginx, LAN-only. The controller creates GatewayClass `kgateway`
+# (controllerName kgateway.dev/kgateway) itself and deploys one Envoy
+# Deployment + Service per Gateway; the Gateway, routes and policies live in the
+# raw sibling bundle kgateway-poc/ (a helm bundle never applies loose manifests).
+#
+# Images come straight from cr.kgateway.dev (not on the zot allow-list), as
+# agentgateway's did.
+#
+# ⚠️ WAF: kgateway OSS has NO wasm field in any CRD at v2.5.2, so coraza-proxy-wasm
+# cannot be loaded; a WAF can only be an external gRPC ext_proc / ext_authz engine.
+# That is the open question this PoC answers against Envoy Gateway (infra-qwet).
+defaultNamespace: kgateway-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-kgateway-crds
+helm:
+  maxHistory: 25
+  releaseName: kgateway
+  chart: oci://cr.kgateway.dev/kgateway-dev/charts/kgateway
+  version: v2.5.2
+  values:
+    ## The chart renders NO securityContext by default; these make the
+    ## controller pod conform to the namespace's PSA `restricted` level.
+    podSecurityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+    controller:
+      replicaCount: 1
+      logLevel: info
+      resources:
+        requests:
+          cpu: 20m
+          memory: 128Mi
+        limits:
+          memory: 512Mi

@@ -1,0 +1,182 @@
+## Default-deny egress for every QA namespace, with the minimum carved out.
+##
+## infra-7rog.41.6, user decision 2026-11-23: no telemetry may leave this cluster to a
+## SaaS vendor, so `*.datadoghq.*` must be unreachable. The CNI is Calico **OSS**
+## (cloudspace spec.cni: calico), which has NO FQDN policy -- `domains` exists only in
+## Calico Enterprise/Cloud, and a CoreDNS-side block is bypassable by IP. So the deny is
+## the default: NOTHING egresses unless a rule below admits the exact destination, and no
+## rule admits a datadog host. Proof: a Pod's `curl https://http-intake.logs.datadoghq.com`
+## times out (bead notes carry the run).
+##
+## Allow list, deliberately short:
+##   - DNS to CoreDNS only (else names would not resolve and the deny proof would be a lie)
+##   - 443 to zot.mdapi.ch's public address only (the image registry; see qa/README.md)
+## Adding a QA workload that needs another destination ADDS a rule here, with the same
+## narrowness; it does not widen the default.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: qa-baseline
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: qa-synthetic-test
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: iast
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+## DNS: the one destination every pod needs, and the only one it gets for free.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: qa-baseline
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: qa-synthetic-test
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: iast
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+## zot.mdapi.ch resolves publicly to 31.3.128.50 (router -> prod ingress -> zot /v2,
+## htpasswd). The address is pinned rather than the name: a name-based egress rule needs
+## FQDN policy this CNI does not have. If the public address changes this rule moves with
+## it (dast/dast-exposure inventory tracks the path).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-zot-registry
+  namespace: qa-baseline
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 31.3.128.50/32
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+## Same registry allow, per namespace (a NetworkPolicy is namespace-scoped; see the
+## rationale above).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-zot-registry
+  namespace: qa-synthetic-test
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 31.3.128.50/32
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+## Same registry allow, per namespace (a NetworkPolicy is namespace-scoped; see the
+## rationale above).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-zot-registry
+  namespace: iast
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 31.3.128.50/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+## the iast-sink and the instrumented app talk to each other in-cluster only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-iast
+  namespace: iast
+spec:
+  podSelector: {}
+  policyTypes: [Egress, Ingress]
+  egress:
+    - to:
+        - podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}

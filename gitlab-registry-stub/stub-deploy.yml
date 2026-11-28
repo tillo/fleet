@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitlab-registry-stub
+  namespace: bootstrap
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gitlab-registry-stub
+  template:
+    metadata:
+      labels:
+        app: gitlab-registry-stub
+    spec:
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: gitlab-registry-stub
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: nginx
+        image: nginxinc/nginx-unprivileged:1.31-alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+          limits:
+            cpu: 200m
+            memory: 64Mi
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          periodSeconds: 20
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: site
+          mountPath: /etc/nginx/conf.d
+          readOnly: true
+      volumes:
+      - name: site
+        configMap:
+          name: gitlab-registry-stub
+          items:
+          - key: default.conf
+            path: default.conf

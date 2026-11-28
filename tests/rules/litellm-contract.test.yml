@@ -1,0 +1,199 @@
+# The litellm contract probe's alerts, one per failure (infra-r9mzd.65). They were one
+# OR'd alert (LitellmContractBroken): one O2 fingerprint and one ledger entry for four
+# causes, and capacity refusals on mbp-mda paged as dead models (85/670 runs 11-12..16).
+# The 13 % case below is that measured rate: it must stay silent as STARVED.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: a-dead-scope-pages-after-20m-per-consumer
+  interval: 1m
+  input_series:
+  - series: litellm_contract_scope_dead_ids{job="litellm_contract",namespace="monitoring",consumer="pi-jump"}
+    values: 16x40
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmScopeDeadIds
+    exp_alerts: []
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmScopeDeadIds
+    exp_alerts:
+    - exp_labels:
+        consumer: pi-jump
+        job: litellm_contract
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+        exported_namespace: monitoring
+      exp_annotations:
+        summary: litellm key pi-jump scopes 16 model id(s) litellm does not serve
+        description: "That virtual key's model scope names ids that are neither a declared model, an\nadvertised id nor a model_group_alias. The consumer gets a 400 the next time it\nasks for one. Usually\
+          \ a door renamed or deleted while a key scope still listed it.\n⛔ Do not just trim the scope: if the consumer offers the id (pi models.json),\nadd the alias in litellm instead (infra-w1p8).\n\n\
+          \  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelDead
+    exp_alerts: []
+- name: an-alias-rename-blip-shorter-than-20m-is-silent
+  interval: 1m
+  input_series:
+  - series: litellm_contract_alias_broken{job="litellm_contract",namespace="monitoring",alias="casa",missing="x"}
+    values: 1x10 _x30
+  alert_rule_test:
+  - eval_time: 12m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmAliasBroken
+    exp_alerts: []
+  - eval_time: 30m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmAliasBroken
+    exp_alerts: []
+- name: a-dangling-alias-pages
+  interval: 1m
+  input_series:
+  - series: litellm_contract_alias_broken{job="litellm_contract",namespace="monitoring",alias="casa",missing="x"}
+    values: 1x40
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmAliasBroken
+    exp_alerts:
+    - exp_labels:
+        alias: casa
+        missing: x
+        job: litellm_contract
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+        exported_namespace: monitoring
+      exp_annotations:
+        summary: litellm alias casa points at x, which does not exist
+        description: "A model_group_alias row points at a model that is neither declared nor another\nalias. The alias 400s exactly like a dead scope id; this is the shape a rename in\nthe UI leaves behind,\
+          \ one indirection away. A rename in flight clears by itself\ninside the 20m hold.\n\n  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+- name: a-router-target-missing-pages
+  interval: 1m
+  input_series:
+  - series: litellm_contract_router_broken{job="litellm_contract",namespace="monitoring",door="auto",missing="gone"}
+    values: 1x40
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmRouterTargetMissing
+    exp_alerts:
+    - exp_labels:
+        door: auto
+        missing: gone
+        job: litellm_contract
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+        exported_namespace: monitoring
+      exp_annotations:
+        summary: litellm auto-router auto names gone, which does not exist
+        description: "An auto-router tier, classifier or default names a model that does not exist.\nThe router falls back to its default tier, so consumers silently get a different\nmodel than the one\
+          \ the router was configured for.\n\n  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+- name: a-dead-local-model-pages-and-is-not-starved
+  interval: 1m
+  input_series:
+  - series: litellm_contract_local_dead{job="litellm_contract",namespace="monitoring",model="hosted_vllm/m",door="d"}
+    values: 1x40
+  - series: litellm_contract_local_busy_model{job="litellm_contract",namespace="monitoring",model="hosted_vllm/m",door="d"}
+    values: '0x40'
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelDead
+    exp_alerts:
+    - exp_labels:
+        model: hosted_vllm/m
+        door: d
+        job: litellm_contract
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+        exported_namespace: monitoring
+      exp_annotations:
+        summary: 'local door d: the upstream answered but does not serve hosted_vllm/m'
+        description: "The local upstream answered and the answer was not ok, not a capacity refusal\nand not an absent upstream: a model-not-found, or something the probe cannot\nexplain (it then logs litellm's\
+          \ call id and the whole body, and\nlitellm_contract_local_unexplained > 0).\n\U0001F4CC Capacity refusals (507 cannot load, 400 memory guard, 503, 408, 429) are NOT\nthis alert: see LitellmLocalModelStarved.\
+          \ A closed or loading laptop is skipped\n(litellm_contract_local_reachable 0) and never pages.\n\n  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+  - eval_time: 25m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelStarved
+    exp_alerts: []
+- name: a-door-busy-in-every-awake-run-is-starved-after-2h30
+  interval: 1m
+  input_series:
+  - series: litellm_contract_local_busy_model{job="litellm_contract",namespace="monitoring",model="hosted_vllm/big",door="poly"}
+    values: 1x300
+  alert_rule_test:
+  - eval_time: 140m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelStarved
+    exp_alerts: []
+  - eval_time: 160m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelStarved
+    exp_alerts:
+    - exp_labels:
+        model: hosted_vllm/big
+        door: poly
+        job: litellm_contract
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+        exported_namespace: monitoring
+      exp_annotations:
+        summary: local door poly refused for capacity in most awake runs over 6h
+        description: "mbp-mda's oMLX answered, but in more than half of the probe runs of the last 6h\n(with at least 2h of the Mac awake) it refused hosted_vllm/big for capacity:\n\"Cannot load ... projected\
+          \ memory\", the memory guard, busy, or too slow. The\nmodel exists; the Mac cannot hold it alongside what else is loaded, so the door\nis unusable for real users too.\nUsual levers: a smaller\
+          \ model for the door, fewer resident models, or the\ndynamic memory cap. Measured 2026-11-12..16 on local-closed-polyglot (25 GB\nE4B), fixed by repointing it to gemma-3-4b.\n\n  https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract\n"
+  - eval_time: 160m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelDead
+    exp_alerts: []
+- name: the-measured-13-percent-busy-rate-is-not-starved
+  interval: 1m
+  input_series:
+  - series: litellm_contract_local_busy_model{job="litellm_contract",namespace="monitoring",model="hosted_vllm/big",door="poly"}
+    values: 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0
+      0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1
+      0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0
+      0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0 0
+      0 0 0 1 0 0 0 0 0 0 0
+  alert_rule_test:
+  - eval_time: 390m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelStarved
+    exp_alerts: []
+- name: a-mac-awake-for-only-1h-cannot-page-starved
+  interval: 1m
+  input_series:
+  - series: litellm_contract_local_busy_model{job="litellm_contract",namespace="monitoring",model="hosted_vllm/big",door="poly"}
+    values: 1x60 _x300
+  alert_rule_test:
+  - eval_time: 100m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelStarved
+    exp_alerts: []
+  - eval_time: 300m
+    groupname: app-batch-jobs.litellm_contract
+    alertname: LitellmLocalModelStarved
+    exp_alerts: []

@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: transmission
+  namespace: tv
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    ## No auth-response-headers: Authorization here (infra-o4i3m.4): oauth2-proxy-tv
+    ## sets none, so it would strip the browser's Basic header and Transmission's
+    ## own RPC login (behind SSO) would loop forever.
+    nginx.ingress.kubernetes.io/auth-signin: https://auth.mdapi.ch/tv/oauth2/start?rd=https://$host$escaped_request_uri
+    nginx.ingress.kubernetes.io/auth-url: http://oauth2-proxy-tv.oauth2-proxy.svc.cluster.local/tv/oauth2/auth
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: transmission.mdapi.ch
+      http:
+        paths:
+          - backend:
+              service:
+                name: transmission
+                port:
+                  number: 9091
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+      - transmission.mdapi.ch
+      secretName: transmission-cert

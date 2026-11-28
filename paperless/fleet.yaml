@@ -1,0 +1,52 @@
+defaultNamespace: paperless
+namespace: paperless
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # PSA warn+audit=baseline (no enforce). Since Fleet v0.16 (2026-10-29) the
+  # live namespace labels equal this list exactly, so the PSA labels must be
+  # declared here or they are stripped (infra-r9mzd.14, PsaLabelDrift).
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-cert-manager
+helm:
+  maxHistory: 25
+
+# The paperless-ngx image tag is bumped by the fleet-image-sync Windmill
+# job: it scans ghcr for newer releases inside the major line that
+# paperless-deploy.yml already pins, and never writes a lower tag than the
+# one already there. Git stays the single source of truth and a Fleet
+# re-apply can never downgrade the code below the DB migration level.
+# paperless-ngx has no major-track floating tag (:latest crosses majors),
+# so the floating-tag lane does not fit it (that lane is `:latest` + a digest
+# Renovate re-pins). No updater
+# annotation is used for the tag on this Deployment — the sync job above is
+# what moves it.
+#
+# Majors are Renovate MR-only and a human merges them. Do not hardcode the
+# major line in the sync job: it was pinned to 2 when v3 landed and reverted
+# the merged bump twice, which took the DMS down for ~24h because v3's
+# migrations are not reversible. See the comment on the image line.
+diff:
+  comparePatches:
+  # No resources strip on the paperless / paperless-valkey Deployments: no VPA
+  # targets them, and a VPA writes pods, not the Deployment, so live == git.
+  # (The old index-pinned `add "{}"` list covered 4 of 6 containers.)
+  # f/heal/volsync_restic_stale_lock (every 15 min) clears an orphaned restic
+  # repo lock by writing spec.restic.unlock on the ReplicationSource live.
+  # git therefore can never match the cluster on that one field: the heal set
+  # 'autoheal-20260828T053845Z' over git's '2026-08-27-stale-root-lock' and
+  # Fleet held mdapi-prod-paperless Modified for 21h+, keeping
+  # FleetBundlesNotReady/Sustained lit and statuspage Platform degraded.
+  # The heal is correct — the GitOps coupling was the defect. Hand the field to
+  # the heal so a successful autoheal stops red-flagging the bundle. The value
+  # in paperless-backup-rs.yml stays as the documented seed/reset value.
+  - apiVersion: volsync.backube/v1alpha1
+    kind: ReplicationSource
+    name: paperless-data-ceph
+    namespace: paperless
+    jsonPointers:
+    - "/spec/restic/unlock"

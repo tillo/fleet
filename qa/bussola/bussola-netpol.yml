@@ -1,0 +1,105 @@
+## QA Bussola's fence: the app reaches DNS, its Postgres and the IAST sink, and
+## nothing else -- no Datadog intake, no internet, no prod (proof in the bead).
+## Ingress: only the QA traffic pods (seed + ZAP, label mdapi.ch/qa-traffic).
+## Postgres is reachable from the app alone, which is what makes trust auth safe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: bussola
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bussola
+  namespace: bussola
+spec:
+  ## both the instrumented app and its tracer-off control (bussola-off)
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [bussola, bussola-off]}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              mdapi.ch/qa-traffic: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels:
+              app: bussola-pg
+      ports:
+        - {protocol: TCP, port: 5432}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iast
+          podSelector:
+            matchLabels:
+              app: iast-sink
+      ports:
+        - {protocol: TCP, port: 8126}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bussola-pg
+  namespace: bussola
+spec:
+  podSelector:
+    matchLabels:
+      app: bussola-pg
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [bussola, bussola-off]}
+      ports:
+        - {protocol: TCP, port: 5432}
+---
+## The QA traffic (seed requests, ZAP active scan): DNS and the app, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: qa-traffic
+  namespace: bussola
+spec:
+  podSelector:
+    matchLabels:
+      mdapi.ch/qa-traffic: "true"
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [bussola, bussola-off]}
+      ports:
+        - {protocol: TCP, port: 8080}

@@ -1,0 +1,18 @@
+## The findings survive a sink restart (a Spot preemption moves the pod). That
+## matters more here than in prod: DefectDojo re-imports the FULL set with
+## close_old_findings, so an emptied sink would mitigate every QA finding.
+## storageClassName spot-ceph, not the default `ssd` (Cinder), measured 2026-11-23:
+## Cinder refuses < 5 GiB ("'size' parameter must be between 5 and 20") and then
+## failed every attach with 413 OverLimit from Spot's csi-proxy for 10+ min, leaving
+## the sink Pending; spot-ceph bound, attached and wrote in 30 s.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: iast-sink-data
+  namespace: iast
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: spot-ceph
+  resources:
+    requests:
+      storage: 1Gi

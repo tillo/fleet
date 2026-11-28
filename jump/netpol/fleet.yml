@@ -1,0 +1,15 @@
+# Namespace-PINNED on purpose: this bundle holds namespaced Calico policies only
+# (tests/test_namespaced_bundle_no_cluster_scoped.py). Kept apart from the jump
+# bundle one level up so a policy change can never touch deploy/jump-bastion;
+# Fleet recurses into jump/, so no GitRepo path change.
+# namespaceLabels MUST equal jump/fleet.yaml's (tests/test_namespace_labels_agree_across_bundles.py):
+# Fleet makes the live labels equal the list, and losing enforce=privileged would
+# make the bastion's next pod unschedulable.
+defaultNamespace: jump
+namespace: jump
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # bastion runs sshd as root + mosh setcap → namespace must allow it
+  pod-security.kubernetes.io/enforce: privileged
+  pod-security.kubernetes.io/warn: baseline

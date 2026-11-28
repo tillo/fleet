@@ -1,0 +1,42 @@
+# auto-cleanup-system-generated-snapshot = false — the snapshot purge stays OUT of
+# the rebuild path. Bead infra-jks8, 2026-10-27. Purging still happens, on a
+# schedule instead: recurringjob-snapshotcleanup.yml. The two files are ONE
+# decision. Never land or revert one without the other.
+#
+# ⛔ With it true, a mass rebuild jams. Measured 2026-10-26 after qua's stall, on
+# Longhorn v1.11.2. engine_controller.go startRebuilding() spawns a goroutine.
+# Only when this setting is true, that goroutine (1) asks the snapshot heavy-task
+# limiter, which polls the purge AND clone status of EVERY engine in the cluster,
+# (2) runs SnapshotPurge, and (3) waits for the purge on a 10 s ticker. Only then
+# does it call ReplicaAdd. The caller polls for just 30 s (EnginePollTimeout) for
+# the replica to appear in the engine, then errors and requeues. The requeue
+# spawns a SECOND goroutine for the same replica (longhorn/longhorn#13992). The
+# first goroutine rebuilds the replica. The second one's ReplicaAdd fails with
+# "not in mode WO: RW", and it removes and fails the replica that was just
+# rebuilt. Then the cycle repeats. When the limiter says no, the goroutine
+# returns, logging only at Debug, and nothing rebuilds at all: quarto's manager
+# logged 0 purges in 20 min. With this false, the goroutine goes straight to
+# ReplicaAdd. The stopgap flip drained 142 replicas in 29 min at the normal
+# 2-per-node limit.
+#
+# ⭐ Upgrading does NOT make it safe to flip back. Longhorn v1.12.2 (bundled by
+# Harvester v1.9.1) adds a per-engine in-flight claim, so the duplicate goroutine
+# is never created (#13914, backported as #13917). But its runRebuild() still
+# returns silently when the limiter denies the pre-rebuild purge. So the "nothing
+# rebuilds" half of the jam survives the upgrade, and this setting is still the
+# lever.
+#
+# ⚠️ What false costs. Every rebuild ATTEMPT, failed ones included, leaves one
+# system snapshot on each replica until a purge runs (ReplicaCreate snapshots
+# before it syncs). That snapshot takes one of the volume's snapshot-max-count (6)
+# slots. A rebuild, a backup or a VolSync snapshot that finds no free slot fails
+# with "snapshot count usage N is equal or larger than snapshotMaxCount 6".
+# Measured 2026-10-27: no volume holds more than 3 non-system snapshots, so every
+# volume keeps at least 3 slots for rebuilds. The hourly snapshotcleanup job is
+# what bounds both the slots and the space these snapshots pin.
+apiVersion: longhorn.io/v1beta2
+kind: Setting
+metadata:
+  name: auto-cleanup-system-generated-snapshot
+  namespace: longhorn-system
+value: "false"

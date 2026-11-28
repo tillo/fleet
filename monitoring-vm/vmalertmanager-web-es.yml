@@ -1,0 +1,69 @@
+## Alertmanager's own web config (infra-o4i3m.5.1, 2026-11-16): one Basic user per
+## client. Mounted by VMAlertmanager.spec.secrets at
+## /etc/vm/secrets/vmalertmanager-web/ and read via --web.config.file (AM re-reads
+## it on every request, so a rotated hash needs no restart).
+##
+## Users: vmalert (notifier), cribl-relay, statuspage (adapter), windmill (f/heal
+## jobs, Windmill variable f/heal/vmalertmanager_password), reloader (the
+## operator's config-reloader, see vmalertmanager.yml), vmagent (self-scrape),
+## ceph (mgr dashboard alerts view), admin (humans: the UI behind SSO asks for it,
+## and the triage/infra-health skills).
+##
+## Each user's password and bcrypt hash live in Akeyless at
+## /mdapi/monitoring/vmalertmanager/<user>/{password,hash}. Rotate by writing BOTH.
+## The hash is stored rather than computed here: ESO's bcrypt would salt afresh on
+## every refresh, change the Secret each hour and make Reloader roll AM.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vmalertmanager-web
+  namespace: monitoring
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: vmalertmanager-web
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      mergePolicy: Replace
+      data:
+        web.yml: |
+          basic_auth_users:
+            vmalert: "{{ .vmalert_hash }}"
+            cribl-relay: "{{ .cribl_relay_hash }}"
+            statuspage: "{{ .statuspage_hash }}"
+            windmill: "{{ .windmill_hash }}"
+            reloader: "{{ .reloader_hash }}"
+            vmagent: "{{ .vmagent_hash }}"
+            admin: "{{ .admin_hash }}"
+            ceph: "{{ .ceph_hash }}"
+        reloader-password: "{{ .reloader_password }}"
+        admin-password: "{{ .admin_password }}"
+        scrape-username: vmagent
+        scrape-password: "{{ .vmagent_password }}"
+  data:
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/vmalert/hash }
+    secretKey: vmalert_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/cribl-relay/hash }
+    secretKey: cribl_relay_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/statuspage/hash }
+    secretKey: statuspage_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/windmill/hash }
+    secretKey: windmill_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/reloader/hash }
+    secretKey: reloader_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/vmagent/hash }
+    secretKey: vmagent_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/admin/hash }
+    secretKey: admin_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/ceph/hash }
+    secretKey: ceph_hash
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/reloader/password }
+    secretKey: reloader_password
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/vmagent/password }
+    secretKey: vmagent_password
+  - remoteRef: { key: /mdapi/monitoring/vmalertmanager/admin/password }
+    secretKey: admin_password

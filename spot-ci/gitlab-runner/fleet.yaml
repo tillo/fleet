@@ -1,0 +1,27 @@
+## The `spot` GitLab runner (group runner 1047, group mdapi), on the Rackspace Spot
+## cloudspace mdapi-ci. Rendered ONLY by that cluster's standalone Fleet, from
+## spot-ci-paths.txt; never by gitrepo/mdapi-prod (tests/test_qa_bundles_never_reach_prod.py).
+##
+## Why a separate cloudspace and not mdapi-qa: the QA cluster may hold only synthetic
+## or anonymised data (qa/README.md); CI job pods hold checkouts of real repositories.
+##
+## What may run here: credential-free CHECK jobs (lint, validate, secret-scan, SAST,
+## SCA) — nothing that pushes an image, holds a registry/deploy credential or a token
+## beyond the job's own CI_JOB_TOKEN. The token Secret `gitlab-runner-spot-token` is
+## created out-of-band from Akeyless /mdapi/rackspace/ci-spot/runner-token
+## (~/src/spot-ci/runner-secret.py); there is no ESO in this cluster.
+defaultNamespace: ci-spot
+namespace: ci-spot
+namespaceLabels:
+  pod-security.kubernetes.io/enforce: baseline
+  pod-security.kubernetes.io/enforce-version: latest
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+helm:
+  maxHistory: 25
+  releaseName: gitlab-runner-spot
+  repo: https://charts.gitlab.io
+  chart: gitlab-runner
+  version: 0.95.1
+  valuesFiles:
+    - values.yml

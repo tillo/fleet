@@ -1,0 +1,46 @@
+# Only bpi-r4 may speak PROXY protocol to docker-mailserver (infra-o4i3m.2, step 1 of
+# infra-o4i3m.1). Whoever reaches a PROXY port can claim any client address: on
+# 2026-11-10 a pod sent `PROXY TCP4 127.0.0.1 ...` to 12525 and relayed to an external
+# address as localhost.
+#
+# The edge haproxy on bpi-r4 forwards public 25/465/587/993/4190 to
+# 192.168.1.48:12525/10465/10587/10993/14190 with send-proxy. The Service runs
+# externalTrafficPolicy Local (docker-mailserver/values.yml), so the router arrives
+# as its own address 192.168.1.254 and can be admitted by address. Every other
+# source is logged and denied on those ports. All other ports fall through to the
+# final Allow, unchanged: this policy narrows the PROXY ports and nothing else.
+#
+# Calico does not police host -> local-workload traffic without a HostEndpoint, so
+# kubelet probes are unaffected.
+#
+# EMERGENCY (public mail down): `git revert` + push. Deleting the object by hand
+# buys ~90 s before Fleet re-creates it.
+#
+# Pinned by tests/test_mail_proxy_ports_admit_only_the_router.py.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: proxy-ports.docker-mailserver
+  namespace: mail
+spec:
+  order: 100
+  selector: app.kubernetes.io/name == "docker-mailserver"
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      source:
+        nets:
+          - 192.168.1.254/32
+      destination:
+        ports: [10143, 10465, 10587, 10993, 12525, 14190]
+    - action: Log
+      protocol: TCP
+      destination:
+        ports: [10143, 10465, 10587, 10993, 12525, 14190]
+    - action: Deny
+      protocol: TCP
+      destination:
+        ports: [10143, 10465, 10587, 10993, 12525, 14190]
+    - action: Allow

@@ -1,0 +1,25 @@
+defaultNamespace: kube-system
+namespace: kube-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+helm:
+  maxHistory: 25
+diff:
+  comparePatches:
+    # ingress-expose: ignore kube-vip-managed runtime annotations and
+    # auto-allocated nodePorts so Fleet doesn't fight kube-vip on every
+    # VIP failover or kube-proxy nodePort rotation.
+    # jsonPointers, not `operations: remove`: none of these exist in the
+    # rendered Service, and a remove op on an absent path fails and makes Fleet
+    # discard every op for the object, so as remove ops this patch never applied
+    # (infra-8f4.19). An absent jsonPointer is skipped silently.
+    - apiVersion: v1
+      kind: Service
+      name: ingress-expose
+      namespace: kube-system
+      jsonPointers:
+        - /metadata/annotations/kube-vip.io~1vipHost
+        - /metadata/annotations/kube-vip.io~1hwaddr
+        - /spec/ports/0/nodePort
+        - /spec/ports/1/nodePort

@@ -1,0 +1,90 @@
+## What the `heal` worker may run through pods/exec in rook-ceph.
+##
+## SA windmill/windmill-worker-heal holds pods/exec in rook-ceph through a
+## RoleBinding (windmill/rbac/rbac.yml, infra-az8.19.11). Exec into the toolbox
+## is Ceph admin (client.admin keyring: `ceph auth get`, `osd pool delete`),
+## and the namespace also holds the privileged OSD pods. RBAC cannot narrow
+## exec by pod or command, so the heal token was full Ceph admin.
+##
+## RBAC grants the verb; this pins the POD, the CONTAINER and the COMMAND to
+## exactly what the three heal scripts send (read from their code 2026-11-19):
+##   ceph_osd_stepped_fill  ceph osd tree|perf|dump -f json, ceph -s -f json,
+##                          ceph osd set|unset norebalance,
+##                          ceph osd crush reweight osd.<N> <weight>
+##   ceph_mclock_enforcer   ceph config set osd / ceph tell osd.* config set
+##                          osd_mclock_profile balanced|high_client_ops,
+##                          ceph config get osd osd_mclock_profile, ceph -s -f json
+##   ceph_noout_release     ceph osd dump 2>/dev/null | grep '^flags',
+##                          ceph osd unset noout 2>&1
+## each as `[/bin/]sh -c "<cmd>"` into a rook-ceph-tools-* pod, no stdin/tty.
+## A script that needs a new ceph command adds it here in the same MR, or the
+## exec is refused (403 -> the job fails loudly).
+##
+## Left open on purpose: those commands themselves (a stolen token can still
+## reweight an OSD or flip norebalance/noout/the mclock profile: disruptive,
+## not data-destroying, and visible in `ceph -s`).
+##
+## Traps: stdin/tty are omitted from the PodExecOptions when false, hence has();
+## CEL matches() is RE2, so `$` is end of text and a `\n<cmd>` suffix fails.
+## Deny, failurePolicy Fail; matchConditions confine it to the heal SA in
+## rook-ceph. Test: heal-ceph-exec-pin.test.sh (raw execs against a pod that
+## does not exist: admission runs before the pod lookup).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: heal-ceph-exec-pin
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: rook-ceph
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec"]
+  matchConditions:
+    - name: heal-sa-only
+      expression: >-
+        request.userInfo.username ==
+        "system:serviceaccount:windmill:windmill-worker-heal"
+  variables:
+    - name: cmd
+      expression: >-
+        has(object.command) && size(object.command) == 3 &&
+        object.command[0] in ["sh", "/bin/sh"] && object.command[1] == "-c"
+        ? object.command[2] : ""
+  validations:
+    - expression: request.name.startsWith("rook-ceph-tools-")
+      messageExpression: >-
+        "heal-ceph-exec-pin: heal may exec only into the rook-ceph-tools pod"
+      reason: Forbidden
+    - expression: >-
+        (!has(object.container) || object.container == "rook-ceph-tools") &&
+        !(has(object.stdin) && object.stdin) &&
+        !(has(object.tty) && object.tty)
+      messageExpression: >-
+        "heal-ceph-exec-pin: heal exec must target container rook-ceph-tools, no stdin/tty"
+      reason: Forbidden
+    - expression: >-
+        variables.cmd.matches("^ceph (osd (tree|perf|dump)|-s) -f json$") ||
+        variables.cmd.matches("^ceph osd (set|unset) norebalance$") ||
+        variables.cmd.matches(
+        "^ceph osd crush reweight osd\\.[0-9]+ [0-9]+(\\.[0-9]+)?(e-[0-9]+)?$") ||
+        variables.cmd.matches(
+        "^ceph (config set osd|tell osd\\.\\* config set) osd_mclock_profile (balanced|high_client_ops)$") ||
+        variables.cmd == "ceph config get osd osd_mclock_profile" ||
+        variables.cmd == "ceph osd dump 2>/dev/null | grep '^flags'" ||
+        variables.cmd == "ceph osd unset noout 2>&1"
+      messageExpression: >-
+        "heal-ceph-exec-pin: command not on the heal ceph allowlist"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: heal-ceph-exec-pin
+spec:
+  policyName: heal-ceph-exec-pin
+  validationActions: [Deny]

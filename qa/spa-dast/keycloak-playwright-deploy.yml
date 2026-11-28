@@ -1,0 +1,360 @@
+## spa-dast-keycloak-playwright: the account-console journey (sign in, open personal info,
+## change a made-up attribute, sign out) driven by Playwright through the SAME pod's ZAP
+## proxy, then the keycloak plan -- so the active scan attacks the URLs the browser really
+## used. infra-7rog.31.24. SUSPENDED: run with
+##   kubectl -n keycloak create job --from=cronjob/spa-dast-keycloak-playwright spa-dast-kc-journey-$(date +%s)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: spa-dast-keycloak-playwright
+  namespace: keycloak
+spec:
+  schedule: "0 4 * * *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 5400
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            mdapi.ch/qa-traffic: "true"
+        spec:
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          imagePullSecrets: [{name: zot-pull}]
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: zap
+              image: docker.io/zaproxy/zap-stable:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  cat > /tmp/drive.py <<'PY'
+                  """Drive the ZAP daemon through its API, one daemon per Job (infra-7rog.31.24).
+
+                  - waits for the daemon (started by run.sh in the same container),
+                  - optionally waits for the Playwright journey to finish (JOURNEY=1) so the traffic it
+                    recorded is in the session before the plan runs,
+                  - runs the automation plan (spider / spiderAjax / openapi / activeScan / report),
+                  - prints the measured coverage (URLs in the session, messages sent, plan progress) and
+                    the report in the pod log between the estate's DAST markers.
+                  """
+                  import base64
+                  import gzip
+                  import json
+                  import os
+                  import sys
+                  import time
+                  import urllib.parse
+                  import urllib.request
+
+                  API = os.environ.get("ZAP_API", "http://127.0.0.1:8090")
+                  WRK = os.environ.get("WRK", "/zap/wrk")
+
+
+                  def call(path, **params):
+                      url = API + path
+                      if params:
+                          url += "?" + urllib.parse.urlencode(params)
+                      with urllib.request.urlopen(url, timeout=60) as r:
+                          return json.loads(r.read() or b"{}")
+
+
+                  def wait_daemon(timeout=240):
+                      end = time.time() + timeout
+                      while time.time() < end:
+                          try:
+                              return call("/JSON/core/view/version/")["version"]
+                          except Exception:
+                              time.sleep(5)
+                      raise SystemExit("zap daemon did not answer")
+
+
+                  def wait_file(path, timeout):
+                      end = time.time() + timeout
+                      while time.time() < end:
+                          if os.path.exists(path):
+                              return True
+                          time.sleep(5)
+                      return False
+
+
+                  def run_plan(plan, label, budget_min):
+                      plan_id = call("/JSON/automation/action/runPlan/", filePath=plan)["planId"]
+                      end = time.time() + budget_min * 60
+                      seen = 0
+                      while time.time() < end:
+                          p = call("/JSON/automation/view/planProgress/", planId=plan_id)
+                          info = p.get("info", [])
+                          for line in info[seen:]:
+                              print(f"zap[{label}]: {line}", flush=True)
+                          seen = len(info)
+                          if p.get("finished"):
+                              for line in p.get("error", []):
+                                  print(f"zap[{label}]: ERROR {line}", flush=True)
+                              for line in p.get("warn", []):
+                                  print(f"zap[{label}]: WARN {line}", flush=True)
+                              print(f"zap[{label}]: plan finished {p['finished']} (started {p['started']})", flush=True)
+                              return not p.get("error")
+                          time.sleep(10)
+                      print(f"zap[{label}]: plan still running after {budget_min} min", flush=True)
+                      return False
+
+
+                  def coverage(base):
+                      urls = call("/JSON/core/view/urls/", baseurl=base).get("urls", [])
+                      msgs = call("/JSON/core/view/numberOfMessages/", baseurl=base)
+                      print(f"zap: coverage base={base} urls={len(urls)} messages={msgs.get('numberOfMessages')}", flush=True)
+                      for u in sorted(urls):
+                          print(f"zap: url {u}", flush=True)
+                      return len(urls)
+
+
+                  def report_block(label, path):
+                      if not os.path.exists(path) or os.path.getsize(path) == 0:
+                          print(f"zap: no report for {label}", flush=True)
+                          return False
+                      with open(path, "rb") as f:
+                          data = gzip.compress(f.read())
+                      print(f"-----BEGIN DAST REPORT zap-full {label}-----", flush=True)
+                      print(base64.b64encode(data).decode(), flush=True)
+                      print(f"-----END DAST REPORT zap-full {label}-----", flush=True)
+                      with open(path) as f:
+                          doc = json.load(f)
+                      for site in doc.get("site", []):
+                          for a in site.get("alerts", []):
+                              print(f"zap: alert {a['riskdesc']} | {a['name']} | {a.get('count')}", flush=True)
+                      return True
+
+
+                  def main():
+                      plan, label, base, report = sys.argv[1:5]
+                      budget = int(sys.argv[5]) if len(sys.argv) > 5 else 45
+                      print(f"zap: daemon {wait_daemon()}", flush=True)
+                      # The QA fence has no egress: passive rules that phone home ("ZAP is Out of Date",
+                      # the version-vulnerability lookup) block the passive queue for 60 s PER MESSAGE and
+                      # hang passiveScan-wait. Disabling them is measured, not guessed (infra-7rog.31.24).
+                      ids = os.environ.get("PSCAN_DISABLE", "10116,20020")
+                      if ids:
+                          print("zap: disable pscan " + str(call("/JSON/pscan/action/disableScanners/", ids=ids)), flush=True)
+                      if os.environ.get("JOURNEY") == "1":
+                          ok = wait_file(f"{WRK}/journey-done", int(os.environ.get("JOURNEY_TIMEOUT", "900")))
+                          print(f"zap: journey {'done' if ok else 'TIMED OUT'}", flush=True)
+                      ok = run_plan(plan, label, budget)
+                      coverage(base)
+                      ok = report_block(label, report) and ok
+                      return 0 if ok else 1
+
+
+                  if __name__ == "__main__":
+                      sys.exit(main())
+                  PY
+                  ## -Xmx, explicitly: zap.sh sizes the heap from /proc/meminfo (the NODE's memory, 15 GB),
+                  ## so it picks -Xmx3744m and the container is OOM-killed at its 2 Gi limit (measured
+                  ## 2026-11-25 on backstage's 163-URL scan). The heap must follow the container, not the node.
+                  /zap/zap.sh -Xmx1500m -daemon -host 127.0.0.1 -port 8090 -config api.disablekey=true \
+                    -config connection.defaultUserAgent=mdapi-dast/zap-active \
+                    -config pscan.rules.10116.enabled=false > /tmp/zap-daemon.log 2>&1 &
+                  python3 /tmp/drive.py /cfg/kc-plan.yml keycloak.spa.journey http://keycloak:8080 /zap/wrk/kc.json 50
+                  rc=$?
+                  echo "spa-dast: zap container exit $rc"
+                  tail -40 /tmp/zap-daemon.log
+                  exit $rc
+              env:
+                - name: QA_TESTER_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: keycloak-qa-users, key: QA_TESTER_PASSWORD}
+                - name: MOZ_DISABLE_CONTENT_SANDBOX
+                  value: "1"
+                - name: JOURNEY
+                  value: "1"
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              resources:
+                # 3 Gi: the AJAX spider's Firefox runs IN THIS CONTAINER, so the limit must
+                # cover a 1.5 Gi heap plus the browser -- 2 Gi was OOMKilled mid-active-scan
+                # twice (measured 2026-11-25). One scan per Job; do not run two at once.
+                requests: {cpu: 500m, memory: 1Gi}
+                limits: {cpu: "2", memory: 3Gi}
+              volumeMounts:
+                - {name: zap-wrk, mountPath: /zap/wrk}
+                - {name: cfg, mountPath: /cfg}
+            - name: journey
+              image: zot.mdapi.ch/mdapi/spa-dast-playwright:1.59.1-mdapi.4@sha256:2bc685cae17b0496a7b23be5767e03676813e66f0c38e283aece3d01247c974d
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  cat > /tmp/journey.js <<'JS'
+                  // Keycloak account-console journey: sign in with the made-up QA user in a real browser,
+                  // open the account pages, change a made-up attribute through the account REST API with
+                  // that user's own token, sign out. Everything goes through the ZAP daemon's proxy
+                  // (ZAP_PROXY), so the traffic lands in ZAP's session and the active scan attacks the URLs
+                  // the journey really used (infra-7rog.31.24).
+                  //
+                  // Why the API step is not a form: the QA realm's account console SPA renders but its own
+                  // API calls come back 401 (measured 2026-11-25: GET /realms/qa-test/account/ without a
+                  // bearer), so the personal-info form never appears. The REST call is the same server-side
+                  // path the form would use, with the same user's token.
+                  //
+                  // Writes /wrk/journey-urls.txt, /wrk/journey-steps.json and then /wrk/journey-done.
+                  const fs = require('fs');
+                  const http = require('http');
+                  const { chromium, request } = require('playwright');
+
+                  const BASE = process.env.KC_BASE || 'http://keycloak:8080';
+                  const ACCOUNT = BASE + '/realms/qa-test/account/';
+                  const USER = process.env.QA_TESTER_USER || 'qa-tester';
+                  const PW = process.env.QA_TESTER_PASSWORD;
+                  const PROXY = process.env.ZAP_PROXY;
+                  const WRK = process.env.WRK || '/wrk';
+                  const steps = [];
+                  const urls = new Set();
+                  const step = (name, ok, detail) => {
+                    steps.push({ name, ok, detail: detail || '' });
+                    console.log(`journey: ${ok ? 'ok  ' : 'FAIL'} ${name}${detail ? ' — ' + detail : ''}`);
+                  };
+                  const write = () => {
+                    fs.writeFileSync(`${WRK}/journey-urls.txt`, [...urls].sort().join('\n') + '\n');
+                    fs.writeFileSync(`${WRK}/journey-steps.json`, JSON.stringify(steps, null, 2) + '\n');
+                    fs.writeFileSync(`${WRK}/journey-done`, new Date().toISOString() + '\n');
+                  };
+
+                  // The ZAP daemon in the sibling container takes ~40 s to answer; the browser must not start
+                  // against a proxy that is not listening yet.
+                  function waitZap(ms) {
+                    return new Promise((resolve) => {
+                      const end = Date.now() + ms;
+                      const tick = () => {
+                        const req = http.get('http://127.0.0.1:8090/JSON/core/view/version/', (res) => {
+                          res.resume();
+                          if (res.statusCode === 200) return resolve(true);
+                          retry();
+                        });
+                        req.on('error', retry);
+                        req.setTimeout(2000, () => { req.destroy(); retry(); });
+                        function retry() {
+                          if (Date.now() > end) return resolve(false);
+                          setTimeout(tick, 3000);
+                        }
+                      };
+                      tick();
+                    });
+                  }
+
+                  (async () => {
+                    if (PROXY) step('zap daemon reachable', await waitZap(240000));
+                    const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], proxy: PROXY ? { server: PROXY } : undefined });
+                    const context = await browser.newContext();
+                    const page = await context.newPage();
+                    page.on('request', (r) => { if (r.url().startsWith(BASE)) urls.add(r.url()); });
+                    let token = null;
+                    let refresh = null;
+                    let uiChanged = null;
+                    try {
+                      await page.goto(ACCOUNT, { waitUntil: 'domcontentloaded' });
+                      await page.waitForSelector('#username', { timeout: 30000 });
+                      await page.fill('#username', USER);
+                      await page.fill('#password', PW);
+                      await Promise.all([page.waitForNavigation({ waitUntil: 'domcontentloaded' }), page.click('#kc-login')]);
+                      step('sign in', page.url().startsWith(ACCOUNT), page.url().slice(0, 120));
+                      await page.waitForLoadState('networkidle');
+                      step('account page', true, (await page.innerText('body')).replace(/\s+/g, ' ').slice(0, 80));
+
+                      await page.goto(ACCOUNT + '#/personal-info', { waitUntil: 'networkidle' });
+                      const field = page.locator('input#firstName, input[name="firstName"]').first();
+                      await field.waitFor({ timeout: 20000 });
+                      const inputs = await page.locator('input').evaluateAll((els) => els.map((e) => e.id || e.name));
+                      step('personal-info page', inputs.length > 0, inputs.join(','));
+                      const changed = 'QA ' + new Date().toISOString().slice(0, 10);
+                      await field.fill(changed);
+                      await page.getByRole('button', { name: /save/i }).first().click();
+                      await page.waitForLoadState('networkidle');
+                      step('change made-up attribute (form)', true, 'firstName -> ' + changed);
+                      uiChanged = changed;
+                    } catch (e) {
+                      step('browser journey', false, String(e).split('\n')[0]);
+                    }
+
+                    // The account REST API with this user's own token, through the same ZAP proxy.
+                    const api = await request.newContext({ proxy: PROXY ? { server: PROXY } : undefined, baseURL: BASE });
+                    try {
+                      const tok = await api.post('/realms/qa-test/protocol/openid-connect/token', {
+                        form: { grant_type: 'password', client_id: 'qa-app', username: USER, password: PW },
+                      });
+                      const t = await tok.json();
+                      token = t.access_token;
+                      refresh = t.refresh_token;
+                      step('token', Boolean(token), 'password grant, client qa-app');
+                      const before = await api.get('/realms/qa-test/account/', { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
+                      step('read account', before.ok(), String(before.status()));
+                      const value = await (await before.json()).firstName;
+                      if (!uiChanged) {
+                        const changed = 'QA ' + new Date().toISOString().slice(0, 10);
+                        // The account API takes a FULL representation: a partial body is rejected 400.
+                        const current = await (await api.get('/realms/qa-test/account/', { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } })).json();
+                        const post = await api.post('/realms/qa-test/account/', {
+                          headers: { Authorization: 'Bearer ' + token, Accept: 'application/json', 'Content-Type': 'application/json' },
+                          data: { ...current, firstName: changed },
+                        });
+                        step('change made-up attribute (api)', post.ok(), `firstName ${value} -> ${changed} (${post.status()})`);
+                        uiChanged = changed;
+                      }
+                      const after = await api.get('/realms/qa-test/account/', { headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' } });
+                      step('read back', (await after.json()).firstName === uiChanged, (await after.json()).firstName);
+                    } catch (e) {
+                      step('account API', false, String(e).split('\n')[0]);
+                    } finally {
+                      if (token) {
+                        const out = await api.post('/realms/qa-test/protocol/openid-connect/logout', { form: { client_id: 'qa-app', refresh_token: refresh } }).catch(() => null);
+                        step('sign out', out ? out.status() < 400 : false, out ? String(out.status()) : 'no answer');
+                      }
+                      await api.dispose();
+                    }
+                    write();
+                    await browser.close();
+                    process.exit(0);
+                  })();
+                  JS
+                  node /tmp/journey.js
+                  echo "spa-dast: journey container exit $?"
+                  exit 0
+              env:
+                - name: QA_TESTER_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: keycloak-qa-users, key: QA_TESTER_PASSWORD}
+                - name: ZAP_PROXY
+                  value: "http://127.0.0.1:8090"
+                - name: WRK
+                  value: /wrk
+                - name: HOME
+                  value: /tmp
+                - name: MOZ_DISABLE_CONTENT_SANDBOX
+                  value: "1"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              resources:
+                requests: {cpu: 250m, memory: 512Mi}
+                limits: {cpu: "1", memory: 2Gi}
+              volumeMounts:
+                - {name: zap-wrk, mountPath: /wrk}
+          volumes:
+            - name: zap-wrk
+              emptyDir: {sizeLimit: 1Gi}
+            - name: cfg
+              configMap: {name: spa-dast-keycloak-plan}

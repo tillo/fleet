@@ -1,0 +1,152 @@
+## Postgres for Dependency-Track (epic infra-7rog.42, 2026-11-23).
+##
+## DT is the component INVENTORY: every SBOM it was fed, re-evaluated against
+## new advisories. The BOMs are re-uploadable by f/security/dependency_track_sync;
+## what is NOT re-creatable is the vulnerability mirror's state, policies, audit
+## decisions and API keys, so the database is backed up like every other:
+## the defectdojo-pg pattern (2 instances, switchover, barman plugin to its own
+## RGW bucket over TLS, daily base backup, offsite grant declared on the OBC).
+##
+## Image: 18-standard-bookworm, NOT the bare :18 tag -- that one is the legacy
+## bullseye build frozen at 18.6 and gets no further patches
+## (memory cnpg_bare_18_tag_frozen_at_18_6_use_standard_bookworm_2026_11_21).
+##
+## The app credential is CNPG-generated (secret dependency-track-pg-app, keys
+## `username`/`password` -- exactly what the chart's database.existingSecret
+## reads) and never leaves the cluster.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: dependency-track-pg
+  namespace: dependency-track
+spec:
+  ## Backup class for the instance PVCs. CNPG creates them (and re-creates one on
+  ## every instance rebuild), so the Cluster is the only place a label survives;
+  ## `default` = what Longhorn already does to an undeclared volume, now declared.
+  ## Barman is the recovery substrate; the PVC backup is the consistency hedge.
+  ## (tests/test_cnpg_clusters_declare_backup_class.py, infra-r9mzd)
+  inheritedMetadata:
+    labels:
+      mdapi.ch/backup-class: default
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18-standard-bookworm
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
+  monitoring:
+    enablePodMonitor: true
+
+  ## The NVD + GHSA + OSV mirror alone is a few GB of rows; 10Gi leaves room
+  ## for the inventory. Re-measure after the first full mirror (infra-7rog.42.1).
+  storage:
+    storageClass: harvester-longhorn-2replicas
+    size: 10Gi
+
+  postgresql:
+    parameters:
+      max_connections: "100"
+      shared_buffers: 128MB
+      effective_cache_size: 384MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+
+  bootstrap:
+    initdb:
+      database: dtrack
+      owner: dtrack
+
+  ## `serverName` stated explicitly: barman keys the archive by it, so a
+  ## changed default would silently start a new archive (see openfga-pg.yml).
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: dependency-track-pg
+        serverName: dependency-track-pg
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: dependency-track-pg
+  namespace: dependency-track
+spec:
+  configuration:
+    destinationPath: s3://cnpg-dependency-track-pg
+    endpointURL: https://rook-ceph-rgw-ceph-objectstore.rook-ceph.svc:443
+    endpointCA:
+      name: rgw-transit-ca
+      key: ca.crt
+    s3Credentials:
+      accessKeyId:
+        name: cnpg-dependency-track-pg
+        key: AWS_ACCESS_KEY_ID
+      secretAccessKey:
+        name: cnpg-dependency-track-pg
+        key: AWS_SECRET_ACCESS_KEY
+      region:
+        name: cnpg-rgw-region
+        key: REGION
+    data:
+      compression: gzip
+      jobs: 1
+    wal:
+      compression: gzip
+  ## Retention lives on the STORE with the plugin; left off, nothing prunes.
+  retentionPolicy: "14d"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: dependency-track-pg-daily
+  namespace: dependency-track
+spec:
+  schedule: "0 5 3 * * *"
+  backupOwnerReference: self
+  ## WAL archiving alone is not a backup: take the first base backup now.
+  immediate: true
+  cluster:
+    name: dependency-track-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io
+---
+## Creates the bucket AND a credential scoped to it (secret
+## cnpg-dependency-track-pg). The offsite grant is declared here so Rook owns it:
+## the OBC reconciler deletes any bucket policy it does not declare.
+## ⚠️ The offsite sweep ALSO needs this bucket classified in
+## g/all/RGW_OFFSITE_ENCRYPT_BUCKETS (bead infra-blil), or it fails closed.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-dependency-track-pg
+  namespace: dependency-track
+spec:
+  bucketName: cnpg-dependency-track-pg
+  storageClassName: ceph-bucket
+  additionalConfig:
+    bucketPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"OffsiteSweepRead","Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/offsite"]},"Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::cnpg-dependency-track-pg","arn:aws:s3:::cnpg-dependency-track-pg/*"]}]}'
+---
+## NOT a credential: RGW's default zonegroup. CNPG types `region` as a
+## SecretKeySelector, so a constant needs a Secret to be referenced.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: dependency-track
+stringData:
+  REGION: us-east-1

@@ -1,0 +1,42 @@
+# The subscription URL is a BEARER CAPABILITY, not a public address: Little
+# Snitch's fetch cannot authenticate (no credentials, no headers, no client
+# cert — see README), so the only confidentiality lever is an unguessable path.
+# That path must not live in git, so it comes from Akeyless and reaches nginx
+# only as an environment variable at container start (see lsrules-deploy.yml).
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: lsrules-path
+  namespace: mac-rules
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: lsrules-path
+    creationPolicy: Owner
+  data:
+    - remoteRef:
+        key: /mdapi/mac-rules/lsrules-path/token
+      secretKey: token
+---
+# The Pushgateway writer credential (infra-o4i3m.5.2): user pg-writer at the
+# vmauth-pushgateway write front. The same Akeyless item the front checks
+# (monitoring-vm/vmauth-pushgateway.yml), so a rotation reaches both.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: pushgw-writer
+  namespace: mac-rules
+spec:
+  refreshInterval: 1h0m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: pushgw-writer
+    creationPolicy: Owner
+  data:
+    - remoteRef: {key: /mdapi/monitoring/vmauth/pg-writer-password}
+      secretKey: password

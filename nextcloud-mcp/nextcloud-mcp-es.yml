@@ -1,0 +1,24 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: nextcloud-mcp-env
+  namespace: nextcloud-mcp
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: nextcloud-mcp-env
+    creationPolicy: Owner
+
+  ## The secret of Keycloak client `nextcloud-mcp` (realm tilloch). It is the
+  ## ONLY credential this pod holds, and all it can do is exchange a token the
+  ## caller already owns. Rotating it: change the value in Akeyless and restart
+  ## the Deployment — the pod reads it once at start.
+  data:
+    - remoteRef:
+        key: /mdapi/nextcloud-mcp/nextcloud-mcp-env/MCP_CLIENT_SECRET
+      secretKey: MCP_CLIENT_SECRET

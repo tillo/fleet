@@ -1,0 +1,74 @@
+# Dependency-Track's api-server (port 8080: REST API, BOM upload) answers only:
+#  - rke2-ingress-nginx, for dtrack.mdapi.ch/api (SSO-gated there);
+#  - the blackbox exporter, for the in-cluster availability probe;
+#  - windmill, whose f/security/dependency_track_sync uploads every SBOM and
+#    retires superseded versions (in-cluster, by API key);
+#  - backstage, whose GET-only proxy feeds the entity page's inventory card.
+# Its management port (9000: health, metrics) is reached by the kubelet only.
+# Egress stays open like every namespace outside the egress-guard enforce step:
+# the vulnerability mirror reaches NVD, the GitHub advisory API and OSV directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dependency-track-api-server-from-known-callers
+  namespace: dependency-track
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dependency-track-api-server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: windmill
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: backstage
+          podSelector:
+            matchLabels:
+              app: backstage
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# The frontend is a static SPA: only the ingress and the probe fetch it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dependency-track-frontend-from-ingress
+  namespace: dependency-track
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dependency-track-frontend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rke2-ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-blackbox-exporter
+      ports:
+        - protocol: TCP
+          port: 8080

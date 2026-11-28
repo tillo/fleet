@@ -1,0 +1,61 @@
+## clamd + freshclam configuration, mounted read-only at /etc/clamav-mdapi (the
+## image's own /etc/clamav files are not used; its certs/ there are). Both processes run as the image's `clamav` user
+## (uid 100) with a read-only root filesystem, so there is no `User` directive and
+## nothing is written outside /var/lib/clamav (PVC), /run/clamav and /tmp (emptyDirs).
+## Reloader restarts the pod when this changes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clamav-config
+  namespace: clamav
+data:
+  clamd.conf: |
+    Foreground yes
+    # No LogFile: in the foreground clamd logs to stdout/stderr itself.
+    # ⛔ `LogFile /dev/stdout` does NOT work: clamd opens it with O_NOFOLLOW and
+    # /dev/stdout is a symlink -> "Symbolic link loop", clamd exits.
+    LogTime yes
+    LogClean no
+    ExtendedDetectionInfo yes
+    DatabaseDirectory /var/lib/clamav
+    TemporaryDirectory /tmp
+    # The socket is for the in-pod callers only: freshclam's NotifyClamd and the
+    # kubelet's exec probes (clamdscan --ping). Everyone else uses TCP 3310.
+    LocalSocket /run/clamav/clamd.sock
+    LocalSocketMode 660
+    TCPSocket 3310
+    # mail (rspamd, max_size 25 MB, 10 s timeout) and Nextcloud (cron background
+    # scan + uploads) together; was 12 in docker-mailserver, 2 in AIO.
+    MaxThreads 12
+    MaxConnectionQueueLength 30
+    ReadTimeout 180
+    IdleTimeout 30
+    SelfCheck 3600
+    # ⭐ Concurrent reload is DELIBERATE although it doubles RSS for the ~20-40 s of
+    # a reload: with `no`, clamd stops scanning for the whole reload, longer than
+    # rspamd's 8 s task_timeout, so every freshclam update (several a day) would
+    # soft-reject the mail in flight. The memory limit is sized for the peak.
+    # A database that fails to load is discarded and the old engine kept.
+    ConcurrentDatabaseReload yes
+    # Nextcloud's files_antivirus is configured by the AIO entrypoint with
+    # av_stream_max_length=2147483648 and says this must match; these are the
+    # exact limits of the nextcloud-aio-clamav container this replaces.
+    StreamMaxLength 2000M
+    MaxScanSize 2000M
+    MaxFileSize 2000M
+    PCREMaxFileSize 2000M
+    MaxDirectoryRecursion 30
+  freshclam.conf: |
+    Foreground yes
+    LogTime yes
+    DatabaseDirectory /var/lib/clamav
+    DatabaseMirror database.clamav.net
+    # 12 checks a day (every 2 h), the upstream default and well inside the
+    # CDN's fair-use limits. ONE freshclam for the estate now, not two.
+    Checks 12
+    NotifyClamd /etc/clamav-mdapi/clamd.conf
+    # Skip freshclam's own trial load of every new database: it costs another
+    # full engine (~1 GiB) in THIS container on every update, and the check is
+    # redundant here because clamd's concurrent reload keeps the old engine
+    # when the new database fails to load.
+    TestDatabases no

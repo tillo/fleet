@@ -1,0 +1,71 @@
+## ovpn-admin at https://vpnadmin.mdapi.ch — its OWN host, not a sub-path.
+##
+## It briefly lived at jump.mdapi.ch/vpn. That was wrong: jump.mdapi.ch already
+## belongs to Guacamole, whose Ingress is behind oauth2-proxy, and sharing a host
+## meant two auth regimes on one server block plus a sub-path the app had to be
+## told about. A dedicated host is simpler and keeps each service's auth its own.
+##
+## DNS needs no manual record: external-dns generates the public A/AAAA (-> the
+## mdapi ingress 31.3.128.50) and split-horizon/external-dns-mdapi the internal
+## view (-> 192.168.1.191), exactly as for chat/backlog/grafana.mdapi.ch.
+##
+## ⭐ BASIC AUTH, deliberately NOT the oauth2-proxy/Keycloak that guards
+## Guacamole. This is the page you open when something is broken, so gating it on
+## Keycloak would reintroduce the runtime dependency that certificate auth just
+## removed from the VPN itself.
+##
+## ⚠️ ORDERING: ingress-nginx caches an auth-secret miss into the rendered config
+## as "# Location denied" and does NOT self-heal — if this Ingress is created
+## before the ExternalSecret below has produced the Secret, delete and recreate
+## the Ingress once it exists. See memory
+## nginx_ingress_auth_secret_ordering_race_2026_09_02.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ovpn-admin-htpasswd
+  namespace: jump
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: ovpn-admin-htpasswd
+    creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        ## nginx basic-auth requires a key literally called `auth` holding
+        ## htpasswd lines. Generated 2026-09-02 as user `tillo`, apr1 hash;
+        ## plaintext at /mdapi/ovpn-admin/password.
+        auth: "{{ .htpasswd }}"
+  data:
+    - secretKey: htpasswd
+      remoteRef:
+        key: /mdapi/ovpn-admin/htpasswd
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ovpn-admin
+  namespace: jump
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: ovpn-admin-htpasswd
+    nginx.ingress.kubernetes.io/auth-realm: "OpenVPN admin"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: vpnadmin.mdapi.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ovpn-admin
+                port: { number: 80 }
+  tls:
+    - hosts: [vpnadmin.mdapi.ch]
+      secretName: ovpn-admin-cert

@@ -1,0 +1,16 @@
+## Baseline for the QA cluster: namespaces, default-deny egress, the zot pull Secret.
+##
+## The CNI is Calico (OSS) -- it cannot express an FQDN policy, so `*.datadoghq.*` is
+## denied by a default-deny egress plus DNS egress carved out only to the cluster DNS,
+## and the datadog/DD hosts are additionally blocked at resolution by the deny-all
+## except DNS rule. Proof of the egress path is a Pod that fails `datadoghq.com`.
+##
+## No images are pulled here except zot.mdapi.ch (public hostname, htpasswd).
+defaultNamespace: qa-baseline
+## takeOwnership: an app bundle that deploys before this one makes Fleet create its
+## namespace bare (no PSA labels, no mdapi.ch/iast-tracer), and this bundle then refuses
+## it as "not owned by us" -- measured 2026-11-24 with qa/backstage: Modified, and the
+## app could not reach the sink. These namespaces are declared HERE and only here, so
+## adopting them is the honest statement. App bundles also dependsOn this one.
+helm:
+  takeOwnership: true

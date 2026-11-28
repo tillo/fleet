@@ -1,0 +1,276 @@
+## QA Horizon with the IAST tracer ON (infra-7rog.41.12), plus `horizon-off` (same image,
+## switch unset = what prod runs) as the overhead control. One throwaway MongoDB, one
+## database per copy (horizon-mongodb.yml). Not a copy of prod's StatefulSet: prod's
+## carries the real database, the CipherTrust-wrapped keyset and the CM credentials.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: horizon
+  namespace: horizon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: horizon
+  template:
+    metadata:
+      labels:
+        app: horizon
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: horizon
+          image: zot.mdapi.ch/mdapi/horizon-ciphertrust:2.12.2-b882@sha256:2bee96968e1b9b1bf67aee96167b956797468700835440d9ae736901f1aa6848
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 9000}
+            - {name: management, containerPort: 7626}
+          env:
+            ## the image's own single-node Pekko config (discovery = itself), not prod's
+            ## kubernetes-api discovery + lease: no ServiceAccount token, no RBAC. Only the
+            ## management endpoint is bound beyond loopback, for the kubelet's probes.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef: {fieldPath: status.podIP}
+            - name: AKKA_ACTOR_SYSTEM
+              value: horizon
+            - name: JAVA_OPTS
+              value: -Dpekko.management.http.bind-hostname=0.0.0.0
+            - name: LICENSE
+              valueFrom:
+                secretKeyRef: {name: horizon-license, key: license}
+            - name: APPLICATION_SECRET
+              valueFrom:
+                secretKeyRef: {name: horizon-qa, key: APPLICATION_SECRET}
+            - name: EVENT_SEAL_SECRET
+              valueFrom:
+                secretKeyRef: {name: horizon-qa, key: EVENT_SEAL_SECRET}
+            - name: EVENT_CHAINSIGN
+              value: "true"
+            ## a throwaway PLAINTEXT keyset: no VAULT_TINK_MASTER_KEY_URI on purpose
+            - name: VAULT_TYPE
+              value: tink
+            - name: KEYSET
+              valueFrom:
+                secretKeyRef: {name: horizon-qa, key: KEYSET}
+            - name: MONGODB_URI
+              value: mongodb://horizon-mongodb.horizon.svc.cluster.local:27017/horizon?directConnection=true
+            - name: HOSTS_ALLOWED.0
+              value: horizon:9000
+            - name: HOSTS_ALLOWED.1
+              value: horizon-off:9000
+            - name: HOSTS_ALLOWED.2
+              value: .horizon.svc.cluster.local
+            - name: HOSTS_ALLOWED.3
+              value: localhost:9000
+            ## plain HTTP inside the cluster (no ingress): a Secure session cookie would
+            ## never come back
+            - name: SESSION_SECURE
+              value: "false"
+            - name: ANALYTICS
+              value: "true"
+            - name: ANALYTICS_URL
+              value: jdbc:duckdb:/opt/horizon/var/analytics.db
+            - name: LOGGING_APPENDER
+              value: console
+            - name: LOGGING_LEVEL
+              value: info
+            ## --- IAST ------------------------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: http://iast-sink.iast.svc:8126
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            - name: DD_RUNTIME_METRICS_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: horizon-ciphertrust
+            - name: DD_ENV
+              value: qa
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            ## prod's (horizon/values.yml); the tracer copy gets 512 MiB more headroom
+            requests:
+              cpu: 300m
+              memory: 1Gi
+            limits:
+              memory: 2560Mi
+          startupProbe:
+            httpGet: {path: /alive, port: management}
+            periodSeconds: 3
+            failureThreshold: 200
+          readinessProbe:
+            httpGet: {path: /ready, port: management}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /alive, port: management}
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 12
+          volumeMounts:
+            - {name: var, mountPath: /opt/horizon/var}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: var
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: horizon
+  namespace: horizon
+spec:
+  selector:
+    app: horizon
+  ports:
+    - {name: http, port: 9000, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: horizon-off
+  namespace: horizon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: horizon-off
+  template:
+    metadata:
+      labels:
+        app: horizon-off
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: horizon
+          image: zot.mdapi.ch/mdapi/horizon-ciphertrust:2.12.2-b882@sha256:2bee96968e1b9b1bf67aee96167b956797468700835440d9ae736901f1aa6848
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 9000}
+            - {name: management, containerPort: 7626}
+          env:
+            ## the image's own single-node Pekko config (discovery = itself), not prod's
+            ## kubernetes-api discovery + lease: no ServiceAccount token, no RBAC. Only the
+            ## management endpoint is bound beyond loopback, for the kubelet's probes.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef: {fieldPath: status.podIP}
+            - name: AKKA_ACTOR_SYSTEM
+              value: horizon-off
+            - name: JAVA_OPTS
+              value: -Dpekko.management.http.bind-hostname=0.0.0.0
+            - name: LICENSE
+              valueFrom:
+                secretKeyRef: {name: horizon-license, key: license}
+            - name: APPLICATION_SECRET
+              valueFrom:
+                secretKeyRef: {name: horizon-qa, key: APPLICATION_SECRET}
+            - name: EVENT_SEAL_SECRET
+              valueFrom:
+                secretKeyRef: {name: horizon-qa, key: EVENT_SEAL_SECRET}
+            - name: EVENT_CHAINSIGN
+              value: "true"
+            ## a throwaway PLAINTEXT keyset: no VAULT_TINK_MASTER_KEY_URI on purpose
+            - name: VAULT_TYPE
+              value: tink
+            - name: KEYSET
+              valueFrom:
+                secretKeyRef: {name: horizon-qa, key: KEYSET}
+            - name: MONGODB_URI
+              value: mongodb://horizon-mongodb.horizon.svc.cluster.local:27017/horizon_off?directConnection=true
+            - name: HOSTS_ALLOWED.0
+              value: horizon:9000
+            - name: HOSTS_ALLOWED.1
+              value: horizon-off:9000
+            - name: HOSTS_ALLOWED.2
+              value: .horizon.svc.cluster.local
+            - name: HOSTS_ALLOWED.3
+              value: localhost:9000
+            ## plain HTTP inside the cluster (no ingress): a Secure session cookie would
+            ## never come back
+            - name: SESSION_SECURE
+              value: "false"
+            - name: ANALYTICS
+              value: "true"
+            - name: ANALYTICS_URL
+              value: jdbc:duckdb:/opt/horizon/var/analytics.db
+            - name: LOGGING_APPENDER
+              value: console
+            - name: LOGGING_LEVEL
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            ## prod's (horizon/values.yml); the tracer copy gets 512 MiB more headroom
+            requests:
+              cpu: 300m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          startupProbe:
+            httpGet: {path: /alive, port: management}
+            periodSeconds: 3
+            failureThreshold: 200
+          readinessProbe:
+            httpGet: {path: /ready, port: management}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /alive, port: management}
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 12
+          volumeMounts:
+            - {name: var, mountPath: /opt/horizon/var}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: var
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: horizon-off
+  namespace: horizon
+spec:
+  selector:
+    app: horizon-off
+  ports:
+    - {name: http, port: 9000, targetPort: http}

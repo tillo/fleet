@@ -1,0 +1,153 @@
+## Dependency-Track — the component inventory (ns `dependency-track`, epic
+## infra-7rog.42). One job: an SBOM per running thing, re-evaluated against
+## new advisories ("where does library X run right now").
+##
+## Internal tooling: warning tier, INTERNAL component `Security` (never mapped
+## to mdapi.statuspage.io). An outage delays an SBOM upload or an inventory
+## question; it never exposes anything. CVE news is NOT alerted here (role map,
+## docs security-findings.md): these rules only say "the inventory stopped
+## being true".
+##
+## What covers what:
+##   * workload arms -- api-server and frontend (Deployments; the StatefulSet
+##     arm keeps the namespace-wide claim true for later), and the CNPG
+##     dependency-track-pg instances (neither kind: DependencyTrackDatabaseUnready);
+##   * DependencyTrackUnreachable -- the in-cluster api-server Service, the path
+##     the Windmill producer and Backstage use;
+##   * DependencyTrackTlsExpiring -- dtrack.mdapi.ch's certificate (the oauth2
+##     gate answers 302; TLS is still measured).
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and
+## load-bearing for f/probe/alert_coverage_check.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-dependency-track
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-dependency-track.rules
+      rules:
+        - alert: DependencyTrackWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="dependency-track", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="dependency-track", deployment=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "dependency-track" }}'
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "dependency-track/{{ $labels.deployment }} unavailable"
+            description: |
+              A Dependency-Track Deployment (api-server or frontend) is short of
+              replicas. SBOM uploads from Windmill fail until it is back. Check:
+                kubectl --context mdapi-prod-direct -n dependency-track get pod
+                kubectl --context mdapi-prod-direct -n dependency-track logs deploy/dependency-track-api-server --tail=50
+
+        - alert: DependencyTrackStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="dependency-track", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="dependency-track", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "dependency-track" }}'
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "dependency-track/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in the dependency-track namespace is short of replicas.
+                kubectl --context mdapi-prod-direct -n dependency-track get sts,pod
+
+        - alert: DependencyTrackDatabaseUnready
+          expr: |
+            count by (namespace) (kube_pod_status_ready{namespace="dependency-track", condition="true", pod=~"dependency-track-pg-[0-9]+"} == 1) < 2
+          for: 30m
+          labels:
+            service: dependency-track-pg
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "dependency-track-pg has fewer than 2 ready instances"
+            description: |
+              The CNPG cluster holding the inventory runs degraded. Check:
+                kubectl --context mdapi-prod-direct -n dependency-track get cluster.postgresql.cnpg.io,pod -l cnpg.io/cluster=dependency-track-pg
+
+        - alert: DependencyTrackUnreachable
+          expr: avg_over_time(probe_success{probe="dependency-track-api"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: dependency-track
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "Dependency-Track's API does not answer in-cluster"
+            description: |
+              The probe of http://dependency-track-api-server.dependency-track.svc.cluster.local:8080/api/version
+              failed for >15m: the api-server pod (a JVM: OOMKilled? still
+              migrating?), its Service, or dependency-track-mdapi/dependency-track-netpol.yml.
+                kubectl --context mdapi-prod-direct -n dependency-track get pod,svc,networkpolicy
+
+        - alert: DependencyTrackTlsExpiring
+          ## Re-provided because the target carries no `component` (see Probe below),
+          ## so SyntheticProbeTLSExpiringSoon does not cover it.
+          expr: (probe_ssl_earliest_cert_expiry{probe="dependency-track-tls"} - time()) < 14 * 86400
+          for: 1h
+          labels:
+            service: dependency-track
+            severity: warning
+            component: Security
+            team: mdapi
+          annotations:
+            summary: "dtrack.mdapi.ch certificate expires in {{ $value | humanizeDuration }}"
+            description: |
+              cert-manager should have renewed at 30 days. Check:
+                kubectl --context mdapi-prod-direct -n dependency-track describe certificate dependency-track-tls
+---
+## No `component`/`team` on the targets, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dependency-track-api
+  namespace: monitoring
+spec:
+  jobName: dependency-track-api
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - http://dependency-track-api-server.dependency-track.svc.cluster.local:8080/api/version
+      labels:
+        probe: dependency-track-api
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: dependency-track-tls
+  namespace: monitoring
+spec:
+  jobName: dependency-track-tls
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_any_redirect
+  targets:
+    staticConfig:
+      static:
+        - https://dtrack.mdapi.ch/
+      labels:
+        probe: dependency-track-tls

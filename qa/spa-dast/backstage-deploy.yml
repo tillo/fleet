@@ -1,0 +1,205 @@
+## spa-dast-backstage: ZAP active scan of the QA backstage, seeded by its per-plugin
+## OpenAPI specs (catalog, search, scaffolder, notifications) plus the AJAX spider of the
+## SPA shell, all with the oauth2Proxy bearer (a fresh token per run, substituted into the
+## plan). infra-7rog.31.24. SUSPENDED: run with
+##   kubectl -n backstage create job --from=cronjob/spa-dast-backstage spa-dast-backstage-$(date +%s)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: spa-dast-backstage
+  namespace: backstage
+spec:
+  schedule: "0 4 * * *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 5400
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            mdapi.ch/qa-traffic: "true"
+        spec:
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          imagePullSecrets: [{name: zot-pull}]
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: zap
+              image: docker.io/zaproxy/zap-stable:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -u
+                  B=http://backstage:7007
+                  TOK=$(python3 -c "import json,urllib.request as u;print(json.load(u.urlopen(u.Request('$B/api/auth/oauth2Proxy/refresh',headers={'x-auth-request-preferred-username':'qa-tester','x-auth-request-email':'qa-tester@example.invalid','X-Requested-With':'XMLHttpRequest'})))['backstageIdentity']['token'])")
+                  [ -n "$TOK" ] || { echo "spa-dast: no backstage token"; exit 1; }
+                  ## Import from FILE, not URL: the openapi job's own fetch is unauthenticated and gets a
+                  ## 401 body, which ZAP reports as "The OpenAPI definition was invalid" (measured).
+                  for p in catalog search scaffolder notifications; do
+                    curl -s -H "Authorization: Bearer $TOK" "$B/api/$p/openapi.json" -o /tmp/spec-$p.json
+                  done
+                  sed "s|TOKEN_PLACEHOLDER|$TOK|g" /cfg/bs-plan.tmpl.yml > /tmp/bs-plan.yml
+                  cat > /tmp/drive.py <<'PY'
+                  """Drive the ZAP daemon through its API, one daemon per Job (infra-7rog.31.24).
+
+                  - waits for the daemon (started by run.sh in the same container),
+                  - optionally waits for the Playwright journey to finish (JOURNEY=1) so the traffic it
+                    recorded is in the session before the plan runs,
+                  - runs the automation plan (spider / spiderAjax / openapi / activeScan / report),
+                  - prints the measured coverage (URLs in the session, messages sent, plan progress) and
+                    the report in the pod log between the estate's DAST markers.
+                  """
+                  import base64
+                  import gzip
+                  import json
+                  import os
+                  import sys
+                  import time
+                  import urllib.parse
+                  import urllib.request
+
+                  API = os.environ.get("ZAP_API", "http://127.0.0.1:8090")
+                  WRK = os.environ.get("WRK", "/zap/wrk")
+
+
+                  def call(path, **params):
+                      url = API + path
+                      if params:
+                          url += "?" + urllib.parse.urlencode(params)
+                      with urllib.request.urlopen(url, timeout=60) as r:
+                          return json.loads(r.read() or b"{}")
+
+
+                  def wait_daemon(timeout=240):
+                      end = time.time() + timeout
+                      while time.time() < end:
+                          try:
+                              return call("/JSON/core/view/version/")["version"]
+                          except Exception:
+                              time.sleep(5)
+                      raise SystemExit("zap daemon did not answer")
+
+
+                  def wait_file(path, timeout):
+                      end = time.time() + timeout
+                      while time.time() < end:
+                          if os.path.exists(path):
+                              return True
+                          time.sleep(5)
+                      return False
+
+
+                  def run_plan(plan, label, budget_min):
+                      plan_id = call("/JSON/automation/action/runPlan/", filePath=plan)["planId"]
+                      end = time.time() + budget_min * 60
+                      seen = 0
+                      while time.time() < end:
+                          p = call("/JSON/automation/view/planProgress/", planId=plan_id)
+                          info = p.get("info", [])
+                          for line in info[seen:]:
+                              print(f"zap[{label}]: {line}", flush=True)
+                          seen = len(info)
+                          if p.get("finished"):
+                              for line in p.get("error", []):
+                                  print(f"zap[{label}]: ERROR {line}", flush=True)
+                              for line in p.get("warn", []):
+                                  print(f"zap[{label}]: WARN {line}", flush=True)
+                              print(f"zap[{label}]: plan finished {p['finished']} (started {p['started']})", flush=True)
+                              return not p.get("error")
+                          time.sleep(10)
+                      print(f"zap[{label}]: plan still running after {budget_min} min", flush=True)
+                      return False
+
+
+                  def coverage(base):
+                      urls = call("/JSON/core/view/urls/", baseurl=base).get("urls", [])
+                      msgs = call("/JSON/core/view/numberOfMessages/", baseurl=base)
+                      print(f"zap: coverage base={base} urls={len(urls)} messages={msgs.get('numberOfMessages')}", flush=True)
+                      for u in sorted(urls):
+                          print(f"zap: url {u}", flush=True)
+                      return len(urls)
+
+
+                  def report_block(label, path):
+                      if not os.path.exists(path) or os.path.getsize(path) == 0:
+                          print(f"zap: no report for {label}", flush=True)
+                          return False
+                      with open(path, "rb") as f:
+                          data = gzip.compress(f.read())
+                      print(f"-----BEGIN DAST REPORT zap-full {label}-----", flush=True)
+                      print(base64.b64encode(data).decode(), flush=True)
+                      print(f"-----END DAST REPORT zap-full {label}-----", flush=True)
+                      with open(path) as f:
+                          doc = json.load(f)
+                      for site in doc.get("site", []):
+                          for a in site.get("alerts", []):
+                              print(f"zap: alert {a['riskdesc']} | {a['name']} | {a.get('count')}", flush=True)
+                      return True
+
+
+                  def main():
+                      plan, label, base, report = sys.argv[1:5]
+                      budget = int(sys.argv[5]) if len(sys.argv) > 5 else 45
+                      print(f"zap: daemon {wait_daemon()}", flush=True)
+                      # The QA fence has no egress: passive rules that phone home ("ZAP is Out of Date",
+                      # the version-vulnerability lookup) block the passive queue for 60 s PER MESSAGE and
+                      # hang passiveScan-wait. Disabling them is measured, not guessed (infra-7rog.31.24).
+                      ids = os.environ.get("PSCAN_DISABLE", "10116,20020")
+                      if ids:
+                          print("zap: disable pscan " + str(call("/JSON/pscan/action/disableScanners/", ids=ids)), flush=True)
+                      if os.environ.get("JOURNEY") == "1":
+                          ok = wait_file(f"{WRK}/journey-done", int(os.environ.get("JOURNEY_TIMEOUT", "900")))
+                          print(f"zap: journey {'done' if ok else 'TIMED OUT'}", flush=True)
+                      ok = run_plan(plan, label, budget)
+                      coverage(base)
+                      ok = report_block(label, report) and ok
+                      return 0 if ok else 1
+
+
+                  if __name__ == "__main__":
+                      sys.exit(main())
+                  PY
+                  ## -Xmx, explicitly: zap.sh sizes the heap from /proc/meminfo (the NODE's memory, 15 GB),
+                  ## so it picks -Xmx3744m and the container is OOM-killed at its 2 Gi limit (measured
+                  ## 2026-11-25 on backstage's 163-URL scan). The heap must follow the container, not the node.
+                  /zap/zap.sh -Xmx1500m -daemon -host 127.0.0.1 -port 8090 -config api.disablekey=true \
+                    -config connection.defaultUserAgent=mdapi-dast/zap-active \
+                    -config pscan.rules.10116.enabled=false > /tmp/zap-daemon.log 2>&1 &
+                  python3 /tmp/drive.py /tmp/bs-plan.yml backstage.spa http://backstage:7007 /zap/wrk/bs.json 30
+                  rc=$?
+                  echo "spa-dast: zap container exit $rc"
+                  tail -40 /tmp/zap-daemon.log
+                  exit $rc
+              env:
+                - name: BACKSTAGE_TOKEN
+                  value: ""
+                - name: MOZ_DISABLE_CONTENT_SANDBOX
+                  value: "1"
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+              resources:
+                # 3 Gi: the AJAX spider's Firefox runs IN THIS CONTAINER, so the limit must
+                # cover a 1.5 Gi heap plus the browser -- 2 Gi was OOMKilled mid-active-scan
+                # twice (measured 2026-11-25). One scan per Job; do not run two at once.
+                requests: {cpu: 500m, memory: 1Gi}
+                limits: {cpu: "2", memory: 3Gi}
+              volumeMounts:
+                - {name: zap-wrk, mountPath: /zap/wrk}
+                - {name: cfg, mountPath: /cfg}
+          volumes:
+            - name: zap-wrk
+              emptyDir: {sizeLimit: 1Gi}
+            - name: cfg
+              configMap: {name: spa-dast-backstage-plan}

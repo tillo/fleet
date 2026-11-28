@@ -1,0 +1,80 @@
+## The QA overlay, read AFTER the image's app-config.yaml and INSTEAD of
+## app-config.production.yaml (args in backstage-deploy.yml). Every entity below is
+## made up (example.invalid); nothing is copied from the prod catalog.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backstage-qa
+  namespace: backstage
+data:
+  app-config.qa.yaml: |
+    app:
+      baseUrl: http://backstage:7007
+    backend:
+      baseUrl: http://backstage:7007
+      listen: ':7007'
+    auth:
+      environment: production
+    permission:
+      enabled: true
+      adminGroups:
+        - user:default/qa-tester
+    catalog:
+      rules:
+        - allow: [Component, System, API, Resource, Location, Domain, Group, User]
+      locations:
+        - type: file
+          target: /qa/entities.yaml
+  entities.yaml: |
+    apiVersion: backstage.io/v1alpha1
+    kind: Group
+    metadata: {name: qa-team, description: Synthetic QA group}
+    spec: {type: team, children: []}
+    ---
+    apiVersion: backstage.io/v1alpha1
+    kind: User
+    metadata: {name: qa-tester}
+    spec:
+      profile: {displayName: QA Tester, email: qa-tester@example.invalid}
+      memberOf: [qa-team]
+    ---
+    apiVersion: backstage.io/v1alpha1
+    kind: System
+    metadata: {name: qa-shop, description: A made-up system}
+    spec: {owner: group:qa-team}
+    ---
+    apiVersion: backstage.io/v1alpha1
+    kind: Component
+    metadata:
+      name: qa-cart
+      description: Made-up cart service
+      annotations:
+        backstage.io/techdocs-ref: dir:.
+      tags: [python, qa]
+      links:
+        - {url: 'https://qa-cart.example.invalid', title: Home}
+    spec: {type: service, lifecycle: experimental, owner: group:qa-team, system: qa-shop, providesApis: [qa-cart-api]}
+    ---
+    apiVersion: backstage.io/v1alpha1
+    kind: Component
+    metadata: {name: qa-checkout, description: Made-up checkout website, tags: [node]}
+    spec: {type: website, lifecycle: production, owner: user:qa-tester, system: qa-shop, consumesApis: [qa-cart-api], dependsOn: [resource:qa-db]}
+    ---
+    apiVersion: backstage.io/v1alpha1
+    kind: API
+    metadata: {name: qa-cart-api, description: Made-up API}
+    spec:
+      type: openapi
+      lifecycle: experimental
+      owner: group:qa-team
+      system: qa-shop
+      definition: |
+        openapi: 3.0.0
+        info: {title: qa-cart, version: 1.0.0}
+        paths:
+          /items: {get: {responses: {'200': {description: ok}}}}
+    ---
+    apiVersion: backstage.io/v1alpha1
+    kind: Resource
+    metadata: {name: qa-db, description: Made-up database}
+    spec: {type: database, owner: group:qa-team, system: qa-shop}

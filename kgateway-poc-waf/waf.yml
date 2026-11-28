@@ -1,0 +1,100 @@
+## How the Gateway talks to the engine, and where it is switched on/off.
+##
+## ⛔ Three kgateway defaults must be overridden or this WAF silently checks
+## nothing (each read from the v2.5.2 API types):
+##   failOpen            defaults TRUE  → a dead engine lets every request pass
+##   requestBodyMode     defaults NONE  → no POST body is ever inspected
+##   responseBodyMode    defaults NONE  → no phase-4 data-leak rules
+## and the engine REFUSES a transaction without x-request-id, which Envoy
+## generates by default.
+##
+## Two more defaults break routes the WAF is merely in front of (measured
+## 2026-11-24, Envoy debug traces on the kgw proxy):
+##   filterStage     defaults AFTER AuthZ → ext_authz's own 401 is sent through
+##                   ext_proc as a response whose request the engine never saw;
+##                   it answers "unknown transaction" and the login prompt
+##                   becomes a 403. Before AuthN the WAF screens the request
+##                   first, which also keeps attacks away from oauth2-proxy.
+##   messageTimeout  defaults 200 ms → CRS needs ~1.3 s per 100 KB of form body,
+##                   so anything over ~15 KB became a 504.
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: GatewayExtension
+metadata:
+  name: coraza
+  namespace: kgw-poc
+spec:
+  extProc:
+    grpcService:
+      backendRef:
+        name: coraza
+        port: 9001
+    failOpen: false
+    filterStage:
+      stage: AuthN
+      predicate: Before
+      weight: -1   # after the buffer filter (body cap) staged at the same place
+    messageTimeout: 5s
+    requestAttributes:
+      - "source.address"
+      - "destination.address"
+      - "request.protocol"
+    processingMode:
+      requestHeaderMode: SEND
+      responseHeaderMode: SEND
+      requestBodyMode: BUFFERED
+      responseBodyMode: BUFFERED
+---
+## Attached to the whole Gateway: every route through kgw is WAF'd unless a more
+## specific policy disables it (the wafoff route below).
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: waf
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: kgw
+  extProc:
+    extensionRef:
+      name: coraza
+---
+## The opt-out, scoped to one route — the equivalent of an nginx Ingress without
+## the modsecurity annotations. It is also the control that PROVES the 403s come
+## from the WAF and not from routing.
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: wafoff
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: wafoff
+  extProc:
+    disable: {}
+---
+## Websocket: the WAF still checks the upgrade handshake (headers), but must not
+## wait for a body. Envoy sees the upgrade request as end_stream=false; in
+## BUFFERED mode it holds the request until a body that a websocket client never
+## sends before its 101 — so the upgrade hung until the client gave up.
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: waf-ws
+  namespace: kgw-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: ws
+  extProc:
+    extensionRef:
+      name: coraza
+    processingMode:
+      requestHeaderMode: SEND
+      responseHeaderMode: SEND
+      requestBodyMode: NONE
+      responseBodyMode: NONE

@@ -1,0 +1,20 @@
+## horizon-mcp and stream-mcp in the QA cluster, INSTRUMENTED for IAST (infra-7rog.41.11).
+##
+## Both are the vendor's stdio MCP servers behind supergateway (+ an nginx bearer gate),
+## pointed at the QA Horizon (qa/horizon) -- never prod Horizon, never Stream (QA has none;
+## the user's licence exception covers Horizon only), so stream-mcp's tools answer from a
+## Horizon that is not a Stream: whatever IAST sees there is its gateway, not its tools.
+## Credentials: Secret horizon-mcp-qa, minted by ~/src/spot-qa/horizon-qa-mcp-key.py IN the
+## QA Horizon (identity qa-mcp, no configuration:*) plus a QA-only gate token. Not in git.
+## kustodyan-mcp stays out of QA: its backend is the vendor RPS with prod client credentials,
+## which the exception does not cover.
+##
+## The tracer loads because DD_IAST_ENABLED=true (the image's /usr/local/bin/iast-entry);
+## NODE_OPTIONS reaches supergateway and the stdio child, never nginx.
+## tests/test_qa_evertrust_mcp_targets_qa_horizon.py pins the targets and the credentials.
+defaultNamespace: evertrust-mcp
+## No namespaceLabels: qa/qa-baseline owns this Namespace (see qa/horizon/fleet.yaml).
+dependsOn:
+  - name: bootstrap-qa-qa-baseline
+helm:
+  maxHistory: 5

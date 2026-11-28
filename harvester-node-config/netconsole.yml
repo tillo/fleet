@@ -1,0 +1,95 @@
+# netconsole: kernel messages leave the box over UDP, to the bpi-r4 (infra-m42.10, infra-kd3t).
+#
+# A silent whole-node freeze (quo 11-17/11-18, qui 11-20) leaves nothing behind: the journal is
+# on the disk the freeze blocks and pstore is filled only by a panic. netconsole sends each
+# kernel line out through netpoll as it is printed, with no disk involved, so the last words
+# before the iLO reset survive on the router (/persist/netconsole/<node>.log, listener
+# /persist/netconsole/listen.sh, one UDP port per node). The router is the receiver because it
+# keeps working when the cluster does not.
+#
+# ⛔ OPT-IN ONLY: matchSelector mdapi.ch/netconsole=true, a label no node carries (2026-11-21).
+#   netconsole on mgmt-br puts netpoll on the bridge, and from then on br_add_if() calls
+#   br_netpoll_enable() for EVERY new port (v6.12 net/bridge/br_if.c); a veth sets
+#   IFF_DISABLE_NETPOLL and is refused, so the port add fails. Every VM NAD (lan, dmz, wan, pppoe,
+#   adlan) is a CNI bridge on mgmt-br, so a node that boots with this (the network stage runs
+#   before any VM) cannot attach a VM NIC afterwards: rancher-mgmt included. On qua/qui/quo,
+#   which already carry VM veths, enabling it fails outright (write to enabled: error 524,
+#   "veth... doesn't support polling"). mgmt-bo and the eno* NICs are enslaved, and
+#   netpoll_setup() refuses a slave ("is a slave device"), so there is no other device to use.
+#   Label a node only if it can NEVER host a VM on a mgmt-br network. A working route needs an
+#   unenslaved NIC (none is cabled today) or a different receiver path: infra-m42.10.
+#   Shipped 2026-11-21 matching every node (!2693); retired the same day before any boot used it.
+#
+# - Dynamic netconsole (configfs target "bpi-r4") on mgmt-br, the bridge over the mgmt-bo LACP
+#   bond. netpoll over bridge -> 802.3ad bond -> tg3/i40e works on quarto while mgmt-br has no
+#   veth port (proven 2026-11-21).
+# - The router MAC is resolved at runtime (ARP), so a replaced router is picked up at the next
+#   boot. No MAC -> the stage fails loudly instead of broadcasting to ff:ff:ff:ff:ff:ff.
+# - kernel.printk 4 4 1 7: a line reaches a console only when its level is below the first
+#   number, so 4 lets ERR and above out (hung task, soft lockup, I/O errors, oom kills) and keeps
+#   WARNING and below in. A panic switches to verbose and sends everything. Measured 2026-11-21:
+#   zero ERR-level lines in 7.5 h on any node, so no steady traffic. To test the path, write a
+#   <3> line to /dev/kmsg; a <4> line is correctly filtered.
+# - A host missing from the port map is skipped (exit 0), never sent to another node's file.
+#
+# Runs in the `network` stage (needs mgmt-br's address and the router's ARP entry). It is
+# idempotent: re-running it rewrites the target. To activate live, run ONLY this script (never
+# the whole network stage: /oem/90_custom.yaml, Harvester's network config, runs there too).
+# The CR only takes effect by itself at each node's next boot.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-netconsole
+spec:
+  matchSelector:
+    mdapi.ch/netconsole: "true"
+  filename: 99_mdapi_netconsole.yaml
+  contents: |
+    # Managed by CloudInit mdapi-netconsole (fleet harvester-node-config/netconsole.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "netconsole: kernel ERR+ lines (and every panic) over UDP to the bpi-r4 listener 192.168.1.254, one port per node (infra-m42.10)"
+    stages:
+      network:
+        - name: "netconsole target bpi-r4 on mgmt-br + console loglevel 4"
+          files:
+            - path: /etc/sysctl.d/96-netconsole.conf
+              permissions: 0644
+              content: |
+                kernel.printk = 4 4 1 7
+          commands:
+            - sysctl -p /etc/sysctl.d/96-netconsole.conf || true
+            - |
+              set -eu
+              router=192.168.1.254
+              dev=mgmt-br
+              target=${NETCONSOLE_CONFIGFS:-/sys/kernel/config}/netconsole/bpi-r4
+              host=$(uname -n)
+              case "$host" in
+                qua) port=6661 ;;
+                qui) port=6662 ;;
+                quo) port=6663 ;;
+                quarto) port=6664 ;;
+                *) echo "netconsole: no listener port for $host, skipping"; exit 0 ;;
+              esac
+              modprobe netconsole
+              ip='' mac=''
+              for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                ip=$(ip -4 -o addr show dev "$dev" | awk '{sub("/.*", "", $4); print $4; exit}')
+                ping -c 1 -W 1 "$router" >/dev/null 2>&1 || true
+                mac=$(ip neigh show "$router" dev "$dev" | awk '/lladdr/ {print $3; exit}')
+                if [ -n "$ip" ] && [ -n "$mac" ]; then break; fi
+                sleep 2
+              done
+              if [ -z "$ip" ] || [ -z "$mac" ]; then
+                echo "netconsole: no IPv4 on $dev ('$ip') or no ARP entry for $router ('$mac')" >&2
+                exit 1
+              fi
+              mkdir -p "$target"
+              if [ "$(cat "$target/enabled" 2>/dev/null)" = 1 ]; then echo 0 > "$target/enabled"; fi
+              echo "$dev" > "$target/dev_name"
+              echo "$ip" > "$target/local_ip"
+              echo "$router" > "$target/remote_ip"
+              echo "$port" > "$target/remote_port"
+              echo "$mac" > "$target/remote_mac"
+              echo 1 > "$target/enabled"
+              echo "netconsole: $host $ip -> $router:$port ($mac) via $dev"

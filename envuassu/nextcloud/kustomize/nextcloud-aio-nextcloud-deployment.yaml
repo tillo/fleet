@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nextcloud-aio-nextcloud
+  namespace: envuassu
+spec:
+  # See sibling -apache patch for rationale (Recreate avoids cross-node RWX
+  # window during rollouts of the shared pvc nextcloud-aio-nextcloud).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      priorityClassName: mdapi-critical
+      containers:
+        - name: nextcloud-aio-nextcloud
+          # Probes mirror nextcloud/nextcloud (see its comments): the first
+          # boot after an image bump runs `occ upgrade` before php-fpm
+          # listens, and on 2026-09-23 the chart's liveness (300s + 3x30s)
+          # killed the container mid-upgrade -> ~15 min of 503. startupProbe
+          # allows up to 30 min; timeout 60s + threshold 6 rides out I/O storms.
+          startupProbe:
+            exec:
+              command: ["/healthcheck.sh"]
+            periodSeconds: 30
+            timeoutSeconds: 60
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["/healthcheck.sh"]
+            initialDelaySeconds: 0
+            periodSeconds: 30
+            timeoutSeconds: 60
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["/healthcheck.sh"]
+            initialDelaySeconds: 0
+            periodSeconds: 30
+            timeoutSeconds: 60
+            failureThreshold: 6
+          # A2 (infra-ka2): explicit request floors sized from the VPA
+          # recommender's targets — VPA Auto does NOT mutate envuassu pods
+          # (works in other namespaces; tracked separately). No limits.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 1Gi
+          imagePullPolicy: IfNotPresent
+          env:
+            # The AIO chart has ONE trusted-proxy slot (ADDITIONAL_TRUSTED_PROXY, index
+            # 2, the router). Without the pod CIDR, Nextcloud does not trust the
+            # in-cluster hops (ingress-nginx, notify-push) and notify_push's
+            # trusted-proxy self-test fails. AIO's run-exec-commands.sh runs this as
+            # www-data on EVERY container start once apache answers, so the entry is
+            # re-asserted on each roll instead of living only in config.php (envuassu
+            # had silently lost the hand-set copy). Setting it is idempotent. It
+            # replaces the script's Collabora branch, which is unused here
+            # (COLLABORA_ENABLED=no, Office is OnlyOffice).
+            - name: NEXTCLOUD_EXEC_COMMANDS
+              # overwritehost: notify-push reaches apache directly (NEXTCLOUD_URL in
+              # nextcloud-aio-notify-push-deployment.yaml), so its requests carry
+              # Host: nextcloud-aio-apache, which is not a trusted domain; overwritehost
+              # makes Nextcloud treat every request as NC_DOMAIN (400 without it).
+              value: |
+                php /var/www/html/occ config:system:set trusted_proxies 4 --value=10.52.0.0/16
+                php /var/www/html/occ config:system:set overwritehost --value=cloud.envuassu.ch
+            # run-exec-commands.sh first loops on `nc -z $APACHE_HOST $APACHE_PORT`
+            # (11000), but this bundle's apache Service serves TCP on 11001 only
+            # (see nextcloud-aio-apache-service.yaml), so the hook above never ran.
+            # In this image APACHE_PORT is read only by that loop and by a
+            # `= 443` test in start.sh, so pointing it at 11001 changes nothing else.
+            - name: APACHE_PORT
+              value: "11001"
+            - name: ADMIN_PASSWORD
+              $patch: delete
+            - name: FULLTEXTSEARCH_PASSWORD
+              $patch: delete
+            - name: IMAGINARY_SECRET
+              $patch: delete
+            - name: ONLYOFFICE_SECRET
+              $patch: delete
+            - name: POSTGRES_PASSWORD
+              $patch: delete
+            - name: REDIS_HOST_PASSWORD
+              $patch: delete
+            - name: SIGNALING_SECRET
+              $patch: delete
+            - name: TURN_SECRET
+              $patch: delete
+            # SMTP login envuassu-nextcloud@smtp.mdapi.ch (infra-o4i3m.1.5): the chart
+            # renders SMTP_PASSWORD as an empty literal, which would shadow envFrom.
+            - name: SMTP_PASSWORD
+              $patch: delete
+          envFrom:
+            - secretRef:
+                name: nextcloud-aio-env-secret
+      volumes:
+        - name: nextcloud-aio-nextcloud-data
+          persistentVolumeClaim:
+            claimName: nextcloud-aio-nextcloud-data-ceph

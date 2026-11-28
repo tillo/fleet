@@ -1,0 +1,19 @@
+# Namespace-PINNED nested bundle (cf. jump/netpol): it holds only the seat-image
+# pre-puller, kept apart from the jump bundle one level up so a change here can
+# never re-render the Helm release that owns deploy/jump-bastion (Recreate: a
+# roll kills every live session). Fleet recurses into jump/, so no GitRepo path
+# change. tests/test_seat_image_is_prepulled_on_every_node.py asserts the split.
+# namespaceLabels MUST equal jump/fleet.yaml's
+# (tests/test_namespace_labels_agree_across_bundles.py): Fleet makes the live
+# labels equal the list, and losing enforce=privileged would make the bastion's
+# next pod unschedulable.
+defaultNamespace: jump
+namespace: jump
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  # bastion runs sshd as root + mosh setcap → namespace must allow it
+  pod-security.kubernetes.io/enforce: privileged
+  pod-security.kubernetes.io/warn: baseline
+helm:
+  maxHistory: 25

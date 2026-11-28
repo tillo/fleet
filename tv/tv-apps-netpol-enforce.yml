@@ -1,0 +1,77 @@
+# ENFORCING (isolation programme infra-az8.4; finding infra-o4i3m.4).
+#
+# Why: these seven apps keep their auth only at the oauth2-proxy-tv ingress and trust
+# whatever reaches the pod. On 2026-11-16, unauthenticated from the jump pod: sonarr/
+# radarr/prowlarr /initialize.json and Bazarr's HTML handed out their API keys;
+# Transmission RPC had no auth (script-torrent-done = code exec); Tdarr /api/v2 answered
+# (flows = code exec); Threadfin /web answered. pms-docker, seerr, sftpgo and autobrr
+# have their own auth and are NOT selected. flaresolverr has its own enforcing policy.
+#
+# Written from learn.tv-apps (2026-11-16 21:21Z -> 2026-11-18, ~33 h, journald
+# suppression 0 on every node; ~/tv-netpol-analysis-20261118.md). Outside the rules
+# already allowed below, the window saw exactly ONE caller: Home Assistant, on exactly
+# its three integrations (Radarr "Film", Sonarr "Serie", Tdarr Server). Kubelet probes
+# are not policed (host -> local workload without a HostEndpoint).
+#
+#   1. BitTorrent peers -> transmission 51413 tcp+udp (LB 192.168.1.47, ETP Local, so
+#      sources are internet addresses). ⛔ Removing it kills every inbound peer.
+#   2. ingress-nginx / Traefik (browsers through oauth2-proxy-tv; dual list on RKE2 1.36).
+#   3. the tv namespace itself: seerr/prowlarr/bazarr/autobrr -> *arr, *arr ->
+#      transmission, pms -> threadfin, tdarr-node-quarto -> tdarr:8266, the
+#      transmission-restart CronJob.
+#   4. Home Assistant -> radarr 7878, sonarr 8989, tdarr 8265 (its integrations). A new
+#      HA integration against a tv app needs its port here.
+#   5. Windmill WORKER pods -> radarr 7878, sonarr 8989, transmission 9091 (2026-11-27,
+#      bead infra-r9mzd.90). f/heal/tv_seed_retention reads the *arr download history
+#      and deletes seed copies whose media is provably still in the library; without
+#      this it times out at the transmission socket. Scoped to the workers by label —
+#      the Windmill app/frontend and postgres pods stay out, because reading
+#      /initialize.json is exactly the key theft this policy exists to stop.
+#   6. Log then Deny: anything else is refused and leaves a netpol_flows row, so a
+#      block is answerable ("what did the policy drop?") rather than silent.
+#
+# Revert: git revert this change (Fleet re-creates the object; a kubectl delete buys ~90 s).
+# Pinned by tests/test_tv_apps_enforce_policy.py.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.tv-apps
+  namespace: tv
+spec:
+  order: 500
+  selector: app in {"sonarr", "radarr", "prowlarr", "bazarr", "tdarr", "threadfin", "transmission-pia"}
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      destination:
+        ports: [51413]
+    - action: Allow
+      protocol: UDP
+      destination:
+        ports: [51413]
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name in {"rke2-ingress-nginx", "rke2-traefik"}
+    - action: Allow
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "tv"
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "home-assistant"
+        selector: app == "home-assistant"
+      destination:
+        ports: [7878, 8989, 8265]
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "windmill"
+        selector: app.kubernetes.io/name == "windmill-workers"
+      destination:
+        ports: [7878, 8989, 9091]
+    - action: Log
+    - action: Deny

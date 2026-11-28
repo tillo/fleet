@@ -1,0 +1,98 @@
+# Read-only operations assistant for mdapi-prod. It can look (Kubernetes
+# get/list/logs/top, the memory brain, the Backstage catalog) and explain; it
+# cannot change anything: k8s-mcp's ServiceAccount is get/list/watch only and
+# Secret-blind, the gateway refuses pods_exec to this client, and it lets only
+# the catalog read tools through to Backstage.
+apiVersion: kagent.dev/v1alpha2
+kind: Agent
+metadata:
+  name: mdapi-ops
+  namespace: kagent
+spec:
+  description: Read-only mdapi-prod operations assistant (cluster state + estate memory).
+  type: Declarative
+  declarative:
+    runtime: go
+    modelConfig: default-model-config
+    stream: true
+    systemMessage: |
+      You are the read-only operations assistant of the mdapi-prod Kubernetes
+      cluster. You diagnose and explain; you never change anything, and you have
+      no tool that could.
+
+      Method:
+      1. Look up the estate's own knowledge first with the memsearch `search`
+         tool (runbooks, incident reports, standing rules), then open only the
+         hits you need with `get_document`.
+      2. Place the thing in the Backstage catalog: `catalog.get-catalog-entity`
+         or `catalog.query-catalog-entities` give its owner, system, what it
+         depends on and what depends on it, and its namespace. A Fleet bundle
+         is the Resource `fleet-<path with / as ->`, a CNPG database the
+         Resource `pg-<namespace>-<cluster>`, a Windmill job the Component
+         `wm-<folder>-<name>`.
+      3. Then look at live state with the Kubernetes tools: list before get,
+         events and logs before conclusions.
+      4. Answer with what you saw (the resource and the field or log line),
+         what you conclude, and the change a human should make. Say plainly
+         when the evidence is not enough.
+
+      Never print Secret values, tokens or customer data, even if a tool
+      returns them.
+    promptTemplate:
+      dataSources:
+        - kind: ConfigMap
+          name: kagent-builtin-prompts
+          alias: builtin
+    tools:
+      - type: McpServer
+        mcpServer:
+          name: mdapi-kubernetes
+          kind: RemoteMCPServer
+          apiGroup: kagent.dev
+          toolNames:
+            - namespaces_list
+            - events_list
+            - pods_list
+            - pods_list_in_namespace
+            - pods_get
+            - pods_log
+            - pods_top
+            - nodes_top
+            - resources_list
+            - resources_get
+      - type: McpServer
+        mcpServer:
+          name: mdapi-memsearch
+          kind: RemoteMCPServer
+          apiGroup: kagent.dev
+          toolNames:
+            - search
+            - get_document
+            - similar
+            - stats
+      - type: McpServer
+        mcpServer:
+          name: mdapi-backstage
+          kind: RemoteMCPServer
+          apiGroup: kagent.dev
+          toolNames:
+            - catalog.get-catalog-entity
+            - catalog.query-catalog-entities
+            - catalog.get-catalog-model-description
+    deployment:
+      resources:
+        requests:
+          cpu: 20m
+          memory: 64Mi
+        limits:
+          memory: 256Mi
+    a2aConfig:
+      skills:
+        - id: mdapi-diagnostics
+          name: mdapi-prod diagnostics
+          description: Read-only diagnosis of mdapi-prod workloads, backed by the estate's runbooks.
+          tags: [kubernetes, diagnostics, read-only]
+          examples:
+            - "Why is a pod in namespace monitoring restarting?"
+            - "What does the runbook say about a Fleet bundle stuck in WaitApplied?"
+            - "What depends on the backstage-pg database?"

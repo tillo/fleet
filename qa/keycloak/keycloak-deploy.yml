@@ -1,0 +1,200 @@
+## QA Keycloak with the IAST tracer ON (infra-7rog.41 wave 1), plus `keycloak-off`
+## (same image, switch unset = prod) as the overhead control. One throwaway Postgres,
+## one database per copy (keycloak-pg.yml says why). Not a copy of prod's Deployment: prod's carries the real
+## database, the bootstrap admin and the realm secrets.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: keycloak
+          image: zot.mdapi.ch/mdapi/keycloak:latest@sha256:3bb5d562a9dc6855caaeae40c0144ecf8cb5b8c4ac1cfb490392db8189dab2cf
+          imagePullPolicy: IfNotPresent
+          ## prod's args plus the test realm import (prod imports nothing)
+          args: [start, --optimized, --import-realm]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: management, containerPort: 9000}
+          env:
+            - name: KC_HOSTNAME
+              value: "http://keycloak:8080"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://keycloak-pg.keycloak.svc.cluster.local/keycloak
+            - name: KC_DB_USERNAME
+              value: keycloak
+            ## trust auth on a pod-only database (keycloak-pg.yml): this is no credential
+            - name: KC_DB_PASSWORD
+              value: qa-trust-auth
+            ## --- IAST ------------------------------------------------------------
+            - name: DD_IAST_ENABLED
+              value: "true"
+            - name: DD_IAST_REQUEST_SAMPLING
+              value: "100"
+            - name: DD_TRACE_AGENT_URL
+              value: http://iast-sink.iast.svc:8126
+            - name: DD_REMOTE_CONFIGURATION_ENABLED
+              value: "false"
+            - name: DD_INSTRUMENTATION_TELEMETRY_ENABLED
+              value: "false"
+            - name: DD_RUNTIME_METRICS_ENABLED
+              value: "false"
+            - name: DD_SERVICE
+              value: keycloak
+            - name: DD_ENV
+              value: qa
+          envFrom:
+            ## QA_ADMIN_PASSWORD / QA_TESTER_PASSWORD for the realm import placeholders
+            - secretRef:
+                name: keycloak-qa-users
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          startupProbe:
+            httpGet: {path: /health/started, port: management}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health/ready, port: management}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /opt/keycloak/data}
+            - {name: realm, mountPath: /opt/keycloak/data/import}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: realm
+          configMap:
+            name: keycloak-qa-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-off
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-off
+  template:
+    metadata:
+      labels:
+        app: keycloak-off
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: keycloak
+          image: zot.mdapi.ch/mdapi/keycloak:latest@sha256:3bb5d562a9dc6855caaeae40c0144ecf8cb5b8c4ac1cfb490392db8189dab2cf
+          imagePullPolicy: IfNotPresent
+          ## prod's args plus the test realm import (prod imports nothing)
+          args: [start, --optimized, --import-realm]
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: management, containerPort: 9000}
+          env:
+            - name: KC_HOSTNAME
+              value: "http://keycloak-off:8080"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://keycloak-pg.keycloak.svc.cluster.local/keycloak_off
+            - name: KC_DB_USERNAME
+              value: keycloak
+            ## trust auth on a pod-only database (keycloak-pg.yml): this is no credential
+            - name: KC_DB_PASSWORD
+              value: qa-trust-auth
+          envFrom:
+            ## QA_ADMIN_PASSWORD / QA_TESTER_PASSWORD for the realm import placeholders
+            - secretRef:
+                name: keycloak-qa-users
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+          startupProbe:
+            httpGet: {path: /health/started, port: management}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /health/ready, port: management}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /opt/keycloak/data}
+            - {name: realm, mountPath: /opt/keycloak/data/import}
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: realm
+          configMap:
+            name: keycloak-qa-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-off
+  namespace: keycloak
+spec:
+  selector:
+    app: keycloak-off
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}

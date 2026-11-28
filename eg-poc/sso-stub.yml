@@ -1,0 +1,123 @@
+## Logged-in SSO path, proven without a Keycloak login: an auth stub answers
+## 200 with identity headers, and the gateway must pass them to the backend —
+## the half of the nginx auth-url contract the 401 row cannot show.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authstub
+  namespace: eg-poc
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      location / {
+        add_header X-Auth-Request-User "alice" always;
+        add_header X-Auth-Request-Email "alice@example.test" always;
+        return 200;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: authstub
+  namespace: eg-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: authstub
+  template:
+    metadata:
+      labels:
+        app: authstub
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: authstub
+          image: docker.io/nginxinc/nginx-unprivileged:1.31-alpine@sha256:c3bcf3d1a53a027bfa515b9fe4fbbe7bf6b791476a5af853de439ad494b145bd
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            ## nginx needs writable /tmp and /var/cache/nginx; the container
+            ## root is read-only (restricted PSA).
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /var/cache/nginx
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: conf
+          configMap:
+            name: authstub
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: authstub
+  namespace: eg-poc
+spec:
+  selector:
+    app: authstub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sso-stub
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["sso-stub.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: sso-stub
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: sso-stub
+  extAuth:
+    http:
+      backendRefs:
+        - name: authstub
+          port: 8080
+      pathOverride: /auth
+      headersToBackend:
+        - x-auth-request-user
+        - x-auth-request-email

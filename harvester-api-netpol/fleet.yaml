@@ -1,0 +1,18 @@
+## Additive NetworkPolicy for the Harvester apiserver (harvester-system).
+##
+## Why (2026-11-27, during the 1.8.2 -> 1.9.1 upgrade): Harvester 1.9.1's chart
+## ships a NetworkPolicy `harvester-api-access` that admits ingress on 8443/8080
+## to the apiserver pods ONLY from namespaces labelled `name: cattle-system`.
+## It assumes Rancher serves the UI from its own namespace. Here the UI is served
+## by rke2-ingress-nginx in kube-system, which carries no such label, so every
+## request from the ingress to harvester.mdapi.ch hung and the public host
+## answered 504 (first observed 04:24Z, ~15.6h).
+##
+## NetworkPolicy is additive: the union of all policies selecting a pod decides.
+## This policy therefore adds an allow for the ingress controller instead of
+## touching the chart's object, which the Harvester Helm release owns and
+## rewrites on every upgrade.
+##
+## Verify: https://harvester.mdapi.ch answers 302 within ~150ms, and the
+## SyntheticProbeFailing alert for that host clears.
+defaultNamespace: harvester-system

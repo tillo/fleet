@@ -1,0 +1,81 @@
+## QA copy of iast-sink/iast-sink-deploy.yml (infra-7rog.41.2). Fleet cannot share
+## the prod file: a bundle carries only files inside its own directory (a kustomize
+## `../` resource or a symlink out of the bundle is refused by `fleet apply`), so the
+## container is copied and tests/test_qa_iast_sink_matches_prod.py fails the MR the
+## moment the two drift. Differences, all deliberate:
+##   * no priorityClassName -- mdapi-low exists only on prod;
+##   * no IAST_SINK_OTLP_ENDPOINT -- QA has no OpenObserve, the sink keeps findings
+##     only ("" = do not forward), and its egress stays DNS-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iast-sink
+  namespace: iast
+  labels:
+    app: iast-sink
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: iast-sink
+  template:
+    metadata:
+      labels:
+        app: iast-sink
+    spec:
+      automountServiceAccountToken: false
+      ## ⛔ The Service is named iast-sink, so the kubelet's docker-link env
+      ## injects IAST_SINK_PORT=tcp://<ip>:8126 - the sink's own port variable
+      ## (first deploy 2026-11-23: int('tcp://...') CrashLoop). Nothing here
+      ## uses service-link variables, so turn them off.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: iast-sink
+          image: zot.mdapi.ch/mdapi/iast-sink:0.1.0-mdapi.11@sha256:9f41e1bf457d866308fa8dd81166da44dbb6eb1b7a9c764699102fe8dc101ad8
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: trace
+              containerPort: 8126
+          env:
+            - name: IAST_SINK_STATE
+              value: /data/findings.json
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: trace
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: trace
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: iast-sink-data

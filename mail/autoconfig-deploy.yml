@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoconfig
+  namespace: mail
+spec:
+  selector:
+    matchLabels:
+      app: autoconfig
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: autoconfig
+    spec:
+      priorityClassName: mdapi-critical
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: autoconfig
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: autoconfig
+        image: zot.mdapi.ch/mdapi/autoconfig:latest@sha256:bdfcc6bfb0f4590cc5b0e60f60db057450595206f6905ae4043d6ddffbb71cb6
+        imagePullPolicy: IfNotPresent
+        resources: {}
+        ports:
+        - containerPort: 80
+          protocol: TCP
+        env:
+        - name: TZ
+          value: Europe/Zurich
+        - name: MAIL_HOSTNAME
+          value: mail.mdapi.ch
+        - name: DISPLAY_NAME
+          value: "Martino Dell'Ambrogio Personal Infrastructure"
+        - name: DISPLAY_SHORT_NAME
+          value: MDAPI
+      imagePullSecrets:
+      - name: zot-pull

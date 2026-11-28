@@ -1,0 +1,25 @@
+## The jump seat's cluster-admin grant, declared (ledger
+## alert:RbacClusterAdminGrowth, approved 2026-10-30).
+##
+## Why this is not a finding to delete: `mdapi-prod-direct` in ~/.kube/config
+## authenticates AS this ServiceAccount (verified 2026-10-30:
+## `kubectl auth whoami` → system:serviceaccount:jump:jump-seat-direct). It is
+## the direct-API path CLAUDE.md requires the seat to use, and it keeps working
+## when Rancher does not. The finding was that it existed in the cluster and in
+## no manifest — a cluster-admin grant nobody can review and nothing notices if
+## it is widened. This file is the answer to that, not a relaxation: the binding
+## is now reviewable, and a future widening shows up as a diff.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jump-seat-direct-cluster-admin
+  labels:
+    app.mdapi.ch/component: seat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: jump-seat-direct
+    namespace: jump

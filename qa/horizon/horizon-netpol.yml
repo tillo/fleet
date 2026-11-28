@@ -1,0 +1,109 @@
+## QA Horizon's fence: the app reaches DNS, its throwaway MongoDB and the IAST sink, and
+## nothing else -- no Datadog intake, no internet, no prod Horizon, no CipherTrust Manager.
+## Ingress: only the QA traffic pods (seed + ZAP, label mdapi.ch/qa-traffic) in this
+## namespace, and the QA MCP copies in namespace evertrust-mcp (infra-7rog.41.11).
+## MongoDB is reachable from the two Horizons alone, which is what makes no-auth safe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: horizon
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: horizon
+  namespace: horizon
+spec:
+  ## both the instrumented app and its tracer-off control (horizon-off)
+  podSelector:
+    matchExpressions:
+      - {key: app, operator: In, values: [horizon, horizon-off]}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              mdapi.ch/qa-traffic: "true"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: evertrust-mcp
+      ports:
+        - protocol: TCP
+          port: 9000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels:
+              app: horizon-mongodb
+      ports:
+        - {protocol: TCP, port: 27017}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: iast
+          podSelector:
+            matchLabels:
+              app: iast-sink
+      ports:
+        - {protocol: TCP, port: 8126}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: horizon-mongodb
+  namespace: horizon
+spec:
+  podSelector:
+    matchLabels:
+      app: horizon-mongodb
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [horizon, horizon-off]}
+      ports:
+        - {protocol: TCP, port: 27017}
+---
+## The QA traffic (seed requests, ZAP active scan): DNS and the two Horizons, nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: qa-traffic
+  namespace: horizon
+spec:
+  podSelector:
+    matchLabels:
+      mdapi.ch/qa-traffic: "true"
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchExpressions:
+              - {key: app, operator: In, values: [horizon, horizon-off]}
+      ports:
+        - {protocol: TCP, port: 9000}

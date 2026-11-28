@@ -1,0 +1,181 @@
+# Keeps the INTERNET-sourced recovery images cached on every node (infra-8f4, 2026-11-21):
+# cert-manager + trust-manager, MetalLB (controller, speaker, frr-k8s, frr),
+# external-secrets, the CNPG operator + barman plugin, and the seat's web door
+# (guacamole, guacd, and guac-pg's postgresql + barman sidecar). They come from ghcr.io,
+# quay.io and docker.io, so a node that never ran one cannot start it while the internet
+# edge is down. The Ceph-backed one (the seat itself) is seat-image-prepull.yml.
+#
+# ⛔ A SEPARATE DaemonSet from the seat's on purpose: a pull failure here (rate limit,
+# upstream outage, a bad digest) holds back THIS pod only, never the seat image's.
+# Each image is a MAIN container, so they pull in parallel and one failure cannot block
+# the rest the way sequential init containers would. A running container also keeps
+# kubelet image GC (85 %/80 % imagefs) off the image.
+#
+# Most of these images are distroless (no sleep, no shell): the one init container
+# copies a STATIC busybox (the -musl build; the default glibc build is dynamically
+# linked) into an emptyDir, and every holder runs `busybox sleep` from there.
+#
+# ⛔ The block between the markers is GENERATED from the live pods by
+# `python3 tools/recovery-prepull-sync.py` -- never edit it by hand, and Renovate is
+# switched off for this file (renovate.json): the chart workloads pull by TAG, so the
+# digest to hold is the one the cluster runs, which neither a chart bump nor a Renovate
+# bump of these lines can know. Alert RecoveryImageNotPrepulled (monitoring-rules/88)
+# fires when a running recovery container's digest is not held here; the tool is the fix.
+# tests/test_recovery_images_are_prepulled_on_every_node.py pins the shape.
+#
+# maxUnavailable 0 + maxSurge 1: the old pod (and every image it holds) stays until the
+# new pod has pulled ALL of its images, so a bump that cannot pull keeps the old cache.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: recovery-image-prepull
+  namespace: jump
+  labels: { app: recovery-image-prepull }
+spec:
+  selector:
+    matchLabels: { app: recovery-image-prepull }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: recovery-image-prepull }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 1      # sleep as PID 1 ignores SIGTERM
+      tolerations:
+        - operator: Exists                  # every node, whatever it is tainted with
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: hold
+          emptyDir: { sizeLimit: 8Mi }
+      initContainers:
+        - name: stage-busybox
+          image: docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/cp", "/bin/busybox", "/hold/busybox"]
+          volumeMounts: [{ name: hold, mountPath: /hold }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      containers:
+      # BEGIN derived
+      - name: cloudnative-pg
+        image: ghcr.io/cloudnative-pg/cloudnative-pg:1.30.2@sha256:f96f6be3d81ec93819b443c665c575c609342fca840df90d4d87dae314a5b913
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: plugin-barman-cloud-sidecar
+        image: ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.16.0@sha256:c669259e20ed1e11fad821f735c396c19d929985aa05b9544b13ecc8b5a386d0
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: plugin-barman-cloud
+        image: ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.16.0@sha256:6404a416718bd7aad943c67a25a7bb20d0558b43edfeab0bf167f013ca435882
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: postgresql
+        image: ghcr.io/cloudnative-pg/postgresql:16.4@sha256:99be063781d171d3971089b49c992706bdab9ccbd2b57cdf126c7542773aedfe
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: external-secrets
+        image: ghcr.io/external-secrets/external-secrets:v2.15.0@sha256:6888f243e5f8f7592c6d7fae2a5547c9e33531441b47b53807b9093b25a00e31
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: guacamole
+        image: guacamole/guacamole:1.6.0@sha256:f344085e618bb05e22b964b0208dbd06d3468275bac70206f93805245e067b40
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: guacd
+        image: guacamole/guacd:1.6.0@sha256:8974eaa9ba32f713daf311e7cc8cd7e4cdfba1edea39eed75524e78ef4b08f4f
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: frr
+        image: quay.io/frrouting/frr:10.6.2@sha256:89e5e1ec8b17c5dffaf57dbac58a29ebeb3731a84e5bc09dad1662adff2ba7f5
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: cert-manager-cainjector
+        image: quay.io/jetstack/cert-manager-cainjector:v1.21.3@sha256:083d0e906f8eb44e255fe4ff817ae54e49f9ed82e22f1011bb4e9e4f4b8a641f
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: cert-manager-controller
+        image: quay.io/jetstack/cert-manager-controller:v1.21.3@sha256:9f4f96a33c7774cef24466fcd85031997531a03a8d117f151126baa8d1290dcc
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: cert-manager-webhook
+        image: quay.io/jetstack/cert-manager-webhook:v1.21.3@sha256:055ac8e9de6a0ba6763794838fe38944acc650f68ebe1b01dd8be079e580f458
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: trust-manager
+        image: quay.io/jetstack/trust-manager:v0.26.0@sha256:783afe31d39f122a811b96ac3aedab9f358488088df21622ae5b057b4a38b5c2
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: trust-pkg-debian-trixie
+        image: quay.io/jetstack/trust-pkg-debian-trixie:20250419-deb13u1.1@sha256:477cc69ef6a026b90a6d67d4ac7114735c5f66edf1cc97e68b9da599adf231af
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: controller
+        image: quay.io/metallb/controller:v0.16.2@sha256:34a6f107f29c4fc6e9d084a7f3bdb781aae7b5ee2b534195a2775ab68c09c503
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: frr-k8s
+        image: quay.io/metallb/frr-k8s:v0.0.27@sha256:de862b74a3a314eb76c8fb4cabc9d2c55cca51002cd022704c32df717f9366b7
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: speaker
+        image: quay.io/metallb/speaker:v0.16.2@sha256:01666518b091a6651d68891c802db84b2219495d7e0e41c2e61c46f9976be231
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      # END derived

@@ -1,0 +1,112 @@
+## Fifth GitLab runner: the HOME FALLBACK for the `spot` tag.
+##
+## fleet-lint and fleet-validate carry `tags: [spot]` and normally run on group
+## runner 1047 in the Rackspace Spot cloudspace mdapi-ci (~/src/spot-ci). When
+## that cloudspace is down or its pool reclaimed they used to wait, and GitLab
+## drops a job pending for 1 h with no active runner. This runner (group runner
+## 1048, tag `spot`, run_untagged=false) carries the same tag and is kept PAUSED
+## in GitLab, so it takes nothing while Spot works. Windmill f/heal/spot_fallback
+## (every 2 min) unpauses it when 1047 is offline / silent > 5 min or a spot job
+## has waited > 5 min, and pauses it after 15 healthy minutes.
+##
+## The jobs it takes hold no credential beyond CI_JOB_TOKEN; the namespace's
+## ci-jobs NetworkPolicy (Log+Deny to pod/service/LAN CIDRs) applies to its pods
+## through the same `has(project.runner.gitlab.com/id)` selector.
+
+image:
+  registry: registry.gitlab.com
+  image: gitlab-org/gitlab-runner
+  tag: alpine-v18.11.3
+
+gitlabUrl: https://gitlab.mdapi.ch/
+
+## Global config.toml settings are chart values; `runners.config` is only the
+## [[runners]] template and ignores them (see ../values.yml).
+concurrent: 2
+checkInterval: 3
+
+## Graceful stop (infra-4h19): SIGQUIT lets in-flight jobs finish; the kubelet's
+## SIGTERM would abort them. Longest spot job (fleet-validate) is ~11 min.
+deploymentLifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "kill -QUIT 1; while kill -0 1 2>/dev/null; do sleep 5; done"]
+terminationGracePeriodSeconds: 3600
+
+runners:
+  secret: gitlab-runner-spot-fallback-token
+  config: |
+    [[runners]]
+      environment = ["FF_USE_FASTZIP=true"]
+      [runners.kubernetes]
+        image = "alpine"
+        namespace = "gitlab-runner-builder"
+        privileged = false
+        cpu_request = "500m"
+        cpu_limit = "8"
+        memory_request = "1Gi"
+        memory_limit = "6Gi"
+        helper_cpu_limit = "1"
+        helper_memory_limit = "512Mi"
+        poll_timeout = 300
+        ## Soft preference away from the CP nodes, as for the shared runner (!1412).
+        [runners.kubernetes.affinity.node_affinity]
+          [[runners.kubernetes.affinity.node_affinity.preferred_during_scheduling_ignored_during_execution]]
+            weight = 100
+            [runners.kubernetes.affinity.node_affinity.preferred_during_scheduling_ignored_during_execution.preference]
+              [[runners.kubernetes.affinity.node_affinity.preferred_during_scheduling_ignored_during_execution.preference.match_expressions]]
+                key = "node-role.kubernetes.io/control-plane"
+                operator = "DoesNotExist"
+
+  ## Token-based registration (glrt-…) from the ExternalSecret below. Runner 1048
+  ## was pre-created on group mdapi, tag `spot`, run_untagged=false, PAUSED
+  ## (~/src/spot-fallback/register-runner.py).
+  tags: "spot"
+  runUntagged: false
+  privileged: false
+
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "pods/exec", "pods/attach", "secrets", "configmaps", "services"]
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get", "list", "watch"]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+metrics:
+  enabled: true
+
+## NOTE: this chart renders extraObjects as `tpl (toYaml .)`, so entries must be
+## MAPPINGS and ESO/Go-template braces must be tpl-escaped as below.
+extraObjects:
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: gitlab-runner-spot-fallback-token
+      namespace: gitlab-runner-builder
+    spec:
+      refreshInterval: 5m0s
+      secretStoreRef:
+        kind: ClusterSecretStore
+        name: cm-akeyless
+      target:
+        name: gitlab-runner-spot-fallback-token
+        creationPolicy: Owner
+        template:
+          engineVersion: v2
+          data:
+            runner-registration-token: ''
+            runner-token: '{{ "{{ .token }}" }}'
+      data:
+      - remoteRef:
+          key: /mdapi/gitlab/runner-spot-fallback-token
+        secretKey: token

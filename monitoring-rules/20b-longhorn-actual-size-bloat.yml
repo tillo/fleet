@@ -1,0 +1,136 @@
+## Longhorn volume actualSize bloat — "this volume is bigger on disk than it
+## should be, and has STAYED that way for longer than a trim cycle".
+##
+## WHY (infra-j45a.5, 2026-10-21). Nothing in the alert set reads
+## `longhorn_volume_actual_size_bytes` against the volume's own capacity, so the
+## only way to tell "the daily filesystem-trim stopped reclaiming" from "this
+## volume's normal snapshot sawtooth" was to come and query VictoriaMetrics by
+## hand — which is exactly what infra-j45a.3 had to do to clear a false alarm.
+##
+## WHAT THE METRIC IS (measured 2026-10-21 on openobserve/data-openobserve-0):
+##   longhorn_volume_actual_size_bytes = the LIVE snapshot's own size + the
+##   volume HEAD. The head holds everything written since the last trim or
+##   coalesce; the live snapshot holds every block not yet punched out of it.
+##   On a VolSync-snapshotted volume that snapshot lives from one run to the
+##   next, so the ratio SAWTOOTHS: o2 (20 GiB nominal) read 8.75 GiB right
+##   after the 15:47 trim and 30.1 GiB (1.51x) at 12:00 the same day, every
+##   day. A peak is NOT a fault.
+##
+## ⇒ the condition worth alerting on is the one that SURVIVES a full trim
+## cycle: ratio > 1.5x continuously for 24h. The daily trims run at 15:27
+## (`trim` group) and 15:47 (`nobackup` group), so 24h of continuous excess
+## means either the trim is not reclaiming this volume or its chain grows
+## faster than it gets punched.
+##
+## MEASURED BEFORE SHIPPING (30d = 2026-09-21..10-21, hourly subquery):
+##   - volumes that sustained > 1.5x for a full 24h: exactly ONE,
+##     nextcloud/nextcloud-aio-nextcloud, at 1.78-1.845x for the WHOLE window.
+##     That is a standing condition, not a stall ⇒ excluded by name below. A
+##     rule that pages on a standing condition is noise from the day it lands
+##     (the standard 12-batch-jobs.yml holds itself to).
+##   - volumes that ever peaked > 1.5x: that one plus openobserve, at 1.51x for
+##     about 40 MINUTES (09:00 1.43x -> 11:30 1.50x -> 12:00 1.51x -> 12:30
+##     0.94x, when the next VolSync snapshot coalesced the chain). The 24h
+##     length is what silences that — daily sawtooth, not a stall.
+##   - next highest over the same window: envuassu/nextcloud-aio-nextcloud
+##     1.22x, webtunnel-bridge 1.08x, openwrt-workspace 1.03x.
+##
+## ⛔ TRAP, measured: the metric carries ONE SERIES PER longhorn-manager
+## INSTANCE, and inside a 24h+ window they disagree (a manager move leaves the
+## old series behind in the window). o2 read 15.9 / 17.0 / 20.6 / 32.4 GiB from
+## four instances at once — a bare
+## `longhorn_volume_actual_size_bytes / longhorn_volume_capacity_bytes` matches
+## an arbitrary copy and reported 0.79x while the volume's own owner reported
+## 1.5x. Every ratio below is therefore `max by (pvc_namespace, pvc, volume)`
+## FIRST, and the subquery re-aggregates inside the window rather than outside
+## it (the same trap 19-longhorn-robustness.yml documents for robustness).
+##
+## The by-name exclusion covers BOTH namespaces' `nextcloud-aio-nextcloud`
+## (nextcloud and envuassu): same app, same RWX share-manager shape, same
+## standing overhead. envuassu's copy peaked at 1.22x in 30d, so nothing is
+## lost today; if it ever needs coverage, narrow the matcher with
+## `pvc_namespace="nextcloud"` rather than raising the threshold — raising it
+## above 1.85 would blind this rule to an 1.8x stall on every other volume.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-longhorn-actual-size-bloat
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-longhorn-actual-size-bloat
+    rules:
+    - alert: LonghornVolumeActualSizeHigh
+      ## `for: 15m` only debounces the final step; the 24h is in the subquery
+      ## so a vmalert restart cannot reset the clock (same reason as
+      ## 19-longhorn-robustness.yml). The "still high NOW" guard matters: a
+      ## DELETED volume keeps its last samples inside the 24h window, so
+      ## min_over_time alone would hold the alert true for a volume that no
+      ## longer exists.
+      ##
+      ## ⛔ `> bool 1.5` inside the subquery, NOT `> 1.5`: a filter comparison
+      ## in PromQL keeps the left operand's VALUE (1.84, not 1), so
+      ## `min_over_time((ratio > 1.5)[24h:5m]) == 1` compares 1.84 against 1
+      ## and never fires. Poison-tested both spellings against live VM: the
+      ## plain one was silent even on the volume that has been at 1.84x for
+      ## 30 days.
+      expr: |
+        (
+          max by (pvc_namespace, pvc, volume) (
+            longhorn_volume_actual_size_bytes{pvc!="nextcloud-aio-nextcloud"} )
+          /
+          max by (pvc_namespace, pvc, volume) (
+            longhorn_volume_capacity_bytes{pvc!="nextcloud-aio-nextcloud"} )
+        ) > 1.5
+        and on (pvc_namespace, pvc, volume)
+        (
+          min_over_time((
+            (
+              max by (pvc_namespace, pvc, volume) (
+                longhorn_volume_actual_size_bytes{pvc!="nextcloud-aio-nextcloud"} )
+              /
+              max by (pvc_namespace, pvc, volume) (
+                longhorn_volume_capacity_bytes{pvc!="nextcloud-aio-nextcloud"} )
+            ) > bool 1.5
+          )[24h:5m]) == 1
+        )
+      for: 15m
+      labels:
+        service: '{{ $labels.pvc }}'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}longhorn-system{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: Storage
+        team: mdapi
+        ## Internal capacity tune-signal: a bloated-but-healthy volume is waste,
+        ## never a user-visible outage — it must not degrade a public statuspage
+        ## component (same call as PVCWillFillIn24h).
+        statuspage: exclude
+      annotations:
+        summary: "Longhorn volume {{ $labels.pvc_namespace }}/{{ $labels.pvc }} at {{ $value | printf \"%.2f\" }}x its capacity for >24h"
+        description: |
+          Volume {{ $labels.volume }} (PVC {{ $labels.pvc_namespace }}/{{ $labels.pvc }}) has
+          reported actualSize/capacity above 1.5x continuously for 24 hours — currently
+          {{ $value | printf "%.2f" }}x. That outlives a full daily filesystem-trim cycle, so this
+          is NOT the normal snapshot+head sawtooth: the volume is either not being trimmed, or its
+          snapshot chain is growing faster than it is punched out.
+
+          Check, in this order:
+            1. the chain — a snapshot created long ago and never coalesced:
+                 kubectl --context=mdapi-prod -n longhorn-system get volume {{ $labels.volume }} \
+                   -o jsonpath='{.status.actualSize}{" head="}{.status.currentNodeID}{"\n"}'
+                 kubectl --context=mdapi-prod -n longhorn-system get snapshots.longhorn.io -o wide
+            2. the last trim for the volume's recurring-job group (labels on the Volume CR):
+                 kubectl --context=mdapi-prod -n longhorn-system get jobs \
+                   -l recurring-job.longhorn.io=<group> --sort-by=.metadata.creationTimestamp
+               and its pod log for "Finished recurring filesystem trim" / "Failed to run volume job"
+            3. only then capacity: actualSize is what the volume occupies on EACH replica's disk,
+               so a persistently bloated volume eats Longhorn disk — see LonghornDiskCapacityHigh
+               and 20-longhorn-disk-capacity.yml.
+
+          ⛔ Do NOT run an extra filesystem-trim to force a reclaim. The trim marks the whole
+          snapshot chain removed and purges it, and the 6-hourly VolSync volumes have a live
+          snapshot 6h out of every 6h — the trim can (and once did) erase it mid-backup. See
+          memory longhorn_trim_erases_snapshot_chain_and_the_unmap_bug_2026_10_21.

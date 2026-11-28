@@ -1,0 +1,118 @@
+# ENFORCING (infra-az8.20, F33). Promoted from learn.horizon, which this REPLACES —
+# that Log+Allow policy is deleted in the same commit, because its blanket Allow
+# would defeat this one (the flaresolverr promotion lesson).
+#
+# WHY: Horizon trusts the client certificate it reads from the `ssl-client-cert`
+# header. ingress-nginx overwrites that header on the public path; inside the cluster
+# nothing stands in front of horizon.horizon.svc:9000, so any pod could send its own.
+# This admits only the measured callers.
+#
+# WINDOW: 2026-11-05 08:25Z -> 2026-11-09 18:50Z (106 h), 29,493 ingress flows.
+# Valid: netpol_log_journald_suppressed_1h max over 106 h = 0 on qui/quo/qua, the
+# pusher never gapped > 1 h, and journald lines/h matched stored rows per node.
+# horizon-0 held EIGHT pod IPs in the window (7 reschedules during the ceph work);
+# every one was carried, and sources were resolved by kube_pod_info AT FLOW TIME —
+# 14 of 30 source IPs belong to a different pod today.
+# Converged at workload level: both halves show the same callers.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# ⛔ The estate's CA. A missing Allow below stops certificate issuance (cert-manager
+# via horizon-issuer) and the public UI/ACME path. MERGE ATTENDED and watch:
+#   * horizon-0 stays 1/1 Ready (kubelet probes on 7626 are host->local and are not
+#     policed by Calico without a HostEndpoint; the window shows zero probe rows);
+#   * a horizon-issuer CertificateRequest reaches Ready;
+#   * https://horizon.mdapi.ch answers;
+#   * every calico-packet line for this pod after the merge is a BLOCK:
+#       SELECT src, dpt FROM "netpol_flows" WHERE dst = '<horizon-0 pod IP>'
+# EMERGENCY: deleting the object with kubectl buys ~90 s (Fleet re-creates it);
+# the real revert is `git revert` + push.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# NOT DERIVED FROM OBSERVED FLOWS:
+#   * evertrust-mcp/horizon-mcp — HORIZON_URL points here, ZERO flows in 4.4 days
+#     (human in the loop: nobody used the MCP). Allowed on intent.
+#   * horizon-discovery — hostNetwork CronJob pinned to qui, so it arrives from qui's
+#     flannel.1 address 10.52.0.0, 34 SYNs every 6 h at :31. When horizon-0 itself
+#     ran on qui these were invisible (host->local is not policed), so they look
+#     intermittent in the window; they are not.
+#   * 9443 (https) and 25520 (artery): zero flows. The Ingress backend is 9000 and
+#     replicas: 1, so nothing calls either; they stay denied. Scaling Horizon past
+#     one replica needs a horizon->horizon artery rule first.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.horizon
+  namespace: horizon
+spec:
+  order: 500
+  selector: app.kubernetes.io/name == "horizon"
+  types:
+    - Ingress
+  ingress:
+    # 1. cert-manager issuer — 12,719 flows, the CA's reason to exist.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "horizon-issuer"
+        selector: app.kubernetes.io/name == "horizon-issuer"
+      destination:
+        ports: [9000]
+
+    # 2. Public path horizon.mdapi.ch (incl. the ACME ingress) — 2,399 flows. The
+    #    controller runs on pod IPs here, NOT host network.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name == "rke2-ingress-nginx"
+      destination:
+        ports: [9000]
+
+    # 3. Windmill probes and heal (f/heal/horizon_lic001_heal) — default 13,072 +
+    #    heal 647 flows over 21 worker pod IPs. Scoped to those two worker groups.
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "windmill"
+        selector: app == "windmill-workers" && workerGroup in {"default", "heal"}
+      destination:
+        ports: [9000]
+
+    # 4. Horizon MCP — declared, unobserved (header).
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "evertrust-mcp"
+        selector: app == "horizon-mcp"
+      destination:
+        ports: [9000]
+
+    # 5. horizon-discovery netscan: hostNetwork, nodeName qui -> qui's flannel.1
+    #    tunnel address. Follows horizon-discovery/resources.yml `nodeName` (tested).
+    - action: Allow
+      protocol: TCP
+      source:
+        nets:
+          - 10.52.0.0/32
+      destination:
+        ports: [9000]
+
+    # 6. Metrics scrape — vmagent, 69 new connections (keep-alive scrapes log once).
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "monitoring"
+        selector: app.kubernetes.io/name == "vmagent"
+      destination:
+        ports: [9095]
+
+    # 7. BASTION — all ports, the programme's standing bastion right (as
+    #    enforce.nameserver). Observed: 14 ad-hoc flows on 11-05.
+    - action: Allow
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "jump"
+        selector: app == "jump-bastion"
+
+    # 8. Everything else: logged, then denied, so a block stays answerable.
+    - action: Log
+    - action: Deny

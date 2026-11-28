@@ -1,0 +1,54 @@
+# Kubelet memory reservation for the 47 GiB node (quarto): the same drop-in as
+# kubelet-memory-reserve.yml with the soft memory eviction line halved, 14Gi -> 7Gi.
+#
+# Why (2026-11-21, bead infra-m42.14): 14Gi was calibrated on the 94 GiB Gen8s (see
+# kubelet-memory-reserve.yml, infra-7ku6). On quarto (MemTotal 46.7 GiB) it is 30 % of RAM, and
+# that afternoon quarto sat in MemoryPressure, tainted NoSchedule, with 19 GiB available. 7Gi is
+# the same share of RAM as 14Gi on the big nodes (tests/test_kubelet_eviction_soft_scales_with_node_ram.py).
+# Everything else (2Gi + 2Gi reserved, eviction-hard 1Gi, the 10m grace) is deliberately identical:
+# the test fails if the two drop-ins differ anywhere but in that one value.
+#
+# Selection: the profile is the VALUE of mdapi.ch/kubelet-memory-reserve. "true" selects the
+# default CR, "48gib" selects this one, so a node matches exactly one. The filename differs from
+# the default CR's, because node-manager deletes a CR's /oem file from every node its selector stops
+# matching; both files write the same rke2 drop-in path, so after the switch only this one does.
+#
+# ROLLOUT (quarto, after this MR is merged and the CR exists):
+#   kubectl --context mdapi-prod-direct label node quarto mdapi.ch/kubelet-memory-reserve=48gib --overwrite
+#   kubectl --context mdapi-prod-direct -n harvester-system delete pod \
+#     -l app.kubernetes.io/name=harvester-node-manager --field-selector spec.nodeName=quarto
+#   # node-manager does not watch Node labels: the pod restart makes it re-evaluate. Then check
+#   # status.rollouts: this CR Present on quarto, the default CR absent on quarto.
+# ACTIVATES AT QUARTO'S NEXT BOOT ONLY: the drop-in is written in the initramfs stage, and until
+# that boot the running kubelet keeps 14Gi (HarvesterNodeConfigBootPendingStale covers it at 30 d).
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-kubelet-memory-reserve-48gib
+spec:
+  matchSelector:
+    mdapi.ch/kubelet-memory-reserve: "48gib"
+  # Keep the .yaml: the node-manager webhook appends it to a bare name, and Fleet would then see
+  # the object as permanently Modified.
+  filename: 99_mdapi_kubelet_memory_reserve_48gib.yaml
+  contents: |
+    name: "mdapi kubelet memory reservation, 48 GiB node profile (fleet harvester-node-config, infra-y6ac, infra-m42.14)"
+    stages:
+      initramfs:
+        - name: "rke2 drop-in 99-zz-mdapi-kubelet-reserve.yaml (48 GiB profile)"
+          files:
+            - path: /etc/rancher/rke2/config.yaml.d/99-zz-mdapi-kubelet-reserve.yaml
+              permissions: 384
+              owner: 0
+              group: 0
+              content: |
+                # Written at every boot from /oem/99_mdapi_kubelet_memory_reserve_48gib.yaml
+                # (CloudInit mdapi-kubelet-memory-reserve-48gib, fleet harvester-node-config).
+                # Local edits are lost at the next boot.
+                kubelet-arg+:
+                  - system-reserved=memory=2Gi,ephemeral-storage=10Gi
+                  - kube-reserved=memory=2Gi,ephemeral-storage=10Gi
+                  - eviction-hard=memory.available<1Gi,nodefs.available<5%,imagefs.available<5%
+                  - eviction-soft=memory.available<7Gi,nodefs.available<10%,imagefs.available<10%
+                  - eviction-soft-grace-period=memory.available=10m,nodefs.available=5m,imagefs.available=5m
+                  - eviction-max-pod-grace-period=60

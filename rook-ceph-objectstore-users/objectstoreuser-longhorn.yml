@@ -1,0 +1,24 @@
+## RGW S3 identity for the Longhorn backup target, moving off the salt/pepper
+## Garage as those two hosts are decommissioned. Rook writes the keys to secret
+## rook-ceph-object-user-ceph-objectstore-longhorn; they are mirrored to Akeyless
+## /mdapi/longhorn/rgw/{access-key,secret-key} so the ExternalSecret in
+## longhorn/backup-target.yml can build the target secret.
+##
+## ⛔ Why not an ObjectBucketClaim, which would create the bucket AND a scoped
+## credential in one object (the pattern zot and the CNPG stores use): Longhorn
+## needs AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY **and AWS_ENDPOINTS in the
+## SAME secret**, and Rook's OBC secret carries only the two key fields. There
+## is no kubernetes-provider SecretStore here to merge the OBC secret with a
+## literal endpoint, so the credential has to come through Akeyless instead --
+## the same route frigate and gitlab already take.
+##
+## The bucket `longhorn-backup` is created with this user's own credentials, so
+## it owns it outright and needs no bucket policy.
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStoreUser
+metadata:
+  name: longhorn
+  namespace: rook-ceph
+spec:
+  store: ceph-objectstore
+  displayName: Longhorn backup target

@@ -1,0 +1,69 @@
+# CnpgWalFillingVolume (infra-bs6r): on 2026-10-26 a replica stranded on cordoned
+# quarto stopped consuming WAL; its replication slot held 4.8G of pg_wal on the
+# 5Gi primary volume until grafana-pg-2 crashlooped 133x on "no free disk space for
+# WALs". Nothing alerted before the volume was full. This rule speaks while there is
+# still room to act (move the replica, drop the slot, grow the PVC). pg_wal is
+# measured against the volume it lives on: the <pod>-wal PVC when the cluster has
+# walStorage, else the data PVC named like the pod.
+rule_files:
+- monitoring-rules/52a-cnpg-wal.yml
+evaluation_interval: 1m
+tests:
+- name: wal-past-60-percent-of-the-data-volume-warns-past-80-pages
+  interval: 1m
+  input_series:
+  - series: cnpg_collector_pg_wal{namespace="monitoring",pod="grafana-pg-2",value="size"}
+    values: '3250000000x15 4600000000x20'
+  - series: cnpg_collector_pg_wal{namespace="monitoring",pod="grafana-pg-2",value="count"}
+    values: '300x35'
+  - series: kubelet_volume_stats_capacity_bytes{namespace="monitoring",persistentvolumeclaim="grafana-pg-2",node="qui"}
+    values: '5000000000x35'
+  alert_rule_test:
+  - eval_time: 9m
+    groupname: cnpg-wal.retention
+    alertname: CnpgWalFillingVolume
+    exp_alerts: []
+  - eval_time: 12m
+    groupname: cnpg-wal.retention
+    alertname: CnpgWalFillingVolume
+    exp_alerts:
+    - exp_labels:
+        namespace: monitoring
+        pod: grafana-pg-2
+        service: grafana-pg-2
+        severity: warning
+        component: Storage
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "CNPG monitoring/grafana-pg-2: pg_wal holds 65% of its volume"
+        description: "pg_wal of monitoring/grafana-pg-2 holds 65% of the volume it lives on. WAL that\nis neither archived nor consumed keeps growing until postgres stops with \"no free\ndisk space for WALs\". Usual cause: a replication slot whose replica is down or\nstranded (cordoned node, detached volume), so check the slots first:\n  kubectl -n monitoring exec grafana-pg-2 -c postgres -- psql -c \"select slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) from pg_replication_slots\"\nthen the archiver (cnpg_collector_pg_wal_archive_status). Growing the PVC by\nspec alone can deadlock: past \"Not enough disk space\" CNPG never reaches the PVC\nreconcile, so patch each PVC to the new spec size by hand (infra-bs6r).\n"
+  - eval_time: 30m
+    groupname: cnpg-wal.retention
+    alertname: CnpgWalFillingVolumeCritical
+    exp_alerts:
+    - exp_labels:
+        namespace: monitoring
+        pod: grafana-pg-2
+        service: grafana-pg-2
+        severity: critical
+        component: Storage
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "CNPG monitoring/grafana-pg-2: pg_wal holds 92% of its volume, postgres stops when it is full"
+        description: "See CnpgWalFillingVolume. At this level the next burst of writes or a missed\narchive cycle fills the volume and the primary goes down.\n"
+- name: a-separate-wal-volume-is-what-counts
+  interval: 1m
+  input_series:
+  - series: cnpg_collector_pg_wal{namespace="app",pod="app-pg-1",value="size"}
+    values: '3000000000x20'
+  - series: kubelet_volume_stats_capacity_bytes{namespace="app",persistentvolumeclaim="app-pg-1",node="qua"}
+    values: '4000000000x20'
+  - series: kubelet_volume_stats_capacity_bytes{namespace="app",persistentvolumeclaim="app-pg-1-wal",node="qua"}
+    values: '20000000000x20'
+  alert_rule_test:
+  - eval_time: 15m
+    groupname: cnpg-wal.retention
+    alertname: CnpgWalFillingVolume
+    exp_alerts: []

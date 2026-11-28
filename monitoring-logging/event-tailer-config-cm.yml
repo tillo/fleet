@@ -1,0 +1,15 @@
+## eventrouter config for the Harvester event-tailer (mounted over the operator's own
+## config-volume by addon.yml eventTailer.workloadOverrides.volumes).
+##
+## Identical to what logging-operator generates (sink + position path) plus
+## enable-prometheus: false. eventrouter's default (true) counts every event into
+## CounterVecs labelled per involved object and never deletes a series, so the pod
+## grew ~20Mi/day and OOMKilled at 100Mi every 2-4 days (infra-2j06z). Nothing
+## scrapes those metrics. tests/test_event_tailer_counters_disabled.py holds this.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: harvester-event-tailer-config
+  namespace: cattle-logging-system
+data:
+  config.json: '{"sink":"stdout","lastResourceVersionPositionPath":"/var/pos/event-tailer","enable-prometheus":false}'

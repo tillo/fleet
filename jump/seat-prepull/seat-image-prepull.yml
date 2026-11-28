@@ -1,0 +1,66 @@
+# Keeps the jump seat's image cached on EVERY node, so deploy/jump-bastion can start
+# wherever it lands while zot.mdapi.ch is down (infra-8f4, 2026-11-21).
+#
+# Why: zot stores every image in a Ceph RGW bucket. On 2026-11-21 Ceph went
+# HEALTH_ERR, RGW crashlooped, zot answered 503, and the seat -- the console the
+# outage is fixed FROM -- went ImagePullBackOff. Its image was cached on one node of
+# four. The rest of the recovery-critical set does not need this: the storage layer
+# and zot itself are RKE2 bootstrap tarballs on every node
+# (/var/lib/rancher/rke2/agent/images, watched by f/probe/rke2_bootstrap_seed_drift),
+# CoreDNS/Canal/ingress-nginx are Harvester-bundled, and CNPG, MetalLB, cert-manager
+# and external-secrets come from upstream registries, not zot.
+#
+# How: one container per image, each only sleeping. A RUNNING container is what
+# stops kubelet image GC (85 % imagefs) from removing the image; an exited init
+# container is a weaker hold, and a separate pause image pinned by digest would add
+# a docker.io pull of its own (the nodes' pause digests differ: tarball vs pull).
+# Pods use the seat's own pull Secret (zot-pull, zot-pull-secrets bundle) and pull
+# IfNotPresent, so after the first pull they never touch zot again.
+#
+# Sync: the image line below is IDENTICAL to jump/bastion.yml's. Renovate rewrites
+# every occurrence of a package in one MR, so a seat bump moves both;
+# tests/test_seat_image_is_prepulled_on_every_node.py fails if they ever differ.
+# maxUnavailable 0 + maxSurge 1: the old pod (and its image) stays until the new
+# image has been pulled, so a bump merged during a zot outage keeps the old image.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: seat-image-prepull
+  namespace: jump
+  labels: { app: seat-image-prepull }
+spec:
+  selector:
+    matchLabels: { app: seat-image-prepull }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: seat-image-prepull }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 1      # sleep as PID 1 ignores SIGTERM
+      imagePullSecrets:
+        - name: zot-pull                    # zot-pull-secrets bundle (infra-8f4.54)
+      tolerations:
+        - operator: Exists                  # every node, whatever it is tainted with
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: jump-bastion
+          image: zot.mdapi.ch/mdapi/jump-bastion:2.1.4-mdapi.1252@sha256:92804a65655d9cd0be95c6d0ac86c5fca6cca248d8ae57a4fea3ea225c5f16a7
+          imagePullPolicy: IfNotPresent
+          command: ["sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 1m, memory: 4Mi }
+            limits: { memory: 16Mi }

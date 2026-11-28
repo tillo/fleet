@@ -1,0 +1,62 @@
+## Public-facing NTP component. The chrony pod in the ntppool namespace
+## participates in pool.ntp.org — i.e. other people on the internet sync
+## their clocks from it. A failure here doesn't just affect us, it affects
+## anyone routed to our pool entry until the pool's monitoring observes the
+## drop and stops handing out our IP.
+##
+## Internal NTP health (chrony on the cluster nodes, etc.) is covered by
+## the existing 09-ntp.yml rules and intentionally stays on component
+## 'General' (admin-only). This file is the public-service angle only.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ntp-public
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-ntp-public.workload
+    rules:
+    ## NtppoolChronyDown removed (infra-3rm.8): the same replica arithmetic as
+    ## NtpChronyUnavailable (09-ntp.yml), which pages for it; its pool-impact text moved there.
+
+    - alert: NtppoolExternalScoreLow
+      ## Driven by Windmill probe f/probe/ntppool_external_score
+      ## (hits the public scoring API for our pool IPs). Pool monitoring
+      ## scores range -1000..20 with 10 being "in active rotation".
+      expr: ntppool_external_score < 10
+      for: 30m
+      labels:
+        service: 'chrony'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}ntppool{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: NTP
+        statuspage: include
+        team: mdapi
+      annotations:
+        summary: "ntp.pool.org score for {{ $labels.ip }} dropped to {{ $value }}"
+        description: |
+          The pool monitoring system's score for our advertised pool IP has
+          dropped below the in-rotation threshold (10). Below 10 means the
+          pool will stop handing out our IP to clients until the score
+          recovers. Drops are usually caused by sustained packet loss,
+          high stratum, or large offset.
+
+    - alert: NtppoolExternalScoreProbeStale
+      expr: time() - ntppool_external_score_last_run_timestamp_seconds > 3 * 3600
+      for: 1h
+      labels:
+        service: 'chrony'
+        namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}ntppool{{ else }}{{ $labels.namespace }}{{ end }}'
+        severity: warning
+        component: NTP
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "ntppool external-score probe stale ({{ $value | humanizeDuration }})"
+        description: |
+          Windmill ntppool_external_score probe hasn't pushed in >3h. The
+          NtppoolExternalScoreLow alert is silently broken until this
+          resolves.

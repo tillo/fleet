@@ -1,0 +1,16 @@
+# The LoadBalancer's class and fixed address (infra-ifhew). The chart (7.0.0 and
+# 7.1.0) renders neither service.loadBalancerClass nor service.loadBalancerIP, so
+# until 2026-11-24 both lived only on the object, from a 2026-05-12 `kubectl apply`:
+# Helm and Fleet leave fields they do not manage alone, so deploys kept working,
+# but a recreated Service (delete, namespace restore, DR rebuild) would have come
+# back on ANY MetalLB address. The edge router DNATs public SMTP/IMAP to .48, so
+# that is a silent stop of all inbound mail. Set here, Fleet owns both.
+# loadBalancerClass is immutable: this value must match the live one (metallb).
+# Pinned by tests/test_mail_rspamd_controller_requires_a_password.py.
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-mailserver
+spec:
+  loadBalancerClass: metallb
+  loadBalancerIP: 192.168.1.48

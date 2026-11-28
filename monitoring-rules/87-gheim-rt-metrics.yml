@@ -1,0 +1,84 @@
+## gheim-rt-guard metrics freshness (infra-o4i3m.5.4, 2026-11-17).
+##
+## gheim-rt-guard is a litellm custom_code guardrail (a DB row, not in git; see
+## litellm/litellm-cm.yml). Each litellm process pushes its own gheim_rt_*_total
+## counters (label `replica`, random per process, no `job`) straight to vmsingle
+## /api/v1/import/prometheus every 15 min. It is the only writer on that path.
+##
+## ⛔ WHY THIS EXISTS: the guard FAILS OPEN, and so does its push. A refused push
+## (vmsingle import put behind auth by infra-o4i3m.5.4, or the host dropped from
+## litellm's user_url_allowed_hosts SSRF list) raises nothing anywhere: the series
+## just stop. Without these rules a broken push and a quiet guard look the same.
+##
+## Gates, so this only fires when the guard SHOULD be pushing:
+##  * litellm has available replicas (kube-state-metrics);
+##  * f/probe/litellm_contract ran in the last hour. It calls the guard on every
+##    pod every 15 min, so the counters move even with zero user traffic. A dead
+##    probe is BatchJobStale's job, not this one.
+## Measured 11-10..17: 670/672 15-min slots had both replicas; the longest gap was
+## one missed push (30 min), so 1h + for: 15m never fires on that.
+## `replica` changes on every pod restart; the per-replica rule COUNTS replicas
+## seen in the last hour instead of tracking any one value, so a rollout is silent.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-gheim-rt-metrics
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-gheim-rt-metrics.rules
+    rules:
+    - alert: GheimRtGuardMetricsStale
+      expr: |
+        absent(max_over_time(gheim_rt_calls_total[1h]))
+          and on() (sum(kube_deployment_status_replicas_available{namespace="litellm", deployment="litellm"}) > 0)
+          and on() ((time() - max(litellm_contract_last_run_timestamp_seconds)) < 3600)
+      for: 15m
+      labels:
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "gheim-rt-guard has pushed no gheim_rt_* metrics to vmsingle for over 1h"
+        description: |
+          The round-trip PII guard runs as custom_code inside each litellm pod and pushes
+          its counters to vmsingle /api/v1/import/prometheus. None arrived for an hour while
+          litellm is up and the contract probe (which calls the guard every 15 min) runs.
+          The guard FAILS OPEN, so a broken push and a broken guard look the same from
+          outside: check that -gheim doors still mask.
+
+          Usual causes: vmsingle import refused (auth added, infra-o4i3m.5.4) or the host
+          missing from litellm user_url_allowed_hosts (litellm-cm.yml, SSRF allowlist).
+
+            kubectl -n litellm logs deploy/litellm | grep -i 'http_request blocked'
+            https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract
+
+    - alert: GheimRtGuardReplicaNotPushing
+      expr: |
+        (
+          count(count by (replica) (max_over_time(gheim_rt_calls_total[1h])))
+            < on() sum(kube_deployment_status_replicas_available{namespace="litellm", deployment="litellm"})
+        )
+          and on() ((time() - max(litellm_contract_last_run_timestamp_seconds)) < 3600)
+      for: 30m
+      labels:
+        service: litellm
+        namespace: litellm
+        severity: warning
+        component: Security
+        team: mdapi
+        statuspage: exclude
+      annotations:
+        summary: "gheim-rt-guard: {{ $value }} of {{ with query \"sum(kube_deployment_status_replicas_available{namespace='litellm', deployment='litellm'})\" }}{{ . | first | value }}{{ end }} litellm replicas pushed metrics in the last hour"
+        description: |
+          Each litellm process pushes its own gheim_rt_* counters (label replica). Fewer
+          replicas pushed in the last hour than litellm pods are available, so one pod's
+          guard is not reporting. It fails open: check that pod still masks.
+
+            https://windmill.mdapi.ch/runs?path=f/probe/litellm_contract

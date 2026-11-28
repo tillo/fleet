@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: ivodellambrogio
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ivodellambrogio
+    spec:
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: ivodellambrogio
+          image: zot.mdapi.ch/mdapi/ivodellambrogio:latest@sha256:0129f807dce03307f31c07ed5290b96376fd693742d83fc2c1c0f8bc01be919e
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 512Mi
+            limits:
+              memory: 768Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: server-tokens
+              mountPath: /etc/apache2/conf-enabled/zz-server-tokens.conf
+              subPath: zz-server-tokens.conf
+              readOnly: true
+      volumes:
+        - name: server-tokens
+          configMap:
+            name: ivodellambrogio-server-tokens
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ivodellambrogio
+  namespace: ivodellambrogio
+spec:
+  selector:
+    app: ivodellambrogio
+  ports:
+    - port: 80
+      targetPort: 80

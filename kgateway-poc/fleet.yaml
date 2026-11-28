@@ -1,0 +1,32 @@
+# kgateway PoC (bead infra-qwet.1): one Gateway on its own LAN VIP beside the
+# production ingress-nginx edge — never in its place.
+#
+#   *.kgw.mdapi.ch  →  192.168.1.66 (MetalLB prod-pool, L2)  →  Envoy (kgateway)
+#
+# ⛔ LAN-ONLY by construction: no router DNAT points at .66, and the name is a
+# split-horizon override only (split-horizon/unbound-cm.yml). Publicly
+# *.kgw.mdapi.ch falls to the *.mdapi.ch wildcard → nginx, whose default-deny
+# Host allowlist refuses it. Exposing it is a separate, deliberate change.
+#
+# One echo backend; each host is one row of ~/kgw-poc/matrix.sh:
+#   plain   TLS termination + http→https redirect   (standard Gateway API)
+#   hdr     strip/add request headers                (standard RequestHeaderModifier)
+#   sso     oauth2-proxy-admin via ext_authz         (kgateway GatewayExtension)
+#   acl     source-CIDR allowlist                    (kgateway TrafficPolicy.acl)
+#   limits  body-size cap + local rate limit         (kgateway TrafficPolicy)
+#   ws      websocket upgrade                        (kgateway TrafficPolicy.httpUpgrade)
+# Phase 2 (WAF with/without per-host exceptions) needs an ext_proc engine —
+# kgateway OSS has no wasm — and is designed in the bead, not here.
+#
+# Raw bundle: a helm bundle would silently drop these manifests.
+defaultNamespace: kgw-poc
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  ## GatewayClass `kgateway` and the gateway.kgateway.dev CRDs.
+  - name: mdapi-prod-kgateway

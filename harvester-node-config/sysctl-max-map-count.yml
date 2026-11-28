@@ -1,0 +1,26 @@
+# vm.max_map_count=262144 (infra-nqfj).
+#
+# Elasticsearch refuses to start below 262144, and any node may schedule it, so every node
+# carries it.
+#
+# ADOPTED, not new: byte-identical to the hand-placed /oem/99_sysctl_maxmapcount.yaml found on
+# all four nodes on 2026-10-27 (sha256 20d9a032...), plus the two "Managed by" lines.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-sysctl-max-map-count
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 99_sysctl_maxmapcount.yaml
+  contents: |
+    # Managed by CloudInit mdapi-sysctl-max-map-count (fleet harvester-node-config/sysctl-max-map-count.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "vm.max_map_count=262144 for Elasticsearch (Nextcloud AIO fulltextsearch). Re-applied each boot via yip."
+    stages:
+      boot:
+        - name: "set vm.max_map_count"
+          sysctl:
+            vm.max_map_count: "262144"
+          commands:
+            - sysctl -w vm.max_map_count=262144

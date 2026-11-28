@@ -1,0 +1,130 @@
+## memsearch — hybrid search MCP over the memory brain (ns `memsearch`).
+##
+## Internal tooling for the seats: nothing visitor-facing, so warning tier and the
+## INTERNAL component `Automation` (never mapped to mdapi.statuspage.io).
+##
+## What covers what:
+##   * workload arms below — the Deployment is short of replicas;
+##   * MemsearchUnreachable — the outside view: Service, NetworkPolicy and
+##     readiness from another namespace, which replica counts cannot see;
+##   * ingest freshness and failure — NOT here: f/desk/memsearch_ingest pushes
+##     memsearch_ingest_last_run_{timestamp_seconds,success} by the 12-batch-jobs
+##     convention, so BatchJobStale / BatchJobLastRunFailed already cover it;
+##   * MemsearchVectorsMissing — the one business signal: answers silently fall
+##     back to lexical-only while the embedder (oMLX on mbp-mda) is away.
+##
+## Selectors are NAMESPACE-WIDE on purpose (alert-coverage contract).
+## `deployment=~".+"` / `statefulset=~".+"` are no-ops in PromQL and load-bearing
+## for f/probe/alert_coverage_check — without them a namespace-only selector
+## claims coverage of a kind it can never fire on.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-memsearch
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: app-memsearch.rules
+      rules:
+        - alert: MemsearchWorkloadUnavailable
+          expr: |
+            ( kube_deployment_spec_replicas{namespace="memsearch", deployment=~".+"}
+              - kube_deployment_status_replicas_available{namespace="memsearch", deployment=~".+"}
+            ) > 0
+          ## Recreate strategy: every rollout has a gap; 15m rides it out.
+          for: 15m
+          labels:
+            service: '{{ or $labels.deployment "memsearch" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "memsearch/{{ $labels.deployment }} unavailable"
+            description: |
+              The memory-brain search index has no available replica. Seats fall
+              back to grepping ~/ — slower, nothing lost (the index is rebuilt
+              by the next ingest). Check:
+                kubectl --context mdapi-prod-direct -n memsearch describe pod -l app=memsearch
+                kubectl --context mdapi-prod-direct -n memsearch logs deploy/memsearch --tail=50
+
+        ## ⚠️ Keep this arm even though it matches nothing today: the coverage
+        ## probe treats a namespace-only selector as covering both kinds.
+        - alert: MemsearchStatefulSetUnavailable
+          expr: |
+            ( kube_statefulset_replicas{namespace="memsearch", statefulset=~".+"}
+              - kube_statefulset_status_replicas_available{namespace="memsearch", statefulset=~".+"}
+            ) > 0
+          for: 15m
+          labels:
+            service: '{{ or $labels.statefulset "memsearch" }}'
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "memsearch/{{ $labels.statefulset }} unavailable"
+            description: |
+              A StatefulSet in ns memsearch has fewer available replicas than desired.
+
+        - alert: MemsearchUnreachable
+          ## avg_over_time gives hysteresis on both edges (as RackKioskUnreachable).
+          expr: avg_over_time(probe_success{probe="memsearch"}[10m]) < 0.5
+          for: 15m
+          labels:
+            service: memsearch
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "memsearch /readyz unreachable from the monitoring namespace"
+            description: |
+              The blackbox probe of http://memsearch.memsearch.svc.cluster.local:8080/readyz
+              has been mostly failing for >15m. With the workload Available this
+              points at the Service or memsearch/memsearch-netpol.yml rather than
+              the pod. Check from a caller's side (a blocked packet logs nothing):
+                kubectl --context mdapi-prod-direct -n memsearch get pod,svc,netpol
+
+        - alert: MemsearchVectorsMissing
+          ## Pushed by f/desk/memsearch_ingest after every run. A missing vector is
+          ## a chunk only lexical search can find; each ingest back-fills them, so
+          ## this persists only while the embedder stays unreachable.
+          expr: max(memsearch_ingest_vectors_missing) > 0
+          for: 24h
+          labels:
+            service: memsearch
+            severity: warning
+            component: Automation
+            team: mdapi
+          annotations:
+            summary: "memsearch: {{ $value }} chunks without an embedding for a day"
+            description: |
+              Search still answers, lexically only for these chunks. The embedder
+              is LiteLLM group local-closed-gemma-embed → oMLX embeddinggemma on
+              mbp-mda (fail-closed: there is deliberately no cloud fallback).
+              The ingest job's last result carries the error (`embed_error`).
+              Check that oMLX serves the model:
+                curl -s -H "Authorization: Bearer $KEY" http://litellm.litellm.svc.cluster.local:4000/v1/embeddings \
+                  -d '{"model":"local-closed-gemma-embed","input":"x"}' | head -c 200
+---
+## No `component`/`team` on the target, deliberately: SyntheticProbe* matches
+## component!="" and is critical + statuspage-coupled. MemsearchUnreachable above
+## selects on `probe` and carries its own warning-tier labels. Plain HTTP inside
+## the cluster, so there is no certificate to watch.
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: memsearch
+  namespace: monitoring
+spec:
+  jobName: memsearch
+  prober:
+    path: /probe
+    url: blackbox.monitoring.svc.cluster.local:9115
+  module: http_2xx
+  targets:
+    staticConfig:
+      static:
+        - http://memsearch.memsearch.svc.cluster.local:8080/readyz
+      labels:
+        probe: memsearch

@@ -1,0 +1,49 @@
+## Who may talk to the QA sink. qa/qa-baseline already gives ns `iast` default-deny
+## egress + DNS, and admits ingress only from inside the namespace; this adds
+## the apps under test, each in its own namespace labelled
+## mdapi.ch/iast-tracer=true (qa/bussola/fleet.yaml), on the trace port only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iast-sink-from-tracers
+  namespace: iast
+spec:
+  podSelector:
+    matchLabels:
+      app: iast-sink
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              mdapi.ch/iast-tracer: "true"
+      ports:
+        - protocol: TCP
+          port: 8126
+---
+## The QA API server's services/proxy (how DefectDojo's sync reads /sarif with the
+## read-only iast-sarif-reader token) reaches the pod through the hosted control
+## plane's konnectivity tunnel: the connection arrives FROM the konnectivity-agent
+## pods in kube-system. Without this rule the proxy answers 503 "dial tcp
+## <pod>:8126: i/o timeout" (measured 2026-11-24).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iast-sink-from-api-proxy
+  namespace: iast
+spec:
+  podSelector:
+    matchLabels:
+      app: iast-sink
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: konnectivity-agent
+      ports:
+        - protocol: TCP
+          port: 8126

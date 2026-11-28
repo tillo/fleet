@@ -1,0 +1,96 @@
+# app-batch-jobs.rook_osd_stale_cephx (infra-8f4.64): the heal acting is info, giving
+# up or failing is warning. Gauges as f/heal/rook_osd_stale_cephx pushes them.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: heal-acted-is-info
+  interval: 5m
+  input_series:
+  - series: rook_osd_stale_cephx_pods_deleted{job="rook_osd_stale_cephx"}
+    values: '3'
+  alert_rule_test:
+  - eval_time: 0m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxHealed
+    exp_alerts:
+    - exp_labels:
+        job: rook_osd_stale_cephx
+        service: ceph
+        namespace: rook-ceph
+        severity: info
+        component: Storage
+        team: mdapi
+      exp_annotations:
+        summary: "rook_osd_stale_cephx deleted 3 OSD pod(s) crashlooping on a stale cephx key"
+        description: "Self-healed: the OSD pods were recreated so cephx-keyring-update re-ran against the mons. Expected once after an outage in which the mons were down; check `ceph osd stat` returns all OSDs up. The pod names are in the heal's last job log (DELETED lines)."
+- name: gave-up-is-warning
+  interval: 5m
+  input_series:
+  - series: rook_osd_stale_cephx_gave_up{job="rook_osd_stale_cephx"}
+    values: '0 1x6'
+  alert_rule_test:
+  - eval_time: 10m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxGaveUp
+    exp_alerts: []
+  - eval_time: 20m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxGaveUp
+    exp_alerts:
+    - exp_labels:
+        job: rook_osd_stale_cephx
+        service: ceph
+        namespace: rook-ceph
+        severity: warning
+        component: Storage
+        team: mdapi
+      exp_annotations:
+        summary: "rook_osd_stale_cephx gave up on 1 OSD(s): still crashlooping after 3 pod deletes in 24 h"
+        description: "Deleting the pod did not fix the handle_auth_bad_method crashloop, so the on-disk key is not just stale. Compare the key in the mon DB (ceph auth get osd.N) with the one in the OSD's keyring, and read the cephx-keyring-update init container log of the newest pod. The OSD ids are in the heal's last job log ('gave up' lines)."
+- name: failing-is-warning-after-30m
+  interval: 5m
+  input_series:
+  - series: rook_osd_stale_cephx_probe_success{job="rook_osd_stale_cephx"}
+    values: '1 0x10'
+  alert_rule_test:
+  - eval_time: 25m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxFailing
+    exp_alerts: []
+  - eval_time: 40m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxFailing
+    exp_alerts:
+    - exp_labels:
+        job: rook_osd_stale_cephx
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Storage
+        team: mdapi
+      exp_annotations:
+        summary: "rook_osd_stale_cephx is failing: OSDs on a stale cephx key would not be healed"
+        description: "The heal's last runs raised (VictoriaMetrics query, pod list or a 403 on pod delete in rook-ceph). Read the error in its last job log; a 403 means the windmill-worker-heal-pod-delete RoleBinding in rook-ceph or the heal-rook-osd-delete-pin admission policy refused it."
+- name: quiet-run-is-silent
+  interval: 5m
+  input_series:
+  - series: rook_osd_stale_cephx_pods_deleted{job="rook_osd_stale_cephx"}
+    values: '0x12'
+  - series: rook_osd_stale_cephx_gave_up{job="rook_osd_stale_cephx"}
+    values: '0x12'
+  - series: rook_osd_stale_cephx_probe_success{job="rook_osd_stale_cephx"}
+    values: '1x12'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxHealed
+    exp_alerts: []
+  - eval_time: 55m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxGaveUp
+    exp_alerts: []
+  - eval_time: 55m
+    groupname: app-batch-jobs.rook_osd_stale_cephx
+    alertname: RookOsdStaleCephxFailing
+    exp_alerts: []

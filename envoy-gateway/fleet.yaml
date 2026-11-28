@@ -1,0 +1,60 @@
+# Envoy Gateway control plane — the side-by-side of kgateway (bead
+# infra-qwet.1), LAN-only. Its point: the WAF runs IN the Envoy process
+# (coraza-proxy-wasm via EnvoyExtensionPolicy.wasm), where kgateway OSS can only
+# call an external ext_proc engine. The Gateway, routes and policies live in the
+# raw sibling bundle eg-poc/ (a helm bundle never applies loose manifests).
+#
+# Images come straight from docker.io/envoyproxy (not on the zot allow-list),
+# as kgateway's come from cr.kgateway.dev.
+defaultNamespace: envoy-gateway-system
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+dependsOn:
+  - name: mdapi-prod-envoy-gateway-crds
+  - name: mdapi-prod-envoy-gateway-crds-envoyproxy
+helm:
+  maxHistory: 25
+  releaseName: envoy-gateway
+  chart: oci://docker.io/envoyproxy/gateway-helm
+  version: 1.10.0
+  values:
+    ## ⛔ OFF: the bundled `crds` subchart installs Gateway API CRDs (owned by
+    ## RKE2, see envoy-gateway-crds/) from its crds/ directory, untracked by
+    ## Helm. The EG CRDs come from the envoy-gateway-crds bundle instead.
+    ## Verified with `helm template --include-crds`: zero CRDs rendered.
+    crds:
+      enabled: false
+    ## Webhook that copies node topology onto Envoy pods for zone-aware routing.
+    ## Single-zone estate, and it is the chart's only cluster-scoped mutating
+    ## webhook (scoped to envoy-gateway-system, failurePolicy Ignore) — off.
+    topologyInjector:
+      enabled: false
+    deployment:
+      replicas: 1
+      envoyGateway:
+        resources:
+          requests:
+            cpu: 20m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
+    config:
+      envoyGateway:
+        gateway:
+          controllerName: gateway.envoyproxy.io/gatewayclass-controller
+        provider:
+          type: Kubernetes
+          kubernetes:
+            deploy:
+              ## Envoy runs in the Gateway's own namespace (eg-poc), not in
+              ## envoy-gateway-system: the PoC stays in one namespace and goes
+              ## away with it, like kgw-poc.
+              type: GatewayNamespace
+        logging:
+          level:
+            default: info

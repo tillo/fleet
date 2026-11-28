@@ -1,0 +1,141 @@
+# ENFORCING — this policy DENIES. Isolation programme infra-az8.4;
+# this workload is infra-az8.4.1.
+# Promoted from learn.gitlab-runner-builder-ci-jobs 2026-10-07 after the same
+# 36h22m window (2026-10-05T18:51:33Z -> 2026-10-07T07:13:15Z), suppression 0.
+# Evidence: ~/ci-job-pods-netpol-analysis-20261007.md
+#
+# ⭐ THE INTERNAL SURFACE HERE IS SMALLER THAN BOOTSTRAP'S: DNS + ingress-nginx
+#    :443, and nothing else. This runner is PINNED to node quo and its cache is
+#    local on the PVC, so there is no S3 path and no rule for one.
+#
+# ⭐ THE S3 QUESTION IS SETTLED, NOT ASSUMED (the sibling policy allows the RGW;
+#    this one must not). The window produced exactly ONE rook-ceph-rgw connection
+#    cluster-wide, from 10.52.1.252 on node quo at 2026-10-05T20:55:09Z — and node
+#    is not enough to attribute it, because a pod on quo could be bootstrap's
+#    (that runner is unpinned and lands anywhere). The discriminator is the job's
+#    `tag_list`: `mdapi` = bootstrap runner, `builder-persistent` = THIS runner.
+#    At that instant two jobs were alive and BOTH were tagged `mdapi`; the only
+#    `builder-persistent` job of the day started 20:55:39 — thirty seconds AFTER
+#    the connection — and ran 40 minutes emitting no RGW row at all.
+#    ⇒ If a rook-ceph-rgw row ever appears for this namespace, that is a REAL
+#       FINDING: this policy will block it and log it, and the log line is the
+#       evidence that the builder's local-cache assumption has changed.
+#
+# ⛔ THE LEARN POLICY IS DELETED IN THE SAME COMMIT AS THIS FILE. Its trailing bare
+#    `Allow` is a catch-all that would swallow every `Deny` below, leaving this
+#    policy enforcing nothing while appearing deployed. Precedent: commit 9428320
+#    (nameserver).
+#
+# ⛔ DO NOT add `netpol-onboarded=true` while no Calico tier exists —
+#    `NetworkPolicyFloorMissing` fires at once. Order: floor -> policy -> label LAST.
+#
+# ⭐ THIS NAMESPACE WAS MEASURED DIRECTLY, NOT INFERRED FROM ITS SIBLING. Because
+#    `make_fast` cannot run by waiting (schedule->never, tag builder-persistent,
+#    runUntagged false), bead infra-az8.4.1.1 forced one FAST_LANE=1 pipeline and
+#    resolved the job pod as 10.52.1.3 on quo. Its ENTIRE internal surface was two
+#    rows, both to an ingress controller on :443:
+#        10.52.1.3 -> 10.52.0.27:443    n=1   (controller on qui)
+#        10.52.1.3 -> 10.52.1.202:443   n=1   (controller on quo)
+#    Zero S3, zero Ceph, zero registry Service, zero LAN, and ingress ZERO across a
+#    40-minute job with logs streaming. ⇒ What this file allows is exactly what was
+#    measured.
+#    ⭐ Those two rows went to TWO DIFFERENT controllers while the pod sat on one
+#       node. That is why rule 3 is a SELECTOR over the whole set and not an
+#       ipBlock on a controller IP: a rule written from one observed IP works until
+#       the next scheduler placement.
+#
+# ⚠️ SELECTOR: verified 2026-10-05 that `has(project.runner.gitlab.com/id)` does NOT
+#    match the runner manager (`app: gitlab-runner-builder`), so this Deny cannot
+#    touch the runner's own control plane. It covers `services:` too, which run as
+#    extra containers in the job pod — this runner is v18.11.3 and has not yet run
+#    a service job; the behaviour is executor-wide (bead infra-8quc, closed).
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.gitlab-runner-builder-ci-jobs
+  namespace: gitlab-runner-builder
+spec:
+  order: 500
+  selector: has(project.runner.gitlab.com/id)
+  types:
+    - Ingress
+    - Egress
+
+  egress:
+    # ── 1-2. DNS, unlogged (an Allow terminates, so resolution stays out of the
+    #    dataset). ⛔ By SELECTOR, never an ipBlock on the 10.53.0.10 Service VIP —
+    #    CoreDNS is reached by POD IP and a VIP rule looks correct while breaking
+    #    all name resolution in the namespace.
+    - action: Allow
+      protocol: UDP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: k8s-app == "kube-dns"
+        ports: [53]
+
+    # ── 3. ⭐ GitLab itself, and the registry a build publishes to — both reached
+    #    as `https://gitlab.mdapi.ch/` / `registry.mdapi.ch`, i.e. through the
+    #    INGRESS. That name resolves to the ingress-expose LB VIP 192.168.1.191,
+    #    DNAT'd BEFORE Calico evaluates, so the far end this policy sees is an
+    #    rke2-ingress-nginx controller POD IP on 443 — not the LAN, not a GitLab
+    #    Service IP.
+    #    ⛔ NEVER allow-list .191: it matches nothing and breaks every job while
+    #       looking correct. Cross-checked cluster-wide: ZERO 10.53.x rows in the
+    #       entire 36h window, i.e. Service VIPs never appear in this data.
+    #    Ports 80+443 because the controllers redirect on 80; the window only ever
+    #    exercised 443.
+    - action: Allow
+      protocol: TCP
+      destination:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name == "rke2-ingress-nginx"
+        ports: [80, 443]
+
+    # ── (no S3 rule here — see the header. cache_dir is local on the PVC.)
+
+    # ── 4-5. ⭐ THE ENFORCEMENT. `Log` is NON-TERMINATING: it records and falls
+    #    through to the Deny, so every future block appears in `netpol_flows` as a
+    #    row instead of an unexplained failure. Keep it immediately before the Deny.
+    #    Scoped to the four nets rather than bare, for the same reason as the
+    #    sibling policy: a build runs arbitrary project code, so its egress set is
+    #    unbounded by design, and Calico `Log` has no rate limit while journald's
+    #    10000/30s budget is PER NODE and SHARED. Scoping bounds the volume by
+    #    construction; a lossy window is worse than none because it looks complete.
+    - action: Log
+      destination:
+        nets:
+          - 10.52.0.0/16       # pod CIDR
+          - 10.53.0.0/16       # service CIDR
+          - 192.168.1.0/24     # LAN: nodes, router, NAS, switches, iLO
+          - 169.254.169.254/32 # link-local metadata
+    - action: Deny
+      destination:
+        nets:
+          - 10.52.0.0/16
+          - 10.53.0.0/16
+          - 192.168.1.0/24
+          - 169.254.169.254/32
+
+    # ── 6. The internet — the build's purpose, deliberately NOT logged. NOT
+    #    port-pinned: the boundary being drawn is "not inside", not "which port
+    #    outside".
+    - action: Allow
+
+  ingress:
+    # NOTHING is allowed in. Measured 2026-10-05 across this runner's real
+    # 40-minute `make_fast` job (pid 33, 20:55:39 -> 21:35:22) with continuous log
+    # streaming: ZERO internal ingress rows. The manager drives the pod through the
+    # Kubernetes API (manager -> kube-apiserver -> kubelet), which is not
+    # pod-to-pod traffic, so do NOT add a manager allow on the theory that it holds
+    # the exec/log channel.
+    # ⭐ Bare Log (not scoped) because the ingress SOURCE set is not unbounded and
+    #    its volume is provably tiny — a bare Log is the only way to keep a deny of
+    #    non-internal ingress answerable.
+    - action: Log
+    - action: Deny

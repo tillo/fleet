@@ -1,0 +1,24 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: lam-env-secret
+spec:
+  refreshInterval: 1m0s
+
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+
+  target:
+    name: lam-env-secret
+    creationPolicy: Owner
+
+  data:
+    - remoteRef:
+        key: /mdapi/openldap/lam-env-secret/LAM_PASSWORD
+      secretKey: LAM_PASSWORD
+    # LAM's own directory credential (infra-r1xf.2): a writer-role service
+    # account, not cn=admin. It manages users and groups and nothing else.
+    - remoteRef:
+        key: /mdapi/ldap/service-accounts/svc-lam
+      secretKey: LDAP_ADMIN_PASSWORD

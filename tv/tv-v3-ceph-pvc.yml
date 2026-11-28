@@ -1,0 +1,26 @@
+## tv-v3-ceph — CephFS RWX target for migrating the Plex media library off fio/Longhorn
+## to the Ceph bulk tier (P420i). ceph-filesystem SC = CephFS, data rep2/min1 + meta rep3.
+## Originally 1536Gi, same as tv-v3. Online pre-synced from tv-v3, then all 8 consumers
+## repoint here at cutover (Plex downtime = pod restart only). No Longhorn backup labels.
+##
+## 2026-11-27: 1536Gi -> 2048Gi. This volume holds the imported library (/Film,
+## /Serie) and is also what sftpgo serves as tv.files.mdapi.ch, so it has warned
+## (FilesPVCNearlyFull) since 2026-11-08 and reached 93.3% (110 GB free),
+## climbing ~6-8 GiB/day — quota full in ~2 weeks, which fails SFTPGo uploads
+## and *arr imports. Growth is structural (every title is seeded on
+## tv-finish-* and copied into this volume; hardlinks cannot cross PVs), so
+## this buys runway while seed-retention automation drains the duplicate
+## copies. It is not a substitute for that retention.
+## Pool ceph-filesystem-data0 had 1.50 TiB MAX AVAIL (data rep2) at this size.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tv-v3-ceph
+  namespace: tv
+spec:
+  storageClassName: ceph-filesystem
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 2048Gi

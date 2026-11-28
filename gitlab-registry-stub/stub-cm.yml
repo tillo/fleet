@@ -1,0 +1,25 @@
+# The three calls GitLab 19.6 makes before a rename/transfer/delete, answered so rails
+# concludes "this project has no registry tags" (read from the shipped source:
+# lib/container_registry/{client,gitlab_api_client}.rb, app/models/container_repository.rb):
+#   GET /gitlab/v1/          -> anything but 200/401 keeps rails on the plain /v2 API
+#   GET /v2/<path>/tags/list -> 200, empty list  => has_tags? false, nothing to delete
+#   GET /v2/                 -> 200 (registry_info, admin health)
+# Everything else is 404: there are no images, and nothing may be pushed here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitlab-registry-stub
+  namespace: bootstrap
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      default_type application/json;
+      add_header Docker-Distribution-API-Version registry/2.0 always;
+
+      location = /healthz { return 200 'ok'; }
+      location /gitlab/ { return 404 '{"errors":[{"code":"NOT_FOUND","message":"GitLab registry API not served (registry retired)"}]}'; }
+      location = /v2/ { return 200 '{}'; }
+      location ~ ^/v2/(.+)/tags/list$ { return 200 '{"name":"$1","tags":[]}'; }
+      location / { return 404 '{"errors":[{"code":"NAME_UNKNOWN","message":"registry retired; zot.mdapi.ch is the registry"}]}'; }
+    }

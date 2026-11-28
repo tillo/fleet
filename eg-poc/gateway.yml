@@ -1,0 +1,157 @@
+## One wildcard certificate for every PoC host. DNS-01 through the cluster issuer
+## (its rfc2136 solver covers mdapi.ch), exactly as kgw-poc's *.kgw.mdapi.ch.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: eg-wildcard
+  namespace: eg-poc
+spec:
+  secretName: eg-wildcard-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-prod
+  dnsNames:
+    - "*.eg.mdapi.ch"
+  renewBefore: 720h0m0s                # canonical Go-duration form so Fleet sees no drift
+---
+## Envoy Gateway ships no GatewayClass; this one binds to its controller.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy-gateway
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+## How Envoy Gateway shapes the Envoy Deployment/Service for the Gateway, and
+## the HTTP filter order.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: eg-proxy
+  namespace: eg-poc
+spec:
+  ## Every Envoy worker thread instantiates its own wasm VM, each holding the
+  ## whole compiled CRS. Unset means one worker per node CPU; two keep the
+  ## WAF's memory bounded and measurable.
+  concurrency: 2
+  ## The same order the kgateway PoC ended on (kgateway-poc-waf/waf.yml), so
+  ## the rows compare like with like:
+  ##   buffer (body cap, 413)  →  wasm (WAF)  →  ext_authz (oauth2-proxy)
+  ## WAF before auth keeps attacks away from oauth2-proxy; the cap before the
+  ## WAF refuses an oversized body before the engine reads it. Envoy Gateway's
+  ## default runs ext_authz first and the buffer after it.
+  filterOrder:
+    - name: envoy.filters.http.wasm
+      before: envoy.filters.http.ext_authz
+    - name: envoy.filters.http.buffer
+      before: envoy.filters.http.wasm
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+        ## ⛔ MetalLB is OPT-IN here (controller --lb-class=metallb): without the
+        ## class the Service stays <pending>, and the field is IMMUTABLE — it
+        ## must be right on the first apply (kgateway PoC, 2026-11-24).
+        loadBalancerClass: metallb
+        ## Local keeps the CLIENT source address (acl row, WAF REMOTE_ADDR).
+        externalTrafficPolicy: Local
+        annotations:
+          ## A free prod-pool address (2026-11-25: in no Service, fleet file or
+          ## doc; no ARP answer from bpi-r4; outside DHCP .100-.249).
+          metallb.io/loadBalancerIPs: 192.168.1.67
+      envoyDeployment:
+        replicas: 1
+        container:
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: eg
+  namespace: eg-poc
+spec:
+  gatewayClassName: envoy-gateway
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      name: eg-proxy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.eg.mdapi.ch"
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.eg.mdapi.ch"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: eg-wildcard-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+## ⚠️ Envoy Gateway sets the listener's per-connection buffer limit to 32 KiB
+## (Envoy's own default, which kgateway keeps, is 1 MiB). A filter that holds
+## the whole request body — the WAF, the buffer filter — is capped by it, so
+## with the WAF on, every form body over ~64 KiB got a 413
+## `request_payload_too_large` from Envoy itself, before any rule ran
+## (measured 2026-11-25: 65,000 B → 200, 65,536 B → 413; the same body
+## through kgateway → 200). 1 MiB matches kgateway and the limits row's cap.
+## A route that takes bigger uploads THROUGH the WAF needs this raised too —
+## the WAF can only inspect what Envoy agrees to buffer.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: eg-buffers
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+  connection:
+    bufferLimit: 1Mi
+  ## ⚠️ For HTTP/2 the per-REQUEST buffer is the stream window, not the
+  ## connection limit above. Envoy Gateway sets it to 64 KiB (Envoy's own
+  ## default, kept by kgateway, is 256 MiB), so behind the WAF every HTTP/2
+  ## body over 64 KiB — every browser form — still got 413 while HTTP/1.1 passed
+  ## (measured 2026-11-25 with both 1 MiB limits in place: 66,000 B and
+  ## 600,000 B → 200 on HTTP/1.1, 413 on HTTP/2). The connection window
+  ## (default 1 MiB) must not be smaller than the stream window.
+  http2:
+    initialStreamWindowSize: 1Mi
+    initialConnectionWindowSize: 2Mi
+---
+## …and the same 32 KiB default on every UPSTREAM cluster. The WAF releases a
+## body it has inspected in one piece, and the router must hold it until the
+## backend connection takes it: over the cluster's limit that is ALSO a 413
+## request_payload_too_large, this time with upstream_host already chosen
+## (measured 2026-11-25 after the listener fix: 64,000 B → 200, 66,000 B →
+## 413 on the WAF route; 600 KB → 200 on wafoff, where the body streams).
+## ⚠️ A route-level BackendTrafficPolicy REPLACES this one unless it sets
+## mergeType (see limits in routes.yml).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: eg-buffers
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+  connection:
+    bufferLimit: 1Mi

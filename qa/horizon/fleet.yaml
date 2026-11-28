@@ -1,0 +1,28 @@
+## Evertrust Horizon in the QA cluster, INSTRUMENTED for IAST (infra-7rog.41.12).
+##
+## ⛔ Horizon is a PROD service (the estate's CLM). This copy is NOT it and never talks to
+## it: its own MongoDB (emptyDir, synthetic data typed in by the QA traffic only), its own
+## made-up users, no link to horizon.mdapi.ch, idp.mdapi.ch or the CipherTrust Manager --
+## egress is DNS, its database and the IAST sink only (horizon-netpol.yml).
+##
+## The ONE prod value here is the Horizon LICENCE, a deliberate user exception
+## (2026-11-25, qa/README.md). It is not in this (public) repo: Secret horizon-license is
+## pushed from the seat by ~/src/spot-qa/horizon-qa-secrets.py, which also mints
+## horizon-qa (app/event-seal secrets and a THROWAWAY plaintext Tink keyset -- no master-key
+## URI, so the estate's ciphertrust:// hook is present in the image but never exercised).
+##
+## The tracer loads because DD_IAST_ENABLED=true (the image's /docker-entrypoint.d/iast.sh);
+## `horizon-off` is the same image without it -- what prod runs -- for the overhead
+## control, with its own database. tests/test_qa_horizon_stays_isolated.py pins all of it.
+## Namespace and labels: qa/qa-baseline.
+defaultNamespace: horizon
+## No namespaceLabels: qa/qa-baseline is the ONE owner of this Namespace. Declaring the same
+## labels here (fleet !2898) made Fleet set exactly that list, which strips the helm
+## ownership labels qa-baseline's release needs -> qa-baseline "Modified", and every bundle
+## that dependsOn it stalls. The first-install strip this bundle did instead is a one-off:
+## force-sync the QA GitRepo, then RESTART the traced pods (memory
+## qa_bundle_first_deploy_strips_namespace_labels_2026_11_25).
+dependsOn:
+  - name: bootstrap-qa-qa-baseline
+helm:
+  maxHistory: 5

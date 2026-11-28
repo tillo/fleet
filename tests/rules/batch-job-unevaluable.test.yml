@@ -1,0 +1,69 @@
+# BatchJobUnevaluable (o2 row infra-v71mo, bead under infra-r9mzd).
+#
+# The rule catches a pusher that has a *_last_run_timestamp_seconds gauge but NO
+# windmill_schedule_interval_seconds entry for its job label — so BatchJobStale cannot
+# threshold it and it would otherwise be unwatched. The case it must NOT swallow is a
+# pusher whose freshness is owned by a purpose-written rule, exactly like bpi_r4_* and
+# kube_bench.
+#
+# mac_mda_home is that case. It is pushed by the Mac seat's own home-audit.sh (via
+# f/desk/mac_home_hygiene, which merely hops over ssh to run it), so the pusher is a
+# LAPTOP and "unreachable" is its normal state. Its Windmill schedule publishes its
+# cadence under the SCRIPT basename (mac_home_hygiene), never under the pushgateway job
+# label, so the join can never match and the rule fired on every ordinary short absence
+# at a flat 24 h — while the rule written for a laptop (MacMdaPushStale) allows 4 days
+# and MacMdaAuditStale 10. Freshness for it therefore belongs to 75-mac-mda-home.yml.
+#
+# vmalert-tool evaluates at 2000-01-01T00:00:00Z + t (time() = 946684800 + t).
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1h
+tests:
+# A genuinely unwatched pusher must still alert: the exclusion is a narrow, named
+# exception, not a hole in the rule.
+- name: a-stale-pusher-with-no-cadence-still-alerts
+  interval: 1h
+  input_series:
+  - series: idle_job_last_run_timestamp_seconds{job="idle_job"}
+    values: '946684800x40'
+  alert_rule_test:
+  # exactly 24h old is not yet "> 24h"
+  - eval_time: 24h
+    groupname: app-batch-jobs.staleness
+    alertname: BatchJobUnevaluable
+    exp_alerts: []
+  # >24h stale and held for the 1h `for:`
+  - eval_time: 26h
+    groupname: app-batch-jobs.staleness
+    alertname: BatchJobUnevaluable
+    exp_alerts:
+    - exp_labels:
+        job: idle_job
+        service: idle_job
+        namespace: windmill
+        severity: warning
+        team: mdapi
+        component: Platform
+        statuspage: exclude
+      exp_annotations:
+        summary: "Batch job idle_job is unwatched and 1d 2h 0m 0s stale"
+        description: "This job pushes a `*_last_run_timestamp_seconds` but has no\n`windmill_schedule_interval_seconds` cadence, so BatchJobStale cannot\nevaluate it — it has been exempt from freshness alerting entirely, and\nit has now been silent for over a day.\n\nFix the CAUSE, not this alert: give the job a Windmill schedule so the\ngeneric rule covers it, or if it is genuinely not a Windmill job, give\nit a dedicated push_time rule the way 21-bpi-r4.yml does for the\nrouter. Retiring the job means removing its pushgateway group too,\notherwise the retained series keeps this firing.\n\n`f/probe/schedule_cadence_map` publishes the cadence map daily.\n"
+
+# The Mac seat's inventory push: its cadence IS published, under the script basename,
+# and a laptop may legitimately be asleep for days. Owned by MacMdaPushStale (4d).
+- name: mac-mda-home-is-owned-by-its-own-laptop-rules
+  interval: 1h
+  input_series:
+  - series: mac_mda_home_last_run_timestamp_seconds{job="mac_mda_home",instance="mbp-mda"}
+    values: '946684800x40'
+  - series: windmill_schedule_interval_seconds{script="mac_home_hygiene",job="schedule_cadence_map"}
+    values: '86400x40'
+  alert_rule_test:
+  - eval_time: 26h
+    groupname: app-batch-jobs.staleness
+    alertname: BatchJobUnevaluable
+    exp_alerts: []
+  - eval_time: 72h
+    groupname: app-batch-jobs.staleness
+    alertname: BatchJobUnevaluable
+    exp_alerts: []

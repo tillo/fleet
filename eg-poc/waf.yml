@@ -1,0 +1,141 @@
+## WAF rows (~/kgw-poc/matrix.sh waf-*): Coraza + OWASP CRS running INSIDE the
+## Envoy process as a wasm filter — the design kgateway OSS cannot load.
+##
+##   waf     WAF attached to the whole Gateway  → canary 403
+##   wafoff  a route-level policy without the WAF → canary reaches the app
+##   wafexc  WAF attached, per-host CRS exception below → canary 200, and any
+##           OTHER attack on that host still 403
+##
+## Module: upstream's own image, pinned by digest. coraza-proxy-wasm
+## publishes no release after 0.6.0 (2025-07); this is `main` built from commit
+## b0c1b024 (2026-07-17), which carries the 2026 response-phase fixes. It embeds
+## Coraza v3.3.3 + CRS 4.14.0 (vs Coraza v3.7.0 + CRS 4.31.0 in the kgateway
+## engine): a wasm module cannot read rule files from disk, so a newer CRS
+## means building the module ourselves (tinygo). The rule IDs the matrix
+## depends on (930120, 932235, 932130, 932160, 942xxx) exist in both.
+##
+## The directives mirror mdapi/coraza-extproc config/rules (base.conf +
+## exclusions.conf), minus the audit log: a wasm VM has no file to write, and
+## matches go to the Envoy log instead.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: waf
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: eg
+  wasm:
+    - name: coraza
+      rootID: coraza
+      ## Fail CLOSED, as the kgateway engine (failOpen: false): a module that
+      ## cannot load must not turn into "no WAF".
+      failOpen: false
+      code:
+        type: Image
+        image:
+          ## OUR build (mdapi/coraza-wasm): upstream's image is from 2026-07
+          ## with Coraza 3.3.3 + CRS 4.14.0, and a wasm module embeds its rules,
+          ## so a current CRS can only come from a rebuild. Ours carries CRS
+          ## 4.31.0 — the SAME tarball as the kgateway engine — and keeps
+          ## upstream's Coraza 3.3.3, which its frozen C++ deps allow (see that
+          ## repo's README). The controller (ns envoy-gateway-system) pulls it
+          ## from zot, hence the pull secret.
+          ## ⚠️ The MANIFEST digest, not an index: Envoy Gateway verifies the
+          ## manifest it pulled against this value, and an index digest is
+          ## rejected ("checksum … does not match") — with failOpen false every
+          ## request then gets a 500 (measured 2026-11-25).
+          url: zot.mdapi.ch/mdapi/coraza-wasm:4.31.0-mdapi.6@sha256:dc22fef2f66d268398d429ba8ac16dc251b73ab16d74a828956157aa555161b9
+          pullSecretRef:
+            name: zot-pull
+      config:
+        directives_map:
+          default:
+            - SecRuleEngine On
+            ## Request body: inspected up to 12 MB, rejected beyond. All in
+            ## memory: a wasm VM has no temp directory to spill to.
+            - SecRequestBodyAccess On
+            - SecRequestBodyLimit 13107200
+            - SecRequestBodyInMemoryLimit 13107200
+            - SecRequestBodyLimitAction Reject
+            ## Response body: phase 4 (data-leak rules 95xxxx) on text types.
+            - SecResponseBodyAccess On
+            - SecResponseBodyMimeType text/plain text/html text/xml application/json
+            - SecResponseBodyLimit 524288
+            - SecResponseBodyLimitAction ProcessPartial
+            - SecAuditEngine Off
+            - Include @crs-setup-conf
+            ## Per-host exception (same rule as coraza-extproc exclusions.conf,
+            ## host renamed). ⛔ Local rule IDs ≥ 1000000: CRS owns 9xxxxx.
+            - >-
+              SecRule REQUEST_HEADERS:Host "@rx ^wafexc\.eg\.mdapi\.ch$"
+              "id:1000001,phase:1,pass,nolog,msg:'CRS exceptions for wafexc.eg.mdapi.ch',ctl:ruleRemoveById=930120,ctl:ruleRemoveById=932235,ctl:ruleRemoveById=932130,ctl:ruleRemoveById=932160"
+            ## Same include ORDER as the engine's crs-include.conf, so both
+            ## WAFs evaluate the same files in the same sequence.
+            - Include @owasp_crs/plugins/*-config.conf
+            - Include @owasp_crs/*-before.conf
+            - Include @owasp_crs/*.conf
+            - Include @owasp_crs/*-after.conf
+        default_directives: default
+---
+## The opt-out, scoped to one route: a route-level EnvoyExtensionPolicy
+## replaces the Gateway-level one for that route, and this one loads nothing.
+## It is also the control that PROVES the 403s come from the WAF.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: wafoff
+  namespace: eg-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: wafoff
+---
+## One host per WAF matrix row.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: waf
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["waf.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: wafoff
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["wafoff.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: wafexc
+  namespace: eg-poc
+spec:
+  parentRefs:
+    - name: eg
+      sectionName: https
+  hostnames: ["wafexc.eg.mdapi.ch"]
+  rules:
+    - backendRefs:
+        - name: echo
+          port: 8080

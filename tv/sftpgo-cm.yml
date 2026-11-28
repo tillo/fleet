@@ -1,0 +1,298 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sftpgo-config
+  namespace: tv
+data:
+  sftpgo.json: |
+    {
+      "common": {
+        "idle_timeout": 15,
+        "umask": "0002",
+        "upload_mode": 0,
+        "actions": { "execute_on": [], "execute_sync": [], "hook": "" }
+      },
+      "sftpd": {
+        "bindings": [{ "port": 2022, "address": "" }],
+        "max_auth_tries": 3,
+        "banner": "tv file gateway",
+        "host_keys": [
+          "/data/.sftpgo/host_key_ed25519",
+          "/data/.sftpgo/host_key_rsa"
+        ]
+      },
+      "ftpd": {
+        "bindings": [{
+          "port": 2121,
+          "address": "",
+          "force_passive_ip": "31.3.128.60",
+          "tls_mode": 0
+        }],
+        "passive_port_range": { "start": 22250, "end": 22259 },
+        "banner": "tv file gateway"
+      },
+      "httpd": {
+        "bindings": [{
+          "port": 8080,
+          "address": "",
+          "enable_web_admin": true,
+          "enable_web_client": true,
+          "enable_rest_api": false,
+          "oidc": {
+            "config_url": "https://idp.mdapi.ch/realms/tilloch",
+            "client_id": "sftpgo",
+            "client_secret_file": "/etc/sftpgo/oidc/client_secret",
+            "redirect_base_url": "https://tv.files.mdapi.ch",
+            "username_field": "preferred_username",
+            "scopes": ["openid", "profile", "email"],
+            "implicit_roles": true
+          },
+          "branding": {
+            "web_client": {
+              "disclaimer_name": "Connection info (SFTP / FTP)",
+              "disclaimer_path": "/disclaimer.html",
+              "extra_css": ["/disclaimer.css"]
+            }
+          }
+        }],
+        "templates_path": "/usr/share/sftpgo/templates",
+        "static_files_path": "/usr/share/sftpgo/static",
+        "openapi_path": "/usr/share/sftpgo/openapi"
+      },
+      "data_provider": {
+        "driver": "memory",
+        "create_default_admin": true,
+        "external_auth_hook": "http://127.0.0.1:8081/auth",
+        "external_auth_scope": 0,
+        "pre_login_hook": "http://127.0.0.1:8081/pre_login"
+      },
+      "telemetry": { "bind_port": 0 }
+    }
+  auth_server.py: |
+    #!/usr/bin/env python3
+    """SFTPGo auth gateway:
+      /auth        -> external_auth_hook  (password validation via Keycloak direct grant + role check)
+      /pre_login   -> pre_login_hook      (role check via Keycloak admin API; gates OIDC + password)
+    """
+    import base64, json, os, sys, time, urllib.parse, urllib.request
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    
+    KC_ISSUER     = os.environ["KC_ISSUER"]            # https://idp.mdapi.ch/realms/tilloch
+    KC_CLIENT_ID  = os.environ["KC_CLIENT_ID"]         # sftpgo
+    KC_CLIENT_SEC = os.environ["KC_CLIENT_SECRET"]
+    REQUIRED_ROLE = os.environ["REQUIRED_ROLE"]        # mdapi-spider3 / mdapi-tv
+    HOME_DIR      = os.environ.get("HOME_DIR", "/data")
+    UID           = int(os.environ.get("HOME_UID", "0"))
+    GID           = int(os.environ.get("HOME_GID", "0"))
+    BIND_PORT     = int(os.environ.get("BIND_PORT", "8081"))
+    
+    KC_ADMIN_BASE = KC_ISSUER.replace("/realms/", "/admin/realms/")  # admin API base
+    
+    def log(msg): print(msg, file=sys.stderr, flush=True)
+    
+    # ---------- admin token cache (client_credentials grant on the sftpgo client) ----------
+    _admin_token = None
+    _admin_expires = 0
+    def admin_token():
+        global _admin_token, _admin_expires
+        now = time.time()
+        if _admin_token and now < _admin_expires - 30:
+            return _admin_token
+        data = urllib.parse.urlencode({
+            "grant_type":   "client_credentials",
+            "client_id":    KC_CLIENT_ID,
+            "client_secret":KC_CLIENT_SEC,
+        }).encode()
+        req = urllib.request.Request(
+            f"{KC_ISSUER}/protocol/openid-connect/token",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            tok = json.loads(r.read())
+        _admin_token = tok["access_token"]
+        _admin_expires = now + tok.get("expires_in", 60)
+        return _admin_token
+    
+    def admin_get(path):
+        req = urllib.request.Request(
+            f"{KC_ADMIN_BASE}{path}",
+            headers={"Authorization": f"Bearer {admin_token()}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    
+    def user_id(username):
+        users = admin_get(f"/users?username={urllib.parse.quote(username)}&exact=true")
+        return users[0]["id"] if users else None
+    
+    def user_roles(uid):
+        roles = admin_get(f"/users/{uid}/role-mappings/realm/composite")
+        return [r["name"] for r in roles]
+    
+    # ---------- /auth (password validation via direct grant + role) ----------
+    def kc_password_grant(user, pwd):
+        data = urllib.parse.urlencode({
+            "grant_type":   "password",
+            "client_id":    KC_CLIENT_ID,
+            "client_secret":KC_CLIENT_SEC,
+            "username":     user,
+            "password":     pwd,
+            "scope":        "openid",
+        }).encode()
+        req = urllib.request.Request(
+            f"{KC_ISSUER}/protocol/openid-connect/token",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                tok = json.loads(r.read())["access_token"]
+        except Exception as e:
+            log(f"kc denied for {user}: {e}")
+            return None
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("realm_access", {}).get("roles", [])
+    
+    def build_user(username):
+        return {
+            "username":    username,
+            "status":      1,
+            "uid":         UID,
+            "gid":         GID,
+            "home_dir":    HOME_DIR,
+            "permissions": {"/": ["*"]},
+            "filesystem":  {"provider": 0},
+        }
+    
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args): log("auth: " + fmt % args)
+    
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length))
+            except Exception:
+                return self._reply(400, "bad json")
+            if self.path == "/auth":
+                return self._handle_auth(body)
+            if self.path == "/pre_login":
+                return self._handle_pre_login(body)
+            self._reply(404, f"unknown path {self.path}")
+    
+        # external_auth_hook: validate password + role
+        def _handle_auth(self, body):
+            user = body.get("username", "")
+            pwd  = body.get("password", "")
+            proto = body.get("protocol", "")
+            if not user or not pwd:
+                return self._deny(f"empty creds for proto={proto}", 401)
+            roles = kc_password_grant(user, pwd)
+            if roles is None:
+                return self._deny(f"kc-bind-failed user={user} proto={proto}", 401)
+            if REQUIRED_ROLE not in roles:
+                return self._deny(f"role-missing user={user} proto={proto} need={REQUIRED_ROLE}", 401)
+            log(f"AUTH-OK user={user} proto={proto}")
+            self._reply_user(build_user(user))
+    
+        # pre_login_hook: gate by role (covers OIDC; also runs for password before /auth)
+        def _handle_pre_login(self, body):
+            user = body.get("username", "")
+            proto = body.get("protocol", "")
+            if not user:
+                return self._deny(f"pre_login no username proto={proto}", 404)
+            try:
+                uid = user_id(user)
+            except Exception as e:
+                return self._deny(f"pre_login lookup failed user={user}: {e}", 500)
+            if not uid:
+                return self._deny(f"pre_login user not found: {user}", 404)
+            try:
+                roles = user_roles(uid)
+            except Exception as e:
+                return self._deny(f"pre_login roles failed user={user}: {e}", 500)
+            if REQUIRED_ROLE not in roles:
+                return self._deny(f"pre_login role-missing user={user} proto={proto} need={REQUIRED_ROLE}", 404)
+            log(f"PRE-LOGIN-OK user={user} proto={proto}")
+            self._reply_user(build_user(user))
+    
+        def _reply(self, code, why=""):
+            if why: log(f"REPLY {code} {why}")
+            self.send_response(code)
+            self.end_headers()
+    
+        def _deny(self, why, code=401):
+            log(f"DENY {why}")
+            self.send_response(code)
+            self.end_headers()
+    
+        def _reply_user(self, u):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(u).encode())
+    
+    if __name__ == "__main__":
+        HTTPServer(("127.0.0.1", BIND_PORT), H).serve_forever()
+  disclaimer.html: |
+    <!DOCTYPE html>
+    <html lang="en"><head><meta charset="utf-8"><title>tv file gateway — connection info</title>
+    <style>body{font-family:system-ui,sans-serif;max-width:780px;margin:2em auto;padding:1em;color:#222}
+    h1{margin-top:0}h2{margin-top:1.6em;border-bottom:1px solid #ddd;padding-bottom:.3em}
+    code,pre{background:#f4f4f4;border-radius:4px;padding:2px 6px}
+    pre{padding:.8em;overflow-x:auto}
+    .note{background:#fffbe6;border-left:4px solid #f0c000;padding:.6em 1em;margin:1em 0}
+    </style></head><body>
+    <h1>tv file gateway</h1>
+    <p>Files in this account are also reachable via SFTP, FTP, and WebDAV. All
+    methods authenticate against the same Keycloak account that gets you in here.</p>
+    <p>Replace <code>USER</code> below with your account username.
+    The password is your LDAP password — same one used to log into the web file manager.</p>
+    
+    <h2>SFTP (recommended)</h2>
+    <pre>sftp -P 22200 USER@tv.files.mdapi.ch</pre>
+    <p>Or any GUI client (FileZilla, Cyberduck, Cyberduck/Mountain Duck, WinSCP):</p>
+    <ul>
+      <li>Protocol: <strong>SFTP / SSH File Transfer</strong></li>
+      <li>Host: <code>tv.files.mdapi.ch</code></li>
+      <li>Port: <code>22200</code></li>
+      <li>Username + password as above</li>
+    </ul>
+    
+    <h2>FTP</h2>
+    <pre>ftp -p tv.files.mdapi.ch 22201</pre>
+    <ul>
+      <li>Host: <code>tv.files.mdapi.ch</code></li>
+      <li>Control port: <code>22201</code></li>
+      <li>Passive port range: <code>22250–22259</code> (open in client config if behind NAT)</li>
+      <li>Mode: <strong>passive</strong></li>
+    </ul>
+    
+    <h2>WebDAV</h2>
+    <p>The web file manager you're looking at right now <em>is</em> a WebDAV-style browser.
+    Native WebDAV mounting is not enabled — use SFTP or this web UI instead.</p>
+    
+    <div class="note"><strong>Need help?</strong> Contact tillo@tillo.ch.</div>
+    </body></html>
+  disclaimer.css: |
+    /* SFTPGo connection-info banner (rendered on all webclient pages) */
+    html::before {
+      content: "🔗 tv file gateway · SFTP: sftp -P 22200 USER@tv.files.mdapi.ch · FTP: ftp -p tv.files.mdapi.ch 22201 (passive 22250-22259) · Full info: /static/disclaimer.html";
+      display: block;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: #fff3cd;
+      color: #664d03;
+      border-bottom: 1px solid #ffecb5;
+      padding: 6px 14px;
+      text-align: center;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      z-index: 10000;
+      white-space: nowrap;
+      overflow-x: auto;
+    }
+    body { padding-top: 32px !important; }

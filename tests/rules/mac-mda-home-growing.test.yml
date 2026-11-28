@@ -1,0 +1,48 @@
+# MacMdaHomeGrowing is a trend alarm on what the user keeps in the home folder.
+# oMLX's paged SSD KV cache (~/.omlx/ssd-cache) runs with ssd_cache_max_size
+# "auto" = half of free disk plus the existing cache, so it legitimately swings by
+# 100+ GB in days and evicts on its own (11-04: 71 -> 226 GB, back to 120 by 11-06).
+# Counting it made every firing of this rule from 11-09 to 11-16 except one a cache
+# breath (infra-4p2t9). The audit pushes once a day and Pushgateway re-serves the
+# value at every scrape, so the series is a step function: 1h samples model that.
+rule_files:
+- monitoring-rules/75-mac-mda-home.yml
+evaluation_interval: 1h
+tests:
+- name: omlx-ssd-cache-breathing-is-silent
+  interval: 1h
+  input_series:
+  # home grows 155 GB in a day, all of it the oMLX SSD cache
+  - series: mac_mda_home_bytes{job="mac_mda_home",instance="mbp-mda"}
+    values: 384e9x168 539e9x60
+  - series: mac_mda_home_omlx_cache_bytes{job="mac_mda_home",instance="mbp-mda"}
+    values: 71e9x168 226e9x60
+  alert_rule_test:
+  - eval_time: 9d
+    groupname: app-mac-mda.home
+    alertname: MacMdaHomeGrowing
+    exp_alerts: []
+- name: model-pull-outside-the-cache-fires
+  interval: 1h
+  input_series:
+  # a 54 GB model lands under ~/.omlx/models; the cache does not move
+  - series: mac_mda_home_bytes{job="mac_mda_home",instance="mbp-mda"}
+    values: 453e9x168 507e9x60
+  - series: mac_mda_home_omlx_cache_bytes{job="mac_mda_home",instance="mbp-mda"}
+    values: 120e9x228
+  alert_rule_test:
+  - eval_time: 9d
+    groupname: app-mac-mda.home
+    alertname: MacMdaHomeGrowing
+    exp_alerts:
+    - exp_labels:
+        job: mac_mda_home
+        instance: mbp-mda
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Storage
+        team: mdapi
+      exp_annotations:
+        summary: "mbp-mda home grew by 50.29Gi in a week"
+        description: "The home folder, not counting the self-evicting oMLX SSD\ncache, gained more than 30 GB in seven days. Usual causes: a\nnew VM bundle, an oMLX/HF model pull, or a build cache.\nIdentify the consumer with `home-audit.sh --list`.\n"

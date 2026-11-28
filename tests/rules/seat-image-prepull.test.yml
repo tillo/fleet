@@ -1,0 +1,132 @@
+# app-k8s.seat-image-prepull (infra-8f4): recovery images must be cached on every node,
+# and the recovery / zot-critical pre-pullers must hold the digest each consumer runs.
+rule_files:
+- monitoring-rules/88-seat-image-prepull.yml
+evaluation_interval: 1m
+tests:
+- name: a-node-without-the-current-seat-image-warns-after-1h
+  interval: 1m
+  input_series:
+  - series: kube_daemonset_status_number_unavailable{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '0x90'
+  - series: kube_daemonset_status_desired_number_scheduled{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '4x90'
+  - series: kube_daemonset_status_updated_number_scheduled{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '3x90'
+  - series: kube_node_status_condition{node="qui",condition="Ready",status="true",instance="ksm"}
+    values: '1x90'
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: app-k8s.seat-image-prepull
+    alertname: PrepullImagesNotCachedEverywhere
+    exp_alerts: []
+  - eval_time: 70m
+    groupname: app-k8s.seat-image-prepull
+    alertname: PrepullImagesNotCachedEverywhere
+    exp_alerts:
+    - exp_labels: {namespace: jump, daemonset: seat-image-prepull, instance: ksm, service: seat-image-prepull, severity: warning, component: Platform, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "jump/seat-image-prepull: pre-pulled recovery images not cached on every node (1 nodes short, 1h)"
+        description: "The pre-puller jump/seat-image-prepull is short on 1 node(s)\nfor an hour: a pod is unavailable, or its current images have not reached\nevery node. Until they do, a recovery workload rescheduled onto that node\nneeds its registry (zot.mdapi.ch for the seat, the internet for the rest).\n`kubectl -n jump get pods -l app=seat-image-prepull -o wide` and the\nevents of the pod that is not Running (usually ImagePullBackOff).\n"
+- name: an-unavailable-pod-on-a-notready-node-stays-silent-and-a-healthy-set-too
+  interval: 1m
+  input_series:
+  - series: kube_daemonset_status_number_unavailable{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '1x90'
+  - series: kube_daemonset_status_desired_number_scheduled{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '4x90'
+  - series: kube_daemonset_status_updated_number_scheduled{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '4x90'
+  - series: kube_node_status_condition{node="qua",condition="Ready",status="true",instance="ksm"}
+    values: '0x90'
+  alert_rule_test:
+  - eval_time: 80m
+    groupname: app-k8s.seat-image-prepull
+    alertname: PrepullImagesNotCachedEverywhere
+    exp_alerts: []
+- name: an-unavailable-pod-with-every-node-ready-warns
+  interval: 1m
+  input_series:
+  - series: kube_daemonset_status_number_unavailable{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '1x90'
+  - series: kube_daemonset_status_desired_number_scheduled{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '4x90'
+  - series: kube_daemonset_status_updated_number_scheduled{namespace="jump",daemonset="seat-image-prepull",instance="ksm"}
+    values: '4x90'
+  - series: kube_node_status_condition{node="qua",condition="Ready",status="true",instance="ksm"}
+    values: '1x90'
+  alert_rule_test:
+  - eval_time: 80m
+    groupname: app-k8s.seat-image-prepull
+    alertname: PrepullImagesNotCachedEverywhere
+    exp_alerts:
+    - exp_labels: {namespace: jump, daemonset: seat-image-prepull, instance: ksm, service: seat-image-prepull, severity: warning, component: Platform, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "jump/seat-image-prepull: pre-pulled recovery images not cached on every node (1 nodes short, 1h)"
+        description: "The pre-puller jump/seat-image-prepull is short on 1 node(s)\nfor an hour: a pod is unavailable, or its current images have not reached\nevery node. Until they do, a recovery workload rescheduled onto that node\nneeds its registry (zot.mdapi.ch for the seat, the internet for the rest).\n`kubectl -n jump get pods -l app=seat-image-prepull -o wide` and the\nevents of the pod that is not Running (usually ImagePullBackOff).\n"
+- name: a-recovery-digest-the-prepuller-does-not-hold-warns-after-2h
+  interval: 1m
+  input_series:
+  - series: kube_pod_container_info{namespace="cert-manager",pod="cert-manager-abc",container="cert-manager-controller",image_id="quay.io/jetstack/cert-manager-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="cert-manager",pod="cert-manager-abc",phase="Running",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_init_container_info{namespace="jump",pod="guac-pg-1",container="bootstrap-controller",image_id="ghcr.io/cloudnative-pg/cloudnative-pg@sha256:1111111111111111111111111111111111111111111111111111111111111111",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="jump",pod="guac-pg-1",phase="Running",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_container_info{namespace="cert-manager",pod="startupapicheck-x",container="check",image_id="quay.io/jetstack/startupapicheck@sha256:3333333333333333333333333333333333333333333333333333333333333333",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="cert-manager",pod="startupapicheck-x",phase="Running",instance="ksm"}
+    values: '0x150'
+  - series: kube_pod_container_info{namespace="jump",pod="openvpn-1",container="openvpn",image_id="docker.io/library/alpine@sha256:4444444444444444444444444444444444444444444444444444444444444444",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="jump",pod="openvpn-1",phase="Running",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_container_info{namespace="jump",pod="recovery-image-prepull-q1",container="cloudnative-pg",image_id="ghcr.io/cloudnative-pg/cloudnative-pg@sha256:1111111111111111111111111111111111111111111111111111111111111111",instance="ksm"}
+    values: '1x150'
+  alert_rule_test:
+  - eval_time: 100m
+    groupname: app-k8s.seat-image-prepull
+    alertname: RecoveryImageNotPrepulled
+    exp_alerts: []
+  - eval_time: 130m
+    groupname: app-k8s.seat-image-prepull
+    alertname: RecoveryImageNotPrepulled
+    exp_alerts:
+    - exp_labels: {namespace: cert-manager, pod: cert-manager-abc, container: cert-manager-controller, image_id: "quay.io/jetstack/cert-manager-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222", digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222", service: recovery-image-prepull, severity: warning, component: Platform, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "cert-manager/cert-manager-abc (cert-manager-controller) runs an image the recovery pre-puller does not hold"
+        description: "quay.io/jetstack/cert-manager-controller@sha256:2222222222222222222222222222222222222222222222222222222222222222 has run for 2 h without being held by\njump/recovery-image-prepull, so only the nodes that happened to pull it\ncan start it while the internet edge is down. Usually a chart bump.\nFix: `python3 tools/recovery-prepull-sync.py` in ~/fleet (rewrites\njump/seat-prepull/recovery-image-prepull.yml from the live pods), then MR.\n"
+- name: a-critical-zot-digest-no-prepuller-holds-warns-after-2h
+  interval: 1m
+  input_series:
+  - series: kube_pod_container_info{namespace="keycloak",pod="keycloak-84b4cd4d84-bqw5q",container="keycloak",image_spec="zot.mdapi.ch/mdapi/keycloak:latest",image_id="zot.mdapi.ch/mdapi/keycloak@sha256:2222222222222222222222222222222222222222222222222222222222222222",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="keycloak",pod="keycloak-84b4cd4d84-bqw5q",phase="Running",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_container_info{namespace="monitoring",pod="vmalert-mdapi-7d59c6f4bb-cxp9b",container="vmalert",image_spec="zot.mdapi.ch/victoriametrics/vmalert:v1.153.0",image_id="zot.mdapi.ch/victoriametrics/vmalert@sha256:1111111111111111111111111111111111111111111111111111111111111111",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_container_info{namespace="monitoring",pod="vmalert-mdapi-7d59c6f4bb-cxp9b",container="config-reloader",image_spec="victoriametrics/operator:config-reloader-v0.75.2",image_id="docker.io/victoriametrics/operator@sha256:3333333333333333333333333333333333333333333333333333333333333333",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="monitoring",pod="vmalert-mdapi-7d59c6f4bb-cxp9b",phase="Running",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_container_info{namespace="monitoring",pod="grafana-5c6d7f8b9-abcde",container="grafana",image_spec="zot.mdapi.ch/grafana/grafana:latest",image_id="zot.mdapi.ch/grafana/grafana@sha256:4444444444444444444444444444444444444444444444444444444444444444",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_status_phase{namespace="monitoring",pod="grafana-5c6d7f8b9-abcde",phase="Running",instance="ksm"}
+    values: '1x150'
+  - series: kube_pod_container_info{namespace="jump",pod="zot-critical-live-prepull-q1",container="vmalert",image_spec="zot.mdapi.ch/victoriametrics/vmalert:v1.153.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",image_id="zot.mdapi.ch/victoriametrics/vmalert@sha256:1111111111111111111111111111111111111111111111111111111111111111",instance="ksm"}
+    values: '1x150'
+  alert_rule_test:
+  - eval_time: 100m
+    groupname: app-k8s.seat-image-prepull
+    alertname: ZotCriticalImageNotPrepulled
+    exp_alerts: []
+  - eval_time: 130m
+    groupname: app-k8s.seat-image-prepull
+    alertname: ZotCriticalImageNotPrepulled
+    exp_alerts:
+    - exp_labels: {namespace: keycloak, pod: keycloak-84b4cd4d84-bqw5q, container: keycloak, image_id: "zot.mdapi.ch/mdapi/keycloak@sha256:2222222222222222222222222222222222222222222222222222222222222222", digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222", service: zot-critical-prepull, severity: warning, component: Platform, statuspage: exclude, team: mdapi}
+      exp_annotations:
+        summary: "keycloak/keycloak-84b4cd4d84-bqw5q (keycloak) runs a critical zot image no pre-puller holds"
+        description: "zot.mdapi.ch/mdapi/keycloak@sha256:2222222222222222222222222222222222222222222222222222222222222222 has run for 2 h without being held by\njump/zot-critical-image-prepull or jump/zot-critical-live-prepull, so only\nthe nodes that happened to pull it can start it while zot (Ceph RGW) is\ndown. Keycloak/Unbound/nameserver/OpenBao: the bump MR missed the line in\njump/seat-prepull/zot-critical-image-prepull.yml (the test should have\ncaught it). oauth2-proxy/redis/VictoriaMetrics: run\n`python3 tools/recovery-prepull-sync.py --set zot-critical-live`, then MR.\n"

@@ -1,0 +1,99 @@
+# FluentdCriblOutputErrors (infra-ggowi). One Cribl worker whose source PQ cannot
+# drain answers 503 to its share of requests; fluentd retries succeed, so the buffer
+# never fills and FluentdCriblOutputBufferFilling stays silent. Measured 10-24..11-11:
+# ~85 errors/min against ~335 writes/min (one worker of four, ~25 %), 18 days unseen.
+# Since the fix the 30m ratio peaked at 3.5 %. Series as scraped from fluentd :24231.
+rule_files:
+- monitoring-rules/15b-logging-pipeline-freshness.yml
+evaluation_interval: 1m
+tests:
+- name: one-worker-in-four-failing-pages-after-1h
+  interval: 1m
+  input_series:
+  # 85 of every 335 writes fail (the 10-26..11-11 shape), on one of two outputs
+  - series: fluentd_output_status_num_errors{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+85x150'
+  - series: fluentd_output_status_write_count{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+300x150'
+  - series: fluentd_output_status_num_errors{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:postfix-loops:clusteroutput:cattle-logging-system:cribl"}
+    values: '0x150'
+  - series: fluentd_output_status_write_count{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:postfix-loops:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+35x150'
+  # a non-Cribl output failing hard must not count
+  - series: fluentd_output_status_num_errors{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:x:clusteroutput:x:openobserve"}
+    values: '0+500x150'
+  alert_rule_test:
+  - eval_time: 55m
+    groupname: app-logging-freshness.fluentd-buffer
+    alertname: FluentdCriblOutputErrors
+    exp_alerts: []
+  - eval_time: 70m
+    groupname: app-logging-freshness.fluentd-buffer
+    alertname: FluentdCriblOutputErrors
+    exp_alerts:
+    - exp_labels:
+        namespace: cattle-logging-system
+        pod: rancher-logging-root-fluentd-0
+        service: rancher-logging-root-fluentd
+        severity: warning
+        component: Logging
+        team: mdapi
+      exp_annotations:
+        summary: "25.37% of fluentd->Cribl writes from rancher-logging-root-fluentd-0 are failing and being retried"
+        description: |
+          fluentd's writes to Cribl fail at a steady rate and succeed on retry, so
+          nothing is lost yet and the buffer alerts stay quiet. A steady share near
+          25 % is ONE of the four Cribl worker processes refusing every request it
+          gets (503 "active connection limit reached"), usually because its source
+          persistent queue holds a journal it cannot read.
+
+          Find the worker: the leader log shows ~10x less SourcePQ:httpraw activity
+          for that cid, and its queue dir is non-empty while the others sit at 0:
+            /opt/cribl/config-volume/state/queues/<N>/inputs/httpraw/
+          Fix: move (never rm) that dir's contents aside, then re-init the input
+          with PATCH /api/v1/system/inputs/httpraw and its unchanged config. Judge
+          by this ratio and the leader log, not by the API's status code.
+          ⛔ Do not raise pq.maxBufferSize: it trades 503s for held connections.
+- name: a-healthy-trickle-of-errors-is-silent
+  interval: 1m
+  input_series:
+  # 3.5 % — the worst 30m since the 11-11 fix — must not page
+  - series: fluentd_output_status_num_errors{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+7x300'
+  - series: fluentd_output_status_write_count{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+200x300'
+  alert_rule_test:
+  - eval_time: 280m
+    groupname: app-logging-freshness.fluentd-buffer
+    alertname: FluentdCriblOutputErrors
+    exp_alerts: []
+- name: a-burst-shorter-than-the-hold-is-silent
+  interval: 1m
+  input_series:
+  # 30 minutes at 25 % (a Cribl rollout or a worker restart), then clean
+  - series: fluentd_output_status_num_errors{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+85x30 2550x210'
+  - series: fluentd_output_status_write_count{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0+335x240'
+  alert_rule_test:
+  - eval_time: 60m
+    groupname: app-logging-freshness.fluentd-buffer
+    alertname: FluentdCriblOutputErrors
+    exp_alerts: []
+  - eval_time: 120m
+    groupname: app-logging-freshness.fluentd-buffer
+    alertname: FluentdCriblOutputErrors
+    exp_alerts: []
+- name: no-writes-at-all-is-not-this-alert
+  interval: 1m
+  input_series:
+  # idle fluentd: 0/0 is NaN, never a ratio over the threshold
+  - series: fluentd_output_status_num_errors{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0x150'
+  - series: fluentd_output_status_write_count{namespace="cattle-logging-system",pod="rancher-logging-root-fluentd-0",plugin_id="clusterflow:cattle-logging-system:all-logs:clusteroutput:cattle-logging-system:cribl"}
+    values: '0x150'
+  alert_rule_test:
+  - eval_time: 140m
+    groupname: app-logging-freshness.fluentd-buffer
+    alertname: FluentdCriblOutputErrors
+    exp_alerts: []

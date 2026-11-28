@@ -1,0 +1,55 @@
+# Tools reach kagent only through the MCP front door. The gateway decides what
+# the `kagent` key may call (route policies, agentgateway DB); the toolNames
+# lists on the Agent are a convenience, not the boundary.
+apiVersion: kagent.dev/v1alpha2
+kind: RemoteMCPServer
+metadata:
+  name: mdapi-kubernetes
+  namespace: kagent
+spec:
+  description: mdapi-prod, read-only (k8s-mcp via agentgateway)
+  protocol: STREAMABLE_HTTP
+  url: http://mcp.agentgateway.svc.cluster.local:8080/kubernetes/mcp
+  timeout: 30s
+  headersFrom:
+    - name: Authorization
+      valueFrom:
+        type: Secret
+        name: kagent-mcp
+        key: Authorization
+---
+apiVersion: kagent.dev/v1alpha2
+kind: RemoteMCPServer
+metadata:
+  name: mdapi-memsearch
+  namespace: kagent
+spec:
+  description: The estate's memory brain, runbooks and incidents (memsearch via agentgateway)
+  protocol: STREAMABLE_HTTP
+  url: http://mcp.agentgateway.svc.cluster.local:8080/memsearch/mcp
+  timeout: 30s
+  headersFrom:
+    - name: Authorization
+      valueFrom:
+        type: Secret
+        name: kagent-mcp
+        key: Authorization
+---
+# Read-only: the gateway serves Backstage's catalog-read server and allows only
+# the catalog read tools (route mcp-backstage, agentgateway DB).
+apiVersion: kagent.dev/v1alpha2
+kind: RemoteMCPServer
+metadata:
+  name: mdapi-backstage
+  namespace: kagent
+spec:
+  description: The Backstage catalog — owner, system, dependencies and namespace of every repo, bundle, Windmill job and data resource (read-only, via agentgateway)
+  protocol: STREAMABLE_HTTP
+  url: http://mcp.agentgateway.svc.cluster.local:8080/backstage/mcp
+  timeout: 30s
+  headersFrom:
+    - name: Authorization
+      valueFrom:
+        type: Secret
+        name: kagent-mcp
+        key: Authorization

@@ -1,0 +1,72 @@
+# MacMdaPushFailed (o2 infra-v71mo, bead infra-r9mzd.94).
+#
+# The Mac's inventory is pushed by the Mac itself, so a REJECTED push is
+# indistinguishable from a laptop that is simply away: the group stops moving and
+# every rule in this file goes on reading stale numbers. 2026-11-22..28 the write
+# front started requiring a credential and the Mac pushed bare — six days lost,
+# surfaced only by OpenObserve, four days after MacMdaPushStale could have said so.
+#
+# f/desk/mac_home_hygiene now publishes its own verdict over a DIFFERENT
+# credential, which is what makes the two states separable:
+#   mac_home_hygiene_mac_reachable  do we reach the Mac at all?
+#   mac_home_hygiene_push_failed    the audit ran and its push was rejected
+#
+# The guard on reachable is the whole point: an away laptop has rejected nothing.
+rule_files:
+- monitoring-rules/75-mac-mda-home.yml
+evaluation_interval: 1h
+tests:
+- name: mac-up-and-push-rejected-fires-after-the-hold
+  interval: 1h
+  input_series:
+  - series: mac_home_hygiene_push_failed{job="mac_home_hygiene"}
+    values: '1x12'
+  - series: mac_home_hygiene_mac_reachable{job="mac_home_hygiene"}
+    values: '1x12'
+  alert_rule_test:
+  - eval_time: 5h
+    groupname: app-mac-mda.home
+    alertname: MacMdaPushFailed
+    exp_alerts: []
+  - eval_time: 7h
+    groupname: app-mac-mda.home
+    alertname: MacMdaPushFailed
+    exp_alerts:
+    - exp_labels:
+        service: mbp-mda
+        namespace: mac-mda
+        severity: warning
+        component: Automation
+        team: mdapi
+        job: mac_home_hygiene
+      exp_annotations:
+        summary: "mbp-mda is reachable but its Pushgateway push is being rejected"
+        description: "The Mac answered the audit and the audit ran, but the gauges were not accepted by\nthe Pushgateway. Every rule in app-mac-mda.home is therefore reading stale\nnumbers, and MacMdaPushStale will not say so for four days — the same silence a\nsleeping laptop produces.\n\nUsual causes: the pg-writer credential is missing, stale or not executable on\nthe Mac (~/.local/bin/pushgw_auth.py), or a write-front change like 2026-11-22\n(fleet !2723) is rejecting a bare push. Redeploy the tools from the seat:\ngitlab.mdapi.ch/mdapi/mac-home-hygiene — deploy.sh verifies both files.\n"
+
+# An away laptop rejects nothing; MacMdaPushStale owns "gone for days", at 4 days.
+- name: an-unreachable-mac-is-not-a-push-failure
+  interval: 1h
+  input_series:
+  - series: mac_home_hygiene_push_failed{job="mac_home_hygiene"}
+    values: '1x12'
+  - series: mac_home_hygiene_mac_reachable{job="mac_home_hygiene"}
+    values: '0x12'
+  alert_rule_test:
+  - eval_time: 9h
+    groupname: app-mac-mda.home
+    alertname: MacMdaPushFailed
+    exp_alerts: []
+
+# A healthy morning stays quiet.
+- name: a-successful-push-is-quiet
+  interval: 1h
+  input_series:
+  - series: mac_home_hygiene_push_failed{job="mac_home_hygiene"}
+    values: '0x12'
+  - series: mac_home_hygiene_mac_reachable{job="mac_home_hygiene"}
+    values: '1x12'
+  alert_rule_test:
+  - eval_time: 9h
+    groupname: app-mac-mda.home
+    alertname: MacMdaPushFailed
+    exp_alerts: []

@@ -1,0 +1,71 @@
+# f/heal/grype_scanner_db_sync (app-batch-jobs.grype_scanner_db_sync). The normal
+# shape after an Anchore publish is a lag that rises for ~1 h and drops back to 0 when
+# the rebuild lands -- that must stay silent. Only a lag past 6 h warns.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 1m
+tests:
+- name: a-normal-publish-catch-up-is-silent
+  interval: 1m
+  input_series:
+  - series: grype_scanner_db_behind{job="grype_scanner_db_sync"}
+    values: "0x9 1x59 0x20"
+  - series: grype_scanner_db_lag_seconds{job="grype_scanner_db_sync"}
+    values: "0x9 3000+60x59 0x20"
+  alert_rule_test:
+  - eval_time: 80m
+    groupname: app-batch-jobs.grype_scanner_db_sync
+    alertname: GrypeScannerDbBehind
+    exp_alerts: []
+- name: behind-past-6h-warns
+  interval: 1m
+  input_series:
+  - series: grype_scanner_db_behind{job="grype_scanner_db_sync"}
+    values: "1x480"
+  - series: grype_scanner_db_lag_seconds{job="grype_scanner_db_sync"}
+    values: "3000+60x480"
+  alert_rule_test:
+  - eval_time: 5h
+    groupname: app-batch-jobs.grype_scanner_db_sync
+    alertname: GrypeScannerDbBehind
+    exp_alerts: []
+  - eval_time: 7h
+    groupname: app-batch-jobs.grype_scanner_db_sync
+    alertname: GrypeScannerDbBehind
+    exp_alerts:
+    - exp_labels:
+        job: grype_scanner_db_sync
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "grype-scanner image 7h 50m 0s behind the published grype DB"
+        description: "grype-scanner:latest does not carry the DB Anchore lists, and the listed DB was\nbuilt more than 6 h ago. The sync job plays the build schedule every 30 min while\nbehind, so its builds are failing or not labelling the image: read the\nmdapi/grype-scanner pipelines (buildkit log line \"db listing: checksum=...\").\nEvery scan meanwhile pays the DB import.\n"
+- name: sync-blind-for-an-hour-warns
+  interval: 1m
+  input_series:
+  - series: grype_scanner_db_sync_probe_success{job="grype_scanner_db_sync"}
+    values: "1x9 0x90"
+  alert_rule_test:
+  - eval_time: 50m
+    groupname: app-batch-jobs.grype_scanner_db_sync
+    alertname: GrypeScannerDbSyncFailing
+    exp_alerts: []
+  - eval_time: 80m
+    groupname: app-batch-jobs.grype_scanner_db_sync
+    alertname: GrypeScannerDbSyncFailing
+    exp_alerts:
+    - exp_labels:
+        job: grype_scanner_db_sync
+        service: windmill
+        namespace: windmill
+        severity: warning
+        component: Automation
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "grype-scanner DB sync is blind: Anchore listing, zot label or GitLab unreadable"
+        description: "f/heal/grype_scanner_db_sync could not read one of its three inputs for an hour,\nso a new Anchore DB is not being baked into zot.mdapi.ch/mdapi/grype-scanner and\nscans fall back to importing it (~3 min each) until the 4-hourly backstop build.\nThe job log's \"read failed:\" line names which read.\n"

@@ -1,0 +1,89 @@
+# Keeps the CRITICAL zot-served images that git pins as ONE `image:` line cached on every
+# node (infra-8f4.68, option A of ~/decision-cards/zot-registry-ceph-dependency-2026-11-21.md):
+# Keycloak (the estate SSO), Unbound (split-horizon DNS), the public BIND nameserver, and
+# OpenBao. zot stores in Ceph RGW, so a Ceph outage stops every zot pull (2026-11-21).
+#
+# ⛔ Each `image:` line below is IDENTICAL to its consumer's line (keycloak/keycloak-deploy.yml,
+# split-horizon/unbound-deploy.yml, nameserver/nameserver-deploy.yml,
+# openbao-bootstrap/openbao-bootstrap-cronjob.yml). These are re-pinned almost daily, so
+# Renovate stays ON for this file: it rewrites every occurrence of a package in one MR, and
+# tests/test_zot_critical_images_are_prepulled.py fails if a consumer line is missing here.
+# Never edit one side alone.
+#
+# A SEPARATE DaemonSet from the seat and recovery pre-pullers: while zot is down THIS
+# pod's rollout stalls, never theirs. Holders are main containers (parallel pulls) running
+# `busybox sleep` from a static busybox staged into an emptyDir (several images are
+# distroless). A running container keeps kubelet image GC (85/80 %) off the image;
+# maxUnavailable 0 + maxSurge 1 keeps the old images until the new ones are pulled.
+# The other critical zot images (oauth2-proxy, redis, VictoriaMetrics) are in
+# zot-critical-live-prepull.yml; alert ZotCriticalImageNotPrepulled covers both.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zot-critical-image-prepull
+  namespace: jump
+  labels: { app: zot-critical-image-prepull }
+spec:
+  selector:
+    matchLabels: { app: zot-critical-image-prepull }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: zot-critical-image-prepull }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 1      # sleep as PID 1 ignores SIGTERM
+      imagePullSecrets:
+        - name: zot-pull                    # zot-pull-secrets bundle (infra-8f4.54)
+      tolerations:
+        - operator: Exists                  # every node, whatever it is tainted with
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: hold
+          emptyDir: { sizeLimit: 8Mi }
+      initContainers:
+        - name: stage-busybox
+          image: docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/cp", "/bin/busybox", "/hold/busybox"]
+          volumeMounts: [{ name: hold, mountPath: /hold }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      containers:
+      - name: keycloak
+        image: zot.mdapi.ch/mdapi/keycloak:latest@sha256:3bb5d562a9dc6855caaeae40c0144ecf8cb5b8c4ac1cfb490392db8189dab2cf
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: unbound
+        image: zot.mdapi.ch/mdapi/unbound:1.25.2-mdapi.1150@sha256:1c4b6908faace3dbc392075504417028076ce0c2afeb4e268e87059bb68d07ab
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: nameserver
+        image: zot.mdapi.ch/mdapi/nameserver:9.20.30-mdapi.1232@sha256:e18b499a1c79af30876373a7f24e229c56c17aa3324c4c88c9e8c46d9e510db8
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: openbao
+        image: zot.mdapi.ch/openbao/openbao:2.7.3@sha256:ba4b133eb9586630024e71a617e66f37f29cc3534cdd46a6233e098ceded8dc9
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }

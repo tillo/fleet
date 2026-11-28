@@ -1,0 +1,499 @@
+# The edge DAST target list, discovered at run time (infra-7rog.31.6/.7/.9).
+# The edge-dast init container runs this before the scanners. It enumerates
+# every EXPOSURE PATH -- the way a stranger reaches a service -- from live
+# sources only, so a new application is onboarded the moment it is published,
+# and no hostname is ever written into this public repo (tenant names,
+# CLAUDE.md):
+#
+#   ingress  every Ingress host                      (API, read-only token)
+#   lb       every LoadBalancer Service port          (API)
+#   dnat     every enabled WAN DNAT redirect on bpi-r4  \  ConfigMap
+#   haproxy  every haproxy bind on bpi-r4                > dast/dast-exposure,
+#   nat64    every v6 redirect into the Jool pool6     /  written hourly by
+#                                                         windmill f/security/
+#                                                         dast_exposure_inventory
+#
+# Outputs:
+#   /targets/hosts      today's share of the HTTP hosts (Ingress hosts plus
+#                       each TLS haproxy front's certificate name), for zap
+#                       and nuclei. Each host lands on one of SHARDS days by
+#                       sha256, so each one is scanned every SHARDS days.
+#   /targets/endpoints  one line per backend owner, `<id> <addr:port>,...`,
+#                       for nuclei-net, all of them every night. Deduped by
+#                       BACKEND: a backend the internet reaches is scanned at
+#                       its public front (what a stranger sees: router, haproxy
+#                       TLS, PROXY protocol), and once only; a LoadBalancer
+#                       port no public path reaches is scanned at the LB
+#                       address (LAN exposure is still exposure), and at
+#                       the LB address too when its public front does not
+#                       answer from the pod (a broken hairpin). Only
+#                       addresses that accept a TCP connection are written.
+#
+#   /targets/starttls   `<id> <protocol> <addr> <name|->` for each of those
+#                       addresses on a STARTTLS port (smtp 25/587, imap 143,
+#                       sieve 4190, ftp 21, ...), for the testssl container
+#                       (infra-7rog.31.19). <name> is the forward-confirmed
+#                       PTR of a public address of the same Service, so the
+#                       certificate is checked against the name the world uses;
+#                       a LAN-only Service declares it with the annotation
+#                       dast.mdapi.ch/server-name (checked to resolve to it).
+#
+# The log ends with `coverage: N paths enumerated, M reachable; <per kind>`
+# and one `unreachable <kind> <front> -> <backend>` line per TCP path the pod
+# could not reach. UDP paths are enumerated and counted, not scanned (no UDP
+# scanner yet); v6-only paths count as unreachable (the pod has no IPv6).
+#
+# The only way out is an annotation that states why, on the Ingress or the
+# Service:      dast.mdapi.ch/skip: "<reason>"
+# A skipped Service stays out whichever path reaches it (router paths into
+# its address are dropped too).
+#
+# Fails closed: no hosts, no endpoints, or a router inventory that is missing,
+# half-read or older than MAX_AGE exits 1, so the CronJob alerts instead of
+# a shrunken scan importing as a clean night.
+# Tests: tests/test_dast_discovers_every_ingress_host.py.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dast-discover
+  namespace: dast
+data:
+  discover.py: |
+    """Write the edge DAST targets from every exposure path."""
+    import collections
+    import concurrent.futures
+    import datetime
+    import hashlib
+    import ipaddress
+    import json
+    import os
+    import re
+    import socket
+    import ssl
+    import sys
+    import urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/dast"
+    EXPOSURE = "/exposure"
+    OUT = "/targets/hosts"
+    ENDPOINTS = "/targets/endpoints"
+    STARTTLS = "/targets/starttls"
+    # Addresses only the LAN can reach: the ranges netpol.yml keeps out of "public".
+    LAN = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+    # The plaintext ports that upgrade to TLS in-band, and testssl.sh's name for the upgrade
+    # (infra-7rog.31.19). Keyed on the port a stranger connects to. Implicit-TLS ports
+    # (465, 993, 636, 443) need no entry: nuclei-net's ssl/ templates already see them.
+    STARTTLS_PORTS = {21: "ftp", 25: "smtp", 110: "pop3", 143: "imap", 389: "ldap", 587: "smtp",
+                      2525: "smtp", 3306: "mysql", 4190: "sieve", 5222: "xmpp", 5269: "xmpp-server",
+                      5432: "postgres", 6667: "irc"}
+    INGRESSES = "/apis/networking.k8s.io/v1/ingresses"
+    SERVICES = "/api/v1/services"
+    SKIP = "dast.mdapi.ch/skip"
+    # The name a LAN-only Service's certificate carries, for the STARTTLS check
+    # (infra-7rog.31.22): with no public front there is no PTR to derive it from.
+    SERVER_NAME = "dast.mdapi.ch/server-name"
+    SHARDS = 4
+    SECTIONS = ["## dnat", "## haproxy", "## jool"]
+    MAX_AGE = datetime.timedelta(hours=26)  # the carrier runs hourly; a day of failures stops the scan
+    KINDS = ["ingress", "lb", "dnat", "nat64", "haproxy"]
+    HOSTNAME = re.compile(r"^(?=.{4,253}$)([a-z0-9-]+\.)+[a-z]{2,}$")
+
+    # One exposure: how (kind, proto), where a stranger connects (front) and what
+    # answers (back). Addresses are "ip:port", v6 as "[ip]:port".
+    Path = collections.namedtuple("Path", "kind proto front back")
+
+
+    def skipped(item):
+        notes = item.get("metadata", {}).get("annotations") or {}
+        if SKIP not in notes:
+            return False
+        if not notes[SKIP].strip():
+            meta = item["metadata"]
+            raise ValueError(f"{meta.get('namespace')}/{meta.get('name')}: {SKIP} needs a reason")
+        return True
+
+
+    def ingress_hosts(items):
+        hosts = set()
+        for item in items:
+            if skipped(item):
+                continue
+            for rule in item.get("spec", {}).get("rules") or []:
+                host = rule.get("host")
+                if host and not host.startswith("*"):
+                    hosts.add(host)
+        return sorted(hosts)
+
+
+    def addr(ip, port):
+        return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+    def ip_of(address):
+        return address.rsplit(":", 1)[0].strip("[]")
+
+
+    def load_balancers(items):
+        """(paths, {ip: id}, opted-out ips) for every LoadBalancer Service with an address."""
+        paths, owner, skip = [], {}, set()
+        for item in items:
+            spec = item.get("spec", {})
+            if spec.get("type") != "LoadBalancer":
+                continue
+            ips = [i["ip"] for i in item.get("status", {}).get("loadBalancer", {}).get("ingress") or [] if i.get("ip")]
+            if not ips:
+                continue
+            meta = item["metadata"]
+            if skipped(item):
+                skip.add(ips[0])       # its ports stay enumerated, counted as skipped
+            owner[ips[0]] = f"{meta['name']}.{meta['namespace']}.svc"
+            for p in spec.get("ports") or []:
+                a = addr(ips[0], p["port"])
+                paths.append(Path("lb", p.get("protocol", "TCP").lower(), a, a))
+        return paths, owner, skip
+
+
+    # --- the router inventory (bpi-r4 gate action `exposure`, carried in as text) ---
+
+    def sections(raw):
+        out, name = {}, None
+        for line in raw.splitlines():
+            if line.startswith("## "):
+                name = line
+                out[name] = []
+            elif name and line.strip():
+                out[name].append(line)
+        return out
+
+
+    def inventory(cm, now):
+        """The raw router text, or ValueError when it is stale, undated or half-read."""
+        try:
+            generated = datetime.datetime.strptime(cm.get("generated", ""), "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise ValueError(f"router inventory has no read time: {cm.get('generated')!r}") from None
+        age = now - generated.replace(tzinfo=datetime.timezone.utc)
+        if age > MAX_AGE:
+            raise ValueError(f"router inventory is {age} old (limit {MAX_AGE})")
+        raw = cm.get("raw", "")
+        got = sections(raw)
+        if list(got) != SECTIONS or not all(got.values()):
+            raise ValueError(f"router inventory is half-read: {[(k, len(v)) for k, v in got.items()]}")
+        return raw
+
+
+    def redirects(lines):
+        found = collections.defaultdict(dict)
+        for line in lines:
+            m = re.match(r"^firewall\.(@redirect\[\d+\]|[\w-]+)(?:\.(\w+))?=(.*)$", line)
+            if m and m.group(2):
+                found[m.group(1)][m.group(2)] = re.findall(r"'([^']*)'", m.group(3))
+        return list(found.values())
+
+
+    def port_range(text):
+        lo, _, hi = text.partition("-")
+        return range(int(lo), int(hi or lo) + 1)
+
+
+    def pool6_of(lines):
+        return [ipaddress.ip_network(line.split()[1]) for line in lines if line.startswith("--pool6 ")]
+
+
+    def first(red, key, default=""):
+        return (red.get(key) or [default])[0]
+
+
+    def is_public_dnat(red):
+        """An enabled WAN DNAT with a port and a destination (SNAT and LAN reflections are not)."""
+        return (first(red, "enabled", "1") != "0" and first(red, "target", "DNAT") == "DNAT"
+                and first(red, "src") == "wan" and bool(first(red, "src_dport")) and bool(first(red, "dest_ip")))
+
+
+    def destination(dest, pools):
+        """(kind, v4 backend ip), or None for a v6 backend Jool does not translate."""
+        if ":" not in dest:
+            return "dnat", dest
+        v6 = ipaddress.ip_address(dest)
+        if not any(v6 in pool for pool in pools):
+            return None
+        return "nat64", str(ipaddress.IPv4Address(int(v6) & 0xFFFFFFFF))
+
+
+    def dnat_paths(red, pools):
+        where = destination(first(red, "dest_ip"), pools) if is_public_dnat(red) else None
+        if not where:
+            return []
+        kind, dest = where
+        fronts = port_range(first(red, "src_dport"))
+        backs = port_range(first(red, "dest_port") or first(red, "src_dport"))
+        protos = " ".join(red.get("proto") or ["tcp udp"]).split()
+        return [Path(kind, proto, addr(first(red, "src_dip"), f), addr(dest, b))
+                for proto in protos for f, b in zip(fronts, backs)]
+
+
+    def haproxy_sections(lines):
+        """[(kind, name, [body lines])] in file order."""
+        out = []
+        for line in lines:
+            if not line[:1].isspace():
+                kind, _, name = line.partition(" ")
+                out.append((kind, name.strip(), []))
+            elif out:
+                out[-1][2].append(line.split())
+        return out
+
+
+    def haproxy_backend(servers, port):
+        """The first server's ip:port; a server without a port keeps the bind's port."""
+        back = (servers or [""])[0]
+        return back if ":" in back and back.rsplit(":", 1)[1].isdigit() else f"{back}:{port}"
+
+
+    def haproxy_paths(lines):
+        secs = haproxy_sections(lines)
+        servers = {name: [w[2] for w in body if w[0] == "server" and len(w) > 2]
+                   for kind, name, body in secs if kind in ("backend", "listen")}
+        paths = []
+        for kind, name, body in (s for s in secs if s[0] in ("frontend", "listen")):
+            pool = next((w[1] for w in body if w[0] == "default_backend"), name)
+            for bind in (w[1] for w in body if w[0] == "bind"):
+                back = haproxy_backend(servers.get(pool), bind.rsplit(":", 1)[1])
+                paths.append(Path("haproxy", "tcp", bind, back))
+        return paths
+
+
+    def router_paths(raw):
+        sec = sections(raw)
+        pools = pool6_of(sec.get("## jool", []))
+        dnat = [p for red in redirects(sec.get("## dnat", [])) for p in dnat_paths(red, pools)]
+        return dnat + haproxy_paths(sec.get("## haproxy", []))
+
+
+    def haproxy_hosts(raw):
+        """The HTTP host of every TLS haproxy front, named by its certificate file."""
+        hosts = set()
+        for line in sections(raw).get("## haproxy", []):
+            w = line.split()
+            if w[:1] == ["bind"] and "ssl" in w and "crt" in w[:-1]:
+                name = w[w.index("crt") + 1].rsplit("/", 1)[-1]
+                for suffix in (".combined.crt", ".pem", ".crt"):
+                    name = name.removesuffix(suffix)
+                if HOSTNAME.match(name):
+                    hosts.add(name)
+        return sorted(hosts)
+
+
+    # --- the plan: one scan target per backend ---
+
+    def options(lb_paths, paths, skip):
+        """{backend: addresses to scan it at, best first}: its v4 public fronts, then its LB address."""
+        opts = collections.defaultdict(list)
+        for p in sorted(paths, key=lambda p: p.front):
+            if p.proto == "tcp" and not p.front.startswith(("[", ":")) and ip_of(p.back) not in skip:
+                opts[p.back].append(p.front)
+        for p in lb_paths:
+            if p.proto == "tcp" and ip_of(p.back) not in skip:
+                opts[p.back].append(p.front)
+        return opts
+
+
+    def candidates(services, paths):
+        """Every address worth a TCP probe."""
+        lb_paths, _, skip = load_balancers(services)
+        return {a for opts in options(lb_paths, paths, skip).values() for a in opts}
+
+
+    def targets_by_backend(lb_paths, paths, skip, up=None):
+        """{backend: the first of its options that answered} (the first option, unprobed).
+        A front that does not answer from the pod falls back to the LB address, so a
+        broken hairpin never drops a backend the LAN still exposes."""
+        return {back: next((a for a in opts if up is None or a in up), opts[0])
+                for back, opts in options(lb_paths, paths, skip).items()}
+
+
+    def plan(services, paths, up=None):
+        lb_paths, owner, skip = load_balancers(services)
+        grouped = collections.defaultdict(set)
+        for back, target in targets_by_backend(lb_paths, paths, skip, up).items():
+            grouped[owner.get(ip_of(back), f"router-{ip_of(back)}")].add(target)
+        return {k: sorted(v) for k, v in grouped.items()}
+
+
+    def endpoint_lines(planned):
+        return sorted(f"{k} {','.join(sorted(v))}" for k, v in planned.items() if v)
+
+
+    def ptr(ip):
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        except OSError:
+            return None
+
+
+    def forward(name):
+        try:
+            return socket.gethostbyname_ex(name)[2]
+        except OSError:
+            return []
+
+
+    def server_name(addresses):
+        """The forward-confirmed PTR name of the first PUBLIC address of a line, or None.
+        One Service serves one certificate, so the name its public front publishes is the name
+        to verify its LAN ports against too; a private address's own PTR is a LAN name the
+        certificate does not carry, and an unconfirmed PTR is anyone's claim."""
+        for ip in (ip_of(a) for a in addresses):
+            if not any(ipaddress.ip_address(ip) in net for net in LAN):
+                name = ptr(ip)
+                if name and ip in forward(name):
+                    return name
+        return None
+
+
+    def declared_names(services):
+        """{svc id: name} from the server-name annotation, only where the name resolves to
+        the Service's own LoadBalancer IP (a stale annotation must not misdirect the check)."""
+        out = {}
+        for item in services:
+            name = ((item.get("metadata") or {}).get("annotations") or {}).get(SERVER_NAME)
+            ips = [i.get("ip") for i in item.get("status", {}).get("loadBalancer", {}).get("ingress") or []]
+            if name and ips and ips[0] in forward(name):
+                meta = item["metadata"]
+                out[f"{meta['name']}.{meta['namespace']}.svc"] = name
+        return out
+
+
+    def listener_names(planned, declared):
+        """{id: the name to check its certificate against}: declared first, else derived."""
+        return {k: declared.get(k) or server_name(v) for k, v in planned.items()}
+
+
+    def starttls_lines(planned, names):
+        """`<id> <protocol> <addr> <name|->` for every planned address on a STARTTLS port."""
+        return sorted(f"{k} {STARTTLS_PORTS[int(a.rsplit(':', 1)[1])]} {a} {names.get(k) or '-'}"
+                      for k, addrs in planned.items() for a in addrs
+                      if int(a.rsplit(":", 1)[1]) in STARTTLS_PORTS)
+
+
+    def reachable(targets, timeout=3):
+        def ok(t):
+            try:
+                with socket.create_connection((ip_of(t), int(t.rsplit(":", 1)[1])), timeout=timeout):
+                    return t
+            except OSError:
+                return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+            return {t for t in pool.map(ok, sorted(set(targets))) if t}
+
+
+    def coverage(hosts, services, paths, planned, up):
+        """('coverage: N paths enumerated, M reachable; ...', [unreachable lines])."""
+        lb_paths, _, skip = load_balancers(services)
+        target = targets_by_backend(lb_paths, paths, skip, up)
+        live = [p for p in lb_paths + paths if ip_of(p.back) not in skip]
+        ok = lambda p: p.proto == "tcp" and target.get(p.back) in up
+        n, m = collections.Counter(), collections.Counter()
+        n["ingress"] = m["ingress"] = len(hosts)       # each one gets a zap + nuclei report
+        for p in live:
+            n[p.kind] += 1
+            m[p.kind] += ok(p)
+        udp = sum(p.proto == "udp" for p in live)
+        skip_n = len(lb_paths) + len(paths) - len(live)
+        line = (f"coverage: {sum(n.values()) + skip_n} paths enumerated, {sum(m.values())} reachable; "
+                + ", ".join(f"{k} {m[k]}/{n[k]}" for k in KINDS)
+                + f"; udp {udp} (no UDP scanner); skipped {skip_n}")
+        unreached = [f"unreachable {p.kind} {p.front} -> {p.back}" for p in live
+                     if p.proto == "tcp" and not ok(p)]
+        return line, unreached
+
+
+    # --- sharding and I/O ---
+
+    def shard_of(host):
+        return int(hashlib.sha256(host.encode()).hexdigest()[:8], 16) % SHARDS
+
+
+    def todays_share(hosts, day):
+        return [h for h in hosts if shard_of(h) == day % SHARDS]
+
+
+    def epoch_day(date):
+        return (date - datetime.date(1970, 1, 1)).days
+
+
+    def now():
+        return datetime.datetime.now(datetime.timezone.utc)
+
+
+    def today():
+        # DAST_DAY pins the share for a manual run (kubectl create job --from,
+        # then set the env): scan shard N now instead of today's.
+        if os.environ.get("DAST_DAY"):
+            return int(os.environ["DAST_DAY"])
+        return epoch_day(now().date())
+
+
+    def token():
+        with open(f"{SA}/token") as f:
+            return f.read().strip()
+
+
+    def tls_context():
+        return ssl.create_default_context(cafile=f"{SA}/ca.crt")
+
+
+    def list_items(path):
+        req = urllib.request.Request(f"{API}{path}",
+                                     headers={"Authorization": f"Bearer {token()}"})
+        with urllib.request.urlopen(req, context=tls_context(), timeout=30) as resp:
+            return json.loads(resp.read())["items"]
+
+
+    def read_exposure():
+        out = {}
+        for key in ("raw", "generated"):
+            with open(f"{EXPOSURE}/{key}") as f:
+                out[key] = f.read().strip() if key == "generated" else f.read()
+        return out
+
+
+    def write_lines(path, lines):
+        with open(path, "w") as f:
+            f.write("".join(f"{line}\n" for line in lines))
+
+
+    def run():
+        services = list_items(SERVICES)
+        try:
+            raw = inventory(read_exposure(), now())
+        except (OSError, ValueError) as e:
+            print(f"discover: router inventory unusable ({e}) -- refusing to scan a shrunken edge")
+            return 1
+        paths = router_paths(raw)
+        hosts = sorted(set(ingress_hosts(list_items(INGRESSES))) | set(haproxy_hosts(raw)))
+        up = reachable(candidates(services, paths))
+        planned = plan(services, paths, up)
+        live = {k: [t for t in v if t in up] for k, v in planned.items()}
+        endpoints = endpoint_lines(live)
+        starttls = starttls_lines(live, listener_names(live, declared_names(services)))
+        line, unreached = coverage(hosts, services, paths, planned, up)
+        for u in unreached:
+            print(u)
+        print(line)
+        if not hosts or not endpoints:
+            print(f"discover: {len(hosts)} hosts, {len(endpoints)} endpoints -- refusing to scan nothing")
+            return 1
+        day = today()
+        share = todays_share(hosts, day)
+        write_lines(OUT, share)
+        write_lines(ENDPOINTS, endpoints)
+        write_lines(STARTTLS, starttls)
+        print(f"discover: {len(hosts)} hosts, {len(share)} today (shard {day % SHARDS}/{SHARDS}); "
+              f"{len(endpoints)} endpoint lines; {len(starttls)} STARTTLS listeners")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(run())

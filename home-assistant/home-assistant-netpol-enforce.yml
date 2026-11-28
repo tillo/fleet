@@ -1,0 +1,56 @@
+# ENFORCING (isolation programme infra-az8.4; finding infra-o4i3m.10).
+#
+# Why: HA trusts X-Forwarded-For from the pod CIDR (trusted_proxies), and its only real
+# proxy, rke2-ingress-nginx, has churning pod IPs inside that CIDR. So any pod could
+# connect straight to :8123 and choose the client IP HA logs and ip_bans (proven
+# 2026-11-16 with a forged 198.51.100.77). Narrowing trusted_proxies cannot fix that;
+# limiting who may CONNECT does.
+#
+# Written from learn.home-assistant (2026-11-17 19:56Z -> 2026-11-19 ~21:40Z, ~49 h,
+# journald suppression 0 on every node; ~/ha-meshcentral-netpol-analysis-20261119.md).
+# Attributed by pod IP at the time of each flow, the only direct callers were:
+#   1. ingress-nginx / Traefik (browsers, the companion app, webhooks; dual list on
+#      RKE2 1.36 as in tv).
+#   2. Windmill workers (default + heal groups: f/probe/zha_mesh_health,
+#      f/heal/ha_stream_unwedge, f/heal/ha_upgrade_rollback, f/lib/mdapi). Selected by
+#      app == "windmill-workers", so every worker group may run them.
+#   3. vmagent-mdapi (the /api/prometheus scrape).
+#   4. Log then Deny: anything else is refused and leaves a netpol_flows row.
+# The jump pod is deliberately NOT admitted: it reaches HA through the ingress like a user.
+# The recorder DB (ha-recorder-pg, CNPG) is not selected. Kubelet probes are not policed
+# (host -> local workload without a HostEndpoint).
+#
+# Revert: git revert this change (Fleet re-creates the object; a kubectl delete buys ~90 s).
+# Pinned by tests/test_o4i3m_10_enforce_policies.py.
+apiVersion: crd.projectcalico.org/v1
+kind: NetworkPolicy
+metadata:
+  name: enforce.home-assistant
+  namespace: home-assistant
+spec:
+  order: 500
+  selector: app == "home-assistant"
+  types:
+    - Ingress
+  ingress:
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "kube-system"
+        selector: app.kubernetes.io/name in {"rke2-ingress-nginx", "rke2-traefik"}
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "windmill"
+        selector: app == "windmill-workers"
+      destination:
+        ports: [8123]
+    - action: Allow
+      protocol: TCP
+      source:
+        namespaceSelector: kubernetes.io/metadata.name == "monitoring"
+        selector: app.kubernetes.io/name == "vmagent"
+      destination:
+        ports: [8123]
+    - action: Log
+    - action: Deny

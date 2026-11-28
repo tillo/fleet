@@ -1,0 +1,66 @@
+# The `spot` runner: k8s executor on the mdapi-ci Spot pool (2 x gp.bm2.small-iad,
+# 12 cores / 32 GB each). See fleet.yaml for what may and may not run here.
+image:
+  registry: registry.gitlab.com
+  image: gitlab-org/gitlab-runner
+  tag: alpine-v18.11.3
+gitlabUrl: https://gitlab.mdapi.ch/
+# Global settings are TOP-LEVEL chart values; inside runners.config they are ignored
+# (fleet !1411).
+concurrent: 8
+checkInterval: 3
+# A pod stop sends SIGTERM = gitlab-runner's FORCEFUL shutdown, aborting in-flight
+# jobs. SIGQUIT is the graceful one; dumb-init forwards it and the hook waits for
+# the runner to exit (fleet !1419). Grace sized to the job timeout (2 h).
+deploymentLifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "kill -QUIT 1; while kill -0 1 2>/dev/null; do sleep 5; done"]
+terminationGracePeriodSeconds: 7200
+runners:
+  secret: gitlab-runner-spot-token
+  config: |
+    [[runners]]
+      # One poll at a time cannot fill 8 slots: the runner logs "Increase
+      # 'request_concurrency' to 2-4" at concurrent 8 (seen 2026-11-24).
+      request_concurrency = 4
+      environment = ["FF_USE_FASTZIP=true"]
+      [runners.kubernetes]
+        image = "alpine"
+        namespace = "ci-spot"
+        privileged = false
+        # fleet-validate fans its two test steps out over the job's CPUs: give it
+        # room to burst to 8 while 8 small jobs still fit on 24 cores.
+        cpu_request = "1"
+        cpu_limit = "8"
+        memory_request = "1Gi"
+        memory_limit = "6Gi"
+        ephemeral_storage_request = "1Gi"
+        ephemeral_storage_limit = "10Gi"
+        helper_cpu_limit = "1"
+        helper_memory_limit = "512Mi"
+        service_cpu_limit = "1"
+        service_memory_limit = "1Gi"
+        poll_timeout = 600
+  # Tags and run_untagged live on the runner ROW for a glrt- token (set at
+  # creation: tag_list=spot, run_untagged=false); these mirror it for the reader.
+  tags: "spot"
+  runUntagged: false
+  privileged: false
+rbac:
+  create: true
+  rules:
+    - apiGroups: [""]
+      resources: ["pods", "pods/exec", "pods/attach", "secrets", "configmaps", "services"]
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: [""]
+      resources: ["pods/log"]
+      verbs: ["get", "list", "watch"]
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+metrics:
+  enabled: true

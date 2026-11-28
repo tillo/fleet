@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openbao-mirror-script
+  namespace: openbao
+data:
+  mirror.py: |
+    # Akeyless -> OpenBao mirror. Reads every /mdapi item (api-key auth), writes
+    # each to OpenBao KV v2 mdapi/<relpath> {"value": <raw>}. k8s-auth role `mirror`.
+    # DYNAMIC_SECRET items are materialized and stored as a point-in-time static
+    # snapshot (DR fallback); encryption/classic keys are skipped (no value).
+    # Secret VALUES are NEVER printed (only counts + error key names).
+    # PHASE TIMING (2026-08-24): repeated DeadlineExceeded hangs were never
+    # attributable to a phase, because the only output was the final counts.
+    # Every phase boundary and every slow item is now timestamped, so the
+    # kubectl logs of a killed job say where the time went.
+    import json, ssl, time, urllib.request, urllib.error
+    T0 = time.monotonic()
+    SLOW_ITEM_S = 5.0
+    PROGRESS_EVERY = 50
+
+    def phase(msg):
+        print(f"[t+{time.monotonic() - T0:7.1f}s] {msg}", flush=True)
+
+    AK = "https://cm.mdapi.ch/akeyless-api/v2"
+    BAO = "https://openbao.openbao.svc:8200"
+    akid = open("/creds/access-id").read().strip()
+    akkey = open("/creds/access-key").read().strip()
+    sa = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+    ctx = ssl.create_default_context()
+    # mdapi-trust-bundle (mounted): Mozilla roots + MDAPI Root CA, so the same
+    # context verifies both Akeyless (public LE) and OpenBao (CA01).
+    ctx.load_verify_locations("/trust/ca-bundle.crt")
+
+    def post(url, body, tok_hdr=None):
+        h = {"Content-Type": "application/json"}
+        if tok_hdr:
+            h["X-Vault-Token"] = tok_hdr
+        data = json.dumps(body).encode()
+        # Retry transient network failures. OSError (not just URLError) so
+        # read-timeouts (TimeoutError, 2026-06-30) are covered too, and the
+        # backoff window is ~2 min because the 2026-07-05 DNS blip outlasted
+        # the previous 20 s schedule. An HTTPError (4xx/5xx) is a real answer
+        # and is never retried.
+        for attempt in range(8):
+            try:
+                req = urllib.request.Request(url, data=data, headers=h, method="POST")
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+                    b = r.read()
+                    return json.loads(b) if b else {}
+            except urllib.error.HTTPError:
+                raise
+            except OSError:
+                if attempt == 7:
+                    raise
+                time.sleep(min(60, 2 ** attempt))
+
+    aktok = post(f"{AK}/auth", {"access-id": akid, "access-type": "api_key", "access-key": akkey})["token"]
+    phase("phase=akeyless_auth done")
+    baotok = post(f"{BAO}/v1/auth/kubernetes/login", {"role": "mirror", "jwt": sa})["auth"]["client_token"]
+    phase("phase=openbao_auth done")
+
+    def fname(f):
+        return f if isinstance(f, str) else (f.get("path") or f.get("folder_name") or f.get("name"))
+
+    def list_items(path):
+        items, folders, pag = [], [], ""
+        while True:
+            body = {"token": aktok, "path": path}
+            if pag:
+                body["pagination-token"] = pag
+            r = post(f"{AK}/list-items", body)
+            items += [(it["item_name"], it.get("item_type", "")) for it in (r.get("items") or [])]
+            folders += [fname(f) for f in (r.get("folders") or [])]
+            pag = r.get("next_page") or ""
+            if not pag:
+                break
+        for f in folders:
+            if f:
+                items += list_items(f)
+        return items
+
+    items = sorted(set(list_items("/mdapi")))
+    phase(f"phase=list_items done akeyless_items={len(items)}")
+    # Encryption/classic keys carry no fetchable secret value -> skip them.
+    KEY_TYPES = {"AES128GCM", "AES256GCM", "AES128SIV", "AES256SIV",
+                 "RSA1024", "RSA2048", "RSA3072", "RSA4096",
+                 "CLASSIC_KEY", "DFC", "GPG"}
+    ok = err = dyn = skipped = 0
+    errs = []
+
+    def mirror_one(name, itype):
+        rel = name[len("/mdapi/"):] if name.startswith("/mdapi/") else name.lstrip("/")
+        if itype in KEY_TYPES:
+            return "skip"
+        if itype == "DYNAMIC_SECRET":
+            # Materialize the producer and store a point-in-time STATIC
+            # snapshot in OpenBao as a DR fallback. TODO (implement dynamic
+            # later): give OpenBao its own DB secrets engine instead.
+            v = post(f"{AK}/get-dynamic-secret-value", {"token": aktok, "name": name})
+            post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": json.dumps(v)}}, tok_hdr=baotok)
+            return "dyn"
+        v = post(f"{AK}/get-secret-value", {"token": aktok, "names": [name]})
+        val = v.get(name)
+        if val is None:
+            return "noval"
+        if not isinstance(val, str):
+            val = json.dumps(val)
+        post(f"{BAO}/v1/mdapi/data/{rel}", {"data": {"value": val}}, tok_hdr=baotok)
+        return "ok"
+
+    slowest = []
+    for idx, (name, itype) in enumerate(items, 1):
+        t_item = time.monotonic()
+        try:
+            try:
+                res = mirror_one(name, itype)
+            except Exception:
+                # One item-level retry: a single slow dynamic-secret
+                # materialization (2026-06-30 paperless-pg-readonly) failed the
+                # whole run's exit code even though 369/370 items mirrored.
+                time.sleep(5)
+                res = mirror_one(name, itype)
+        except Exception as e:
+            err += 1; errs.append(f"{name}:{type(e).__name__}")
+            continue
+        finally:
+            dt = time.monotonic() - t_item
+            slowest.append((dt, name, itype))
+            if dt >= SLOW_ITEM_S:
+                phase(f"SLOW item {name} ({itype or 'STATIC'}) took {dt:.1f}s")
+            if idx % PROGRESS_EVERY == 0:
+                phase(f"phase=mirror progress {idx}/{len(items)}")
+        if res == "skip":
+            skipped += 1
+        elif res == "dyn":
+            dyn += 1
+        elif res == "noval":
+            err += 1; errs.append(name + ":noval")
+        else:
+            ok += 1
+    phase(f"phase=mirror done mirrored={ok} dynamic={dyn} skipped_keys={skipped} errors={err}")
+    for dt, name, itype in sorted(slowest, reverse=True)[:5]:
+        print(f"SLOWEST {dt:6.1f}s {name} ({itype or 'STATIC'})", flush=True)
+    for e in errs[:25]:
+        print("ERR", e)
+    raise SystemExit(1 if err else 0)

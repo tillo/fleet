@@ -1,0 +1,134 @@
+## Ceph RGW (S3 object gateway) alerting.
+##
+## WHY THIS FILE EXISTS SEPARATELY FROM 30-ceph.yml
+## 30-ceph.yml is a re-syncable copy of rook's upstream prometheus-ceph-rules
+## pack (89 rules, 16 groups) and carries a documented list of LOCAL DIVERGENCES
+## to re-apply on every re-sync. Anything added there is lost or conflicts at the
+## next upgrade re-sync. These rules are ours, so they live in a `30a-` sub-series
+## file per the numbering convention in _README.md.
+##
+## WHY IT EXISTS AT ALL (beads infra-3rm.10, raised to P1 on 2026-09-19)
+## The upstream pack has rules for mon, osd, mds, mgr, pgs, pools and nodes —
+## and ZERO for the object gateway. That was survivable while RGW was a side
+## service. As of 2026-09-19 it is THE local backup store for the estate:
+## all six backed-up CNPG clusters (barman), the Longhorn backup target, the
+## Home Assistant tarballs, the GitLab application backup and config-backups.
+## "No alerting on the object gateway" now means the store behind every local
+## restore path is unwatched, and a silent degradation would be discovered by a
+## failed restore — the one moment you cannot afford to discover it.
+##
+## DELIBERATELY NOT HERE
+## - Pool capacity: the upstream `pools` group already alerts generically on
+##   pool fullness, and the RGW data pools are ordinary pools. Not duplicated.
+## - Request-volume ("nothing is writing") alerts: backup freshness is asserted
+##   at the tenant, not at the gateway — see 52-cnpg-backups.yml, 31-volsync.yml
+##   and f/probe/restic_snapshot_freshness. A quiet gateway is normal at 03:00.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ceph-rgw
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+    - name: ceph-rgw.availability
+      rules:
+        ## Fail-closed: the gateway has vanished from the mgr's daemon inventory
+        ## entirely. Baseline 2026-09-19: count(ceph_rgw_metadata) == 2, one per
+        ## RGW pod (qua, quo). Poison-tested with `< 5`, which returned 2 — so
+        ## the series and the aggregation are real, not an empty-vector no-op.
+        ##
+        ## 10m rather than 5m: ceph-mgr failover re-publishes this inventory and
+        ## a failover can take a couple of minutes. A shorter window turns every
+        ## mgr restart into a page.
+        - alert: CephRgwDown
+          expr: absent(ceph_rgw_metadata)
+          for: 10m
+          labels:
+            service: 'ceph-rgw'
+            namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}rook-ceph{{ else }}{{ $labels.namespace }}{{ end }}'
+            severity: critical
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "Ceph RGW object gateway is GONE from the mgr daemon inventory"
+            description: |
+              No `ceph_rgw_metadata` series for 10m: ceph-mgr reports no RGW
+              daemon at all. Every S3 client is down with it — barman base
+              backups and WAL archiving for all six backed-up CNPG clusters,
+              the Longhorn backup target, Home Assistant backup tarballs, the
+              GitLab application backup and config-backups.
+              Check: `kubectl -n rook-ceph get pods -l app=rook-ceph-rgw` and
+              `kubectl -n rook-ceph get cephobjectstore ceph-objectstore -o yaml`
+              (a missing `sslCertificateRef` secret holds the store at
+              Progressing with no TLS listener — see memory
+              fleet_helm_bundle_ignores_loose_manifests_2026_09_19).
+              ⚠️ If ceph-mgr itself is down this fires as collateral; check the
+              mgr alerts first before chasing RGW.
+
+        ## Derived from the Deployment's own spec, NOT a hardcoded replica count.
+        ## A literal `count(ceph_rgw_metadata) < 2` would silently stop meaning
+        ## anything the day the gateway is scaled — the same hand-maintained-list
+        ## failure that made rancher-mgmt-2-etcd a false positive (beads infra-nvk).
+        - alert: CephRgwDegraded
+          expr: |
+            kube_deployment_status_replicas_ready{deployment=~"rook-ceph-rgw.*"}
+              < kube_deployment_spec_replicas{deployment=~"rook-ceph-rgw.*"}
+          for: 15m
+          labels:
+            service: 'ceph-rgw'
+            namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}rook-ceph{{ else }}{{ $labels.namespace }}{{ end }}'
+            severity: warning
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "Ceph RGW {{ $labels.deployment }}: fewer ready gateways than desired"
+            description: |
+              At least one RGW gateway pod has been not-ready for 15m while the
+              Deployment still wants it. S3 is still served by the survivors, so
+              this is a warning, not a page — but the gateway is no longer
+              redundant and a second failure takes the object store offline.
+              Check: `kubectl -n rook-ceph get pods -l app=rook-ceph-rgw -o wide`
+              and the pod events / logs for the not-ready replica.
+
+    - name: ceph-rgw.errors
+      rules:
+        ## ⛔ CALIBRATION, do not "tidy" this threshold down.
+        ## S3 clients probe for objects that do not exist as a matter of course
+        ## (restic and barman both HEAD before writing), and RGW counts every
+        ## 404 as a failed request. The CUMULATIVE ratio was 18% on 2026-09-19 —
+        ## a naive `failed/total > 0` or even `> 0.10` alert would be pure noise.
+        ## Measured baseline the same day: 5.4% over 1h, 6.3% over 15m, at
+        ## ~3.5-4 req/s. 25% is well clear of that while still catching a gateway
+        ## returning 5xx for a quarter of its traffic.
+        ##
+        ## The `and` clause is a volume floor: at near-zero traffic a couple of
+        ## 404s make the ratio meaningless, and 03:00 is legitimately quiet here.
+        ## Poison-tested 2026-09-19 by lowering the threshold to 0.01, which
+        ## fired and returned 0.062 — the rule evaluates, it is simply below
+        ## threshold in normal operation.
+        - alert: CephRgwHighErrorRate
+          expr: |
+            (sum(rate(ceph_rgw_failed_req[15m])) / sum(rate(ceph_rgw_req[15m])) > 0.25)
+              and (sum(rate(ceph_rgw_req[15m])) > 0.2)
+          for: 15m
+          labels:
+            service: 'ceph-rgw'
+            namespace: '{{ if or (eq $labels.namespace "") (eq $labels.namespace "monitoring") }}rook-ceph{{ else }}{{ $labels.namespace }}{{ end }}'
+            severity: warning
+            component: Storage
+            team: mdapi
+          annotations:
+            summary: "Ceph RGW failing {{ $value | humanizePercentage }} of requests"
+            description: |
+              More than 25% of RGW requests have failed for 15m at a
+              non-trivial request rate. Normal baseline is ~5-6% (S3 clients
+              HEAD-probing for absent objects; RGW counts 404 as failed), so
+              this is a real change, not the usual noise.
+              Check the gateway logs:
+              `kubectl -n rook-ceph logs -l app=rook-ceph-rgw --tail=200`
+              and the cluster's health (`ceph -s`) — RGW returns 5xx when its
+              pools are full, unavailable or the cluster is in a write-blocked
+              state, so look for a pool/PG alert firing beside this one.

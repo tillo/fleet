@@ -1,0 +1,68 @@
+## The one backend every PoC route points at. jmalloc/echo-server echoes the
+## request (method, Host, every header) as the body, which is what the matrix
+## reads to prove header stripping / auth headers; /.ws is its websocket echo.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: kgw-poc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: echo
+          image: docker.io/jmalloc/echo-server:v0.3.7@sha256:c87f80de8dbb976a59b228fc9ecf257e0574c6f760c2f1c5f05f64c7ac7fbc1e
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PORT
+              value: "8080"
+            - name: LOG_HTTP_HEADERS
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: kgw-poc
+spec:
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      ## Lets kgateway treat /.ws upgrades as websockets without a policy too;
+      ## the ws row still sets httpUpgrade explicitly to exercise the policy.
+      appProtocol: http

@@ -1,0 +1,47 @@
+# Escalate soft-lockups and hung tasks to a kernel panic (infra-nqfj).
+#
+# A partial hang (kubelet and network dead, systemd still petting the watchdog) never trips
+# 95_watchdog.yaml. Panicking on soft-lockup / hung-task stops PID 1, so the hardware watchdog
+# resets the node with the trace in pstore. hung_task_timeout=1800s (300s until 2026-11-21): a
+# cluster-wide Ceph stall blocks every RBD writer in D state, and at 300s that panicked quarto
+# and quo together, turning a two-node outage into a full-cluster reset (infra-m42.11,
+# tests/test_hung_task_timeout_outlasts_ceph_recovery.py).
+#
+# Every panic also dumps what the node was doing (infra-m42.10): softlockup_all_cpu_backtrace=1,
+# and panic_print=192 (0xC0) = all-CPU backtraces (0x40) + D-state tasks (0x80), printed before
+# kmsg_dump writes ERST (v6.12 kernel/panic.c). Not 0x01 (every task): too long for the panic
+# window. With netconsole.yml those lines reach the bpi-r4 even if the ERST write hangs.
+#
+# The boot stage below applies it at the next boot only; set it live with
+# `echo <value> > /proc/sys/kernel/<name>` on each node.
+#
+# ADOPTED, not new: byte-identical to the hand-placed /oem/95b_lockup_panic.yaml found on all
+# four nodes on 2026-10-27 (sha256 d3381215...), plus the two "Managed by" lines.
+apiVersion: node.harvesterhci.io/v1beta1
+kind: CloudInit
+metadata:
+  name: mdapi-lockup-panic
+spec:
+  matchSelector:
+    harvesterhci.io/managed: "true"
+  filename: 95b_lockup_panic.yaml
+  contents: |
+    # Managed by CloudInit mdapi-lockup-panic (fleet harvester-node-config/lockup-panic.yml).
+    # harvester-node-manager reverts local edits: change it in git.
+    name: "lockup-panic escalation: convert soft-lockup / hung-task (D-state) stalls into a kernel panic so PID1 stops and the already-armed iLO HW watchdog (see 95_watchdog.yaml, 120s) hardware-resets the node, with the trace captured to pstore/ERST. Closes the 2026-06-19 qua partial-hang gap where kubelet/network died but systemd kept petting the watchdog so it never expired (and it was not an NMI hard-lockup, so hardlockup_panic did not fire). hung_task_timeout=1800s outlasts a cluster-wide Ceph stall (infra-m42.11). Applied every boot."
+    stages:
+      boot:
+        - name: "lockup-panic sysctls"
+          files:
+            - path: /etc/sysctl.d/95-lockup-panic.conf
+              permissions: 0644
+              content: |
+                kernel.softlockup_panic = 1
+                kernel.hung_task_panic = 1
+                kernel.hung_task_timeout_secs = 1800
+                kernel.panic_on_oops = 1
+                kernel.panic = 10
+                kernel.softlockup_all_cpu_backtrace = 1
+                kernel.panic_print = 192
+          commands:
+            - sysctl -p /etc/sysctl.d/95-lockup-panic.conf || true

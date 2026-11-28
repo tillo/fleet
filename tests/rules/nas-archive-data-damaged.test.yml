@@ -1,0 +1,79 @@
+# NasArchiveDataDamaged (infra-hnbe.15, 2026-11-21): santillo and nastillo are powered
+# off, so the restic repos on o2switch and B2 are the only reachable copy of what they
+# held. Windmill f/desk/nas_archive_watch re-reads 4 of 120 o2switch subsets daily and
+# diffs the B2 inventory against a baseline. A subset that does not read back clean, or
+# a B2 object that went missing/changed size/appeared, is DAMAGE: critical at once.
+# The job's own failures (error/busy/b2_error) are NOT this alert: they set
+# nas_archive_watch_last_run_success=0 and go through BatchJobLastRunFailed.
+rule_files:
+- monitoring-rules/batch-jobs/12-batch-jobs.yml
+evaluation_interval: 5m
+tests:
+- name: a-damaged-o2-subset-pages-at-once
+  interval: 5m
+  input_series:
+  - series: nas_archive_verify_result{job="nas_archive_watch",result="failed"}
+    values: '1x12'
+  - series: nas_archive_verify_failed_subset{job="nas_archive_watch"}
+    values: '37x12'
+  alert_rule_test:
+  - eval_time: 5m
+    groupname: app-batch-jobs.nas-archive
+    alertname: NasArchiveDataDamaged
+    exp_alerts:
+    - exp_labels:
+        job: nas_archive_watch
+        result: failed
+        service: nas_archive_watch
+        severity: critical
+        component: Backups
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Offsite NAS archive damaged: failed"
+        description: "The only reachable copy of the retired NAS data (restic on o2switch + B2) failed\nits daily re-proof: result=failed. o2 subset that did not read back clean: 37\n(0 = none). B2 inventory vs baseline: missing=-1 resized=-1 added=-1 (-1 = not\nmeasured). Read ~/nastillo-archive-offsite/logs/cycle-*.log on the jump seat and\nREADME \"Ongoing verification\"; a legitimate B2 change needs a NEW baseline, taken\non purpose. Runs: https://windmill.mdapi.ch/runs\n"
+- name: a-changed-b2-inventory-pages-and-carries-the-counts
+  interval: 5m
+  input_series:
+  - series: nas_archive_verify_result{job="nas_archive_watch",result="b2_changed"}
+    values: '1x12'
+  - series: nas_archive_verify_failed_subset{job="nas_archive_watch"}
+    values: '0x12'
+  - series: nas_archive_verify_b2_missing{job="nas_archive_watch"}
+    values: '3x12'
+  - series: nas_archive_verify_b2_resized{job="nas_archive_watch"}
+    values: '0x12'
+  - series: nas_archive_verify_b2_added{job="nas_archive_watch"}
+    values: '0x12'
+  alert_rule_test:
+  - eval_time: 5m
+    groupname: app-batch-jobs.nas-archive
+    alertname: NasArchiveDataDamaged
+    exp_alerts:
+    - exp_labels:
+        job: nas_archive_watch
+        result: b2_changed
+        service: nas_archive_watch
+        severity: critical
+        component: Backups
+        statuspage: exclude
+        team: mdapi
+      exp_annotations:
+        summary: "Offsite NAS archive damaged: b2_changed"
+        description: "The only reachable copy of the retired NAS data (restic on o2switch + B2) failed\nits daily re-proof: result=b2_changed. o2 subset that did not read back clean: 0\n(0 = none). B2 inventory vs baseline: missing=3 resized=0 added=0 (-1 = not\nmeasured). Read ~/nastillo-archive-offsite/logs/cycle-*.log on the jump seat and\nREADME \"Ongoing verification\"; a legitimate B2 change needs a NEW baseline, taken\non purpose. Runs: https://windmill.mdapi.ch/runs\n"
+- name: a-clean-run-and-the-jobs-own-failures-do-not-fire-it
+  interval: 5m
+  input_series:
+  - series: nas_archive_verify_result{job="nas_archive_watch",result="ok"}
+    values: '1x12'
+  - series: nas_archive_verify_result{job="nas_archive_watch",result="busy"}
+    values: '1x12'
+  - series: nas_archive_verify_result{job="nas_archive_watch",result="b2_error"}
+    values: '1x12'
+  - series: nas_archive_verify_result{job="nas_archive_watch",result="error"}
+    values: '1x12'
+  alert_rule_test:
+  - eval_time: 1h
+    groupname: app-batch-jobs.nas-archive
+    alertname: NasArchiveDataDamaged
+    exp_alerts: []

@@ -1,0 +1,50 @@
+## Which pods the `heal` worker may delete in rook-ceph (infra-8f4.64).
+##
+## SA windmill/windmill-worker-heal holds pods delete in rook-ceph through a
+## RoleBinding (windmill/rbac/rbac.yml) for exactly one caller:
+## f/heal/rook_osd_stale_cephx, which deletes an OSD pod crashlooping on a stale
+## cephx key so its cephx-keyring-update init container re-runs. RBAC cannot narrow
+## delete by label, and the namespace also holds the mons, mgrs, the toolbox, the
+## MDS and RGW: deleting a mon pod during an outage is the one thing the heal must
+## never be able to do. This pins the delete to pods labelled app=rook-ceph-osd.
+##
+## Deny, failurePolicy Fail; matchConditions confine it to the heal SA in rook-ceph.
+## A DELETE of a pod that does not exist never reaches admission (NotFound first),
+## so heal-rook-osd-delete-pin.test.sh proves it with a server-side dry-run delete
+## of live pods: dryRun=All runs admission and deletes nothing.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: heal-rook-osd-delete-pin
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: rook-ceph
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: heal-sa-only
+      expression: >-
+        request.userInfo.username ==
+        "system:serviceaccount:windmill:windmill-worker-heal"
+  validations:
+    - expression: >-
+        oldObject != null && has(oldObject.metadata.labels) &&
+        "app" in oldObject.metadata.labels &&
+        oldObject.metadata.labels["app"] == "rook-ceph-osd"
+      messageExpression: >-
+        "heal-rook-osd-delete-pin: heal may delete only app=rook-ceph-osd pods in rook-ceph"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: heal-rook-osd-delete-pin
+spec:
+  policyName: heal-rook-osd-delete-pin
+  validationActions: [Deny]

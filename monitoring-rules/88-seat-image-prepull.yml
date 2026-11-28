@@ -1,0 +1,133 @@
+## Recovery image pre-pullers (infra-8f4, 2026-11-21).
+##
+## Two DaemonSets in ns jump keep the images the estate is recovered WITH cached on every
+## node: seat-image-prepull (the jump seat, from zot.mdapi.ch, i.e. Ceph RGW-backed) and
+## recovery-image-prepull (cert-manager, MetalLB, external-secrets, CNPG + barman, and
+## the seat's web door guacamole/guacd/guac-pg, from the internet). Both fail SILENTLY:
+## a node where the pod never pulled, or a bump whose new image never arrived (maxSurge
+## keeps the old pod Available, so number_unavailable stays 0), looks exactly like a
+## healthy cluster until the day it is needed.
+##
+## PrepullImagesNotCachedEverywhere measures both of those arms. Namespace-wide
+## (`daemonset=~".+"` is load-bearing for f/probe/alert_coverage_check: it makes the
+## selector claim DaemonSets). The unavailable arm subtracts NotReady nodes, like the
+## generic DaemonSet catch-all in 40-alert-coverage.yml: a dead node is paged by its own
+## rules.
+##
+## RecoveryImageNotPrepulled is the DRIFT guard. The recovery workloads pull by TAG from
+## Helm charts and CNPG picks its bootstrap/sidecar images at runtime, so no chart render
+## and no Renovate bump knows which digest a node runs. This compares, digest by digest,
+## what every Running recovery container runs against what recovery-image-prepull holds,
+## whatever moved it: a chart bump, a values change, a re-pull of a re-pushed tag. The
+## seat image is pinned in git and guarded by tests/test_seat_image_is_prepulled_on_every_node.py.
+## ZotCriticalImageNotPrepulled is the same guard for the critical zot-served images
+## (infra-8f4.68): Keycloak, oauth2-proxy + redis, Unbound, the nameserver, OpenBao and
+## vmsingle/vmagent/vmalert/vmalertmanager against the two zot-critical DaemonSets. Only
+## zot.mdapi.ch images count (the VM pods' config-reloader comes from docker.io).
+## Test: tests/rules/seat-image-prepull.test.yml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: seat-image-prepull
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-k8s.seat-image-prepull
+    rules:
+    - alert: PrepullImagesNotCachedEverywhere
+      expr: |
+        (
+          kube_daemonset_status_number_unavailable{namespace="jump", daemonset=~".+"}
+          > scalar(count(kube_node_status_condition{condition="Ready", status="true"} == 0) or vector(0))
+        )
+        or
+        (
+          kube_daemonset_status_desired_number_scheduled{namespace="jump", daemonset=~".+"}
+          - kube_daemonset_status_updated_number_scheduled{namespace="jump", daemonset=~".+"}
+        ) > 0
+      for: 1h
+      labels:
+        service: '{{ $labels.daemonset }}'
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "jump/{{ $labels.daemonset }}: pre-pulled recovery images not cached on every node ({{ $value }} nodes short, 1h)"
+        description: |
+          The pre-puller jump/{{ $labels.daemonset }} is short on {{ $value }} node(s)
+          for an hour: a pod is unavailable, or its current images have not reached
+          every node. Until they do, a recovery workload rescheduled onto that node
+          needs its registry (zot.mdapi.ch for the seat, the internet for the rest).
+          `kubectl -n jump get pods -l app={{ $labels.daemonset }} -o wide` and the
+          events of the pod that is not Running (usually ImagePullBackOff).
+    - alert: RecoveryImageNotPrepulled
+      expr: |
+        label_replace(
+          max by (namespace, pod, container, image_id) (
+            (
+              kube_pod_container_info{namespace=~"cert-manager|metallb-system|external-secrets|cnpg-system", image_id=~".+@sha256:.+"}
+              or kube_pod_init_container_info{namespace=~"cert-manager|metallb-system|external-secrets|cnpg-system", image_id=~".+@sha256:.+"}
+              or kube_pod_container_info{namespace="jump", pod=~"(guacamole|guacd|guac-pg)-.+", image_id=~".+@sha256:.+"}
+              or kube_pod_init_container_info{namespace="jump", pod=~"(guacamole|guacd|guac-pg)-.+", image_id=~".+@sha256:.+"}
+            )
+            and on (namespace, pod) (kube_pod_status_phase{phase="Running"} == 1)
+          ),
+          "digest", "$1", "image_id", ".*@(sha256:[0-9a-f]+)$"
+        )
+        unless on (digest)
+        label_replace(
+          kube_pod_container_info{namespace="jump", pod=~"recovery-image-prepull-.+"},
+          "digest", "$1", "image_id", ".*@(sha256:[0-9a-f]+)$"
+        )
+      for: 2h
+      labels:
+        service: recovery-image-prepull
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) runs an image the recovery pre-puller does not hold"
+        description: |
+          {{ $labels.image_id }} has run for 2 h without being held by
+          jump/recovery-image-prepull, so only the nodes that happened to pull it
+          can start it while the internet edge is down. Usually a chart bump.
+          Fix: `python3 tools/recovery-prepull-sync.py` in ~/fleet (rewrites
+          jump/seat-prepull/recovery-image-prepull.yml from the live pods), then MR.
+    - alert: ZotCriticalImageNotPrepulled
+      expr: |
+        label_replace(
+          max by (namespace, pod, container, image_id) (
+            {__name__=~"kube_pod_container_info|kube_pod_init_container_info",
+             namespace=~"keycloak|oauth2-proxy|split-horizon|nameserver|openbao|monitoring",
+             pod=~"keycloak-[0-9a-f]{8,10}-[a-z0-9]{5}|oauth2-proxy-.+|unbound-.+|nameserver-.+|openbao-[0-9]+|(vmsingle|vmagent|vmalert|vmalertmanager)-mdapi-.+",
+             image_spec=~"zot\\.mdapi\\.ch/.+", image_id=~".+@sha256:.+"}
+            and on (namespace, pod) (kube_pod_status_phase{phase="Running"} == 1)
+          ),
+          "digest", "$1", "image_id", ".*@(sha256:[0-9a-f]+)$"
+        )
+        unless on (digest)
+        label_replace(
+          kube_pod_container_info{namespace="jump", pod=~"zot-critical-(image|live)-prepull-.+"},
+          "digest", "$1", "image_id", ".*@(sha256:[0-9a-f]+)$"
+        )
+      for: 2h
+      labels:
+        service: zot-critical-prepull
+        severity: warning
+        component: Platform
+        statuspage: exclude
+        team: mdapi
+      annotations:
+        summary: "{{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) runs a critical zot image no pre-puller holds"
+        description: |
+          {{ $labels.image_id }} has run for 2 h without being held by
+          jump/zot-critical-image-prepull or jump/zot-critical-live-prepull, so only
+          the nodes that happened to pull it can start it while zot (Ceph RGW) is
+          down. Keycloak/Unbound/nameserver/OpenBao: the bump MR missed the line in
+          jump/seat-prepull/zot-critical-image-prepull.yml (the test should have
+          caught it). oauth2-proxy/redis/VictoriaMetrics: run
+          `python3 tools/recovery-prepull-sync.py --set zot-critical-live`, then MR.

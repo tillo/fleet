@@ -1,0 +1,29 @@
+# ALTCHA HMAC secret for the WordPress login's self-hosted proof-of-work captcha.
+#
+# ⛔ Both consumers FAIL CLOSED when this is empty:
+#   * html/altcha-challenge.php refuses to mint challenges
+#   * the altcha-login mu-plugin refuses the login
+# An empty secret would otherwise still issue challenges and still "verify" them,
+# so the login would look protected while accepting anything — which is the exact
+# failure mode ALTCHA was brought in to avoid. Failing closed locks the admin out
+# instead, which is loud and recoverable.
+#
+# This replaced sucuri-scanner, whose failed-login log grew to 651 MB and took the
+# site's login down for five months.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: altcha-secret
+  namespace: coiffuredreams
+spec:
+  refreshInterval: 5m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: altcha-secret
+    creationPolicy: Owner
+  data:
+  - remoteRef:
+      key: /mdapi/coiffuredreams/altcha-hmac-secret
+    secretKey: ALTCHA_HMAC_SECRET

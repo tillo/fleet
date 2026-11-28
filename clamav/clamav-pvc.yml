@@ -1,0 +1,22 @@
+## The signature database (~180 MB: main.cvd + daily.cld + bytecode.cvd).
+## Persistent rather than emptyDir: a restart must not re-download main.cvd from
+## database.clamav.net, whose CDN rate-limits (HTTP 429 + cool-down) clients that
+## fetch full databases repeatedly. Rebuildable, so declared backup-class none.
+## ⚠️ backup-class is the LONGHORN recurring-job label: on ceph-block nothing
+## reads it, so f/probe/pvc_backup_coverage needs the backup-exempt annotation
+## (without it PvcBackupUncovered fired from 2026-11-08, o2 row infra-8lp51).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clamav-db
+  namespace: clamav
+  labels:
+    mdapi.ch/backup-class: none
+  annotations:
+    mdapi.ch/backup-exempt: "freshclam signature DB; re-downloaded from database.clamav.net, not a backup source"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 2Gi

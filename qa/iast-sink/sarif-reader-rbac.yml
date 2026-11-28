@@ -1,0 +1,48 @@
+## Read-only identity for f/security/defectdojo_grype_sync (Windmill, prod) to fetch
+## the QA sink's SARIF through the QA API server's services/proxy subresource
+## (infra-7rog.41.2). It can GET that one Service's proxy and nothing else: no
+## pods, no secrets, no other namespace. The long-lived token below is copied into
+## a Windmill secret variable by a script (never printed); revoke it by deleting
+## this Secret.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iast-sarif-reader
+  namespace: iast
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: iast-sarif-reader
+  namespace: iast
+rules:
+  - apiGroups: [""]
+    resources: ["services/proxy"]
+    ## The proxy path names the Service as <name>:<port>; RBAC matches that
+    ## segment literally.
+    resourceNames: ["iast-sink:trace"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: iast-sarif-reader
+  namespace: iast
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: iast-sarif-reader
+subjects:
+  - kind: ServiceAccount
+    name: iast-sarif-reader
+    namespace: iast
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: iast-sarif-reader-token
+  namespace: iast
+  annotations:
+    kubernetes.io/service-account.name: iast-sarif-reader
+type: kubernetes.io/service-account-token

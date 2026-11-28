@@ -1,0 +1,16 @@
+# In-cluster only (infra-7rog.31.21, 2026-11-23). slapd has no TLS (ENABLE_TLS=false),
+# so a LAN listener put cleartext binds on the wire. The LoadBalancer 192.168.1.52
+# (2026-04-20, for VPN auth) had no client left: the VPN dropped LDAP when it moved into
+# the cluster, and every consumer dials ldap://openldap.openldap.svc.cluster.local.
+# A LAN client needs TLS first. tests/test_openldap_has_no_lan_listener.py.
+apiVersion: v1
+kind: Service
+metadata:
+  name: openldap
+  namespace: openldap
+spec:
+  type: ClusterIP
+  selector:
+    app: openldap
+  ports:
+    - port: 389

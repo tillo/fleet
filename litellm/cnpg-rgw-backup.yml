@@ -1,0 +1,62 @@
+## Barman object store for litellm-pg, on the in-cluster Ceph RGW.
+##
+## ⭐ NEW ARCHIVE, not a migration (2026-10-07, user decision). litellm-pg is the
+## only CNPG cluster on the estate that had no backup path at all: no
+## `spec.backup`, no plugin, no ObjectStore, no ScheduledBackup, and
+## `status.firstRecoverabilityPoint` empty. Its manifest carried a written
+## exemption -- "No barman here ... this DB holds nothing that cannot be
+## reconstructed by re-minting keys" -- and that judgement is what is being
+## revised. Nothing moves and nothing is orphaned: this bucket did not exist
+## before, so there is no prior PITR history to keep continuous.
+##
+## ⚠️ That same fact removes the safety net the five migrations had. There, the
+## acceptance test was "the store's firstRecoverabilityPoint still reads the
+## PRE-migration date" -- continuity against history that already existed. Here
+## there is nothing to compare against, so the ONLY acceptable evidence that this
+## works is a completed base backup appearing in the bucket, followed by a
+## nightly ScheduledBackup that keeps completing.
+##
+## The ObjectBucketClaim is what makes this declarative: it creates BOTH the
+## bucket and a credential scoped to just that bucket, so nothing has to be
+## created out-of-band or mirrored through Akeyless. (The exemption note in
+## litellm-pg.yml called for "an Akeyless-backed s3 ExternalSecret" -- that was
+## the pre-RGW shape and is obsolete; no namespace uses it any more.)
+##
+## ⭐ `bucketName` (not `generateBucketName`): verified 2026-09-19 that Rook
+## honours it verbatim -- the ConfigMap came back with BUCKET_NAME exactly as
+## asked. That matters because CNPG's destinationPath is a literal string and
+## cannot be templated from the OBC's ConfigMap.
+##
+## The OBC writes secret/cnpg-litellm-pg in this namespace with AWS_ACCESS_KEY_ID
+## and AWS_SECRET_ACCESS_KEY.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: cnpg-litellm-pg
+  namespace: litellm
+spec:
+  bucketName: cnpg-litellm-pg
+  storageClassName: ceph-bucket
+  ## ⭐ Declare the offsite grant so Rook OWNS it: the OBC reconciler deletes any
+  ## policy not in additionalConfig.bucketPolicy (it wiped all six existing grants
+  ## on 2026-09-28). A bucket onboarded WITHOUT this line would silently never be
+  ## swept offsite -- openfga-pg was onboarded 09-25 without one and had to be
+  ## retrofitted. litellm-pg is being born with it.
+  additionalConfig:
+    bucketPolicy: '{"Version":"2012-10-17","Statement":[{"Sid":"OffsiteSweepRead","Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/offsite"]},"Action":["s3:ListBucket","s3:GetObject"],"Resource":["arn:aws:s3:::cnpg-litellm-pg","arn:aws:s3:::cnpg-litellm-pg/*"]}]}'
+---
+## ⚠️ NOT a credential. `us-east-1` is RGW's default zonegroup and is public
+## knowledge; it lives in a Secret only because CNPG types `region` as a
+## SecretKeySelector, so a constant has no other way to be referenced. Rook's
+## OBC secret carries only the two key fields, which is why this cannot simply
+## ride along there.
+##
+## barman-cloud signs with SigV4 and botocore refuses to sign without a region,
+## so leaving it unset fails at the first WAL upload, not at apply time.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cnpg-rgw-region
+  namespace: litellm
+stringData:
+  REGION: us-east-1

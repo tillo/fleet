@@ -1,0 +1,86 @@
+## iast-sink: a Datadog trace-agent-compatible endpoint. One replica because
+## the findings file sits on an RWO volume (Recreate); a tracer that cannot
+## reach it for the length of a rollout buffers and retries, nothing is lost
+## that the next request would not re-report.
+##
+## Image: built by mdapi/iast-sink CI (ci-templates build/scan/secret-scan),
+## pinned by tag+digest and bumped by Renovate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iast-sink
+  namespace: iast
+  labels:
+    app: iast-sink
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: iast-sink
+  template:
+    metadata:
+      labels:
+        app: iast-sink
+    spec:
+      automountServiceAccountToken: false
+      ## ⛔ The Service is named iast-sink, so the kubelet's docker-link env
+      ## injects IAST_SINK_PORT=tcp://<ip>:8126 - the sink's own port variable
+      ## (first deploy 2026-11-23: int('tcp://...') CrashLoop). Nothing here
+      ## uses service-link variables, so turn them off.
+      enableServiceLinks: false
+      priorityClassName: mdapi-low
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: zot-pull
+      containers:
+        - name: iast-sink
+          image: zot.mdapi.ch/mdapi/iast-sink:0.1.0-mdapi.11@sha256:9f41e1bf457d866308fa8dd81166da44dbb6eb1b7a9c764699102fe8dc101ad8
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: trace
+              containerPort: 8126
+          env:
+            - name: IAST_SINK_STATE
+              value: /data/findings.json
+            ## BASE url: the sink appends /v1/traces itself. The collector's
+            ## ingress policy (openobserve/otel-collector-netpol-enforce.yml)
+            ## admits this pod by namespace AND label.
+            - name: IAST_SINK_OTLP_ENDPOINT
+              value: http://otel-collector.openobserve.svc.cluster.local:4318
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: trace
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: trace
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: iast-sink-data

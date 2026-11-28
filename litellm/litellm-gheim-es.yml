@@ -1,0 +1,32 @@
+# Credentials of gheim-guard (litellm-cm.yml, infra-z06ur), as env for litellm.
+# Its own ExternalSecret because one value is TEMPLATED: GHEIM_METRICS_AUTH is the
+# HTTP Basic header for vmauth's write-only user `gheim-rt-guard`
+# (monitoring-vm/vmauth-vmsingle.yml), built from the password, and a template on
+# litellm-env-secret would replace every key it does not list.
+#   GHEIM_API_KEY       bearer of the gheim detector on mbp-mda
+#   GHEIM_METRICS_AUTH  "Basic base64(gheim-rt-guard:<password>)"
+# Rotating the vmauth password = write Akeyless only; this refreshes within a
+# minute and Reloader rolls litellm.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: litellm-gheim-secret
+spec:
+  refreshInterval: 1m0s
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: cm-akeyless
+  target:
+    name: litellm-gheim-secret
+    creationPolicy: Owner
+    template:
+      data:
+        GHEIM_API_KEY: "{{ .detector_key }}"
+        GHEIM_METRICS_AUTH: 'Basic {{ printf "gheim-rt-guard:%s" .metrics_password | b64enc }}'
+  data:
+  - secretKey: detector_key
+    remoteRef:
+      key: /mdapi/litellm/gheim-detector-api-key
+  - secretKey: metrics_password
+    remoteRef:
+      key: /mdapi/monitoring/vmauth/gheim-rt-guard-password

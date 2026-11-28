@@ -1,0 +1,70 @@
+## Ceph OSD down and crashlooping while a mon quorum exists (infra-8f4.64, 2026-11-21).
+##
+## The CephCluster uses daemon cephx keyGeneration 2. An OSD pod whose
+## `cephx-keyring-update` init container runs while the mons are unreachable times
+## out, keeps the STALE on-disk key (exit 0 by design), and the OSD then crashloops on
+## `handle_auth_bad_method ... (13) Permission denied`. A container restart never
+## re-runs init containers: only deleting the POD heals it. On 2026-11-21 osd.14/17/19
+## sat like that for hours after the full-cluster outage (HEALTH_ERR, RGW + zot down)
+## until they were deleted by hand. Memory:
+## rook_osd_started_without_mons_keeps_stale_cephx_key_2026_11_21.
+##
+## f/heal/rook_osd_stale_cephx (every 5 min) deletes such pods once a mon quorum
+## exists. This rule is the BACKSTOP for when it cannot: the heal is broken, gave up
+## (3 deletes per OSD in 24 h), or the crashloop has another cause (no auth line in the
+## log, which the heal deliberately leaves alone). Either way a human must look.
+##
+## Why these signals (measured 2026-11-21 in VictoriaMetrics):
+##   - ceph_osd_up == 0 per ceph_daemon (mgr exporter): 10 OSDs down 13:22-13:48.
+##   - the OSD's `osd` container restarting: increase(restarts[15m]) >= 2. The
+##     CrashLoopBackOff waiting_reason series was GAPPY (present 13:22-13:30,
+##     13:38-13:42: between back-offs the container is briefly Running), so a `for:`
+##     on it resets; restarts are a counter and do not.
+##   - a mon quorum exists: count(ceph_mon_quorum_status == 1) > count(ceph_mon_metadata) / 2
+##     (a majority of the monmap). That is all cephx-keyring-update needs to fetch the
+##     current key. Was "every mon" until infra-8f4.64.1: quorum was 2/3 until 13:46
+##     that day, and requiring the third mon matched nothing in the incident; with the
+##     majority the expression selects exactly osd.14/17/19 from 13:32. An OSD down
+##     with NO quorum is the outage itself (CephMonDown*/CephOSDDown* cover it).
+## The handle_auth_bad_method LOG LINE is not used here: it lives only in OpenObserve
+## (pod_logs, 3654-4074 lines per OSD pod that day), and the heal reads it straight
+## from the pod log, so the alert stays cause-agnostic and the description says how
+## to tell the two apart.
+##
+## Severity warning, component Storage (internal): reduced redundancy, not an outage.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-ceph-osd-crashloop
+  namespace: monitoring
+  labels:
+    monitoring-stack: mdapi
+spec:
+  groups:
+  - name: app-ceph-osd-crashloop
+    rules:
+    - alert: CephOSDCrashLoopWithMonQuorum
+      expr: |
+        (
+          max by (ceph_daemon) (
+            label_replace(
+              increase(kube_pod_container_status_restarts_total{namespace="rook-ceph",container="osd",pod=~"rook-ceph-osd-[0-9]+-.+"}[15m]),
+              "ceph_daemon", "osd.$1", "pod", "rook-ceph-osd-([0-9]+)-.+")
+          ) >= 2
+        )
+        and on (ceph_daemon) (max by (ceph_daemon) (ceph_osd_up) == 0)
+        and on () (count(ceph_mon_quorum_status == 1) > count(ceph_mon_metadata) / 2)
+      for: 30m
+      labels:
+        service: 'ceph'
+        namespace: 'rook-ceph'
+        severity: warning
+        component: Storage
+        team: mdapi
+      annotations:
+        summary: 'Ceph {{ $labels.ceph_daemon }} is down and crashlooping while a mon quorum exists'
+        description: |
+          {{ $labels.ceph_daemon }} has been down for 30 min, its osd container restarting, although a mon quorum exists (a majority of the mons is in quorum).
+          Most likely cause after a mon outage: the pod's cephx-keyring-update init container ran while the mons were unreachable and kept a STALE cephx key; the log shows `handle_auth_bad_method ... (13) Permission denied`. f/heal/rook_osd_stale_cephx should have deleted the pod: read its last job log (skip reason, or gave up) and the rook_osd_stale_cephx_* gauges.
+          Check: kubectl -n rook-ceph logs <pod> -c osd --previous | grep handle_auth_bad_method. If present: kubectl -n rook-ceph delete pod <pod> (the POD, never the Deployment); a container restart does not re-run init.
+          If absent, the crashloop has another cause (bluestore, device, OOM): read the log; this is not the stale-key trap.

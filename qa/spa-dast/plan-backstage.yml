@@ -1,0 +1,68 @@
+## The plan the spa-dast-backstage CronJob runs (see backstage-deploy.yml).
+## The Job fetches the per-plugin specs with a fresh backstage token into /tmp/spec-*.json,
+## substitutes TOKEN_PLACEHOLDER in this file, and runs it through the daemon API.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spa-dast-backstage-plan
+  namespace: backstage
+data:
+  bs-plan.tmpl.yml: |
+    ## ZAP automation plan: backstage (Node SPA + per-plugin REST APIs).
+    ## The QA copy authenticates through oauth2Proxy headers, so a fresh backstage token is
+    ## fetched by the Job and substituted for TOKEN_PLACEHOLDER. The `replacer` rule puts the
+    ## bearer on EVERY request ZAP sends -- including the AJAX spider's browser traffic and
+    ## the active scan -- which is what makes the SPA's XHRs authenticated.
+    ## The OpenAPI specs are fetched (with the same token) into /tmp/spec-*.json and imported
+    ## from FILE: importing from URL failed with "The OpenAPI definition was invalid" because
+    ## the job's fetch was unauthenticated and got back a 401 body (measured 2026-11-25).
+    ## infra-7rog.31.24.
+    env:
+      contexts:
+        - name: bs
+          urls: ["http://backstage:7007"]
+          includePaths: ["http://backstage:7007/.*"]
+          excludePaths: ["http://backstage:7007/api/auth/.*"]
+      parameters:
+        failOnError: true
+        failOnWarning: false
+        progressToStdout: true
+    jobs:
+      - type: replacer
+        rules:
+          - description: backstage bearer token
+            url: "http://backstage:7007/.*"
+            matchType: req_header
+            matchString: Authorization
+            replacementString: "Bearer TOKEN_PLACEHOLDER"
+            # `proxy` is the one that matters for the AJAX spider: its browser talks to ZAP
+            # as a proxy, and the initiator names ajaxspider/selenium are NOT recognised.
+            initiators: ["proxy", "httpsender", "spider", "ascan"]
+        parameters: {deleteAllRules: true}
+      - type: openapi
+        parameters: {apiFile: "/tmp/spec-catalog.json", targetUrl: "http://backstage:7007", context: bs}
+      - type: openapi
+        parameters: {apiFile: "/tmp/spec-search.json", targetUrl: "http://backstage:7007", context: bs}
+      - type: openapi
+        parameters: {apiFile: "/tmp/spec-scaffolder.json", targetUrl: "http://backstage:7007", context: bs}
+      - type: openapi
+        parameters: {apiFile: "/tmp/spec-notifications.json", targetUrl: "http://backstage:7007", context: bs}
+      - type: spiderAjax
+        parameters:
+          context: bs
+          url: "http://backstage:7007/"
+          browserId: firefox-headless
+          numberOfBrowsers: 2
+          maxDuration: 8
+      - type: spider
+        parameters: {context: bs, url: "http://backstage:7007/", maxDuration: 3}
+      - type: passiveScan-wait
+        parameters: {maxDuration: 3}
+      - type: activeScan
+        parameters:
+          context: bs
+          recurse: true
+          maxRuleDurationInMins: 1
+          maxScanDurationInMins: 12
+      - type: report
+        parameters: {template: traditional-json-plus, reportDir: /zap/wrk, reportFile: bs.json}

@@ -1,0 +1,31 @@
+## Let the ingress controller reach the Harvester apiserver.
+##
+## Harvester 1.9.1's own `harvester-api-access` policy admits only namespaces
+## labelled `name: cattle-system`; the ingress (rke2-ingress-nginx) lives in
+## kube-system, so harvester.mdapi.ch hung at 504 for ~15.6h after the upgrade.
+## NetworkPolicy is additive — this widens by exactly one source namespace and
+## leaves the chart's own policy intact.
+##
+## Ports mirror the chart's: 8443 (UI/API) and 8080 (metrics-side listener).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: harvester-api-ingress-controller
+  namespace: harvester-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: apiserver
+      app.kubernetes.io/name: harvester
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 8443
+          protocol: TCP
+        - port: 8080
+          protocol: TCP

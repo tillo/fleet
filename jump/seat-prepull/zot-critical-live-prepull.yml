@@ -1,0 +1,99 @@
+# Keeps the CRITICAL zot-served images with no single git line to mirror cached on every
+# node (infra-8f4.68): oauth2-proxy and its redis session stores (tag@digest split across
+# Helm values fields) and vmsingle/vmagent/vmalert/vmalertmanager (tags from the VM
+# operator's defaults). They move rarely (0-3 bumps in 30 days).
+#
+# ⛔ The block between the markers is GENERATED from the live pods by
+# `python3 tools/recovery-prepull-sync.py --set zot-critical-live` -- never edit it by
+# hand; Renovate is OFF for this file (renovate.json): the digest to hold is the one the
+# cluster runs. Alert ZotCriticalImageNotPrepulled (monitoring-rules/88) fires when a
+# running critical zot container's digest is held by neither zot-critical DaemonSet.
+#
+# Isolated like zot-critical-image-prepull.yml (see there): own DaemonSet, parallel main
+# containers, static busybox staged into an emptyDir, maxUnavailable 0 + maxSurge 1.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zot-critical-live-prepull
+  namespace: jump
+  labels: { app: zot-critical-live-prepull }
+spec:
+  selector:
+    matchLabels: { app: zot-critical-live-prepull }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: zot-critical-live-prepull }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 1      # sleep as PID 1 ignores SIGTERM
+      imagePullSecrets:
+        - name: zot-pull                    # zot-pull-secrets bundle (infra-8f4.54)
+      tolerations:
+        - operator: Exists                  # every node, whatever it is tainted with
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile: { type: RuntimeDefault }
+      volumes:
+        - name: hold
+          emptyDir: { sizeLimit: 8Mi }
+      initContainers:
+        - name: stage-busybox
+          image: docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/cp", "/bin/busybox", "/hold/busybox"]
+          volumeMounts: [{ name: hold, mountPath: /hold }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      containers:
+      # BEGIN derived
+      - name: redis
+        image: zot.mdapi.ch/library/redis:8.12.0-alpine@sha256:5af80107c1eeecb484a2269b80a26d12bfa6521787da4663bd9f19f60a163483
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: oauth2-proxy
+        image: zot.mdapi.ch/oauth2-proxy/oauth2-proxy:v7.15.6@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: alertmanager
+        image: zot.mdapi.ch/prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: victoria-metrics
+        image: zot.mdapi.ch/victoriametrics/victoria-metrics:v1.155.0@sha256:f60dc268b54ecf87f6e09d740c2b732838aa9193090cc741417c9f6386a130df
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: vmagent
+        image: zot.mdapi.ch/victoriametrics/vmagent:v1.155.0@sha256:8e3c03905be15bba8312d4868e8ae6f9fc2fefee0a41d544472034249ca42bb4
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      - name: vmalert
+        image: zot.mdapi.ch/victoriametrics/vmalert:v1.153.0@sha256:0c1c7718b54b03e8559d0f257f31f1bd79ef7fa32ac6e9ed90d7b92a74a4fe76
+        imagePullPolicy: IfNotPresent
+        command: ["/hold/busybox", "sleep", "2147483647"]
+        volumeMounts: [{ name: hold, mountPath: /hold, readOnly: true }]
+        securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+        resources: { requests: { cpu: 1m, memory: 2Mi }, limits: { memory: 16Mi } }
+      # END derived

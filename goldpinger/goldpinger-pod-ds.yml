@@ -1,0 +1,110 @@
+## POD-path arm: pod network, so every peer call crosses flannel VXLAN (canal) on
+## mgmt-br, which is the path the Ceph OSDs and mons use. Its hostNetwork twin
+## (goldpinger-host-ds.yml) runs the same probes over the same NICs, bond and
+## switch WITHOUT the overlay; the alerts compare the two, pair by pair.
+##
+## LABEL_SELECTOR must stay arm-specific: an arm that discovers the other arm's
+## pods would mix the two paths in one set of series.
+##
+## REFRESH_INTERVAL 5 s: the Ceph OSD heartbeat grace is 20 s, so a cut that
+## matters to Ceph lasts several cycles. UDP_PACKET_COUNT 20 gives 5 % loss
+## resolution per cycle.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: goldpinger-pod
+  namespace: goldpinger
+  labels:
+    app.kubernetes.io/name: goldpinger
+    app.kubernetes.io/component: pod-path
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: goldpinger
+      app.kubernetes.io/component: pod-path
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: goldpinger
+        app.kubernetes.io/component: pod-path
+    spec:
+      serviceAccountName: goldpinger
+      ## A network probe that leaves a node during a taint is blind exactly when
+      ## that node's path is in question.
+      tolerations:
+        - operator: Exists
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: goldpinger
+          image: bloomberg/goldpinger:3.11.5@sha256:f7c60d31915048283bd91c41531388dde1956bc4ed7d99bbd28995871fab9a6e
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LABEL_SELECTOR
+              value: "app.kubernetes.io/name=goldpinger,app.kubernetes.io/component=pod-path"
+            - name: DISPLAY_NODENAME
+              value: "true"
+            - name: REFRESH_INTERVAL
+              value: "5"
+            - name: PING_TIMEOUT
+              value: "300ms"
+            - name: UDP_ENABLED
+              value: "true"
+            - name: UDP_PORT
+              value: "6969"
+            - name: UDP_PACKET_COUNT
+              value: "20"
+            - name: UDP_TIMEOUT
+              value: "1s"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: udp-probe
+              containerPort: 6969
+              protocol: UDP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 5m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

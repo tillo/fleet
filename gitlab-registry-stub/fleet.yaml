@@ -1,0 +1,23 @@
+# Registry API stub for GitLab (infra-5jnt8, 2026-11-25).
+#
+# The registry was retired 2026-11-08 (gitlab/values.yaml `registry.enabled: false`),
+# but `global.registry.enabled` stays true so CI keeps CI_REGISTRY_IMAGE. Rails then
+# still calls the registry api_url (http://gitlab-registry.bootstrap.svc:5000) before
+# it renames, transfers or deletes a project, and with no Service there every one of
+# those failed ("failed to connect to the container registry"). This bundle puts a
+# Service of exactly that name in front of an nginx that answers "no tags".
+# tests/test_gitlab_registry_api_url_has_a_responder.py pins the contract.
+#
+# Own bundle, not inside gitlab/: the gitlab bundle embeds a vendored chart near the
+# etcd size margin, and this has nothing to do with the chart.
+defaultNamespace: bootstrap
+# Must equal gitlab/fleet.yaml's list (test_namespace_labels_agree_across_bundles).
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: baseline
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: baseline
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25

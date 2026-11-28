@@ -1,0 +1,18 @@
+# WAF rows of the kgateway PoC (bead infra-qwet.1): Coraza + OWASP CRS as a
+# gRPC ext_proc engine behind the kgw Gateway.
+#
+#   waf     coraza attached to the whole Gateway  → canary 403
+#   wafoff  same rule, extProc disabled on the route → canary reaches the app
+#   wafexc  coraza attached, with a per-host CRS exception in the image's
+#           config/rules/exclusions.conf → canary 200, and any OTHER attack on
+#           that host still 403
+#
+# kgateway OSS has no wasm filter (measured at v2.5.2), so this external engine
+# is the ONLY way to put a WAF in front of a kgateway route — the finding
+# against Envoy Gateway (which loads coraza-proxy-wasm in-process).
+#
+# Raw bundle: a helm bundle would silently drop these manifests.
+defaultNamespace: kgw-poc
+dependsOn:
+  - name: mdapi-prod-kgateway-poc
+  - name: mdapi-prod-kgateway

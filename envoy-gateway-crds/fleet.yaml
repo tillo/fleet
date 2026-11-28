@@ -1,0 +1,31 @@
+# Envoy Gateway CRDs (gateway.envoyproxy.io: EnvoyProxy, ClientTrafficPolicy,
+# BackendTrafficPolicy, SecurityPolicy, EnvoyExtensionPolicy, EnvoyPatchPolicy,
+# HTTPRouteFilter, Backend). Own bundle so the controller can dependsOn it: a CRD
+# and its first CR in one Helm release race on a fresh install.
+#
+# Side-by-side of kgateway (bead infra-qwet.1), LAN-only.
+#
+# ⚠️ RAW, vendored: crds.yaml is RENDERED by tools/vendor-envoy-gateway-crds.sh
+# from oci://docker.io/envoyproxy/gateway-crds-helm. As a Helm bundle of that
+# chart the release Secret is 1.87 MB (> the 1 MiB limit): Helm stores every
+# template, and the chart carries the full Gateway API CRDs as templates even
+# when they render nothing. tests/test_envoy_gateway_crds_match_controller.py
+# fails if crds.yaml and envoy-gateway/fleet.yaml name different versions.
+#
+# ⛔ Gateway API itself (v1.5.1 standard) is OWNED by the RKE2 Helm release
+# rke2-traefik-crd — the vendor script refuses any other CRD group. Envoy
+# Gateway v1.8.x is the line built against Gateway API v1.5.1 (compatibility
+# matrix); v1.9/v1.10 expect v1.6.1.
+defaultNamespace: envoy-gateway-system
+## First bundle to create the namespace: Fleet stamps namespaceLabels only at
+## creation, so the full set lives here too.
+namespaceLabels:
+  cd.mdapi.ch: fleet
+  cdenv.mdapi.ch: prod
+  pod-security.kubernetes.io/warn: restricted
+  pod-security.kubernetes.io/warn-version: latest
+  pod-security.kubernetes.io/audit: restricted
+  pod-security.kubernetes.io/audit-version: latest
+helm:
+  maxHistory: 25
+  releaseName: envoy-gateway-crds

@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Service
+# ⛔ Fleet owns this object through the wrangler markers ON the live object, not
+# through this file. If it is ever recreated by hand — as it was during the
+# 2026-11-28 .191 VIP repair — Fleet answers "service.v1 kube-system/ingress-expose
+# is not owned by us" and the WHOLE GitRepo reads Modified until the markers are
+# stamped back on, copied from this bundle's two ConfigMaps:
+#   kubectl -n kube-system label    svc ingress-expose \
+#     objectset.rio.cattle.io/hash=<hash shared by both ConfigMaps> \
+#     app.kubernetes.io/managed-by=Helm --overwrite
+#   kubectl -n kube-system annotate svc ingress-expose \
+#     objectset.rio.cattle.io/id=default-mdapi-prod-ingress \
+#     meta.helm.sh/release-name=mdapi-prod-ingress \
+#     meta.helm.sh/release-namespace=kube-system --overwrite
+#   kubectl -n kube-system annotate svc ingress-expose \
+#     kubectl.kubernetes.io/last-applied-configuration-
+# helm.takeOwnership in fleet.yaml does NOT help: it adopts only at a bundle's
+# FIRST install. Then Fleet reports the remaining drift it will never apply — write
+# exactly the value its bundle status names (memory
+# feedback_fleet_bundle_takeOwnership_for_adopted_resources).
+metadata:
+  name: ingress-expose
+  namespace: kube-system
+  annotations:
+    # Static IP for kube-vip. NOT the bootstrap pattern — that uses
+    # loadbalancerIPs=0.0.0.0 + hwaddr to trigger DHCP-mode allocation
+    # (per harvester-system/vip ConfigMap which has mode: dhcp).
+    # We don't have a DHCP server reachable from this kube-vip with the
+    # bootstrap MAC registered, so DHCP mode times out. Use static IP.
+    kube-vip.io/ignore-service-security: "true"
+    # The edge DAST scans every host behind it by name (dast/discover.yml).
+    dast.mdapi.ch/skip: "ingress -- edge-dast scans its hosts"
+    kube-vip.io/loadbalancerIPs: "192.168.1.191"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.191
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: rke2-ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+    - {name: https, port: 443, targetPort: 443, protocol: TCP}
+    - {name: http,  port: 80,  targetPort: 80,  protocol: TCP}

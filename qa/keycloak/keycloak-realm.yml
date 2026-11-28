@@ -1,0 +1,58 @@
+## The test realm, imported at start (--import-realm; IGNORE_EXISTING, and the DB is an
+## emptyDir, so every restart starts from exactly this). Every name is made up.
+## ${QA_*_PASSWORD} are Keycloak's import placeholders, filled from the pod env
+## (Secret keycloak-qa-users), so no credential sits in git.
+## Token lifespan 1 h: the ZAP scan authenticates once and keeps the token.
+## qa-tester carries the `account` client's view-profile + manage-account roles: an
+## imported realm does not grant them, and without them the account console SPA renders
+## "Something went wrong" and every /realms/qa-test/account/ call answers 401 (measured
+## 2026-11-25, infra-7rog.31.24) -- i.e. the app wave 1 "scanned" could not work at all.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-qa-realm
+  namespace: keycloak
+data:
+  realm-qa-test.json: |
+    {
+      "realm": "qa-test",
+      "enabled": true,
+      "displayName": "QA test realm (synthetic)",
+      "accessTokenLifespan": 3600,
+      "registrationAllowed": true,
+      "resetPasswordAllowed": true,
+      "loginWithEmailAllowed": true,
+      "groups": [{"name": "qa-team"}],
+      "roles": {"realm": [{"name": "qa-reader"}]},
+      "clients": [
+        {
+          "clientId": "qa-app",
+          "publicClient": true,
+          "directAccessGrantsEnabled": true,
+          "standardFlowEnabled": true,
+          "redirectUris": ["http://qa-app.example.invalid/*"],
+          "webOrigins": ["+"]
+        }
+      ],
+      "users": [
+        {
+          "username": "qa-admin",
+          "email": "qa-admin@example.invalid",
+          "firstName": "QA", "lastName": "Admin",
+          "enabled": true, "emailVerified": true,
+          "credentials": [{"type": "password", "value": "${QA_ADMIN_PASSWORD}", "temporary": false}],
+          "groups": ["qa-team"],
+          "clientRoles": {"realm-management": ["realm-admin"]}
+        },
+        {
+          "username": "qa-tester",
+          "email": "qa-tester@example.invalid",
+          "firstName": "QA", "lastName": "Tester",
+          "enabled": true, "emailVerified": true,
+          "credentials": [{"type": "password", "value": "${QA_TESTER_PASSWORD}", "temporary": false}],
+          "realmRoles": ["qa-reader"],
+          "clientRoles": {"account": ["view-profile", "manage-account"]},
+          "groups": ["qa-team"]
+        }
+      ]
+    }
